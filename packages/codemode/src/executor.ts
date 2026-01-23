@@ -1,20 +1,16 @@
-import type { CodeModeProxy } from "./proxy";
-
 interface ExecutorEntrypoint {
   evaluate(): Promise<{ result: unknown; err?: string; stack?: string }>;
 }
 
 export interface CodeExecutorOptions {
   loader: WorkerLoader;
-  /** Service binding to CodeModeProxy for tool RPC */
-  proxy: Fetcher<CodeModeProxy>;
-  /** Optional outbound fetch handler to filter requests. Set to null to block all outbound. */
-  globalOutbound?: Fetcher | null;
+  /** globalOutbound that handles tool calls and optionally other requests */
+  globalOutbound: Fetcher;
 }
 
 /**
  * Create a sandboxed code executor that runs user-generated code
- * in an isolated Worker. Tools are called via the CodeModeProxy binding.
+ * in an isolated Worker. Tools are called via fetch to codemode:// URLs.
  */
 export function createCodeExecutor(options: CodeExecutorOptions) {
   return async (code: string): Promise<unknown> => {
@@ -30,15 +26,16 @@ import { WorkerEntrypoint } from "cloudflare:workers";
 
 export default class CodeExecutor extends WorkerEntrypoint {
   async evaluate() {
-    const { CodeModeProxy } = this.env;
-
-    // Create codemode proxy that routes tool calls through CodeModeProxy
+    // Create codemode proxy that calls tools via fetch
     const codemode = new Proxy({}, {
       get: (_, toolName) => async (args) => {
-        return CodeModeProxy.callFunction({
-          functionName: String(toolName),
-          args: args ?? {}
+        const res = await fetch(\`codemode://\${String(toolName)}\`, {
+          method: "POST",
+          body: JSON.stringify(args ?? {})
         });
+        const data = await res.json();
+        if (data.error) throw new Error(data.error);
+        return data.result;
       }
     });
 
@@ -52,11 +49,7 @@ export default class CodeExecutor extends WorkerEntrypoint {
 }
         `
         },
-        env: {
-          CodeModeProxy: options.proxy
-        },
-        // null blocks all outbound, undefined allows all (if user wants filtering, they pass a Fetcher)
-        globalOutbound: options.globalOutbound ?? null
+        globalOutbound: options.globalOutbound
       })
     );
 

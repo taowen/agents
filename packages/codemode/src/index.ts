@@ -5,4 +5,3 @@ export {
   type ToolDescriptor,
   type ToolDescriptors
 } from "./types";
-export { CodeModeProxy, type CodeModeProxyProps } from "./proxy";

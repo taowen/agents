@@ -1,8 +1,8 @@
 /**
- * Integration tests for proxy-based codemode.
+ * Integration tests for codemode.
  *
  * These tests verify that the tool execution works correctly
- * including closure preservation through CodeModeProxy.
+ * including closure preservation through globalOutbound.
  */
 import { describe, it, expect, vi } from "vitest";
 import { experimental_createCodeTool } from "../tool";
@@ -237,42 +237,7 @@ describe("codemode integration", () => {
   });
 
   describe("tool configuration", () => {
-    it("should pass proxy to executor", async () => {
-      const tools: ToolDescriptors = {
-        dummy: {
-          description: "Dummy",
-          inputSchema: z.object({}),
-          execute: async () => ({})
-        }
-      };
-
-      const mockProxy = createMockProxy(tools);
-
-      let capturedConfig: any = null;
-      const mockLoader = {
-        get: vi.fn((name: string, factory: () => any) => {
-          capturedConfig = factory();
-          return {
-            getEntrypoint: () => ({
-              evaluate: async () => ({ result: null })
-            })
-          };
-        })
-      };
-
-      const codemode = experimental_createCodeTool({
-        tools,
-        loader: mockLoader as any,
-        proxy: mockProxy as any
-      });
-
-      await codemode.execute?.({ code: "async () => null" }, {} as any);
-
-      // Proxy should be in env as CodeModeProxy
-      expect(capturedConfig.env.CodeModeProxy).toBe(mockProxy);
-    });
-
-    it("should block outbound by default", async () => {
+    it("should pass globalOutbound to executor", async () => {
       const tools: ToolDescriptors = {
         dummy: {
           description: "Dummy",
@@ -295,17 +260,16 @@ describe("codemode integration", () => {
 
       const codemode = experimental_createCodeTool({
         tools,
-        loader: mockLoader as any,
-        proxy: createMockProxy(tools) as any
+        loader: mockLoader as any
       });
 
       await codemode.execute?.({ code: "async () => null" }, {} as any);
 
-      // globalOutbound should be null (blocks all)
-      expect(capturedConfig.globalOutbound).toBeNull();
+      // globalOutbound should be set (handles tool calls)
+      expect(capturedConfig.globalOutbound).toBeDefined();
     });
 
-    it("should allow custom globalOutbound for network filtering", async () => {
+    it("should allow custom onFetch for network filtering", async () => {
       const tools: ToolDescriptors = {
         dummy: {
           description: "Dummy",
@@ -315,17 +279,6 @@ describe("codemode integration", () => {
       };
 
       const fetchLog: string[] = [];
-      const customGlobalOutbound = {
-        fetch: async (input: any) => {
-          const url = typeof input === "string" ? input : input.url;
-          fetchLog.push(url);
-          // Block certain domains
-          if (url.includes("blocked.com")) {
-            return new Response("Blocked", { status: 403 });
-          }
-          return new Response("OK");
-        }
-      };
 
       let capturedConfig: any = null;
       const mockLoader = {
@@ -342,14 +295,16 @@ describe("codemode integration", () => {
       const codemode = experimental_createCodeTool({
         tools,
         loader: mockLoader as any,
-        proxy: createMockProxy(tools) as any,
-        globalOutbound: customGlobalOutbound as any
+        onFetch: async (request) => {
+          fetchLog.push(request.url);
+          return fetch(request);
+        }
       });
 
       await codemode.execute?.({ code: "async () => null" }, {} as any);
 
-      // Custom globalOutbound should be passed through
-      expect(capturedConfig.globalOutbound).toBe(customGlobalOutbound);
+      // globalOutbound should be set
+      expect(capturedConfig.globalOutbound).toBeDefined();
     });
   });
 });

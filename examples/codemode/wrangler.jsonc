@@ -24,18 +24,6 @@
       "new_sqlite_classes": ["Codemode"]
     }
   ],
-  "services": [
-    {
-      "binding": "CodeModeProxy",
-      "service": "codemode-demo",
-      "entrypoint": "CodeModeProxy"
-    },
-    {
-      "binding": "globalOutbound",
-      "service": "codemode-demo",
-      "entrypoint": "globalOutbound"
-    }
-  ],
   "observability": {
     "enabled": true
   },

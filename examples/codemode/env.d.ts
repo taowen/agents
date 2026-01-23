@@ -7,8 +7,6 @@ declare namespace Cloudflare {
   interface Env {
     Codemode: DurableObjectNamespace;
     LOADER: WorkerLoader;
-    CodeModeProxy: Service<typeof import("./src/server").CodeModeProxy>;
-    globalOutbound: Service<typeof import("./src/server").globalOutbound>;
   }
 }
 interface Env extends Cloudflare.Env {}

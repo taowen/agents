@@ -1,6 +1,6 @@
 import { routeAgentRequest, Agent, callable, type Connection } from "agents";
 import { getSchedulePrompt } from "agents/schedule";
-import { experimental_createCodeTool, CodeModeProxy } from "@cloudflare/codemode";
+import { experimental_createCodeTool } from "@cloudflare/codemode";
 import {
   streamText,
   type UIMessage,
@@ -10,22 +10,7 @@ import {
   generateId
 } from "ai";
 import { openai } from "@ai-sdk/openai";
-import { WorkerEntrypoint } from "cloudflare:workers";
 import { tools } from "./tools";
-
-// Re-export CodeModeProxy for service binding
-export { CodeModeProxy };
-
-// Export globalOutbound to filter outbound requests from sandbox
-export class globalOutbound extends WorkerEntrypoint {
-  async fetch(request: Request): Promise<Response> {
-    const url = new URL(request.url);
-    if (url.hostname === "example.com" && url.pathname === "/sub-path") {
-      return new Response("Not allowed", { status: 403 });
-    }
-    return fetch(request);
-  }
-}
 
 // inline this until enable_ctx_exports is supported by default
 declare global {
@@ -72,15 +57,6 @@ export class Codemode extends Agent<Env, State> {
     void this.removeMcpServer(id);
   }
 
-  // Called by CodeModeProxy to execute tools
-  callTool(functionName: string, args: unknown) {
-    const tool = tools[functionName];
-    if (!tool?.execute) {
-      throw new Error(`Tool ${functionName} not found`);
-    }
-    return tool.execute(args);
-  }
-
   async onStateUpdate(state: State, source: Connection | "server") {
     if (source === "server") return;
 
@@ -100,14 +76,15 @@ export class Codemode extends Agent<Env, State> {
     const codemode = experimental_createCodeTool({
       tools,
       loader: this.env.LOADER,
-      proxy: this.ctx.exports.CodeModeProxy({
-        props: {
-          binding: "Codemode",
-          name: this.name,
-          callback: "callTool"
+      // Optional: allow specific outbound requests
+      onFetch: async (request) => {
+        const url = new URL(request.url);
+        // Block requests to example.com/sub-path
+        if (url.hostname === "example.com" && url.pathname === "/sub-path") {
+          return null; // Block
         }
-      }),
-      globalOutbound: this.env.globalOutbound
+        return fetch(request); // Allow
+      }
     });
 
     const result = streamText({

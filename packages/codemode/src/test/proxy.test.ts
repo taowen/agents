@@ -1,8 +1,8 @@
 /**
- * Tests for the proxy-based codemode implementation.
+ * Tests for the globalOutbound-based codemode implementation.
  *
  * This tests that tool execute functions are called correctly through
- * the CodeModeProxy service binding.
+ * the codemode:// fetch protocol.
  */
 import { describe, it, expect, vi } from "vitest";
 import { experimental_createCodeTool } from "../tool";
@@ -22,42 +22,7 @@ function createMockProxy(tools: ToolDescriptors) {
   };
 }
 
-// Mock WorkerLoader that simulates sandbox execution with proxy
-function createMockLoader(mockProxy: ReturnType<typeof createMockProxy>) {
-  return {
-    get: vi.fn((name: string, factory: () => any) => {
-      const config = factory();
-
-      return {
-        getEntrypoint: () => ({
-          evaluate: async () => {
-            // In a real sandbox, the code would call CodeModeProxy.callFunction
-            // Here we simulate that by making the codemode proxy available
-            const codemode = new Proxy(
-              {},
-              {
-                get: (_, toolName) => async (args: unknown) => {
-                  // Route through the mock proxy (simulates env.CodeModeProxy)
-                  return mockProxy.callFunction({
-                    functionName: String(toolName),
-                    args: args ?? {}
-                  });
-                }
-              }
-            );
-
-            // Return the config for inspection (in real execution, code runs)
-            return {
-              result: { codemode, config }
-            };
-          }
-        })
-      };
-    })
-  };
-}
-
-describe("proxy-based codemode", () => {
+describe("globalOutbound-based codemode", () => {
   it("should create a tool with correct structure", () => {
     const tools: ToolDescriptors = {
       testTool: {
@@ -67,20 +32,20 @@ describe("proxy-based codemode", () => {
       }
     };
 
-    const mockProxy = createMockProxy(tools);
-    const mockLoader = createMockLoader(mockProxy);
+    const mockLoader = {
+      get: vi.fn()
+    };
 
     const codemode = experimental_createCodeTool({
       tools,
-      loader: mockLoader as any,
-      proxy: mockProxy as any
+      loader: mockLoader as any
     });
 
     expect(codemode).toBeDefined();
     expect(codemode.description).toContain("testTool");
   });
 
-  it("should handle tool calls through proxy", async () => {
+  it("should handle tool calls through mock proxy", async () => {
     const tools: ToolDescriptors = {
       greet: {
         description: "Greet someone",
@@ -156,47 +121,7 @@ describe("proxy-based codemode", () => {
     ).rejects.toThrow("Tool nonexistent not found");
   });
 
-  it("should pass globalOutbound to worker config when provided", async () => {
-    const tools: ToolDescriptors = {
-      dummy: {
-        description: "Dummy",
-        inputSchema: z.object({}),
-        execute: async () => ({})
-      }
-    };
-
-    const userGlobalOutbound = {
-      fetch: async (input: any, init: any) => {
-        return new Response(JSON.stringify({ proxied: true }));
-      }
-    };
-
-    let capturedConfig: any = null;
-    const mockLoader = {
-      get: vi.fn((name: string, factory: () => any) => {
-        capturedConfig = factory();
-        return {
-          getEntrypoint: () => ({
-            evaluate: async () => ({ result: "test" })
-          })
-        };
-      })
-    };
-
-    const codemode = experimental_createCodeTool({
-      tools,
-      loader: mockLoader as any,
-      proxy: createMockProxy(tools) as any,
-      globalOutbound: userGlobalOutbound as any
-    });
-
-    await codemode.execute?.({ code: "async () => {}" }, {} as any);
-
-    // globalOutbound should be passed through
-    expect(capturedConfig.globalOutbound).toBe(userGlobalOutbound);
-  });
-
-  it("should default globalOutbound to null when not provided", async () => {
+  it("should pass globalOutbound config to worker", async () => {
     const tools: ToolDescriptors = {
       dummy: {
         description: "Dummy",
@@ -219,15 +144,14 @@ describe("proxy-based codemode", () => {
 
     const codemode = experimental_createCodeTool({
       tools,
-      loader: mockLoader as any,
-      proxy: createMockProxy(tools) as any
-      // No globalOutbound provided
+      loader: mockLoader as any
     });
 
     await codemode.execute?.({ code: "async () => {}" }, {} as any);
 
-    // globalOutbound should be null (blocks all outbound)
-    expect(capturedConfig.globalOutbound).toBeNull();
+    // globalOutbound should be set
+    expect(capturedConfig.globalOutbound).toBeDefined();
+    expect(capturedConfig.globalOutbound.fetch).toBeDefined();
   });
 
   it("should generate correct sandbox code structure", async () => {
@@ -253,8 +177,7 @@ describe("proxy-based codemode", () => {
 
     const codemode = experimental_createCodeTool({
       tools,
-      loader: mockLoader as any,
-      proxy: createMockProxy(tools) as any
+      loader: mockLoader as any
     });
 
     await codemode.execute?.({ code: "async () => null" }, {} as any);
@@ -262,45 +185,8 @@ describe("proxy-based codemode", () => {
     const config = capturedConfig;
     const executorCode = config.modules["executor.js"];
 
-    // Should use CodeModeProxy for tool calls
-    expect(executorCode).toContain("CodeModeProxy");
-    expect(executorCode).toContain("callFunction");
-    // Should NOT use the old codemode:// protocol
-    expect(executorCode).not.toContain("codemode://");
-  });
-
-  it("should pass CodeModeProxy in env", async () => {
-    const tools: ToolDescriptors = {
-      dummy: {
-        description: "Dummy",
-        inputSchema: z.object({}),
-        execute: async () => ({})
-      }
-    };
-
-    const mockProxy = createMockProxy(tools);
-
-    let capturedConfig: any = null;
-    const mockLoader = {
-      get: vi.fn((name: string, factory: () => any) => {
-        capturedConfig = factory();
-        return {
-          getEntrypoint: () => ({
-            evaluate: async () => ({ result: null })
-          })
-        };
-      })
-    };
-
-    const codemode = experimental_createCodeTool({
-      tools,
-      loader: mockLoader as any,
-      proxy: mockProxy as any
-    });
-
-    await codemode.execute?.({ code: "async () => null" }, {} as any);
-
-    // CodeModeProxy should be in env
-    expect(capturedConfig.env.CodeModeProxy).toBe(mockProxy);
+    // Should use codemode:// protocol for tool calls
+    expect(executorCode).toContain("codemode://");
+    expect(executorCode).toContain("fetch");
   });
 });
