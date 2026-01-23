@@ -1,10 +1,4 @@
-export {
-  createCodeTool,
-  codeToolInputSchema,
-  type CreateCodeToolOptions,
-  type CodeTool,
-  type CodeToolResult
-} from "./tool";
+export { experimental_createCodeTool, type CreateCodeToolOptions } from "./tool";
 export { createCodeExecutor, type CodeExecutorOptions } from "./executor";
 export {
   generateTypes,

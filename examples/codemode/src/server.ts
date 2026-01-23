@@ -1,24 +1,31 @@
 import { routeAgentRequest, Agent, callable, type Connection } from "agents";
-
 import { getSchedulePrompt } from "agents/schedule";
-
-import { experimental_codemode as codemode } from "@cloudflare/codemode/ai";
+import { experimental_createCodeTool, CodeModeProxy } from "@cloudflare/codemode";
 import {
   streamText,
   type UIMessage,
   stepCountIs,
   convertToModelMessages,
-  type ToolSet,
   readUIMessageStream,
   generateId
 } from "ai";
 import { openai } from "@ai-sdk/openai";
+import { WorkerEntrypoint } from "cloudflare:workers";
 import { tools } from "./tools";
-import { env } from "cloudflare:workers";
 
-// export this WorkerEntryPoint that lets you
-// reroute function calls back to a caller
-export { CodeModeProxy } from "@cloudflare/codemode/ai";
+// Re-export CodeModeProxy for service binding
+export { CodeModeProxy };
+
+// Export globalOutbound to filter outbound requests from sandbox
+export class globalOutbound extends WorkerEntrypoint {
+  async fetch(request: Request): Promise<Response> {
+    const url = new URL(request.url);
+    if (url.hostname === "example.com" && url.pathname === "/sub-path") {
+      return new Response("Not allowed", { status: 403 });
+    }
+    return fetch(request);
+  }
+}
 
 // inline this until enable_ctx_exports is supported by default
 declare global {
@@ -29,44 +36,18 @@ declare global {
 
   interface DurableObjectState<Props = unknown> {
     readonly exports: Cloudflare.Exports;
-    readonly props: Props;
   }
 }
 
 const model = openai("gpt-5");
 
-export const globalOutbound = {
-  fetch: async (
-    input: string | URL | RequestInfo,
-    init?: RequestInit<CfProperties<unknown>> | undefined
-  ): Promise<Response> => {
-    const url = new URL(
-      typeof input === "string"
-        ? input
-        : typeof input === "object" && "url" in input
-          ? input.url
-          : input.toString()
-    );
-    if (url.hostname === "example.com" && url.pathname === "/sub-path") {
-      return new Response("Not allowed", { status: 403 });
-    }
-    return fetch(input, init);
-  }
-};
-
 type State = {
-  messages: UIMessage<typeof tools>[];
+  messages: UIMessage[];
   loading: boolean;
 };
 
 export class Codemode extends Agent<Env, State> {
-  /**
-   * Handles incoming chat messages and manages the response stream
-   */
-  tools: ToolSet = {};
-
   observability = undefined;
-
   lastMessageRepliedTo: string | undefined;
 
   initialState: State = {
@@ -79,144 +60,100 @@ export class Codemode extends Agent<Env, State> {
       this.state.messages[this.state.messages.length - 1]?.id;
   }
 
-  @callable({
-    description: "Add an MCP server to the agent"
-  })
+  @callable({ description: "Add an MCP server to the agent" })
   addMcp({ name, url }: { name: string; url: string }) {
     void this.addMcpServer(name, url, "http://localhost:5173")
-      .then(() => {
-        console.log("mcpServer added", name, url);
-      })
-      .catch((error) => {
-        console.error("mcpServer addition failed", error);
-      });
+      .then(() => console.log("mcpServer added", name, url))
+      .catch((error) => console.error("mcpServer addition failed", error));
   }
 
-  @callable({
-    description: "Remove an MCP server from the agent"
-  })
+  @callable({ description: "Remove an MCP server from the agent" })
   removeMcp(id: string) {
     void this.removeMcpServer(id);
   }
 
-  callTool(functionName: string, args: unknown[]) {
-    return this.tools[functionName]?.execute?.(args, {
-      abortSignal: new AbortController().signal,
-      toolCallId: "123",
-      messages: []
-    });
+  // Called by CodeModeProxy to execute tools
+  callTool(functionName: string, args: unknown) {
+    const tool = tools[functionName];
+    if (!tool?.execute) {
+      throw new Error(`Tool ${functionName} not found`);
+    }
+    return tool.execute(args);
   }
 
   async onStateUpdate(state: State, source: Connection | "server") {
-    if (source === "server") {
-      return;
-    }
+    if (source === "server") return;
+
+    const lastMessage = state.messages[state.messages.length - 1];
     if (
       state.messages.length > 0 &&
-      this.lastMessageRepliedTo !==
-        state.messages[state.messages.length - 1]?.id
+      this.lastMessageRepliedTo !== lastMessage?.id
     ) {
       await this.onChatMessage();
-      this.lastMessageRepliedTo = state.messages[state.messages.length - 1]?.id;
+      this.lastMessageRepliedTo = lastMessage?.id;
     }
   }
 
   async onChatMessage() {
-    // Collect all tools, including MCP tools
     this.setState({ messages: this.state.messages, loading: true });
-    const allTools = {
-      ...tools,
-      ...this.mcp.getAITools()
-    };
 
-    this.tools = allTools;
-
-    const { prompt, tools: wrappedTools } = await codemode({
-      prompt: `You are a helpful assistant that can do various tasks... 
-
-${getSchedulePrompt({ date: new Date() })}
-
-If the user asks to schedule a task, use the schedule tool to schedule the task.
-`,
-      tools: allTools,
-      globalOutbound: env.globalOutbound,
-      loader: env.LOADER,
+    const codemode = experimental_createCodeTool({
+      tools,
+      loader: this.env.LOADER,
       proxy: this.ctx.exports.CodeModeProxy({
         props: {
           binding: "Codemode",
           name: this.name,
           callback: "callTool"
         }
-      })
+      }),
+      globalOutbound: this.env.globalOutbound
     });
 
     const result = streamText({
-      system: prompt,
+      system: `You are a helpful assistant that can execute code to achieve goals.
 
+When you need to perform multiple operations or complex logic, use the codemode tool.
+The codemode tool lets you write JavaScript code that calls available functions.
+
+${getSchedulePrompt({ date: new Date() })}
+`,
       messages: await convertToModelMessages(this.state.messages),
       model,
-      // tools: allTools,
-      tools: wrappedTools,
-
-      onError: (error) => {
-        console.error("error", error);
-      },
-      // onFinish: ({response}) => {
-      //   this.setState({ messages: this.state.messages, loading: false });
-      // },
-
+      tools: { codemode },
+      onError: (error) => console.error("error", error),
       stopWhen: stepCountIs(10)
     });
 
-    for await (const uiMessage of readUIMessageStream<UIMessage<typeof tools>>({
-      stream: result.toUIMessageStream({
-        generateMessageId: generateId
-      }),
-      onError: (error) => {
-        console.error("error", error);
-      }
+    for await (const uiMessage of readUIMessageStream<UIMessage>({
+      stream: result.toUIMessageStream({ generateMessageId: generateId }),
+      onError: (error) => console.error("error", error)
     })) {
-      // console.log("Current message state:", uiMessage);
       this.setState({
         messages: updateMessages(this.state.messages, uiMessage),
         loading: this.state.loading
       });
     }
-    this.setState({
-      messages: this.state.messages,
-      loading: false
-    });
+
+    this.setState({ messages: this.state.messages, loading: false });
   }
 }
 
-function updateMessages(
-  messages: UIMessage<typeof tools>[],
-  newMessage: UIMessage<typeof tools>
-) {
-  const finalMessages = [];
-  let updated = false;
-  for (const message of messages) {
-    if (message.id === newMessage.id) {
-      finalMessages.push(newMessage);
-      updated = true;
-    } else {
-      finalMessages.push(message);
-    }
+function updateMessages(messages: UIMessage[], newMessage: UIMessage) {
+  const index = messages.findIndex((m) => m.id === newMessage.id);
+  if (index >= 0) {
+    return [
+      ...messages.slice(0, index),
+      newMessage,
+      ...messages.slice(index + 1)
+    ];
   }
-  if (!updated) {
-    finalMessages.push(newMessage);
-  }
-
-  return finalMessages;
+  return [...messages, newMessage];
 }
 
-/**
- * Worker entry point that routes incoming requests to the appropriate handler
- */
 export default {
   async fetch(request: Request, env: Env, _ctx: ExecutionContext) {
     return (
-      // Route the request to our agent or return 404 if not found
       (await routeAgentRequest(request, env)) ||
       new Response("Not found", { status: 404 })
     );

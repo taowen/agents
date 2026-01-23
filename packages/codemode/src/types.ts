@@ -1,7 +1,8 @@
 import {
   zodToTs,
   printNode as printNodeZodToTs,
-  createTypeAlias
+  createTypeAlias,
+  createAuxiliaryTypeStore
 } from "zod-to-ts";
 import type { ZodType } from "zod";
 import type { ToolSet } from "ai";
@@ -16,6 +17,7 @@ export interface ToolDescriptor {
   description?: string;
   inputSchema: ZodType;
   outputSchema?: ZodType;
+  execute?: (args: unknown) => Promise<unknown>;
 }
 
 export type ToolDescriptors = Record<string, ToolDescriptor>;
@@ -28,6 +30,8 @@ export function generateTypes(tools: ToolDescriptors | ToolSet): string {
   let availableTools = "";
   let availableTypes = "";
 
+  const auxiliaryTypeStore = createAuxiliaryTypeStore();
+
   for (const [toolName, tool] of Object.entries(tools)) {
     // Handle both our ToolDescriptor and AI SDK Tool types
     const inputSchema =
@@ -37,7 +41,7 @@ export function generateTypes(tools: ToolDescriptors | ToolSet): string {
 
     const inputType = printNodeZodToTs(
       createTypeAlias(
-        zodToTs(inputSchema as ZodType, `${toCamelCase(toolName)}Input`).node,
+        zodToTs(inputSchema as ZodType, { auxiliaryTypeStore }).node,
         `${toCamelCase(toolName)}Input`
       )
     );
@@ -45,8 +49,7 @@ export function generateTypes(tools: ToolDescriptors | ToolSet): string {
     const outputType = outputSchema
       ? printNodeZodToTs(
           createTypeAlias(
-            zodToTs(outputSchema as ZodType, `${toCamelCase(toolName)}Output`)
-              .node,
+            zodToTs(outputSchema as ZodType, { auxiliaryTypeStore }).node,
             `${toCamelCase(toolName)}Output`
           )
         )

@@ -26,14 +26,14 @@
   ],
   "services": [
     {
-      "binding": "globalOutbound",
-      "service": "codemode-demo",
-      "entrypoint": "globalOutbound"
-    },
-    {
       "binding": "CodeModeProxy",
       "service": "codemode-demo",
       "entrypoint": "CodeModeProxy"
+    },
+    {
+      "binding": "globalOutbound",
+      "service": "codemode-demo",
+      "entrypoint": "globalOutbound"
     }
   ],
   "observability": {

@@ -6,12 +6,15 @@ interface ExecutorEntrypoint {
 
 export interface CodeExecutorOptions {
   loader: WorkerLoader;
+  /** Service binding to CodeModeProxy for tool RPC */
   proxy: Fetcher<CodeModeProxy>;
+  /** Optional outbound fetch handler to filter requests. Set to null to block all outbound. */
+  globalOutbound?: Fetcher | null;
 }
 
 /**
  * Create a sandboxed code executor that runs user-generated code
- * in an isolated Worker with access to tools via the proxy.
+ * in an isolated Worker. Tools are called via the CodeModeProxy binding.
  */
 export function createCodeExecutor(options: CodeExecutorOptions) {
   return async (code: string): Promise<unknown> => {
@@ -29,11 +32,12 @@ export default class CodeExecutor extends WorkerEntrypoint {
   async evaluate() {
     const { CodeModeProxy } = this.env;
 
+    // Create codemode proxy that routes tool calls through CodeModeProxy
     const codemode = new Proxy({}, {
-      get: (_, toolName) => {
-        return (args) => CodeModeProxy.callFunction({
-          functionName: toolName,
-          args
+      get: (_, toolName) => async (args) => {
+        return CodeModeProxy.callFunction({
+          functionName: String(toolName),
+          args: args ?? {}
         });
       }
     });
@@ -50,7 +54,9 @@ export default class CodeExecutor extends WorkerEntrypoint {
         },
         env: {
           CodeModeProxy: options.proxy
-        }
+        },
+        // null blocks all outbound, undefined allows all (if user wants filtering, they pass a Fetcher)
+        globalOutbound: options.globalOutbound ?? null
       })
     );
 
