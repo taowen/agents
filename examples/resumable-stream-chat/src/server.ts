@@ -67,7 +67,10 @@ export class ResumableStreamingChat extends AIChatAgent {
         // Simulate a lookup delay
         await new Promise((r) => setTimeout(r, 1500));
 
-        // Second write with same type+id: replaces "searching" in-place
+        // Second write with same type+id: replaces "searching" in-place.
+        // Results are hardcoded here to keep the example focused on the
+        // data parts plumbing — in a real app you'd query a vector DB or
+        // search index and return actual results.
         writer.write({
           type: "data-sources",
           id: "src-1",
