@@ -149,6 +149,10 @@ const STREAM_STALE_THRESHOLD_MS = 5 * 60 * 1000;
 const CLEANUP_INTERVAL_MS = 10 * 60 * 1000;
 /** Default age threshold for cleaning up completed streams (ms) - 24 hours */
 const CLEANUP_AGE_THRESHOLD_MS = 24 * 60 * 60 * 1000;
+/** Maximum size for a single file/data part's payload in bytes. DO SQLite has a 2 MB row limit
+ * The part is still broadcast to connected clients even when it exceeds this limit,
+ * but it will not be persisted into the assistant message stored in SQLite. */
+const MAX_DATA_PART_SIZE_BYTES = 2 * 1024 * 1024;
 
 const decoder = new TextDecoder();
 
@@ -1452,6 +1456,21 @@ export class AIChatAgent<
               }
 
               case "file": {
+                const fileUrl = data.url as string;
+                const fileByteLength = new TextEncoder().encode(
+                  fileUrl
+                ).byteLength;
+                if (fileByteLength > MAX_DATA_PART_SIZE_BYTES) {
+                  console.error(
+                    `[AIChatAgent] File part URL exceeds maximum size of ` +
+                      `${MAX_DATA_PART_SIZE_BYTES} bytes (got ${fileByteLength} bytes). ` +
+                      `Skipping persistence — the part will still be broadcast ` +
+                      `to connected clients. Consider using a hosted URL instead ` +
+                      `of a data URL for large files.`
+                  );
+                  break;
+                }
+
                 message.parts.push({
                   type: "file",
                   mediaType: data.mediaType,
@@ -1745,7 +1764,57 @@ export class AIChatAgent<
 
                 break;
               }
-              // Do we want to handle data parts?
+
+              default: {
+                // https://ai-sdk.dev/docs/ai-sdk-ui/streaming-data
+                if (data.type.startsWith("data-")) {
+                  const dataChunk = data as {
+                    type: string;
+                    id?: string;
+                    data: unknown;
+                    transient?: boolean;
+                  };
+
+                  if (!dataChunk.transient) {
+                    const serialized = JSON.stringify(dataChunk.data);
+                    const byteLength = new TextEncoder().encode(
+                      serialized
+                    ).byteLength;
+                    if (byteLength > MAX_DATA_PART_SIZE_BYTES) {
+                      console.error(
+                        `[AIChatAgent] Data part "${dataChunk.type}" exceeds ` +
+                          `maximum size of ${MAX_DATA_PART_SIZE_BYTES} bytes ` +
+                          `(got ${byteLength} bytes). Skipping persistence — ` +
+                          `the part will still be broadcast to connected clients.`
+                      );
+                      break;
+                    }
+
+                    // If a part with the same type and id already exists,
+                    // update its data in-place instead of appending.
+                    // This matches the AI SDK client behavior for progressive updates
+                    if (dataChunk.id != null) {
+                      const existing = message.parts.find(
+                        (p) =>
+                          p.type === dataChunk.type &&
+                          "id" in p &&
+                          (p as { id?: string }).id === dataChunk.id
+                      );
+                      if (existing) {
+                        (existing as { data: unknown }).data = dataChunk.data;
+                        break;
+                      }
+                    }
+
+                    message.parts.push({
+                      type: dataChunk.type,
+                      ...(dataChunk.id != null && { id: dataChunk.id }),
+                      data: dataChunk.data
+                    } as ChatMessage["parts"][number]);
+                  }
+                }
+                break;
+              }
             }
 
             // Convert internal AI SDK stream events to valid UIMessageStreamPart format.
