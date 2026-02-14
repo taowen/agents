@@ -1,5 +1,23 @@
 # @cloudflare/agents
 
+## 0.4.2
+
+### Patch Changes
+
+- [#899](https://github.com/cloudflare/agents/pull/899) [`04c6411`](https://github.com/cloudflare/agents/commit/04c6411c9a73fe48784d7ce86150d62cf54becda) Thanks [@threepointone](https://github.com/threepointone)! - Fix React hooks exhaustive-deps warning in useAgent by referencing cacheInvalidatedAt inside useMemo body.
+
+- [#904](https://github.com/cloudflare/agents/pull/904) [`d611b94`](https://github.com/cloudflare/agents/commit/d611b940e7884af4accd8e3c97a7a8f86703e6f9) Thanks [@ask-bonk](https://github.com/apps/ask-bonk)! - Fix TypeScript "excessively deep" error with deeply nested state types
+
+  Add a depth counter to `CanSerialize` and `IsSerializableParam` types that bails out to `true` after 10 levels of recursion. This prevents the "Type instantiation is excessively deep and possibly infinite" error when using deeply nested types like AI SDK `CoreMessage[]` as agent state.
+
+- [#911](https://github.com/cloudflare/agents/pull/911) [`67b1601`](https://github.com/cloudflare/agents/commit/67b1601e0f6f82998c1d6ffb2023bc50ba12fc99) Thanks [@threepointone](https://github.com/threepointone)! - Update all dependencies and fix breaking changes.
+
+  Update all dependencies, add required `aria-label` props to Kumo `Button` components with `shape` (now required for accessibility), and fix state test for constructor-time validation of conflicting `onStateChanged`/`onStateUpdate` hooks.
+
+- [#898](https://github.com/cloudflare/agents/pull/898) [`cd2d34f`](https://github.com/cloudflare/agents/commit/cd2d34fc3d77e80ab9a369e1f2cd76bd0ddd3e79) Thanks [@jvg123](https://github.com/jvg123)! - Add keepalive ping to POST SSE response streams in WorkerTransport
+
+  The GET SSE handler already sends `event: ping` every 30 seconds to keep the connection alive, but the POST SSE handler did not. This caused POST response streams to be silently dropped by proxies and infrastructure during long-running tool calls (e.g., MCP tools/call), resulting in clients never receiving the response.
+
 ## 0.4.1
 
 ### Patch Changes
