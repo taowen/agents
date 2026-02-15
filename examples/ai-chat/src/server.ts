@@ -9,32 +9,37 @@ import {
   stepCountIs
 } from "ai";
 import { z } from "zod";
-import { Bash, InMemoryFs } from "just-bash";
+import { AgentFS } from "agentfs-sdk/cloudflare";
+import { AgentFsAdapter } from "./agentfs-adapter";
+import { Bash, InMemoryFs, MountableFs } from "just-bash";
 
 /**
- * AI Chat Agent showcasing @cloudflare/ai-chat features:
- * - streamText with toUIMessageStreamResponse (simplest pattern)
- * - Server-side tools with execute
- * - Client-side tools (no execute, handled via onToolCall)
- * - Tool approval with needsApproval
- * - Message pruning for long conversations
- * - Storage management with maxPersistedMessages
+ * AI Chat Agent with sandboxed bash tool via just-bash.
  */
 export class ChatAgent extends AIChatAgent {
   // Keep the last 200 messages in SQLite storage
   maxPersistedMessages = 200;
 
-  // Sandboxed bash environment with in-memory filesystem
-  private bash = new Bash({
-    fs: new InMemoryFs(),
-    cwd: "/home/user",
-    executionLimits: {
-      maxCommandCount: 1000,
-      maxLoopIterations: 1000,
-      maxCallDepth: 50,
-      maxStringLength: 1_048_576
-    }
-  });
+  private bash: Bash;
+
+  constructor(ctx: DurableObjectState, env: Env) {
+    super(ctx, env);
+    const agentFs = AgentFS.create(ctx.storage);
+    const homeFs = new AgentFsAdapter(agentFs);
+    const fs = new MountableFs({ base: new InMemoryFs() });
+    fs.mount("/home/user", homeFs);
+    this.bash = new Bash({
+      fs,
+      cwd: "/home/user",
+      network: { dangerouslyAllowFullInternetAccess: true },
+      executionLimits: {
+        maxCommandCount: 1000,
+        maxLoopIterations: 1000,
+        maxCallDepth: 50,
+        maxStringLength: 1_048_576
+      }
+    });
+  }
 
   async onChatMessage() {
     const google = createGoogleGenerativeAI({
@@ -45,11 +50,10 @@ export class ChatAgent extends AIChatAgent {
     const result = streamText({
       model: google("gemini-3-flash-preview"),
       system:
-        "You are a helpful assistant. You can check the weather, get the user's timezone, " +
-        "run calculations, and execute bash commands in a sandboxed virtual filesystem. " +
-        "The bash environment supports common commands like ls, grep, awk, sed, find, cat, echo, etc. " +
-        "Files created persist across commands within the same session. " +
-        "For calculations over $100, you need user approval first.",
+        "You are a helpful assistant. You can execute bash commands in a sandboxed virtual filesystem. " +
+        "The bash environment supports common commands like ls, grep, awk, sed, find, cat, echo, curl, etc. " +
+        "Use curl to fetch content from URLs. Files in /home/user persist across sessions (stored in durable storage). " +
+        "Files outside /home/user only persist within the current session.",
       // Prune old tool calls and reasoning to save tokens on long conversations
       messages: pruneMessages({
         messages: await convertToModelMessages(this.messages),
@@ -57,40 +61,11 @@ export class ChatAgent extends AIChatAgent {
         reasoning: "before-last-message"
       }),
       tools: {
-        // Server-side tool: executes automatically
-        getWeather: tool({
-          description: "Get the current weather for a city",
-          inputSchema: z.object({
-            city: z.string().describe("City name")
-          }),
-          execute: async ({ city }) => {
-            // In a real app, call a weather API
-            const conditions = ["sunny", "cloudy", "rainy", "snowy"];
-            const temp = Math.floor(Math.random() * 30) + 5;
-            return {
-              city,
-              temperature: temp,
-              condition:
-                conditions[Math.floor(Math.random() * conditions.length)],
-              unit: "celsius"
-            };
-          }
-        }),
-
-        // Client-side tool: no execute, handled by onToolCall in the client
-        getUserTimezone: tool({
-          description:
-            "Get the user's timezone from their browser. Use this when you need to know the user's local time.",
-          inputSchema: z.object({})
-          // No execute -- the client provides the result via onToolCall
-        }),
-
-        // Sandboxed bash execution in virtual filesystem
         bash: tool({
           description:
             "Execute a bash command in a sandboxed virtual filesystem. " +
-            "Supports ls, grep, awk, sed, find, cat, echo, mkdir, cp, mv, sort, uniq, wc, head, tail, and more. " +
-            "Files persist across commands within the session.",
+            "Supports ls, grep, awk, sed, find, cat, echo, mkdir, cp, mv, sort, uniq, wc, head, tail, curl, and more. " +
+            "Use curl to fetch content from URLs. Files persist across commands within the session.",
           inputSchema: z.object({
             command: z.string().describe("The bash command to execute")
           }),
@@ -101,30 +76,6 @@ export class ChatAgent extends AIChatAgent {
               stderr: result.stderr,
               exitCode: result.exitCode
             };
-          }
-        }),
-
-        // Tool with approval: requires user confirmation before executing
-        calculate: tool({
-          description:
-            "Perform a calculation. Requires approval for large amounts.",
-          inputSchema: z.object({
-            expression: z.string().describe("Math expression to evaluate"),
-            amount: z
-              .number()
-              .optional()
-              .describe("Dollar amount involved, if any")
-          }),
-          // Only require approval when a dollar amount over 100 is involved
-          needsApproval: async ({ amount }) => (amount ?? 0) > 100,
-          execute: async ({ expression }) => {
-            try {
-              // Simple eval for demo (use a proper math parser in production)
-              const result = new Function(`return ${expression}`)();
-              return { expression, result: Number(result) };
-            } catch {
-              return { expression, error: "Invalid expression" };
-            }
           }
         })
       },
