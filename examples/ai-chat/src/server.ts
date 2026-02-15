@@ -1,4 +1,4 @@
-import { createWorkersAI } from "workers-ai-provider";
+import { createGoogleGenerativeAI } from "@ai-sdk/google";
 import { routeAgentRequest } from "agents";
 import { AIChatAgent } from "@cloudflare/ai-chat";
 import {
@@ -24,11 +24,13 @@ export class ChatAgent extends AIChatAgent {
   maxPersistedMessages = 200;
 
   async onChatMessage() {
-    const workersai = createWorkersAI({ binding: this.env.AI });
+    const google = createGoogleGenerativeAI({
+      baseURL: "https://api.whatai.cc/v1beta",
+      apiKey: this.env.GOOGLE_AI_API_KEY
+    });
 
     const result = streamText({
-      // @ts-expect-error -- model not yet in workers-ai-provider type list
-      model: workersai("@cf/zai-org/glm-4.7-flash"),
+      model: google("gemini-3-flash-preview"),
       system:
         "You are a helpful assistant. You can check the weather, get the user's timezone, " +
         "and run calculations. For calculations over $100, you need user approval first.",
