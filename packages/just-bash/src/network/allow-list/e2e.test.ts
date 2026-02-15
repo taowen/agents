@@ -10,7 +10,6 @@ import {
   type AdapterFactory,
   createBashEnvAdapter,
   createMockFetch,
-  createSandboxAdapter,
   MOCK_EVIL_BODY,
   MOCK_FILE_BODY,
   MOCK_POSTS_BODY,
@@ -459,6 +458,5 @@ function runAllowListTests(name: string, createAdapter: AdapterFactory) {
   });
 }
 
-// Run tests with both BashEnv and Sandbox adapters
+// Run tests with BashEnv adapter
 runAllowListTests("BashEnv", createBashEnvAdapter);
-runAllowListTests("Sandbox", createSandboxAdapter);

@@ -66,16 +66,4 @@ describe("curl availability", () => {
       expect(result.stdout).toContain("--header");
     });
   });
-
-  describe("Sandbox API", () => {
-    it("supports network config via Sandbox.create", async () => {
-      const { Sandbox } = await import("../../../sandbox/index.js");
-      const sandbox = await Sandbox.create({
-        network: { allowedUrlPrefixes: ["https://api.example.com"] }
-      });
-      const cmd = await sandbox.runCommand("curl --help");
-      const stdout = await cmd.stdout();
-      expect(stdout).toContain("curl");
-    });
-  });
 });

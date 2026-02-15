@@ -3,14 +3,13 @@
  *
  * This module provides:
  * - Mock fetch implementation with predefined responses
- * - Environment adapters for BashEnv and Sandbox
+ * - Environment adapters for Bash
  * - Test utilities like expectBlocked
  */
 
 import { expect, vi } from "vitest";
 import type { BashOptions } from "../../Bash.js";
 import { Bash } from "../../Bash.js";
-import { Sandbox } from "../../sandbox/index.js";
 
 // Unique markers in mock responses to verify we're not hitting real network
 const MOCK_MARKER: string = "MOCK_RESPONSE_12345";
@@ -110,7 +109,7 @@ export function createMockFetch(): ReturnType<typeof vi.fn<typeof fetch>> {
 }
 
 /**
- * Environment adapter interface for running tests with both BashEnv and Sandbox
+ * Environment adapter interface for running tests with Bash
  */
 export interface EnvAdapter {
   exec(
@@ -120,34 +119,13 @@ export interface EnvAdapter {
 }
 
 /**
- * Creates an adapter for BashEnv
+ * Creates an adapter for Bash
  */
 export function createBashEnvAdapter(options: BashOptions): EnvAdapter {
   const env = new Bash(options);
   return {
     exec: (cmd) => env.exec(cmd),
     readFile: (path) => env.readFile(path)
-  };
-}
-
-/**
- * Creates an adapter for Sandbox
- */
-export async function createSandboxAdapter(
-  options: BashOptions
-): Promise<EnvAdapter> {
-  const sandbox = await Sandbox.create({ network: options.network });
-  return {
-    exec: async (cmd) => {
-      const command = await sandbox.runCommand(cmd);
-      const finished = await command.wait();
-      return {
-        exitCode: finished.exitCode,
-        stdout: await command.stdout(),
-        stderr: await command.stderr()
-      };
-    },
-    readFile: (path) => sandbox.readFile(path)
   };
 }
 

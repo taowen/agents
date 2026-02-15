@@ -86,27 +86,14 @@ export type CommandName =
   | "tac"
   | "hostname"
   | "od"
-  | "gzip"
-  | "gunzip"
-  | "zcat"
-  | "tar"
-  | "yq"
-  | "xan"
-  | "sqlite3"
   | "time"
   | "whoami";
 
 /** Network command names (only available when network is configured) */
 export type NetworkCommandName = "curl";
 
-/** Python command names (only available when python is explicitly enabled) */
-export type PythonCommandName = "python3" | "python";
-
-/** All command names including network and python commands */
-export type AllCommandName =
-  | CommandName
-  | NetworkCommandName
-  | PythonCommandName;
+/** All command names including network commands */
+export type AllCommandName = CommandName | NetworkCommandName;
 
 // Statically analyzable loaders - each import() call is a literal string
 const commandLoaders: LazyCommandDef<CommandName>[] = [
@@ -450,59 +437,8 @@ const commandLoaders: LazyCommandDef<CommandName>[] = [
   {
     name: "od",
     load: async () => (await import("./od/od.js")).od
-  },
-
-  // Compression
-  {
-    name: "gzip",
-    load: async () => (await import("./gzip/gzip.js")).gzipCommand
-  },
-  {
-    name: "gunzip",
-    load: async () => (await import("./gzip/gzip.js")).gunzipCommand
-  },
-  {
-    name: "zcat",
-    load: async () => (await import("./gzip/gzip.js")).zcatCommand
   }
 ];
-
-// tar, yq, xan, and sqlite3 don't work in browsers
-// __BROWSER__ is defined by esbuild at build time for browser bundles
-declare const __BROWSER__: boolean | undefined;
-if (typeof __BROWSER__ === "undefined" || !__BROWSER__) {
-  commandLoaders.push({
-    name: "tar" as CommandName,
-    load: async () => (await import("./tar/tar.js")).tarCommand
-  });
-  commandLoaders.push({
-    name: "yq" as CommandName,
-    load: async () => (await import("./yq/yq.js")).yqCommand
-  });
-  commandLoaders.push({
-    name: "xan" as CommandName,
-    load: async () => (await import("./xan/xan.js")).xanCommand
-  });
-  commandLoaders.push({
-    name: "sqlite3" as CommandName,
-    load: async () => (await import("./sqlite3/sqlite3.js")).sqlite3Command
-  });
-}
-
-// Python commands - only registered when python is explicitly enabled
-// These introduce additional security surface (arbitrary code execution)
-const pythonCommandLoaders: LazyCommandDef<PythonCommandName>[] = [];
-// __BROWSER__ is defined by esbuild at build time for browser bundles
-if (typeof __BROWSER__ === "undefined" || !__BROWSER__) {
-  pythonCommandLoaders.push({
-    name: "python3",
-    load: async () => (await import("./python3/python3.js")).python3Command
-  });
-  pythonCommandLoaders.push({
-    name: "python",
-    load: async () => (await import("./python3/python3.js")).pythonCommand
-  });
-}
 
 // Network commands - only registered when network is configured
 const networkCommandLoaders: LazyCommandDef<NetworkCommandName>[] = [
@@ -527,15 +463,6 @@ function createLazyCommand(def: LazyCommandDef): Command {
       if (!cmd) {
         cmd = await def.load();
         cache.set(def.name, cmd);
-      }
-
-      // Emit flag coverage hits when fuzzing (not available in browser bundles)
-      if (
-        ctx.coverage &&
-        (typeof __BROWSER__ === "undefined" || !__BROWSER__)
-      ) {
-        const { emitFlagCoverage } = await import("./flag-coverage.js");
-        emitFlagCoverage(ctx.coverage, def.name, args);
       }
 
       return cmd.execute(args, ctx);
@@ -574,22 +501,6 @@ export function createLazyCommands(filter?: CommandName[]): Command[] {
  */
 export function createNetworkCommands(): Command[] {
   return networkCommandLoaders.map(createLazyCommand);
-}
-
-/**
- * Gets all python command names
- */
-export function getPythonCommandNames(): string[] {
-  return pythonCommandLoaders.map((def) => def.name);
-}
-
-/**
- * Creates python commands for registration (python3, python).
- * These are only registered when python is explicitly enabled.
- * Note: Python introduces additional security surface (arbitrary code execution).
- */
-export function createPythonCommands(): Command[] {
-  return pythonCommandLoaders.map(createLazyCommand);
 }
 
 /**

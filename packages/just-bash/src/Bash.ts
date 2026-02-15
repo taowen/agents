@@ -12,8 +12,7 @@ import type { FunctionDefNode } from "./ast/types.js";
 import {
   type CommandName,
   createLazyCommands,
-  createNetworkCommands,
-  createPythonCommands
+  createNetworkCommands
 } from "./commands/registry.js";
 import {
   type CustomCommand,
@@ -47,11 +46,6 @@ import {
 } from "./network/index.js";
 import { LexerError } from "./parser/lexer.js";
 import { type ParseException, parse } from "./parser/parser.js";
-import {
-  DefenseInDepthBox,
-  SecurityViolationError
-} from "./security/defense-in-depth-box.js";
-import type { DefenseInDepthConfig } from "./security/types.js";
 import { serialize } from "./transform/serialize.js";
 import type {
   BashTransformResult,
@@ -106,12 +100,6 @@ export interface BashOptions {
    */
   network?: NetworkConfig;
   /**
-   * Enable python3/python commands.
-   * Python is disabled by default as it introduces additional security surface
-   * (arbitrary code execution via pyodide).
-   */
-  python?: boolean;
-  /**
    * Optional list of command names to register.
    * If not provided, all built-in commands are available.
    * Use this to restrict which commands can be executed.
@@ -154,33 +142,6 @@ export interface BashOptions {
    */
   trace?: TraceCallback;
   /**
-   * Defense-in-depth configuration.
-   *
-   * When enabled, monkey-patches dangerous JavaScript globals (Function, eval,
-   * setTimeout, process, etc.) during script execution to block potential
-   * escape vectors.
-   *
-   * IMPORTANT: This is a SECONDARY defense layer. It should never be relied
-   * upon as the primary security mechanism. The primary security comes from
-   * proper sandboxing, input validation, and architectural constraints.
-   *
-   * @example
-   * ```ts
-   * // Simple enable
-   * const bash = new Bash({ defenseInDepth: true });
-   *
-   * // With custom configuration
-   * const bash = new Bash({
-   *   defenseInDepth: {
-   *     enabled: true,
-   *     auditMode: false, // Set to true to log but not block
-   *     onViolation: (v) => console.warn('Violation:', v),
-   *   },
-   * });
-   * ```
-   */
-  defenseInDepth?: DefenseInDepthConfig | boolean;
-  /**
    * Feature coverage writer for fuzzing instrumentation.
    * When provided, interpreter emits coverage hits for analysis.
    */
@@ -220,7 +181,6 @@ export class Bash {
   private sleepFn?: (ms: number) => Promise<void>;
   private traceFn?: TraceCallback;
   private logger?: BashLogger;
-  private defenseInDepthConfig?: DefenseInDepthConfig | boolean;
   private coverageWriter?: FeatureCoverageWriter;
   // biome-ignore lint/suspicious/noExplicitAny: type-erased plugin storage for untyped API
   private transformPlugins: TransformPlugin<any>[] = [];
@@ -278,9 +238,6 @@ export class Bash {
 
     // Store logger if provided
     this.logger = options.logger;
-
-    // Store defense-in-depth config if provided
-    this.defenseInDepthConfig = options.defenseInDepth;
 
     // Store coverage writer if provided (for fuzzing instrumentation)
     this.coverageWriter = options.coverage;
@@ -371,14 +328,6 @@ export class Bash {
     // Register network commands only when network is configured
     if (options.network) {
       for (const cmd of createNetworkCommands()) {
-        this.registerCommand(cmd);
-      }
-    }
-
-    // Register python commands only when explicitly enabled
-    // Python introduces additional security surface (arbitrary code execution)
-    if (options.python) {
-      for (const cmd of createPythonCommands()) {
         this.registerCommand(cmd);
       }
     }
@@ -528,15 +477,7 @@ export class Bash {
       normalized = normalizeScript(commandLine);
     }
 
-    // Activate defense-in-depth box if configured
-    // This wraps execution in AsyncLocalStorage context for context-aware blocking
-    const defenseBox = this.defenseInDepthConfig
-      ? DefenseInDepthBox.getInstance(this.defenseInDepthConfig)
-      : null;
-    const defenseHandle = defenseBox?.activate();
-
     try {
-      // Run execution inside defense-in-depth context if enabled
       const executeScript = async (): Promise<BashExecResult> => {
         let ast = parse(normalized);
 
@@ -578,10 +519,6 @@ export class Bash {
         return this.logResult(execResult);
       };
 
-      // If defense-in-depth is enabled, run within the protected context
-      if (defenseHandle) {
-        return await defenseHandle.run(executeScript);
-      }
       return await executeScript();
     } catch (error) {
       // ExitError propagates from 'exit' builtin (including via eval/source)
@@ -620,15 +557,6 @@ export class Bash {
           env: mapToRecordWithExtras(this.state.env, options?.env)
         });
       }
-      // SecurityViolationError is thrown when defense-in-depth detects a blocked operation
-      if (error instanceof SecurityViolationError) {
-        return this.logResult({
-          stdout: "",
-          stderr: `bash: security violation: ${error.message}\n`,
-          exitCode: 1,
-          env: mapToRecordWithExtras(this.state.env, options?.env)
-        });
-      }
       if ((error as ParseException).name === "ParseException") {
         return this.logResult({
           stdout: "",
@@ -656,9 +584,6 @@ export class Bash {
         });
       }
       throw error;
-    } finally {
-      // Always deactivate defense-in-depth box when done
-      defenseHandle?.deactivate();
     }
   }
 

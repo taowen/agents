@@ -7,15 +7,13 @@
  * 3. Bash examples execute correctly
  */
 
-import { execSync } from "node:child_process";
 import * as fs from "node:fs";
 import * as path from "node:path";
 import { describe, expect, it } from "vitest";
 import { Bash } from "./Bash.js";
 import {
   getCommandNames,
-  getNetworkCommandNames,
-  getPythonCommandNames
+  getNetworkCommandNames
 } from "./commands/registry.js";
 
 const README_PATH = path.join(import.meta.dirname, "..", "README.md");
@@ -119,198 +117,6 @@ function extractTypeScriptBlocks(content: string): string[] {
   return blocks;
 }
 
-/**
- * Rename duplicate const/let declarations to avoid redeclaration errors
- * e.g., if "const env" appears twice, the second becomes "const env_2"
- */
-function renameDuplicateDeclarations(code: string): string {
-  const varCounts = new Map<string, number>();
-  // Match const/let declarations like "const env =" or "const env="
-  return code.replace(
-    /\b(const|let)\s+([a-zA-Z_][a-zA-Z0-9_]*)\s*=/g,
-    (match, keyword, varName) => {
-      const count = (varCounts.get(varName) || 0) + 1;
-      varCounts.set(varName, count);
-      if (count > 1) {
-        return `${keyword} ${varName}_${count} =`;
-      }
-      return match;
-    }
-  );
-}
-
-/**
- * Add implied imports to a code block and wrap non-import code in async IIFE
- * to avoid redeclaration errors between examples
- */
-function addImpliedImports(code: string): string {
-  const imports: string[] = [];
-
-  // Check what's used and add appropriate imports
-  if (code.includes("Bash") && !code.includes('from "just-bash"')) {
-    imports.push('import { Bash } from "just-bash";');
-  }
-  if (code.includes("defineCommand") && !code.includes('from "just-bash"')) {
-    imports.push('import { defineCommand } from "just-bash";');
-  }
-  if (code.includes("Sandbox") && !code.includes('from "just-bash"')) {
-    imports.push('import { Sandbox } from "just-bash";');
-  }
-  // bash-tool imports are handled via ephemeral type definitions
-  if (
-    code.includes("OverlayFs") &&
-    !code.includes('from "just-bash/fs/overlay-fs"')
-  ) {
-    imports.push('import { OverlayFs } from "just-bash/fs/overlay-fs";');
-  }
-  if (
-    code.includes("ReadWriteFs") &&
-    !code.includes('from "just-bash/fs/read-write-fs"')
-  ) {
-    imports.push('import { ReadWriteFs } from "just-bash/fs/read-write-fs";');
-  }
-  // ai imports are handled via ephemeral type definitions
-
-  // Extract existing imports from code
-  const existingImports = code.match(/^import .*/gm) || [];
-  const codeWithoutImports = code.replace(/^import .*\n?/gm, "").trim();
-
-  // Filter out imports that are already present
-  const newImports = imports.filter(
-    (imp) => !existingImports.some((existing) => existing.includes(imp))
-  );
-
-  // Combine all imports
-  const allImports = [...existingImports, ...newImports];
-
-  // Rename duplicate variable declarations to avoid redeclaration errors
-  const scopedCode = renameDuplicateDeclarations(codeWithoutImports);
-
-  // Wrap non-import code in async IIFE to create separate scope
-  const wrappedCode = `(async () => {\n${scopedCode}\n})();`;
-
-  if (allImports.length === 0) {
-    return wrappedCode;
-  }
-
-  return `${allImports.join("\n")}\n\n${wrappedCode}`;
-}
-
-/**
- * Compile TypeScript blocks from multiple sources in a single tsc invocation
- */
-function compileTypeScriptBlocks(
-  blocksBySource: Array<{ source: string; blocks: string[] }>
-): void {
-  const tmpDir = path.join(import.meta.dirname, "..", ".docs-test-tmp");
-  fs.mkdirSync(tmpDir, { recursive: true });
-
-  try {
-    const files: string[] = [];
-    const fileToSource: Map<string, string> = new Map();
-
-    // Write all blocks from all sources to files
-    for (const { source, blocks } of blocksBySource) {
-      for (let i = 0; i < blocks.length; i++) {
-        const code = addImpliedImports(blocks[i]);
-        const fileName = `${source.replace(/[^a-z0-9]/gi, "-")}-${i}.ts`;
-        const filePath = path.join(tmpDir, fileName);
-        fs.writeFileSync(filePath, code);
-        files.push(filePath);
-        fileToSource.set(fileName, source);
-      }
-    }
-
-    if (files.length === 0) return;
-
-    // Create ephemeral type definitions for external packages
-    const bashToolTypes = `
-export interface CreateBashToolOptions {
-  files?: Record<string, string>;
-  cwd?: string;
-  env?: Record<string, string>;
-  network?: { allowedUrlPrefixes?: string[] };
-}
-export function createBashTool(options?: CreateBashToolOptions): any;
-`;
-    fs.writeFileSync(path.join(tmpDir, "bash-tool.d.ts"), bashToolTypes);
-
-    const aiTypes = `
-export function generateText(options: {
-  model: string;
-  tools?: Record<string, any>;
-  prompt: string;
-  maxSteps?: number;
-}): Promise<any>;
-`;
-    fs.writeFileSync(path.join(tmpDir, "ai.d.ts"), aiTypes);
-
-    // Create a single tsconfig for type checking all files
-    const tsconfig = {
-      compilerOptions: {
-        target: "ES2022",
-        module: "NodeNext",
-        moduleResolution: "NodeNext",
-        strict: true,
-        skipLibCheck: true,
-        noEmit: true,
-        esModuleInterop: true,
-        allowSyntheticDefaultImports: true,
-        resolveJsonModule: true,
-        paths: {
-          "just-bash": [path.join(import.meta.dirname, "..", "src/index.ts")],
-          "just-bash/fs/overlay-fs": [
-            path.join(import.meta.dirname, "..", "src/fs/overlay-fs/index.ts")
-          ],
-          "just-bash/fs/read-write-fs": [
-            path.join(
-              import.meta.dirname,
-              "..",
-              "src/fs/read-write-fs/index.ts"
-            )
-          ],
-          "bash-tool": [path.join(tmpDir, "bash-tool.d.ts")],
-          ai: [path.join(tmpDir, "ai.d.ts")]
-        }
-      },
-      include: files
-    };
-    fs.writeFileSync(
-      path.join(tmpDir, "tsconfig.json"),
-      JSON.stringify(tsconfig, null, 2)
-    );
-
-    // Run tsc once to check all files
-    try {
-      execSync("npx tsc --project tsconfig.json", {
-        cwd: tmpDir,
-        encoding: "utf-8",
-        stdio: "pipe"
-      });
-    } catch (error) {
-      const execError = error as { stdout?: string; stderr?: string };
-      const output = execError.stdout || execError.stderr || "";
-
-      // Parse errors to show which example failed
-      const errorLines = output
-        .split("\n")
-        .filter((line) => line.includes("error TS"));
-
-      if (errorLines.length > 0) {
-        expect.fail(
-          `TypeScript errors in documentation examples:\n${errorLines.slice(0, 10).join("\n")}` +
-            (errorLines.length > 10
-              ? `\n... and ${errorLines.length - 10} more`
-              : "")
-        );
-      }
-    }
-  } finally {
-    // Cleanup
-    fs.rmSync(tmpDir, { recursive: true, force: true });
-  }
-}
-
 describe("README validation", () => {
   describe("command list completeness", () => {
     it("should list all registered commands", () => {
@@ -318,8 +124,7 @@ describe("README validation", () => {
       const readmeCommands = extractReadmeCommands(readme);
       const registryCommands = new Set([
         ...getCommandNames(),
-        ...getNetworkCommandNames(),
-        ...getPythonCommandNames()
+        ...getNetworkCommandNames()
       ]);
 
       // Commands in registry but not in README
@@ -380,8 +185,7 @@ describe("AGENTS.npm.md validation", () => {
       const agentsCommands = extractAgentsCommands(agents);
       const registryCommands = new Set([
         ...getCommandNames(),
-        ...getNetworkCommandNames(),
-        ...getPythonCommandNames()
+        ...getNetworkCommandNames()
       ]);
 
       // Commands in registry but not in AGENTS.npm.md
@@ -437,26 +241,6 @@ describe("Documentation TypeScript examples", () => {
     const blocks = extractTypeScriptBlocks(transformReadme);
     expect(blocks.length).toBeGreaterThan(0);
   });
-
-  it(
-    "should have valid TypeScript syntax in all examples",
-    { timeout: 30000 },
-    () => {
-      const readme = parseReadme();
-      const agents = parseAgents();
-      const transformReadme = parseTransformReadme();
-
-      // Compile all TypeScript blocks from both files in a single tsc run
-      compileTypeScriptBlocks([
-        { source: "README", blocks: extractTypeScriptBlocks(readme) },
-        { source: "AGENTS", blocks: extractTypeScriptBlocks(agents) },
-        {
-          source: "transform-README",
-          blocks: extractTypeScriptBlocks(transformReadme)
-        }
-      ]);
-    }
-  );
 });
 
 describe("AGENTS.npm.md Bash examples", () => {

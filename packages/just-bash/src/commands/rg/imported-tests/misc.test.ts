@@ -1074,26 +1074,8 @@ it.skip("vimgrep_no_line_no_column: --no-column not implemented", () => {});
 it.skip("preprocessing: --pre not implemented", () => {});
 it.skip("preprocessing_glob: --pre-glob not implemented", () => {});
 
-// 74. compressed_gzip
-describe("rg misc: compressed_gzip", () => {
-  const { gzipSync } = require("node:zlib");
-  it("should search gzip files with -z", async () => {
-    const compressed = gzipSync(Buffer.from(SHERLOCK));
-    const bash = new Bash({
-      cwd: "/home/user",
-      files: {
-        "/home/user/sherlock.gz": compressed
-      }
-    });
-    const result = await bash.exec("rg -z Sherlock sherlock.gz");
-    expect(result.exitCode).toBe(0);
-    expect(result.stdout).toBe(
-      "For the Doctor Watsons of this world, as opposed to the Sherlock\nbe, to a very large extent, the result of luck. Sherlock Holmes\n"
-    );
-  });
-});
-
-// 75-82. Other compression formats - SKIP: only gzip supported
+// 74-82. Compression - not supported in browser-only build
+it.skip("compressed_gzip: gzip not supported in browser build", () => {});
 it.skip("compressed_bzip2: bzip2 not supported", () => {});
 it.skip("compressed_xz: xz not supported", () => {});
 it.skip("compressed_lz4: lz4 not supported", () => {});

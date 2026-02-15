@@ -1,6 +1,5 @@
 import { describe, expect, it } from "vitest";
 import { Bash } from "../../Bash.js";
-import { OverlayFs } from "../../fs/overlay-fs/index.js";
 import type { TraceEvent } from "../../types.js";
 import {
   evaluateExpressionWithPrune,
@@ -252,50 +251,6 @@ describe("find performance tracing", () => {
     expect((summary?.details?.nodeCount as number) || 0).toBeLessThanOrEqual(
       25
     );
-  });
-
-  it("should trace against real filesystem (current project)", async () => {
-    // Use OverlayFs to read from the actual project directory
-    const fs = new OverlayFs({ root: process.cwd() });
-    const mountPoint = fs.getMountPoint();
-
-    const events: TraceEvent[] = [];
-    const env = new Bash({
-      fs,
-      cwd: mountPoint,
-      trace: (event) => events.push(event)
-    });
-
-    // Test the -path pattern query against real files
-    console.log("\n--- Real Filesystem Test: -path pattern ---");
-    const start1 = Date.now();
-    const result1 = await env.exec(
-      'find . -path "*/commands/*.ts" -type f | head -20'
-    );
-    const elapsed1 = Date.now() - start1;
-    expect(result1.exitCode).toBe(0);
-
-    const summary1 = events.find(
-      (e) => e.category === "find" && e.name === "summary"
-    );
-    console.log(`Wall clock: ${elapsed1}ms`);
-    console.log(JSON.stringify(summary1?.details, null, 2));
-
-    // Clear events and test maxdepth
-    events.length = 0;
-    console.log("\n--- Real Filesystem Test: -maxdepth ---");
-    const start2 = Date.now();
-    const result2 = await env.exec(
-      'find . -maxdepth 3 -type d -name "commands"'
-    );
-    const elapsed2 = Date.now() - start2;
-    expect(result2.exitCode).toBe(0);
-
-    const summary2 = events.find(
-      (e) => e.category === "find" && e.name === "summary"
-    );
-    console.log(`Wall clock: ${elapsed2}ms`);
-    console.log(JSON.stringify(summary2?.details, null, 2));
   });
 
   it("should compare fast-path vs regular evaluation", async () => {

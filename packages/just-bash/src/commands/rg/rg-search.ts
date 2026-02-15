@@ -2,7 +2,6 @@
  * Core search logic for rg command
  */
 
-import { gunzipSync } from "node:zlib";
 import { createUserRegex, type UserRegex } from "../../regex/index.js";
 import type { CommandContext, ExecResult } from "../../types.js";
 import {
@@ -14,13 +13,6 @@ import {
 import { FileTypeRegistry } from "./file-types.js";
 import { GitignoreManager, loadGitignores } from "./gitignore.js";
 import type { RgOptions } from "./rg-options.js";
-
-/**
- * Check if data is gzip compressed (magic bytes)
- */
-function isGzip(data: Uint8Array): boolean {
-  return data.length >= 2 && data[0] === 0x1f && data[1] === 0x8b;
-}
 
 /**
  * Validate glob pattern for errors (e.g., unclosed character class)
@@ -725,21 +717,6 @@ async function readFileContent(
           return { content: result.stdout, isBinary: sample.includes("\0") };
         }
         // Preprocessing failed, fall through to normal file read
-      }
-    }
-
-    // For -z option, try to decompress gzip files
-    if (options.searchZip && file.endsWith(".gz")) {
-      const buffer = await ctx.fs.readFileBuffer(filePath);
-      if (isGzip(buffer)) {
-        try {
-          const decompressed = gunzipSync(buffer);
-          const content = new TextDecoder().decode(decompressed);
-          const sample = content.slice(0, 8192);
-          return { content, isBinary: sample.includes("\0") };
-        } catch {
-          return null; // Decompression failed
-        }
       }
     }
 

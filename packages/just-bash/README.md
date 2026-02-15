@@ -2,7 +2,7 @@
 
 A simulated bash environment with an in-memory virtual filesystem, written in TypeScript.
 
-Designed for AI agents that need a secure, sandboxed bash environment.
+Designed for AI agents that need a secure bash environment. Browser-compatible.
 
 Supports optional network access via `curl` with secure-by-default URL filtering.
 
@@ -18,9 +18,6 @@ Supports optional network access via `curl` with secure-by-default URL filtering
   - [Custom Commands](#custom-commands)
   - [Filesystem Options](#filesystem-options)
   - [AI SDK Tool](#ai-sdk-tool)
-  - [Vercel Sandbox Compatible API](#vercel-sandbox-compatible-api)
-  - [CLI Binary](#cli-binary)
-  - [Interactive Shell](#interactive-shell)
 - [Supported Commands](#supported-commands)
 - [Shell Features](#shell-features)
 - [Default Layout](#default-layout)
@@ -100,7 +97,7 @@ Custom commands receive the full `CommandContext` with access to `fs`, `cwd`, `e
 
 ### Filesystem Options
 
-Four filesystem implementations are available:
+Two filesystem implementations are available:
 
 **InMemoryFs** (default) - Pure in-memory filesystem, no disk access:
 
@@ -109,65 +106,33 @@ import { Bash } from "just-bash";
 const env = new Bash(); // Uses InMemoryFs by default
 ```
 
-**OverlayFs** - Copy-on-write over a real directory. Reads come from disk, writes stay in memory:
-
-```typescript
-import { Bash } from "just-bash";
-import { OverlayFs } from "just-bash/fs/overlay-fs";
-
-const overlay = new OverlayFs({ root: "/path/to/project" });
-const env = new Bash({ fs: overlay, cwd: overlay.getMountPoint() });
-
-await env.exec("cat package.json"); // reads from disk
-await env.exec('echo "modified" > package.json'); // stays in memory
-```
-
-**ReadWriteFs** - Direct read-write access to a real directory. Use this if you want the agent to be agle to write to your disk:
-
-```typescript
-import { Bash } from "just-bash";
-import { ReadWriteFs } from "just-bash/fs/read-write-fs";
-
-const rwfs = new ReadWriteFs({ root: "/path/to/sandbox" });
-const env = new Bash({ fs: rwfs });
-
-await env.exec('echo "hello" > file.txt'); // writes to real filesystem
-```
-
-**MountableFs** - Mount multiple filesystems at different paths. Combines read-only and read-write filesystems into a unified namespace:
+**MountableFs** - Mount multiple filesystems at different paths. Combines filesystems into a unified namespace:
 
 ```typescript
 import { Bash, MountableFs, InMemoryFs } from "just-bash";
-import { OverlayFs } from "just-bash/fs/overlay-fs";
-import { ReadWriteFs } from "just-bash/fs/read-write-fs";
 
-const fs = new MountableFs({ base: new InMemoryFs() });
+const base = new InMemoryFs();
+const workspace = new InMemoryFs();
 
-// Mount read-only knowledge base
-fs.mount("/mnt/knowledge", new OverlayFs({ root: "/path/to/knowledge", readOnly: true }));
+const fs = new MountableFs({ base });
+fs.mount("/workspace", workspace);
 
-// Mount read-write workspace
-fs.mount("/home/agent", new ReadWriteFs({ root: "/path/to/workspace" }));
+const bash = new Bash({ fs, cwd: "/workspace" });
 
-const bash = new Bash({ fs, cwd: "/home/agent" });
-
-await bash.exec("ls /mnt/knowledge"); // reads from knowledge base
-await bash.exec("cp /mnt/knowledge/doc.txt ./"); // cross-mount copy
-await bash.exec('echo "notes" > notes.txt'); // writes to workspace
+await bash.exec("ls /"); // sees both base and mounted filesystems
+await bash.exec('echo "notes" > notes.txt'); // writes to workspace mount
 ```
 
 You can also configure mounts in the constructor:
 
 ```typescript
 import { MountableFs, InMemoryFs } from "just-bash";
-import { OverlayFs } from "just-bash/fs/overlay-fs";
-import { ReadWriteFs } from "just-bash/fs/read-write-fs";
 
 const fs = new MountableFs({
   base: new InMemoryFs(),
   mounts: [
-    { mountPoint: "/data", filesystem: new OverlayFs({ root: "/shared/data" }) },
-    { mountPoint: "/workspace", filesystem: new ReadWriteFs({ root: "/tmp/work" }) },
+    { mountPoint: "/data", filesystem: new InMemoryFs() },
+    { mountPoint: "/workspace", filesystem: new InMemoryFs() },
   ],
 });
 ```
@@ -197,81 +162,6 @@ const result = await generateText({
 
 See the [bash-tool documentation](https://github.com/vercel-labs/bash-tool) for more details and examples.
 
-### Vercel Sandbox Compatible API
-
-Bash provides a `Sandbox` class that's API-compatible with [`@vercel/sandbox`](https://vercel.com/docs/vercel-sandbox), making it easy to swap implementations. You can start with Bash and switch to a real sandbox when you need the power of a full VM (e.g. to run node, python, or custom binaries).
-
-```typescript
-import { Sandbox } from "just-bash";
-
-// Create a sandbox instance
-const sandbox = await Sandbox.create({ cwd: "/app" });
-
-// Write files to the virtual filesystem
-await sandbox.writeFiles({
-  "/app/script.sh": 'echo "Hello World"',
-  "/app/data.json": '{"key": "value"}',
-});
-
-// Run commands and get results
-const cmd = await sandbox.runCommand("bash /app/script.sh");
-const output = await cmd.stdout(); // "Hello World\n"
-const exitCode = (await cmd.wait()).exitCode; // 0
-
-// Read files back
-const content = await sandbox.readFile("/app/data.json");
-
-// Create directories
-await sandbox.mkDir("/app/logs", { recursive: true });
-
-// Clean up (no-op for Bash, but API-compatible)
-await sandbox.stop();
-```
-
-### CLI Binary
-
-After installing globally (`npm install -g just-bash`), use the `just-bash` command as a secure alternative to `bash` for AI agents:
-
-```bash
-# Execute inline script
-just-bash -c 'ls -la && cat package.json | head -5'
-
-# Execute with specific project root
-just-bash -c 'grep -r "TODO" src/' --root /path/to/project
-
-# Pipe script from stdin
-echo 'find . -name "*.ts" | wc -l' | just-bash
-
-# Execute a script file
-just-bash ./scripts/deploy.sh
-
-# Get JSON output for programmatic use
-just-bash -c 'echo hello' --json
-# Output: {"stdout":"hello\n","stderr":"","exitCode":0}
-```
-
-The CLI uses OverlayFS - reads come from the real filesystem, but all writes stay in memory and are discarded after execution. The project root is mounted at `/home/user/project`.
-
-Options:
-
-- `-c <script>` - Execute script from argument
-- `--root <path>` - Root directory (default: current directory)
-- `--cwd <path>` - Working directory in sandbox
-- `-e, --errexit` - Exit on first error
-- `--json` - Output as JSON
-
-### Interactive Shell
-
-```bash
-pnpm shell
-```
-
-The interactive shell has full internet access enabled by default, allowing you to use `curl` to fetch data from any URL. Use `--no-network` to disable this:
-
-```bash
-pnpm shell --no-network
-```
-
 ## Supported Commands
 
 ### File Operations
@@ -284,11 +174,7 @@ pnpm shell --no-network
 
 ### Data Processing
 
-`jq` (JSON), `python3`/`python` (Python via Pyodide; required opt-in), `sqlite3` (SQLite), `xan` (CSV), `yq` (YAML/XML/TOML/CSV)
-
-### Compression & Archives
-
-`gzip` (+ `gunzip`, `zcat`), `tar`
+`jq` (JSON)
 
 ### Navigation & Environment
 
@@ -361,40 +247,6 @@ const env = new Bash({
 
 **Note:** The `curl` command only exists when network is configured. Without network configuration, `curl` returns "command not found".
 
-## Python Support
-
-Python support via Pyodide is opt-in due to additional security surface. Enable it explicitly, but be aware of the risk:
-
-```typescript
-const env = new Bash({
-  python: true,
-});
-
-// Execute Python code
-await env.exec('python3 -c "print(1 + 2)"');
-
-// Run Python scripts
-await env.exec('python3 script.py');
-```
-
-**Note:** The `python3` and `python` commands only exist when `python: true` is configured. Python is not available in browser environments.
-
-## SQLite Support
-
-The `sqlite3` command uses sql.js (WASM-based SQLite) which is fully sandboxed and cannot access the real filesystem:
-
-```typescript
-const env = new Bash();
-
-// Query in-memory database
-await env.exec('sqlite3 :memory: "SELECT 1 + 1"');
-
-// Query file-based database
-await env.exec('sqlite3 data.db "SELECT * FROM users"');
-```
-
-**Note:** SQLite is not available in browser environments. Queries run in a worker thread with a configurable timeout (default: 5 seconds) to prevent runaway queries from blocking execution.
-
 ### Allow-List Security
 
 The allow-list enforces:
@@ -463,11 +315,10 @@ See [src/transform/README.md](src/transform/README.md) for the full API, built-i
 ## Development
 
 ```bash
-pnpm test        # Run tests in watch mode
-pnpm test:run    # Run tests once
-pnpm typecheck   # Type check without emitting
-pnpm build       # Build TypeScript
-pnpm shell       # Run interactive shell
+npm test         # Run tests in watch mode
+npm run test:run # Run tests once
+npm run typecheck # Type check without emitting
+npm run build    # Build TypeScript
 ```
 
 ## AI Agent Instructions

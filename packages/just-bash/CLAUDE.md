@@ -4,90 +4,29 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 ## Project Overview
 
-just-bash is a TypeScript implementation of a bash interpreter with an in-memory virtual filesystem. Designed for AI agents needing a secure, sandboxed bash environment. No WASM dependencies allowed.
+just-bash is a TypeScript implementation of a bash interpreter with an in-memory virtual filesystem. Designed for AI agents needing a secure bash environment. Browser-compatible, no WASM dependencies allowed.
 
 ## Commands
 
 ```bash
 # Build & Lint
-pnpm build                 # Build TypeScript (required before using dist/)
-pnpm typecheck             # Type check
-pnpm lint:fix              # Fix lint errors (biome)
-pnpm knip                  # Check for unused exports/dependencies
+npm run build                 # Build TypeScript (required before using dist/)
+npm run typecheck             # Type check
+npm run lint:fix              # Fix lint errors (biome)
+npm run knip                  # Check for unused exports/dependencies
 
 # Testing
-pnpm test:run              # Run ALL tests (including spec tests)
-pnpm test:unit             # Run unit tests only (fast, no comparison/spec)
-pnpm test:comparison       # Run comparison tests only (uses fixtures)
-pnpm test:comparison:record # Re-record comparison test fixtures
-
-# Excluding spec tests (spec tests have known failures)
-pnpm test:run --exclude src/spec-tests
+npm run test:run              # Run ALL tests (including spec tests)
+npm run test:unit             # Run unit tests only (fast, no comparison/spec)
+npm run test:comparison       # Run comparison tests only (uses fixtures)
+npm run test:comparison:record # Re-record comparison test fixtures
 
 # Run specific test file
-pnpm test:run src/commands/grep/grep.basic.test.ts
+npx vitest run src/commands/grep/grep.basic.test.ts
 
 # Run specific spec test file by name pattern
-pnpm test:run src/spec-tests/spec.test.ts -t "arith.test.sh"
-pnpm test:run src/spec-tests/spec.test.ts -t "array-basic.test.sh"
-
-# Interactive shell
-pnpm shell                 # Full network access
-pnpm shell --no-network    # No network
-
-# Sandboxed CLI (read-only by default)
-node ./dist/cli/just-bash.js -c 'ls -la' --root .
-node ./dist/cli/just-bash.js -c 'cat package.json' --root .
-node ./dist/cli/just-bash.js -c 'grep -r "TODO" src/' --root .
-```
-
-### Sandboxed Shell Execution with `just-bash`
-
-The `just-bash` CLI provides a secure, sandboxed bash environment using OverlayFS:
-
-```bash
-# Execute inline script (read-only by default)
-node ./dist/cli/just-bash.js -c 'ls -la && cat README.md | head -5' --root .
-
-# Execute with JSON output
-node ./dist/cli/just-bash.js -c 'echo hello' --root . --json
-
-# Allow writes (writes stay in memory, don't affect real filesystem)
-node ./dist/cli/just-bash.js -c 'echo test > /tmp/file.txt && cat /tmp/file.txt' --root . --allow-write
-
-# Execute script file
-node ./dist/cli/just-bash.js script.sh --root .
-
-# Exit on first error
-node ./dist/cli/just-bash.js -e -c 'false; echo "not reached"' --root .
-```
-
-Options:
-- `--root <path>` - Root directory (default: current directory)
-- `--cwd <path>` - Working directory in sandbox (default: /home/user/project)
-- `--allow-write` - Enable write operations (writes stay in memory)
-- `--json` - Output as JSON (stdout, stderr, exitCode)
-- `-e, --errexit` - Exit on first error
-
-### Debug with `pnpm dev:exec`
-
-Reads script from stdin, executes it, shows output. Prefer this over ad-hoc test files.
-
-```bash
-# Basic execution
-echo 'echo hello' | pnpm dev:exec
-
-# Compare with real bash
-echo 'x=5; echo $((x + 3))' | pnpm dev:exec --real-bash
-
-# Show parsed AST
-echo 'for i in 1 2 3; do echo $i; done' | pnpm dev:exec --print-ast
-
-# Multi-line script
-echo 'arr=(a b c)
-for x in "${arr[@]}"; do
-  echo "item: $x"
-done' | pnpm dev:exec --real-bash
+npx vitest run src/spec-tests/spec.test.ts -t "arith.test.sh"
+npx vitest run src/spec-tests/spec.test.ts -t "array-basic.test.sh"
 ```
 
 ## Architecture
@@ -121,7 +60,7 @@ Input Script → Parser (src/parser/) → AST (src/ast/) → Interpreter (src/in
 - Each command in its own directory with implementation + tests
 - Registry pattern via `registry.ts`
 
-**Filesystem** (`src/fs.ts`, `src/overlay-fs/`): In-memory VFS with optional overlay on real filesystem
+**Filesystem** (`src/fs/`): In-memory VFS and MountableFs for combining filesystems
 
 **AWK** (`src/commands/awk/`): AWK text processing implementation
 
@@ -161,13 +100,13 @@ Comparison tests use pre-recorded bash outputs stored in `src/comparison-tests/f
 
 ```bash
 # Run comparison tests (uses fixtures, no real bash needed)
-pnpm test:comparison
+npm run test:comparison
 
 # Re-record fixtures (skips locked fixtures)
-RECORD_FIXTURES=1 pnpm test:run src/comparison-tests/mytest.comparison.test.ts
+RECORD_FIXTURES=1 npx vitest run src/comparison-tests/mytest.comparison.test.ts
 
 # Force re-record including locked fixtures
-RECORD_FIXTURES=force pnpm test:comparison
+RECORD_FIXTURES=force npm run test:comparison
 ```
 
 When adding comparison tests:
@@ -179,10 +118,9 @@ When adding comparison tests:
 ## Development Guidelines
 
 - Read AGENTS.md
-- Use `pnpm dev:exec` instead of ad-hoc test scripts (avoids approval prompts)
-- Always verify with `pnpm typecheck && pnpm lint:fix && pnpm knip && pnpm test:run` before finishing
+- Always verify with `npm run typecheck && npm run lint:fix && npm run knip && npm run test:run` before finishing
 - Assert full stdout/stderr in tests, not partial matches
 - Implementation must match real bash behavior, not convenience
-- Dependencies using WASM are not allowed (exception: sql.js for SQLite, approved for security sandboxing)
+- Dependencies using WASM are not allowed
 - We explicitly don't support 64-bit integers
 - All parsing/execution must have reasonable limits to prevent runaway compute

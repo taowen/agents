@@ -9,7 +9,7 @@ import {
   stepCountIs
 } from "ai";
 import { z } from "zod";
-import { Bash, InMemoryFs } from "just-bash/browser";
+import { Bash, InMemoryFs } from "just-bash";
 
 /**
  * AI Chat Agent showcasing @cloudflare/ai-chat features:

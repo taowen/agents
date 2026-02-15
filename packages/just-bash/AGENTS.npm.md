@@ -62,21 +62,21 @@ const result = await bash.exec("cat input.txt | grep pattern");
 
 1. **Isolation**: Each `exec()` call is isolated. Environment variables, functions, and cwd changes don't persist between calls. Only filesystem changes persist.
 
-2. **No real filesystem**: By default, commands only see the virtual filesystem. Use `OverlayFs` to read from a real directory (writes stay in memory).
+2. **No real filesystem**: By default, commands only see the virtual filesystem. Use `MountableFs` to combine multiple in-memory filesystems.
 
 3. **No network by default**: `curl` doesn't exist unless you configure `network` options with URL allowlists.
 
-4. **No binaries/WASM**: Only built-in commands work. You cannot run node, python, or other binaries.
+4. **No binaries/WASM**: Only built-in commands work. You cannot run node or other binaries.
 
 ## Available Commands
 
 **Text processing**: `awk`, `cat`, `column`, `comm`, `cut`, `egrep`, `expand`, `fgrep`, `fold`, `grep`, `head`, `join`, `nl`, `paste`, `rev`, `rg`, `sed`, `sort`, `strings`, `tac`, `tail`, `tr`, `unexpand`, `uniq`, `wc`, `xargs`
 
-**Data processing**: `jq` (JSON), `python3`/`python` (Python via Pyodide), `sqlite3` (SQLite), `xan` (CSV), `yq` (YAML/XML/TOML/CSV)
+**Data processing**: `jq` (JSON)
 
 **File operations**: `basename`, `chmod`, `cp`, `dirname`, `du`, `file`, `find`, `ln`, `ls`, `mkdir`, `mv`, `od`, `pwd`, `readlink`, `rm`, `rmdir`, `split`, `stat`, `touch`, `tree`
 
-**Utilities**: `alias`, `base64`, `bash`, `clear`, `curl`, `date`, `diff`, `echo`, `env`, `expr`, `false`, `gzip`, `gunzip`, `help`, `history`, `hostname`, `html-to-markdown`, `md5sum`, `printenv`, `printf`, `seq`, `sh`, `sha1sum`, `sha256sum`, `sleep`, `tar`, `tee`, `time`, `timeout`, `true`, `unalias`, `which`, `whoami`, `zcat`
+**Utilities**: `alias`, `base64`, `bash`, `clear`, `curl`, `date`, `diff`, `echo`, `env`, `expr`, `false`, `help`, `history`, `hostname`, `html-to-markdown`, `md5sum`, `printenv`, `printf`, `seq`, `sh`, `sha1sum`, `sha256sum`, `sleep`, `tee`, `time`, `timeout`, `true`, `unalias`, `which`, `whoami`
 
 All commands support `--help` for usage details.
 
@@ -98,84 +98,6 @@ jq '[.items[] | {id, name}]' data.json
 echo '{"x":1}' | jq '.x'
 ```
 
-### YAML - `yq`
-
-```bash
-# Extract value
-yq '.config.database.host' config.yaml
-
-# Output as JSON
-yq -o json '.' config.yaml
-
-# Filter with jq syntax
-yq '.users[] | select(.role == "admin")' users.yaml
-
-# Modify file in-place
-yq -i '.version = "2.0"' config.yaml
-```
-
-### TOML - `yq`
-
-```bash
-# Read TOML (auto-detected from .toml extension)
-yq '.package.name' Cargo.toml
-yq '.tool.poetry.version' pyproject.toml
-
-# Convert TOML to JSON
-yq -o json '.' config.toml
-
-# Convert YAML to TOML
-yq -o toml '.' config.yaml
-```
-
-### CSV/TSV - `yq -p csv`
-
-```bash
-# Read CSV (auto-detects from .csv/.tsv extension)
-yq '.[0].name' data.csv
-yq '.[0].name' data.tsv
-
-# Filter rows
-yq '[.[] | select(.status == "active")]' data.csv
-
-# Convert CSV to JSON
-yq -o json '.' data.csv
-```
-
-### Front-matter - `yq --front-matter`
-
-```bash
-# Extract YAML front-matter from markdown
-yq --front-matter '.title' post.md
-yq -f '.tags[]' blog-post.md
-
-# Works with TOML front-matter (+++) too
-yq -f '.date' hugo-post.md
-```
-
-### XML - `yq -p xml`
-
-```bash
-# Extract element
-yq '.root.users.user[0].name' data.xml
-
-# Access attributes (use +@ prefix)
-yq '.root.item["+@id"]' data.xml
-
-# Convert XML to JSON
-yq -p xml -o json '.' data.xml
-```
-
-### INI - `yq -p ini`
-
-```bash
-# Read INI section value
-yq '.database.host' config.ini
-
-# Convert INI to JSON
-yq -p ini -o json '.' config.ini
-```
-
 ### HTML - `html-to-markdown`
 
 ```bash
@@ -184,28 +106,6 @@ html-to-markdown page.html
 
 # From stdin
 echo '<h1>Title</h1><p>Text</p>' | html-to-markdown
-```
-
-### Format Conversion with yq
-
-```bash
-# JSON to YAML
-yq -p json '.' data.json
-
-# YAML to JSON
-yq -o json '.' data.yaml
-
-# YAML to TOML
-yq -o toml '.' config.yaml
-
-# TOML to JSON
-yq -o json '.' Cargo.toml
-
-# CSV to JSON
-yq -p csv -o json '.' data.csv
-
-# XML to YAML
-yq -p xml '.' data.xml
 ```
 
 ## Common Patterns
@@ -301,7 +201,7 @@ const bash = new Bash({
 
 **Output size limits**: AWK, sed, jq, and printf enforce `maxStringLength` on their output buffers. Commands that exceed the limit exit with code 126.
 
-**File read size limits**: `OverlayFs` and `ReadWriteFs` default to a 10MB max file read size. Override with `maxFileReadSize` in filesystem options (set to `0` to disable).
+**File read size limits**: Filesystem implementations may enforce max file read sizes.
 
 **Network response size**: `maxResponseSize` in `NetworkConfig` caps HTTP response bodies (default: 10MB).
 

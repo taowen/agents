@@ -12,13 +12,11 @@ export { Bash } from "./Bash.js";
 export type {
   AllCommandName,
   CommandName,
-  NetworkCommandName,
-  PythonCommandName
+  NetworkCommandName
 } from "./commands/registry.js";
 export {
   getCommandNames,
-  getNetworkCommandNames,
-  getPythonCommandNames
+  getNetworkCommandNames
 } from "./commands/registry.js";
 // Custom commands API
 export type { CustomCommand, LazyCommand } from "./custom-commands.js";
@@ -44,11 +42,6 @@ export {
   type MountableFsOptions,
   type MountConfig
 } from "./fs/mountable-fs/index.js";
-export { OverlayFs, type OverlayFsOptions } from "./fs/overlay-fs/index.js";
-export {
-  ReadWriteFs,
-  type ReadWriteFsOptions
-} from "./fs/read-write-fs/index.js";
 export type { NetworkConfig } from "./network/index.js";
 export {
   NetworkAccessDeniedError,
@@ -57,28 +50,6 @@ export {
 } from "./network/index.js";
 // Parser
 export { parse } from "./parser/parser.js";
-export type {
-  CommandFinished as SandboxCommandFinished,
-  OutputMessage,
-  SandboxOptions,
-  WriteFilesInput
-} from "./sandbox/index.js";
-// Vercel Sandbox API compatible exports
-export { Command as SandboxCommand, Sandbox } from "./sandbox/index.js";
-// Security module - defense-in-depth
-export type {
-  DefenseInDepthConfig,
-  DefenseInDepthHandle,
-  DefenseInDepthStats,
-  SecurityViolation,
-  SecurityViolationType
-} from "./security/index.js";
-export {
-  createConsoleViolationCallback,
-  DefenseInDepthBox,
-  SecurityViolationError,
-  SecurityViolationLogger
-} from "./security/index.js";
 // Transform API
 export { BashTransformPipeline } from "./transform/pipeline.js";
 export type { CommandCollectorMetadata } from "./transform/plugins/command-collector.js";
