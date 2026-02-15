@@ -1,0 +1,61 @@
+{
+  "string_value": "hello world",
+  "integer_value": 42,
+  "float_value": 3.14,
+  "boolean_true": true,
+  "boolean_false": false,
+  "date_value": "2024-01-15",
+  "datetime_value": "2024-01-15T10:30:00.000Z",
+  "simple_array": [
+    1,
+    2,
+    3,
+    4,
+    5
+  ],
+  "string_array": [
+    "apple",
+    "banana",
+    "cherry"
+  ],
+  "nested_array": [
+    [
+      1,
+      2
+    ],
+    [
+      3,
+      4
+    ],
+    [
+      5,
+      6
+    ]
+  ],
+  "multiline_basic": "This is a\nmultiline string\nspanning multiple lines",
+  "multiline_literal": "Line 1\nLine 2\nLine 3",
+  "inline": {
+    "name": "inline",
+    "value": 123
+  },
+  "dotted": {
+    "key": {
+      "value": "nested via dots"
+    }
+  },
+  "unicode": "Hello 世界 🌍",
+  "products": [
+    {
+      "name": "Widget",
+      "price": 19.99
+    },
+    {
+      "name": "Gadget",
+      "price": 29.99
+    },
+    {
+      "name": "Doodad",
+      "price": 49.99
+    }
+  ]
+}

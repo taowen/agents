@@ -1,0 +1,37 @@
+[
+  {
+    "id": 1,
+    "name": "Widget",
+    "price": 19.99,
+    "category": "electronics",
+    "in_stock": true
+  },
+  {
+    "id": 2,
+    "name": "Gadget",
+    "price": 29.99,
+    "category": "electronics",
+    "in_stock": true
+  },
+  {
+    "id": 3,
+    "name": "Gizmo",
+    "price": 9.99,
+    "category": "accessories",
+    "in_stock": false
+  },
+  {
+    "id": 4,
+    "name": "Doodad",
+    "price": 49.99,
+    "category": "electronics",
+    "in_stock": true
+  },
+  {
+    "id": 5,
+    "name": "Thingamajig",
+    "price": 14.99,
+    "category": "accessories",
+    "in_stock": true
+  }
+]

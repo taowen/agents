@@ -1,0 +1,30 @@
+{
+  "library": {
+    "book": [
+      {
+        "title": "The Great Adventure",
+        "author": "Jane Smith",
+        "year": "2020",
+        "price": "24.99",
+        "+@id": "1",
+        "+@genre": "fiction"
+      },
+      {
+        "title": "Learning TypeScript",
+        "author": "John Doe",
+        "year": "2023",
+        "price": "39.99",
+        "+@id": "2",
+        "+@genre": "non-fiction"
+      },
+      {
+        "title": "Mystery Manor",
+        "author": "Alice Johnson",
+        "year": "2021",
+        "price": "19.99",
+        "+@id": "3",
+        "+@genre": "fiction"
+      }
+    ]
+  }
+}

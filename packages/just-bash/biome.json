@@ -1,0 +1,65 @@
+{
+  "$schema": "https://biomejs.dev/schemas/2.3.10/schema.json",
+  "assist": { "actions": { "source": { "organizeImports": "on" } } },
+  "linter": {
+    "enabled": true,
+    "rules": {
+      "recommended": true,
+      "correctness": {
+        "noUnusedImports": "error",
+        "noUnusedVariables": "error",
+        "noUnusedPrivateClassMembers": "error"
+      },
+      "suspicious": {
+        "noTemplateCurlyInString": "off",
+        "noControlCharactersInRegex": "off",
+        "noImplicitAnyLet": "error",
+        "noAssignInExpressions": "error",
+        "noExplicitAny": "error"
+      },
+      "style": {
+        "noNonNullAssertion": "error",
+        "useTemplate": "error",
+        "noRestrictedGlobals": {
+          "level": "error",
+          "options": {
+            "deniedGlobals": {
+              "RegExp": "Use createUserRegex() for user patterns or new ConstantRegex() for internal patterns. See src/regex/index.ts"
+            }
+          }
+        }
+      }
+    }
+  },
+  "overrides": [
+    {
+      "includes": ["**/*.test.ts", "**/spec-tests/**", "**/regex/**"],
+      "linter": {
+        "rules": {
+          "style": {
+            "noRestrictedGlobals": "off"
+          }
+        }
+      }
+    }
+  ],
+  "formatter": {
+    "enabled": true,
+    "indentStyle": "space",
+    "indentWidth": 2
+  },
+  "files": {
+    "includes": [
+      "**",
+      "!**/dist",
+      "!**/node_modules",
+      "!**/coverage",
+      "!**/*.md",
+      "!examples",
+      "!**/*.parsed.json",
+      "!.claude",
+      "!.pnpm-store",
+      "!src/commands/python3/worker.js"
+    ]
+  }
+}

@@ -1,0 +1,48 @@
+{
+  "?xml": {
+    "+@version": "1.0",
+    "+@encoding": "UTF-8"
+  },
+  "root": {
+    "empty": "",
+    "self-closing": "",
+    "whitespace": "trimmed",
+    "cdata": "<script>alert(\"test\")</script>",
+    "entities": "<tag> & \"quotes\"",
+    "unicode": "Hello &#19990;&#30028;",
+    "mixed-content": {
+      "b": "bold",
+      "+content": "Textmore text"
+    },
+    "multiple-attrs": {
+      "+@id": "1",
+      "+@class": "item",
+      "+@data-value": "test",
+      "+@enabled": "true"
+    },
+    "namespaced": {
+      "+content": "namespaced content",
+      "+@custom:attr": "value"
+    },
+    "numbers": {
+      "int": "42",
+      "float": "3.14",
+      "negative": "-17"
+    },
+    "nested": {
+      "level1": {
+        "level2": {
+          "level3": "deep value"
+        }
+      }
+    },
+    "repeated": {
+      "item": [
+        "first",
+        "second",
+        "third"
+      ]
+    },
+    "+@xmlns:custom": "http://example.com/custom"
+  }
+}

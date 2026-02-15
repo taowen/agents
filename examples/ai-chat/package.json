@@ -14,7 +14,8 @@
     "@cloudflare/ai-chat": "*",
     "@cloudflare/kumo": "^1.5.0",
     "@phosphor-icons/react": "^2.1.10",
-    "agents": "*"
+    "agents": "*",
+    "just-bash": "file:../../packages/just-bash"
   },
   "devDependencies": {
     "@tailwindcss/vite": "^4",

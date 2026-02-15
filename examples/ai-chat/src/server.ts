@@ -9,6 +9,7 @@ import {
   stepCountIs
 } from "ai";
 import { z } from "zod";
+import { Bash, InMemoryFs } from "just-bash/browser";
 
 /**
  * AI Chat Agent showcasing @cloudflare/ai-chat features:
@@ -23,6 +24,18 @@ export class ChatAgent extends AIChatAgent {
   // Keep the last 200 messages in SQLite storage
   maxPersistedMessages = 200;
 
+  // Sandboxed bash environment with in-memory filesystem
+  private bash = new Bash({
+    fs: new InMemoryFs(),
+    cwd: "/home/user",
+    executionLimits: {
+      maxCommandCount: 1000,
+      maxLoopIterations: 1000,
+      maxCallDepth: 50,
+      maxStringLength: 1_048_576
+    }
+  });
+
   async onChatMessage() {
     const google = createGoogleGenerativeAI({
       baseURL: "https://api.whatai.cc/v1beta",
@@ -33,7 +46,10 @@ export class ChatAgent extends AIChatAgent {
       model: google("gemini-3-flash-preview"),
       system:
         "You are a helpful assistant. You can check the weather, get the user's timezone, " +
-        "and run calculations. For calculations over $100, you need user approval first.",
+        "run calculations, and execute bash commands in a sandboxed virtual filesystem. " +
+        "The bash environment supports common commands like ls, grep, awk, sed, find, cat, echo, etc. " +
+        "Files created persist across commands within the same session. " +
+        "For calculations over $100, you need user approval first.",
       // Prune old tool calls and reasoning to save tokens on long conversations
       messages: pruneMessages({
         messages: await convertToModelMessages(this.messages),
@@ -67,6 +83,25 @@ export class ChatAgent extends AIChatAgent {
             "Get the user's timezone from their browser. Use this when you need to know the user's local time.",
           inputSchema: z.object({})
           // No execute -- the client provides the result via onToolCall
+        }),
+
+        // Sandboxed bash execution in virtual filesystem
+        bash: tool({
+          description:
+            "Execute a bash command in a sandboxed virtual filesystem. " +
+            "Supports ls, grep, awk, sed, find, cat, echo, mkdir, cp, mv, sort, uniq, wc, head, tail, and more. " +
+            "Files persist across commands within the session.",
+          inputSchema: z.object({
+            command: z.string().describe("The bash command to execute")
+          }),
+          execute: async ({ command }) => {
+            const result = await this.bash.exec(command);
+            return {
+              stdout: result.stdout,
+              stderr: result.stderr,
+              exitCode: result.exitCode
+            };
+          }
         }),
 
         // Tool with approval: requires user confirmation before executing
