@@ -15,3 +15,10 @@ export {
 } from "./git-credentials";
 export type { GitCredential } from "./git-credentials";
 export { syncDirtyGitMounts } from "./sync";
+export {
+  createGitHubOAuthRoutes,
+  handleGitHubOAuthDORequest,
+  generateOAuthState,
+  verifyOAuthState
+} from "./github-oauth";
+export type { GitHubOAuthDeps } from "./github-oauth";
