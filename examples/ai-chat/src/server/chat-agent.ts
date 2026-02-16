@@ -359,23 +359,38 @@ class ChatAgentBase extends AIChatAgent {
       }
 
       // Read LLM settings from D1
-      let apiKey = this.env.GOOGLE_AI_API_KEY;
-      let provider: string = "google";
-      let baseURL = "https://generativelanguage.googleapis.com/v1beta";
-      let model = "gemini-2.0-flash";
+      let provider: string = "builtin";
 
       if (this.userId) {
         const settings = await this.getCachedSettings();
-        if (settings?.llm_api_key) apiKey = settings.llm_api_key;
         if (settings?.llm_provider) provider = settings.llm_provider;
-        if (settings?.llm_base_url) baseURL = settings.llm_base_url;
-        if (settings?.llm_model) model = settings.llm_model;
       }
 
-      const llmModel =
-        provider === "openai-compatible"
-          ? createOpenAICompatible({ name: "llm", baseURL, apiKey })(model)
-          : createGoogleGenerativeAI({ baseURL, apiKey })(model);
+      let llmModel;
+      if (provider === "builtin") {
+        const apiKey = this.env.ARK_API_KEY;
+        const baseURL = "https://ark.cn-beijing.volces.com/api/v3";
+        const model = "doubao-seed-2-0-pro-260215";
+        llmModel = createOpenAICompatible({ name: "llm", baseURL, apiKey })(
+          model
+        );
+      } else {
+        let apiKey = this.env.GOOGLE_AI_API_KEY;
+        let baseURL = "https://generativelanguage.googleapis.com/v1beta";
+        let model = "gemini-2.0-flash";
+
+        if (this.userId) {
+          const settings = await this.getCachedSettings();
+          if (settings?.llm_api_key) apiKey = settings.llm_api_key;
+          if (settings?.llm_base_url) baseURL = settings.llm_base_url;
+          if (settings?.llm_model) model = settings.llm_model;
+        }
+
+        llmModel =
+          provider === "openai-compatible"
+            ? createOpenAICompatible({ name: "llm", baseURL, apiKey })(model)
+            : createGoogleGenerativeAI({ baseURL, apiKey })(model);
+      }
 
       const messages = await Sentry.startSpan(
         { name: "convertMessages", op: "serialize" },

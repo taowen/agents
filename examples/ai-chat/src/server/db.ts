@@ -19,7 +19,7 @@ export interface Session {
   updated_at: string;
 }
 
-export type LlmProvider = "google" | "openai-compatible";
+export type LlmProvider = "builtin" | "google" | "openai-compatible";
 
 export interface UserSettings {
   user_id: string;
@@ -151,10 +151,9 @@ export async function upsertSettings(
         partial.github_client_id ?? null,
         partial.github_client_secret ?? null,
         partial.llm_api_key ?? null,
-        partial.llm_provider ?? "google",
-        partial.llm_base_url ??
-          "https://generativelanguage.googleapis.com/v1beta",
-        partial.llm_model ?? "gemini-2.0-flash"
+        partial.llm_provider ?? "builtin",
+        partial.llm_base_url ?? null,
+        partial.llm_model ?? null
       )
       .run();
   } else {

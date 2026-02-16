@@ -23,11 +23,9 @@ interface Settings {
 export function SettingsPage({ onBack }: SettingsPageProps) {
   const [settings, setSettings] = useState<Settings>({});
   const [llmApiKey, setLlmApiKey] = useState("");
-  const [llmProvider, setLlmProvider] = useState("google");
-  const [llmBaseUrl, setLlmBaseUrl] = useState(
-    "https://generativelanguage.googleapis.com/v1beta"
-  );
-  const [llmModel, setLlmModel] = useState("gemini-2.0-flash");
+  const [llmProvider, setLlmProvider] = useState("builtin");
+  const [llmBaseUrl, setLlmBaseUrl] = useState("");
+  const [llmModel, setLlmModel] = useState("");
   const [githubClientId, setGithubClientId] = useState("");
   const [githubClientSecret, setGithubClientSecret] = useState("");
   const [saving, setSaving] = useState(false);
@@ -120,54 +118,63 @@ export function SettingsPage({ onBack }: SettingsPageProps) {
                 onChange={(e) => setLlmProvider(e.target.value)}
                 className={inputClass}
               >
+                <option value="builtin">Built-in (Doubao)</option>
                 <option value="google">Google Gemini</option>
                 <option value="openai-compatible">OpenAI Compatible</option>
               </select>
             </div>
 
-            <div>
-              <label className="block text-xs font-medium text-kumo-secondary mb-1">
-                API Key
-                {settings.llm_api_key_set && (
-                  <span className="ml-1 text-kumo-inactive font-normal">
-                    (configured — leave blank to keep current)
-                  </span>
-                )}
-              </label>
-              <input
-                type="password"
-                value={llmApiKey}
-                onChange={(e) => setLlmApiKey(e.target.value)}
-                placeholder={
-                  settings.llm_api_key_set ? "********" : "Enter API key"
-                }
-                className={inputClass}
-              />
-            </div>
+            {llmProvider === "builtin" ? (
+              <div className="px-3 py-2 rounded-lg bg-kumo-elevated text-sm text-kumo-secondary">
+                Using built-in Doubao model. No API key needed.
+              </div>
+            ) : (
+              <>
+                <div>
+                  <label className="block text-xs font-medium text-kumo-secondary mb-1">
+                    API Key
+                    {settings.llm_api_key_set && (
+                      <span className="ml-1 text-kumo-inactive font-normal">
+                        (configured — leave blank to keep current)
+                      </span>
+                    )}
+                  </label>
+                  <input
+                    type="password"
+                    value={llmApiKey}
+                    onChange={(e) => setLlmApiKey(e.target.value)}
+                    placeholder={
+                      settings.llm_api_key_set ? "********" : "Enter API key"
+                    }
+                    className={inputClass}
+                  />
+                </div>
 
-            <div>
-              <label className="block text-xs font-medium text-kumo-secondary mb-1">
-                Base URL
-              </label>
-              <input
-                type="text"
-                value={llmBaseUrl}
-                onChange={(e) => setLlmBaseUrl(e.target.value)}
-                className={inputClass}
-              />
-            </div>
+                <div>
+                  <label className="block text-xs font-medium text-kumo-secondary mb-1">
+                    Base URL
+                  </label>
+                  <input
+                    type="text"
+                    value={llmBaseUrl}
+                    onChange={(e) => setLlmBaseUrl(e.target.value)}
+                    className={inputClass}
+                  />
+                </div>
 
-            <div>
-              <label className="block text-xs font-medium text-kumo-secondary mb-1">
-                Model
-              </label>
-              <input
-                type="text"
-                value={llmModel}
-                onChange={(e) => setLlmModel(e.target.value)}
-                className={inputClass}
-              />
-            </div>
+                <div>
+                  <label className="block text-xs font-medium text-kumo-secondary mb-1">
+                    Model
+                  </label>
+                  <input
+                    type="text"
+                    value={llmModel}
+                    onChange={(e) => setLlmModel(e.target.value)}
+                    className={inputClass}
+                  />
+                </div>
+              </>
+            )}
           </div>
         </div>
 

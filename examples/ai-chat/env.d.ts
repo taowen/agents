@@ -10,6 +10,7 @@ declare namespace Cloudflare {
     ChatAgent: DurableObjectNamespace<import("./src/server/index").ChatAgent>;
     DB: D1Database;
     GOOGLE_AI_API_KEY: string;
+    ARK_API_KEY: string;
     MYBROWSER: Fetcher;
     AUTH_SECRET: string;
     GOOGLE_CLIENT_ID: string;

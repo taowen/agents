@@ -90,9 +90,7 @@ export async function handleApiRoutes(
     const settings = await getSettings(env.DB, userId);
     if (!settings) {
       return Response.json({
-        llm_provider: "google",
-        llm_base_url: "https://generativelanguage.googleapis.com/v1beta",
-        llm_model: "gemini-2.0-flash"
+        llm_provider: "builtin"
       });
     }
     // Mask secrets
@@ -102,7 +100,7 @@ export async function handleApiRoutes(
         settings.github_client_id && settings.github_client_secret
       ),
       llm_api_key_set: !!settings.llm_api_key,
-      llm_provider: settings.llm_provider ?? "google",
+      llm_provider: settings.llm_provider ?? "builtin",
       llm_base_url: settings.llm_base_url,
       llm_model: settings.llm_model
     });
