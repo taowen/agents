@@ -23,11 +23,11 @@ import {
   CheckCircleIcon,
   XCircleIcon,
   GearIcon,
-  CloudSunIcon,
-  GithubLogoIcon,
-  XIcon,
-  ArrowSquareOutIcon
+  CloudSunIcon
 } from "@phosphor-icons/react";
+import { LoginPage } from "./LoginPage";
+import { SessionSidebar, type SessionInfo } from "./SessionSidebar";
+import { SettingsPage } from "./SettingsPage";
 
 function getMessageText(message: UIMessage): string {
   return message.parts
@@ -36,209 +36,29 @@ function getMessageText(message: UIMessage): string {
     .join("");
 }
 
-function GitHubSetupModal({
-  open,
-  onClose
-}: {
-  open: boolean;
-  onClose: () => void;
-}) {
-  const [clientId, setClientId] = useState("");
-  const [clientSecret, setClientSecret] = useState("");
-  const [configured, setConfigured] = useState(false);
-  const [saving, setSaving] = useState(false);
-  const [error, setError] = useState("");
-
-  useEffect(() => {
-    if (open) {
-      setError("");
-      fetch("/oauth/github/config?agent_id=default")
-        .then((res) => res.json())
-        .then((data: { clientId?: string; configured?: boolean }) => {
-          if (data.clientId) setClientId(data.clientId);
-          setConfigured(!!data.configured);
-        })
-        .catch(() => {});
-    }
-  }, [open]);
-
-  const callbackUrl =
-    typeof window !== "undefined"
-      ? `${window.location.origin}/oauth/github/callback`
-      : "";
-
-  const handleSaveAndConnect = async () => {
-    if (!clientId.trim()) {
-      setError("Client ID is required");
-      return;
-    }
-    if (!clientSecret.trim() && !configured) {
-      setError("Client Secret is required");
-      return;
-    }
-    setSaving(true);
-    setError("");
-    try {
-      const body: Record<string, string> = { clientId: clientId.trim() };
-      if (clientSecret.trim()) body.clientSecret = clientSecret.trim();
-      const res = await fetch("/oauth/github/config?agent_id=default", {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify(body)
-      });
-      if (!res.ok) throw new Error(await res.text());
-      window.location.href = "/oauth/github?agent_id=default";
-    } catch (e) {
-      setError(e instanceof Error ? e.message : "Save failed");
-      setSaving(false);
-    }
-  };
-
-  if (!open) return null;
-
-  const inputClass =
-    "w-full px-3 py-2 rounded-lg border border-kumo-line bg-kumo-elevated text-kumo-default text-sm focus:outline-none focus:ring-2 focus:ring-kumo-ring font-mono";
-
-  return (
-    <div
-      className="fixed inset-0 z-50 flex items-center justify-center bg-black/50"
-      onClick={onClose}
-    >
-      <div
-        className="w-full max-w-lg mx-4 rounded-xl ring ring-kumo-line overflow-hidden bg-kumo-base"
-        onClick={(e: React.MouseEvent) => e.stopPropagation()}
-      >
-        {/* Header */}
-        <div className="flex items-center justify-between px-5 py-4 border-b border-kumo-line">
-          <div className="flex items-center gap-2">
-            <GithubLogoIcon size={20} className="text-kumo-default" />
-            <span className="text-sm font-semibold text-kumo-default">
-              Connect GitHub
-            </span>
-          </div>
-          <button
-            onClick={onClose}
-            className="p-1 rounded hover:bg-kumo-elevated text-kumo-inactive hover:text-kumo-default transition-colors"
-          >
-            <XIcon size={18} />
-          </button>
-        </div>
-
-        <div className="px-5 py-4 space-y-4">
-          {/* Instructions */}
-          <div className="space-y-2 text-sm text-kumo-secondary">
-            <span className="text-xs font-semibold text-kumo-default">
-              Setup Instructions
-            </span>
-            <ol className="list-decimal list-inside space-y-1.5 text-kumo-secondary">
-              <li>
-                <a
-                  href="https://github.com/settings/applications/new"
-                  target="_blank"
-                  rel="noopener noreferrer"
-                  className="text-kumo-brand hover:underline inline-flex items-center gap-1"
-                >
-                  Create a GitHub OAuth App
-                  <ArrowSquareOutIcon size={12} />
-                </a>
-              </li>
-              <li>
-                Set <strong>Homepage URL</strong> to:{" "}
-                <code className="px-1 py-0.5 rounded bg-kumo-elevated text-xs">
-                  {typeof window !== "undefined" ? window.location.origin : ""}
-                </code>
-              </li>
-              <li>
-                Set <strong>Authorization callback URL</strong> to:
-                <div className="mt-1">
-                  <code className="block px-2 py-1 rounded bg-kumo-elevated text-xs break-all select-all">
-                    {callbackUrl}
-                  </code>
-                </div>
-              </li>
-              <li>
-                Copy the <strong>Client ID</strong> and generate a{" "}
-                <strong>Client Secret</strong> below
-              </li>
-            </ol>
-          </div>
-
-          {/* Form */}
-          <div className="space-y-3">
-            <div>
-              <label className="block text-xs font-medium text-kumo-secondary mb-1">
-                Client ID
-              </label>
-              <input
-                type="text"
-                value={clientId}
-                onChange={(e) => setClientId(e.target.value)}
-                placeholder="Ov23li..."
-                className={inputClass}
-              />
-            </div>
-            <div>
-              <label className="block text-xs font-medium text-kumo-secondary mb-1">
-                Client Secret
-                {configured && (
-                  <span className="ml-1 text-kumo-inactive font-normal">
-                    (leave blank to keep current)
-                  </span>
-                )}
-              </label>
-              <input
-                type="password"
-                value={clientSecret}
-                onChange={(e) => setClientSecret(e.target.value)}
-                placeholder={configured ? "********" : "Enter client secret"}
-                className={inputClass}
-              />
-            </div>
-          </div>
-
-          {/* Error */}
-          {error && <p className="text-xs text-red-500">{error}</p>}
-
-          {/* Actions */}
-          <div className="flex items-center justify-between pt-2">
-            {configured && (
-              <Button
-                variant="secondary"
-                size="sm"
-                onClick={() => {
-                  window.location.href = "/oauth/github?agent_id=default";
-                }}
-              >
-                Connect with existing config
-              </Button>
-            )}
-            <div className={configured ? "" : "ml-auto"}>
-              <Button
-                variant="primary"
-                size="sm"
-                icon={<GithubLogoIcon size={14} />}
-                onClick={handleSaveAndConnect}
-                loading={saving}
-              >
-                {configured ? "Save & Reconnect" : "Save & Connect"}
-              </Button>
-            </div>
-          </div>
-        </div>
-      </div>
-    </div>
-  );
+interface UserInfo {
+  id: string;
+  email: string;
+  name: string | null;
+  picture: string | null;
 }
 
-function Chat() {
+function Chat({
+  sessionId,
+  onFirstMessage
+}: {
+  sessionId: string;
+  onFirstMessage: (text: string) => void;
+}) {
   const [connectionStatus, setConnectionStatus] =
     useState<ConnectionStatus>("connecting");
   const [input, setInput] = useState("");
-  const [showGitHubSetup, setShowGitHubSetup] = useState(false);
   const messagesEndRef = useRef<HTMLDivElement>(null);
+  const firstMessageSent = useRef(false);
 
   const agent = useAgent({
     agent: "ChatAgent",
+    name: sessionId,
     onOpen: useCallback(() => setConnectionStatus("connected"), []),
     onClose: useCallback(() => setConnectionStatus("disconnected"), []),
     onError: useCallback(
@@ -255,11 +75,9 @@ function Chat() {
     status
   } = useAgentChat({
     agent,
-    // Custom data sent with every request (available in options.body on server)
     body: {
       clientVersion: "1.0.0"
     },
-    // Handle client-side tools (tools without server execute function)
     onToolCall: async ({ toolCall, addToolOutput }) => {
       if (toolCall.toolName === "getUserTimezone") {
         addToolOutput({
@@ -285,7 +103,11 @@ function Chat() {
     if (!text || isStreaming) return;
     setInput("");
     sendMessage({ role: "user", parts: [{ type: "text", text }] });
-  }, [input, isStreaming, sendMessage]);
+    if (!firstMessageSent.current) {
+      firstMessageSent.current = true;
+      onFirstMessage(text);
+    }
+  }, [input, isStreaming, sendMessage, onFirstMessage]);
 
   return (
     <div className="flex flex-col h-screen bg-kumo-elevated">
@@ -304,13 +126,6 @@ function Chat() {
             <ModeToggle />
             <Button
               variant="secondary"
-              icon={<GithubLogoIcon size={16} />}
-              onClick={() => setShowGitHubSetup(true)}
-            >
-              GitHub
-            </Button>
-            <Button
-              variant="secondary"
               icon={<TrashIcon size={16} />}
               onClick={clearHistory}
             >
@@ -327,7 +142,7 @@ function Chat() {
             <Empty
               icon={<CloudSunIcon size={32} />}
               title="Start a conversation"
-              description='Try "What is the weather in London?" or "What timezone am I in?" or "Calculate 150 * 3 (amount: $450)"'
+              description='Try "What is the weather in London?" or "What timezone am I in?" or ask to explore files with bash'
             />
           )}
 
@@ -338,7 +153,6 @@ function Chat() {
 
             return (
               <div key={message.id} className="space-y-2">
-                {/* Text content */}
                 {isUser ? (
                   <div className="flex justify-end">
                     <div className="max-w-[85%] px-4 py-2.5 rounded-2xl rounded-br-md bg-kumo-contrast text-kumo-inverse leading-relaxed">
@@ -358,14 +172,12 @@ function Chat() {
                   </div>
                 )}
 
-                {/* Tool parts */}
                 {message.parts
                   .filter((part) => isToolUIPart(part))
                   .map((part) => {
                     if (!isToolUIPart(part)) return null;
                     const toolName = getToolName(part);
 
-                    // Tool completed
                     if (part.state === "output-available") {
                       const isBash = toolName === "bash";
                       const isBrowser = toolName === "browser";
@@ -400,123 +212,169 @@ function Chat() {
                           }
                         | undefined;
 
+                      if (isBash) {
+                        const cmd = bashInput?.command || "";
+                        const cmdShort =
+                          cmd.length > 80 ? cmd.slice(0, 80) + "…" : cmd;
+                        const output = bashOutput?.stdout || "";
+                        const outputShort =
+                          output.split("\n")[0]?.slice(0, 80) || "";
+                        const exitOk = bashOutput?.exitCode === 0;
+
+                        return (
+                          <div
+                            key={part.toolCallId}
+                            className="flex justify-start"
+                          >
+                            <div className="max-w-[85%] space-y-1">
+                              {/* Request (command) — collapsed by default */}
+                              <details className="group">
+                                <summary className="cursor-pointer list-none flex items-center gap-2 px-3 py-1.5 rounded-lg bg-kumo-base ring ring-kumo-line hover:bg-kumo-elevated transition-colors">
+                                  <GearIcon
+                                    size={12}
+                                    className="text-kumo-inactive shrink-0"
+                                  />
+                                  <span className="font-mono text-xs text-kumo-secondary truncate">
+                                    $ {cmdShort}
+                                  </span>
+                                </summary>
+                                <div className="mt-1 px-3 py-2 rounded-lg bg-kumo-base ring ring-kumo-line font-mono text-xs whitespace-pre-wrap overflow-x-auto max-h-[300px] overflow-y-auto">
+                                  <Text size="xs" variant="secondary">
+                                    {cmd}
+                                  </Text>
+                                </div>
+                              </details>
+                              {/* Response (output) — collapsed by default */}
+                              <details className="group">
+                                <summary className="cursor-pointer list-none flex items-center gap-2 px-3 py-1.5 rounded-lg bg-kumo-base ring ring-kumo-line hover:bg-kumo-elevated transition-colors">
+                                  {exitOk ? (
+                                    <CheckCircleIcon
+                                      size={12}
+                                      className="text-kumo-inactive shrink-0"
+                                    />
+                                  ) : (
+                                    <XCircleIcon
+                                      size={12}
+                                      className="text-kumo-inactive shrink-0"
+                                    />
+                                  )}
+                                  {exitOk ? (
+                                    <span className="text-xs text-kumo-secondary truncate">
+                                      {outputShort || "OK"}
+                                    </span>
+                                  ) : (
+                                    <span className="text-xs text-kumo-secondary truncate">
+                                      Exit {bashOutput?.exitCode}
+                                      {bashOutput?.stderr
+                                        ? `: ${bashOutput.stderr.split("\n")[0]?.slice(0, 60)}`
+                                        : ""}
+                                    </span>
+                                  )}
+                                </summary>
+                                <div className="mt-1 px-3 py-2 rounded-lg bg-kumo-base ring ring-kumo-line font-mono text-xs whitespace-pre-wrap overflow-x-auto max-h-[400px] overflow-y-auto">
+                                  {bashOutput?.stdout && (
+                                    <Text size="xs" variant="secondary">
+                                      {bashOutput.stdout}
+                                    </Text>
+                                  )}
+                                  {bashOutput?.stderr && (
+                                    <Text size="xs" variant="error">
+                                      {bashOutput.stderr}
+                                    </Text>
+                                  )}
+                                </div>
+                              </details>
+                            </div>
+                          </div>
+                        );
+                      }
+
+                      if (isBrowser && browserOutput) {
+                        const action =
+                          browserOutput.action || browserInput?.action || "";
+                        const url =
+                          browserOutput.url || browserInput?.url || "";
+                        const summaryText = `${action}${url ? " " + url : ""}`;
+                        const summaryShort =
+                          summaryText.length > 70
+                            ? summaryText.slice(0, 70) + "…"
+                            : summaryText;
+
+                        return (
+                          <div
+                            key={part.toolCallId}
+                            className="flex justify-start"
+                          >
+                            <details className="max-w-[85%]">
+                              <summary className="cursor-pointer list-none flex items-center gap-2 px-3 py-1.5 rounded-lg bg-kumo-base ring ring-kumo-line hover:bg-kumo-elevated transition-colors">
+                                <GearIcon
+                                  size={12}
+                                  className="text-kumo-inactive shrink-0"
+                                />
+                                <span className="font-mono text-xs text-kumo-secondary truncate">
+                                  {summaryShort}
+                                </span>
+                                {browserOutput.success ? (
+                                  <Badge variant="secondary">OK</Badge>
+                                ) : (
+                                  <Badge variant="destructive">Failed</Badge>
+                                )}
+                              </summary>
+                              <div className="mt-1 px-3 py-2 rounded-lg bg-kumo-base ring ring-kumo-line space-y-2">
+                                {browserOutput.error && (
+                                  <Text size="xs" variant="error">
+                                    {browserOutput.error}
+                                  </Text>
+                                )}
+                                {browserOutput.url && browserOutput.title && (
+                                  <Text size="xs" variant="secondary">
+                                    {browserOutput.title} — {browserOutput.url}
+                                  </Text>
+                                )}
+                                {browserOutput.screenshot && (
+                                  <img
+                                    src={`data:image/png;base64,${browserOutput.screenshot}`}
+                                    alt="Browser screenshot"
+                                    className="rounded border border-kumo-line max-w-full"
+                                  />
+                                )}
+                                {browserOutput.text && (
+                                  <pre className="p-2 bg-kumo-elevated rounded overflow-x-auto text-xs text-kumo-secondary max-h-[300px] overflow-y-auto">
+                                    {browserOutput.text}
+                                  </pre>
+                                )}
+                              </div>
+                            </details>
+                          </div>
+                        );
+                      }
+
                       return (
                         <div
                           key={part.toolCallId}
                           className="flex justify-start"
                         >
-                          <Surface className="max-w-[85%] px-4 py-2.5 rounded-xl ring ring-kumo-line">
-                            <div className="flex items-center gap-2 mb-1">
+                          <details className="max-w-[85%]">
+                            <summary className="cursor-pointer list-none flex items-center gap-2 px-3 py-1.5 rounded-lg bg-kumo-base ring ring-kumo-line hover:bg-kumo-elevated transition-colors">
                               <GearIcon
-                                size={14}
-                                className="text-kumo-inactive"
+                                size={12}
+                                className="text-kumo-inactive shrink-0"
                               />
                               <Text size="xs" variant="secondary" bold>
                                 {toolName}
                               </Text>
-                              {isBash && bashOutput ? (
-                                bashOutput.exitCode === 0 ? (
-                                  <Badge variant="secondary">Done</Badge>
-                                ) : (
-                                  <Badge variant="destructive">
-                                    Exit {bashOutput.exitCode}
-                                  </Badge>
-                                )
-                              ) : isBrowser && browserOutput ? (
-                                browserOutput.success ? (
-                                  <Badge variant="secondary">
-                                    {browserOutput.action}
-                                  </Badge>
-                                ) : (
-                                  <Badge variant="destructive">Failed</Badge>
-                                )
-                              ) : (
-                                <Badge variant="secondary">Done</Badge>
-                              )}
+                              <Badge variant="secondary">Done</Badge>
+                            </summary>
+                            <div className="mt-1 px-3 py-2 rounded-lg bg-kumo-base ring ring-kumo-line font-mono text-xs whitespace-pre-wrap">
+                              <Text size="xs" variant="secondary">
+                                {JSON.stringify(part.output, null, 2)}
+                              </Text>
                             </div>
-                            {isBash && bashInput?.command && (
-                              <div className="font-mono bg-kumo-elevated rounded px-2 py-1 mb-1">
-                                <Text size="xs" variant="secondary">
-                                  $ {bashInput.command}
-                                </Text>
-                              </div>
-                            )}
-                            {isBrowser && browserInput?.action && (
-                              <div className="font-mono bg-kumo-elevated rounded px-2 py-1 mb-1">
-                                <Text size="xs" variant="secondary">
-                                  {browserInput.action}
-                                  {browserInput.url
-                                    ? ` ${browserInput.url}`
-                                    : ""}
-                                  {browserInput.selector
-                                    ? ` ${browserInput.selector}`
-                                    : ""}
-                                  {browserInput.text
-                                    ? ` "${browserInput.text}"`
-                                    : ""}
-                                  {browserInput.direction
-                                    ? ` ${browserInput.direction}`
-                                    : ""}
-                                </Text>
-                              </div>
-                            )}
-                            <div className="font-mono whitespace-pre-wrap">
-                              {isBash && bashOutput ? (
-                                <>
-                                  {bashOutput.stdout && (
-                                    <Text size="xs" variant="secondary">
-                                      {bashOutput.stdout}
-                                    </Text>
-                                  )}
-                                  {bashOutput.stderr && (
-                                    <Text size="xs" variant="error">
-                                      {bashOutput.stderr}
-                                    </Text>
-                                  )}
-                                </>
-                              ) : isBrowser && browserOutput ? (
-                                <div className="space-y-2">
-                                  {browserOutput.error && (
-                                    <Text size="xs" variant="error">
-                                      {browserOutput.error}
-                                    </Text>
-                                  )}
-                                  {browserOutput.url && browserOutput.title && (
-                                    <Text size="xs" variant="secondary">
-                                      {browserOutput.title} —{" "}
-                                      {browserOutput.url}
-                                    </Text>
-                                  )}
-                                  {browserOutput.screenshot && (
-                                    <img
-                                      src={`data:image/png;base64,${browserOutput.screenshot}`}
-                                      alt="Browser screenshot"
-                                      className="rounded border border-kumo-line max-w-full"
-                                    />
-                                  )}
-                                  {browserOutput.text && (
-                                    <details className="text-xs">
-                                      <summary className="cursor-pointer text-kumo-secondary hover:text-kumo-default">
-                                        Extracted text
-                                      </summary>
-                                      <pre className="mt-1 p-2 bg-kumo-elevated rounded overflow-x-auto text-kumo-secondary">
-                                        {browserOutput.text}
-                                      </pre>
-                                    </details>
-                                  )}
-                                </div>
-                              ) : (
-                                <Text size="xs" variant="secondary">
-                                  {JSON.stringify(part.output, null, 2)}
-                                </Text>
-                              )}
-                            </div>
-                          </Surface>
+                          </details>
                         </div>
                       );
                     }
 
-                    // Tool needs approval
                     if (
                       "approval" in part &&
                       part.state === "approval-requested"
@@ -579,7 +437,6 @@ function Chat() {
                       );
                     }
 
-                    // Tool executing
                     if (
                       part.state === "input-available" ||
                       part.state === "input-streaming"
@@ -654,17 +511,146 @@ function Chat() {
           <PoweredByAgents />
         </div>
       </div>
+    </div>
+  );
+}
 
-      {/* GitHub Setup Modal */}
-      <GitHubSetupModal
-        open={showGitHubSetup}
-        onClose={() => setShowGitHubSetup(false)}
+function AuthenticatedApp({ user }: { user: UserInfo }) {
+  const [sessions, setSessions] = useState<SessionInfo[]>([]);
+  const [activeSessionId, setActiveSessionId] = useState<string | null>(null);
+  const [view, setView] = useState<"chat" | "settings">("chat");
+
+  // Load sessions on mount
+  useEffect(() => {
+    fetch("/api/sessions")
+      .then((res) => res.json())
+      .then((data: SessionInfo[]) => {
+        setSessions(data);
+        if (data.length > 0) {
+          setActiveSessionId(data[0].id);
+        }
+      })
+      .catch(console.error);
+  }, []);
+
+  const handleNewSession = async () => {
+    try {
+      const res = await fetch("/api/sessions", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({})
+      });
+      const session = (await res.json()) as SessionInfo;
+      setSessions((prev) => [session, ...prev]);
+      setActiveSessionId(session.id);
+      setView("chat");
+    } catch (e) {
+      console.error("Failed to create session:", e);
+    }
+  };
+
+  const handleDeleteSession = async (id: string) => {
+    try {
+      await fetch(`/api/sessions/${id}`, { method: "DELETE" });
+      setSessions((prev) => prev.filter((s) => s.id !== id));
+      if (activeSessionId === id) {
+        const remaining = sessions.filter((s) => s.id !== id);
+        setActiveSessionId(remaining.length > 0 ? remaining[0].id : null);
+      }
+    } catch (e) {
+      console.error("Failed to delete session:", e);
+    }
+  };
+
+  const handleFirstMessage = async (text: string) => {
+    if (!activeSessionId) return;
+    const title = text.length > 50 ? text.slice(0, 50) + "..." : text;
+    try {
+      await fetch(`/api/sessions/${activeSessionId}`, {
+        method: "PATCH",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ title })
+      });
+      setSessions((prev) =>
+        prev.map((s) => (s.id === activeSessionId ? { ...s, title } : s))
+      );
+    } catch (e) {
+      console.error("Failed to update session title:", e);
+    }
+  };
+
+  // Auto-create first session if none exist
+  useEffect(() => {
+    if (sessions.length === 0 && activeSessionId === null) {
+      handleNewSession();
+    }
+  }, [sessions.length, activeSessionId]);
+
+  return (
+    <div className="flex h-screen">
+      <SessionSidebar
+        sessions={sessions}
+        activeSessionId={activeSessionId}
+        user={user}
+        onNewSession={handleNewSession}
+        onSelectSession={(id) => {
+          setActiveSessionId(id);
+          setView("chat");
+        }}
+        onDeleteSession={handleDeleteSession}
+        onOpenSettings={() => setView("settings")}
       />
+      <div className="flex-1">
+        {view === "settings" ? (
+          <SettingsPage onBack={() => setView("chat")} />
+        ) : activeSessionId ? (
+          <Chat
+            key={activeSessionId}
+            sessionId={activeSessionId}
+            onFirstMessage={handleFirstMessage}
+          />
+        ) : (
+          <div className="flex items-center justify-center h-full text-kumo-inactive">
+            Loading...
+          </div>
+        )}
+      </div>
     </div>
   );
 }
 
 export default function App() {
+  const [authState, setAuthState] = useState<
+    "loading" | "unauthenticated" | "authenticated"
+  >("loading");
+  const [user, setUser] = useState<UserInfo | null>(null);
+
+  useEffect(() => {
+    fetch("/auth/status")
+      .then((res) => res.json())
+      .then((data: { authenticated: boolean; user?: UserInfo }) => {
+        if (data.authenticated && data.user) {
+          setUser(data.user);
+          setAuthState("authenticated");
+        } else {
+          setAuthState("unauthenticated");
+        }
+      })
+      .catch(() => setAuthState("unauthenticated"));
+  }, []);
+
+  if (authState === "loading") {
+    return (
+      <div className="flex items-center justify-center h-screen text-kumo-inactive">
+        Loading...
+      </div>
+    );
+  }
+
+  if (authState === "unauthenticated") {
+    return <LoginPage />;
+  }
+
   return (
     <Suspense
       fallback={
@@ -673,7 +659,7 @@ export default function App() {
         </div>
       }
     >
-      <Chat />
+      <AuthenticatedApp user={user!} />
     </Suspense>
   );
 }

@@ -4,7 +4,7 @@
   "compatibility_flags": ["nodejs_compat"],
   "assets": {
     "not_found_handling": "single-page-application",
-    "run_worker_first": ["/agents/*", "/oauth/*"]
+    "run_worker_first": ["/agents/*", "/oauth/*", "/auth/*", "/api/*"]
   },
   "durable_objects": {
     "bindings": [
@@ -14,6 +14,13 @@
       }
     ]
   },
+  "d1_databases": [
+    {
+      "binding": "DB",
+      "database_name": "ai-chat-db",
+      "database_id": "615cce83-8d31-4a0e-922c-052bf499c1b1"
+    }
+  ],
   "main": "src/server.ts",
   "migrations": [
     {
@@ -24,5 +31,8 @@
   "name": "ai-chat-example",
   "browser": {
     "binding": "MYBROWSER"
+  },
+  "observability": {
+    "enabled": true
   }
 }
