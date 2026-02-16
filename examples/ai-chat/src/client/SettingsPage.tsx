@@ -3,12 +3,14 @@ import {
   GithubLogoIcon,
   ArrowSquareOutIcon,
   FloppyDiskIcon,
-  ArrowLeftIcon
+  ArrowLeftIcon,
+  ListIcon
 } from "@phosphor-icons/react";
 import { Button, Text } from "@cloudflare/kumo";
 
 interface SettingsPageProps {
   onBack: () => void;
+  onOpenSidebar?: () => void;
 }
 
 interface Settings {
@@ -20,7 +22,7 @@ interface Settings {
   llm_model?: string;
 }
 
-export function SettingsPage({ onBack }: SettingsPageProps) {
+export function SettingsPage({ onBack, onOpenSidebar }: SettingsPageProps) {
   const [settings, setSettings] = useState<Settings>({});
   const [llmApiKey, setLlmApiKey] = useState("");
   const [llmProvider, setLlmProvider] = useState("builtin");
@@ -93,6 +95,12 @@ export function SettingsPage({ onBack }: SettingsPageProps) {
       <div className="max-w-2xl mx-auto px-5 py-6">
         {/* Header */}
         <div className="flex items-center gap-3 mb-6">
+          <button
+            onClick={onOpenSidebar}
+            className="md:hidden p-1.5 rounded-lg hover:bg-kumo-elevated text-kumo-secondary hover:text-kumo-default transition-colors"
+          >
+            <ListIcon size={20} />
+          </button>
           <button
             onClick={onBack}
             className="p-1.5 rounded-lg hover:bg-kumo-elevated text-kumo-secondary hover:text-kumo-default transition-colors"

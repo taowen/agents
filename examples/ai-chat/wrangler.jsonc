@@ -29,6 +29,12 @@
     }
   ],
   "name": "ai-chat-example",
+  "routes": [
+    {
+      "pattern": "ai.connect-screen.com",
+      "custom_domain": true
+    }
+  ],
   "browser": {
     "binding": "MYBROWSER"
   },

@@ -15,6 +15,7 @@ function AuthenticatedApp({ user }: { user: UserInfo }) {
   const [sessions, setSessions] = useState<SessionInfo[]>([]);
   const [activeSessionId, setActiveSessionId] = useState<string | null>(null);
   const [view, setView] = useState<"chat" | "settings">("chat");
+  const [sidebarOpen, setSidebarOpen] = useState(false);
 
   // Load sessions on mount
   useEffect(() => {
@@ -82,28 +83,58 @@ function AuthenticatedApp({ user }: { user: UserInfo }) {
     }
   }, [sessions.length, activeSessionId]);
 
+  const sidebarProps = {
+    sessions,
+    activeSessionId,
+    user,
+    onNewSession: () => {
+      handleNewSession();
+      setSidebarOpen(false);
+    },
+    onSelectSession: (id: string) => {
+      setActiveSessionId(id);
+      setView("chat");
+      setSidebarOpen(false);
+    },
+    onDeleteSession: handleDeleteSession,
+    onOpenSettings: () => {
+      setView("settings");
+      setSidebarOpen(false);
+    }
+  };
+
   return (
     <div className="flex h-screen">
-      <SessionSidebar
-        sessions={sessions}
-        activeSessionId={activeSessionId}
-        user={user}
-        onNewSession={handleNewSession}
-        onSelectSession={(id) => {
-          setActiveSessionId(id);
-          setView("chat");
-        }}
-        onDeleteSession={handleDeleteSession}
-        onOpenSettings={() => setView("settings")}
-      />
-      <div className="flex-1">
+      {/* Desktop sidebar */}
+      <div className="hidden md:block">
+        <SessionSidebar {...sidebarProps} />
+      </div>
+
+      {/* Mobile sidebar overlay */}
+      {sidebarOpen && (
+        <div className="fixed inset-0 z-40 md:hidden">
+          <div
+            className="absolute inset-0 bg-black/40"
+            onClick={() => setSidebarOpen(false)}
+          />
+          <div className="relative z-10 h-full w-64">
+            <SessionSidebar {...sidebarProps} />
+          </div>
+        </div>
+      )}
+
+      <div className="flex-1 min-w-0">
         {view === "settings" ? (
-          <SettingsPage onBack={() => setView("chat")} />
+          <SettingsPage
+            onBack={() => setView("chat")}
+            onOpenSidebar={() => setSidebarOpen(true)}
+          />
         ) : activeSessionId ? (
           <Chat
             key={activeSessionId}
             sessionId={activeSessionId}
             onFirstMessage={handleFirstMessage}
+            onOpenSidebar={() => setSidebarOpen(true)}
           />
         ) : (
           <div className="flex items-center justify-center h-full text-kumo-inactive">

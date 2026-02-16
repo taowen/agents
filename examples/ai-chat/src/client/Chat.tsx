@@ -13,7 +13,8 @@ import {
 import {
   PaperPlaneRightIcon,
   TrashIcon,
-  CloudSunIcon
+  CloudSunIcon,
+  ListIcon
 } from "@phosphor-icons/react";
 import { ToolOutput } from "./ToolOutput";
 
@@ -26,10 +27,12 @@ function getMessageText(message: UIMessage): string {
 
 export function Chat({
   sessionId,
-  onFirstMessage
+  onFirstMessage,
+  onOpenSidebar
 }: {
   sessionId: string;
   onFirstMessage: (text: string) => void;
+  onOpenSidebar?: () => void;
 }) {
   const [connectionStatus, setConnectionStatus] =
     useState<ConnectionStatus>("connecting");
@@ -93,11 +96,17 @@ export function Chat({
   return (
     <div className="flex flex-col h-screen bg-kumo-elevated">
       {/* Header */}
-      <header className="px-5 py-4 bg-kumo-base border-b border-kumo-line">
+      <header className="px-4 md:px-5 py-3 md:py-4 bg-kumo-base border-b border-kumo-line">
         <div className="max-w-3xl mx-auto flex items-center justify-between">
           <div className="flex items-center gap-3">
+            <button
+              onClick={onOpenSidebar}
+              className="md:hidden p-1.5 -ml-1.5 rounded-lg hover:bg-kumo-elevated text-kumo-secondary hover:text-kumo-default transition-colors"
+            >
+              <ListIcon size={20} />
+            </button>
             <h1 className="text-lg font-semibold text-kumo-default">AI Chat</h1>
-            <Badge variant="secondary">
+            <Badge variant="secondary" className="hidden sm:inline-flex">
               <CloudSunIcon size={12} weight="bold" className="mr-1" />
               Tools + Approval
             </Badge>
@@ -107,8 +116,16 @@ export function Chat({
             <ModeToggle />
             <Button
               variant="secondary"
+              shape="square"
               icon={<TrashIcon size={16} />}
               onClick={clearHistory}
+              className="sm:hidden"
+            />
+            <Button
+              variant="secondary"
+              icon={<TrashIcon size={16} />}
+              onClick={clearHistory}
+              className="hidden sm:inline-flex"
             >
               Clear
             </Button>
@@ -118,7 +135,7 @@ export function Chat({
 
       {/* Messages */}
       <div className="flex-1 overflow-y-auto">
-        <div className="max-w-3xl mx-auto px-5 py-6 space-y-5">
+        <div className="max-w-3xl mx-auto px-4 md:px-5 py-6 space-y-5">
           {messages.length === 0 && (
             <Empty
               icon={<CloudSunIcon size={32} />}
@@ -180,7 +197,7 @@ export function Chat({
             e.preventDefault();
             send();
           }}
-          className="max-w-3xl mx-auto px-5 py-4"
+          className="max-w-3xl mx-auto px-4 md:px-5 py-3 md:py-4"
         >
           <div className="flex items-end gap-3 rounded-xl border border-kumo-line bg-kumo-base p-3 shadow-sm focus-within:ring-2 focus-within:ring-kumo-ring focus-within:border-transparent transition-shadow">
             <InputArea
