@@ -1,0 +1,218 @@
+import { useCallback, useState, useEffect, useRef } from "react";
+import { useAgent } from "agents/react";
+import { useAgentChat } from "@cloudflare/ai-chat/react";
+import { isToolUIPart } from "ai";
+import type { UIMessage } from "ai";
+import { Button, Badge, InputArea, Empty } from "@cloudflare/kumo";
+import {
+  ConnectionIndicator,
+  ModeToggle,
+  PoweredByAgents,
+  type ConnectionStatus
+} from "@cloudflare/agents-ui";
+import {
+  PaperPlaneRightIcon,
+  TrashIcon,
+  CloudSunIcon
+} from "@phosphor-icons/react";
+import { ToolOutput } from "./ToolOutput";
+
+function getMessageText(message: UIMessage): string {
+  return message.parts
+    .filter((part) => part.type === "text")
+    .map((part) => (part as { type: "text"; text: string }).text)
+    .join("");
+}
+
+export function Chat({
+  sessionId,
+  onFirstMessage
+}: {
+  sessionId: string;
+  onFirstMessage: (text: string) => void;
+}) {
+  const [connectionStatus, setConnectionStatus] =
+    useState<ConnectionStatus>("connecting");
+  const [input, setInput] = useState("");
+  const messagesEndRef = useRef<HTMLDivElement>(null);
+  const firstMessageSent = useRef(false);
+
+  const agent = useAgent({
+    agent: "ChatAgent",
+    name: sessionId,
+    onOpen: useCallback(() => setConnectionStatus("connected"), []),
+    onClose: useCallback(() => setConnectionStatus("disconnected"), []),
+    onError: useCallback(
+      (error: Event) => console.error("WebSocket error:", error),
+      []
+    )
+  });
+
+  const {
+    messages,
+    sendMessage,
+    clearHistory,
+    addToolApprovalResponse,
+    status
+  } = useAgentChat({
+    agent,
+    body: {
+      clientVersion: "1.0.0"
+    },
+    onToolCall: async ({ toolCall, addToolOutput }) => {
+      if (toolCall.toolName === "getUserTimezone") {
+        addToolOutput({
+          toolCallId: toolCall.toolCallId,
+          output: {
+            timezone: Intl.DateTimeFormat().resolvedOptions().timeZone,
+            localTime: new Date().toLocaleTimeString()
+          }
+        });
+      }
+    }
+  });
+
+  const isStreaming = status === "streaming";
+  const isConnected = connectionStatus === "connected";
+
+  useEffect(() => {
+    messagesEndRef.current?.scrollIntoView({ behavior: "smooth" });
+  }, [messages]);
+
+  const send = useCallback(() => {
+    const text = input.trim();
+    if (!text || isStreaming) return;
+    setInput("");
+    sendMessage({ role: "user", parts: [{ type: "text", text }] });
+    if (!firstMessageSent.current) {
+      firstMessageSent.current = true;
+      onFirstMessage(text);
+    }
+  }, [input, isStreaming, sendMessage, onFirstMessage]);
+
+  return (
+    <div className="flex flex-col h-screen bg-kumo-elevated">
+      {/* Header */}
+      <header className="px-5 py-4 bg-kumo-base border-b border-kumo-line">
+        <div className="max-w-3xl mx-auto flex items-center justify-between">
+          <div className="flex items-center gap-3">
+            <h1 className="text-lg font-semibold text-kumo-default">AI Chat</h1>
+            <Badge variant="secondary">
+              <CloudSunIcon size={12} weight="bold" className="mr-1" />
+              Tools + Approval
+            </Badge>
+          </div>
+          <div className="flex items-center gap-3">
+            <ConnectionIndicator status={connectionStatus} />
+            <ModeToggle />
+            <Button
+              variant="secondary"
+              icon={<TrashIcon size={16} />}
+              onClick={clearHistory}
+            >
+              Clear
+            </Button>
+          </div>
+        </div>
+      </header>
+
+      {/* Messages */}
+      <div className="flex-1 overflow-y-auto">
+        <div className="max-w-3xl mx-auto px-5 py-6 space-y-5">
+          {messages.length === 0 && (
+            <Empty
+              icon={<CloudSunIcon size={32} />}
+              title="Start a conversation"
+              description='Try "What is the weather in London?" or "What timezone am I in?" or ask to explore files with bash'
+            />
+          )}
+
+          {messages.map((message, index) => {
+            const isUser = message.role === "user";
+            const isLastAssistant =
+              message.role === "assistant" && index === messages.length - 1;
+
+            return (
+              <div key={message.id} className="space-y-2">
+                {isUser ? (
+                  <div className="flex justify-end">
+                    <div className="max-w-[85%] px-4 py-2.5 rounded-2xl rounded-br-md bg-kumo-contrast text-kumo-inverse leading-relaxed">
+                      {getMessageText(message)}
+                    </div>
+                  </div>
+                ) : (
+                  <div className="flex justify-start">
+                    <div className="max-w-[85%] px-4 py-2.5 rounded-2xl rounded-bl-md bg-kumo-base text-kumo-default leading-relaxed">
+                      <div className="whitespace-pre-wrap">
+                        {getMessageText(message)}
+                        {isLastAssistant && isStreaming && (
+                          <span className="inline-block w-0.5 h-[1em] bg-kumo-brand ml-0.5 align-text-bottom animate-blink-cursor" />
+                        )}
+                      </div>
+                    </div>
+                  </div>
+                )}
+
+                {message.parts
+                  .filter((part) => isToolUIPart(part))
+                  .map((part) => {
+                    if (!isToolUIPart(part)) return null;
+                    return (
+                      <ToolOutput
+                        key={part.toolCallId}
+                        part={part}
+                        addToolApprovalResponse={addToolApprovalResponse}
+                      />
+                    );
+                  })}
+              </div>
+            );
+          })}
+
+          <div ref={messagesEndRef} />
+        </div>
+      </div>
+
+      {/* Input */}
+      <div className="border-t border-kumo-line bg-kumo-base">
+        <form
+          onSubmit={(e) => {
+            e.preventDefault();
+            send();
+          }}
+          className="max-w-3xl mx-auto px-5 py-4"
+        >
+          <div className="flex items-end gap-3 rounded-xl border border-kumo-line bg-kumo-base p-3 shadow-sm focus-within:ring-2 focus-within:ring-kumo-ring focus-within:border-transparent transition-shadow">
+            <InputArea
+              value={input}
+              onValueChange={setInput}
+              onKeyDown={(e) => {
+                if (e.key === "Enter" && !e.shiftKey) {
+                  e.preventDefault();
+                  send();
+                }
+              }}
+              placeholder="Try: What's the weather in Paris?"
+              disabled={!isConnected || isStreaming}
+              rows={2}
+              className="flex-1 !ring-0 focus:!ring-0 !shadow-none !bg-transparent !outline-none"
+            />
+            <Button
+              type="submit"
+              variant="primary"
+              shape="square"
+              aria-label="Send message"
+              disabled={!input.trim() || !isConnected || isStreaming}
+              icon={<PaperPlaneRightIcon size={18} />}
+              loading={isStreaming}
+              className="mb-0.5"
+            />
+          </div>
+        </form>
+        <div className="flex justify-center pb-3">
+          <PoweredByAgents />
+        </div>
+      </div>
+    </div>
+  );
+}

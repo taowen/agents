@@ -21,7 +21,7 @@
       "database_id": "615cce83-8d31-4a0e-922c-052bf499c1b1"
     }
   ],
-  "main": "src/server.ts",
+  "main": "src/server/index.ts",
   "migrations": [
     {
       "new_sqlite_classes": ["ChatAgent"],

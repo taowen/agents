@@ -1,6 +1,5 @@
 import { createGoogleGenerativeAI } from "@ai-sdk/google";
 import { createOpenAICompatible } from "@ai-sdk/openai-compatible";
-import { routeAgentRequest } from "agents";
 import { AIChatAgent } from "@cloudflare/ai-chat";
 import type { Connection } from "agents";
 import * as Sentry from "@sentry/cloudflare";
@@ -19,197 +18,17 @@ import {
   GitFs,
   parseGitCredentials,
   findCredential,
-  upsertCredential,
-  syncDirtyGitMounts,
-  generateOAuthState,
-  verifyOAuthState
+  syncDirtyGitMounts
 } from "vfs";
-import { Bash, InMemoryFs, MountableFs, defineCommand } from "just-bash";
-import type { CustomCommand } from "just-bash";
+import { Bash, InMemoryFs, MountableFs } from "just-bash";
 import { D1FsAdapter } from "./d1-fs-adapter";
-import {
-  getSettings,
-  upsertSettings as upsertSettingsDb,
-  type UserSettings
-} from "./db";
-import { handleAuthRoutes, requireAuth } from "./auth";
-import { handleApiRoutes } from "./api";
-
+import { getSettings, type UserSettings } from "./db";
 import {
   createBrowserState,
   createBrowserTool,
   type BrowserState
 } from "./browser-tool";
-
-/**
- * Create mount/umount commands for the D1-backed filesystem.
- * Mirrors vfs createMountCommands but without AgentFS dependency.
- */
-function createD1MountCommands(mountableFs: MountableFs): CustomCommand[] {
-  const mountCmd = defineCommand(
-    "mount",
-    async (args: string[], ctx: { env: Map<string, string> }) => {
-      if (args.length === 0) {
-        const mounts = mountableFs.getMounts();
-        const lines = mounts.map((m) => {
-          let fsType = "unknown";
-          if (m.filesystem instanceof D1FsAdapter) fsType = "d1fs";
-          else if (m.filesystem instanceof GitFs) fsType = "git";
-          return `${fsType} on ${m.mountPoint}`;
-        });
-        return {
-          stdout: lines.length ? lines.join("\n") + "\n" : "",
-          stderr: "",
-          exitCode: 0
-        };
-      }
-
-      let type: string | undefined;
-      let optsRaw: string | undefined;
-      const positional: string[] = [];
-
-      for (let i = 0; i < args.length; i++) {
-        if (args[i] === "-t" && i + 1 < args.length) {
-          type = args[++i];
-        } else if (args[i] === "-o" && i + 1 < args.length) {
-          optsRaw = args[++i];
-        } else {
-          positional.push(args[i]);
-        }
-      }
-
-      if (!type) {
-        return {
-          stdout: "",
-          stderr:
-            "mount: missing -t flag (usage: mount -t <type> <device> <mountpoint>)\n",
-          exitCode: 1
-        };
-      }
-
-      if (type === "git") {
-        if (positional.length < 2) {
-          return {
-            stdout: "",
-            stderr:
-              "mount: usage: mount -t git [-o options] <url> <mountpoint>\n",
-            exitCode: 1
-          };
-        }
-        const url = positional[0];
-        const mountpoint = positional[1];
-        const opts = optsRaw ? parseOpts(optsRaw) : {};
-        const ref = opts.ref || "main";
-        const depth = opts.depth ? parseInt(opts.depth, 10) : 1;
-
-        let username: string | undefined = opts.username;
-        let password: string | undefined = opts.password;
-
-        if (!username) username = ctx.env.get("GIT_USERNAME") ?? undefined;
-        if (!password) password = ctx.env.get("GIT_PASSWORD") ?? undefined;
-
-        if (!username) {
-          try {
-            const parsed = new URL(url);
-            if (parsed.username) {
-              username = decodeURIComponent(parsed.username);
-              if (!password && parsed.password)
-                password = decodeURIComponent(parsed.password);
-            }
-          } catch {
-            /* ignore */
-          }
-        }
-
-        if (!username) {
-          try {
-            const credContent = await mountableFs.readFile(
-              "/etc/git-credentials",
-              { encoding: "utf8" }
-            );
-            const creds = parseGitCredentials(credContent as string);
-            const match = findCredential(creds, url);
-            if (match) {
-              username = match.username;
-              password = match.password;
-            }
-          } catch {
-            /* ignore */
-          }
-        }
-
-        const onAuth = username
-          ? () => ({ username: username!, password })
-          : undefined;
-        const gitFs = new GitFs({
-          url,
-          ref,
-          depth: isNaN(depth) || depth < 1 ? 1 : depth,
-          onAuth
-        });
-
-        try {
-          mountableFs.mount(mountpoint, gitFs);
-        } catch (err) {
-          const msg = err instanceof Error ? err.message : String(err);
-          return { stdout: "", stderr: `mount: ${msg}\n`, exitCode: 1 };
-        }
-
-        return gitFs.init().then(
-          () => ({ stdout: "", stderr: "", exitCode: 0 }),
-          (err) => {
-            try {
-              mountableFs.unmount(mountpoint);
-            } catch {
-              /* ignore */
-            }
-            const msg = err instanceof Error ? err.message : String(err);
-            return {
-              stdout: "",
-              stderr: `mount: clone failed: ${msg}\n`,
-              exitCode: 1
-            };
-          }
-        );
-      }
-
-      return {
-        stdout: "",
-        stderr: `mount: unsupported filesystem type '${type}'\n`,
-        exitCode: 1
-      };
-    }
-  );
-
-  const umountCmd = defineCommand("umount", async (args: string[]) => {
-    if (args.length === 0) {
-      return {
-        stdout: "",
-        stderr: "umount: usage: umount <mountpoint>\n",
-        exitCode: 1
-      };
-    }
-    try {
-      mountableFs.unmount(args[0]);
-    } catch (err) {
-      const msg = err instanceof Error ? err.message : String(err);
-      return { stdout: "", stderr: `umount: ${msg}\n`, exitCode: 1 };
-    }
-    return { stdout: "", stderr: "", exitCode: 0 };
-  });
-
-  return [mountCmd, umountCmd];
-}
-
-function parseOpts(raw: string): Record<string, string> {
-  const result: Record<string, string> = {};
-  for (const pair of raw.split(",")) {
-    const eq = pair.indexOf("=");
-    if (eq === -1) result[pair] = "";
-    else result[pair.slice(0, eq)] = pair.slice(eq + 1);
-  }
-  return result;
-}
+import { createD1MountCommands } from "./mount-commands";
 
 /**
  * AI Chat Agent with sandboxed bash tool via just-bash.
@@ -239,7 +58,7 @@ class ChatAgentBase extends AIChatAgent {
     const now = Date.now();
     if (
       this.cachedSettings &&
-      now - this.cachedSettings.fetchedAt < ChatAgent.SETTINGS_TTL
+      now - this.cachedSettings.fetchedAt < ChatAgentBase.SETTINGS_TTL
     ) {
       return this.cachedSettings.data;
     }
@@ -440,8 +259,8 @@ class ChatAgentBase extends AIChatAgent {
                 username = match.username;
                 password = match.password;
               }
-            } catch {
-              /* ignore */
+            } catch (e) {
+              Sentry.captureException(e, { level: "warning" });
             }
           }
 
@@ -477,8 +296,8 @@ class ChatAgentBase extends AIChatAgent {
             );
             try {
               this.mountableFs.unmount(entry.mountPoint);
-            } catch {
-              /* ignore */
+            } catch (unmountErr) {
+              Sentry.captureException(unmountErr, { level: "warning" });
             }
           }
         }
@@ -521,12 +340,8 @@ class ChatAgentBase extends AIChatAgent {
     ctx: import("agents").ConnectionContext
   ) {
     // Capture userId from the initial WebSocket upgrade request
-    try {
-      const uid = await this.getUserId(ctx.request);
-      this.initBash(uid);
-    } catch (e) {
-      console.error("onConnect: failed to get userId:", e);
-    }
+    const uid = await this.getUserId(ctx.request);
+    this.initBash(uid);
     return super.onConnect(connection, ctx);
   }
 
@@ -537,12 +352,8 @@ class ChatAgentBase extends AIChatAgent {
         await Sentry.startSpan(
           { name: "getUserId", op: "db.query" },
           async () => {
-            try {
-              const uid = await this.getUserId();
-              this.initBash(uid);
-            } catch (e) {
-              console.error("onChatMessage: no userId available:", e);
-            }
+            const uid = await this.getUserId();
+            this.initBash(uid);
           }
         );
       }
@@ -554,15 +365,11 @@ class ChatAgentBase extends AIChatAgent {
       let model = "gemini-2.0-flash";
 
       if (this.userId) {
-        try {
-          const settings = await this.getCachedSettings();
-          if (settings?.llm_api_key) apiKey = settings.llm_api_key;
-          if (settings?.llm_provider) provider = settings.llm_provider;
-          if (settings?.llm_base_url) baseURL = settings.llm_base_url;
-          if (settings?.llm_model) model = settings.llm_model;
-        } catch (e) {
-          console.error("Failed to read LLM settings:", e);
-        }
+        const settings = await this.getCachedSettings();
+        if (settings?.llm_api_key) apiKey = settings.llm_api_key;
+        if (settings?.llm_provider) provider = settings.llm_provider;
+        if (settings?.llm_base_url) baseURL = settings.llm_base_url;
+        if (settings?.llm_model) model = settings.llm_model;
       }
 
       const llmModel =
@@ -674,177 +481,4 @@ export const ChatAgent = instrumentDurableObjectWithSentry(
     tracesSampleRate: 1.0
   }),
   ChatAgentBase
-);
-
-// ---- GitHub OAuth (D1-based) ----
-
-async function handleGitHubOAuth(
-  request: Request,
-  env: Env,
-  userId: string
-): Promise<Response | null> {
-  const url = new URL(request.url);
-
-  // GET /oauth/github/config — read config (never expose secret)
-  if (url.pathname === "/oauth/github/config" && request.method === "GET") {
-    const settings = await getSettings(env.DB, userId);
-    return Response.json({
-      clientId: settings?.github_client_id || "",
-      configured: !!(
-        settings?.github_client_id && settings?.github_client_secret
-      )
-    });
-  }
-
-  // POST /oauth/github/config — save config
-  if (url.pathname === "/oauth/github/config" && request.method === "POST") {
-    const body = (await request.json()) as {
-      clientId?: string;
-      clientSecret?: string;
-    };
-    const partial: Record<string, string | null> = {};
-    if (body.clientId !== undefined)
-      partial.github_client_id = body.clientId || null;
-    if (body.clientSecret !== undefined)
-      partial.github_client_secret = body.clientSecret || null;
-    await upsertSettingsDb(env.DB, userId, partial);
-    return Response.json({ ok: true });
-  }
-
-  // GET /oauth/github — initiate OAuth flow
-  if (url.pathname === "/oauth/github" && request.method === "GET") {
-    const settings = await getSettings(env.DB, userId);
-    const clientId = settings?.github_client_id;
-    const clientSecret = settings?.github_client_secret;
-
-    if (!clientId || !clientSecret) {
-      // Fall back to env vars
-      if (!env.GITHUB_CLIENT_ID || !env.GITHUB_CLIENT_SECRET) {
-        return new Response("GitHub OAuth not configured", { status: 400 });
-      }
-    }
-
-    const secret = clientSecret || env.GITHUB_CLIENT_SECRET!;
-    const state = await generateOAuthState(userId, secret);
-    const redirectUri = `${url.origin}/oauth/github/callback`;
-    const ghUrl = new URL("https://github.com/login/oauth/authorize");
-    ghUrl.searchParams.set("client_id", clientId || env.GITHUB_CLIENT_ID!);
-    ghUrl.searchParams.set("redirect_uri", redirectUri);
-    ghUrl.searchParams.set("scope", "repo");
-    ghUrl.searchParams.set("state", state);
-    return Response.redirect(ghUrl.toString(), 302);
-  }
-
-  // GET /oauth/github/callback — exchange code for token
-  if (url.pathname === "/oauth/github/callback" && request.method === "GET") {
-    const code = url.searchParams.get("code");
-    const state = url.searchParams.get("state");
-    if (!code || !state) {
-      return new Response("Missing code or state", { status: 400 });
-    }
-
-    const settings = await getSettings(env.DB, userId);
-    const clientId = settings?.github_client_id || env.GITHUB_CLIENT_ID;
-    const clientSecret =
-      settings?.github_client_secret || env.GITHUB_CLIENT_SECRET;
-
-    if (!clientId || !clientSecret) {
-      return new Response("GitHub OAuth not configured", { status: 400 });
-    }
-
-    const payload = await verifyOAuthState(state, clientSecret);
-    if (!payload) {
-      return new Response("Invalid or expired state", { status: 403 });
-    }
-
-    // Exchange code for token
-    const tokenRes = await fetch(
-      "https://github.com/login/oauth/access_token",
-      {
-        method: "POST",
-        headers: {
-          "Content-Type": "application/json",
-          Accept: "application/json"
-        },
-        body: JSON.stringify({
-          client_id: clientId,
-          client_secret: clientSecret,
-          code
-        })
-      }
-    );
-    const tokenData = (await tokenRes.json()) as {
-      access_token?: string;
-      error?: string;
-    };
-    if (!tokenData.access_token) {
-      return new Response(
-        `GitHub token exchange failed: ${tokenData.error || "unknown"}`,
-        { status: 502 }
-      );
-    }
-
-    // Store token in D1 files table as /etc/git-credentials
-    const d1Fs = new D1FsAdapter(env.DB, userId, "/etc");
-    let existing = "";
-    try {
-      existing = await d1Fs.readFile("/git-credentials");
-    } catch {
-      /* file doesn't exist yet */
-    }
-
-    const updated = upsertCredential(existing, {
-      protocol: "https",
-      host: "github.com",
-      username: "oauth2",
-      password: tokenData.access_token
-    });
-    await d1Fs.writeFile("/git-credentials", updated);
-
-    return Response.redirect(url.origin + "/", 302);
-  }
-
-  return null;
-}
-
-// ---- Worker fetch handler ----
-
-export default Sentry.withSentry(
-  (env: Env) => ({
-    dsn: env.SENTRY_DSN,
-    tracesSampleRate: 1.0
-  }),
-  {
-    async fetch(request: Request, env: Env) {
-      // 1. Public auth routes (Google OAuth)
-      const authResponse = await handleAuthRoutes(request, env);
-      if (authResponse) return authResponse;
-
-      // 2. Require authentication for everything else
-      const authResult = await requireAuth(request, env);
-      if (authResult instanceof Response) return authResult;
-      const userId = authResult;
-
-      // 3. API routes (session/settings CRUD)
-      const apiResponse = await handleApiRoutes(request, env, userId);
-      if (apiResponse) return apiResponse;
-
-      // 4. GitHub OAuth (D1-based, per-user)
-      const ghResponse = await handleGitHubOAuth(request, env, userId);
-      if (ghResponse) return ghResponse;
-
-      // 5. Route to ChatAgent DO with userId header injected
-      const headers = new Headers(request.headers);
-      headers.set("x-user-id", userId);
-      const agentReq = new Request(request.url, {
-        method: request.method,
-        headers,
-        body: request.body
-      });
-      return (
-        (await routeAgentRequest(agentReq, env)) ||
-        new Response("Not found", { status: 404 })
-      );
-    }
-  } satisfies ExportedHandler<Env>
 );
