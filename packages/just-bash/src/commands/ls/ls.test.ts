@@ -209,6 +209,66 @@ describe("ls", () => {
     });
   });
 
+  describe("-F flag (classify)", () => {
+    it("should append / to directories", async () => {
+      const env = new Bash({
+        files: {
+          "/dir/subdir/file.txt": "",
+          "/dir/plain.txt": ""
+        }
+      });
+      const result = await env.exec("ls -F /dir");
+      expect(result.stdout).toBe("plain.txt\nsubdir/\n");
+      expect(result.stderr).toBe("");
+      expect(result.exitCode).toBe(0);
+    });
+
+    it("should work with -a flag", async () => {
+      const env = new Bash({
+        files: {
+          "/dir/.hidden/inner": "",
+          "/dir/file.txt": ""
+        }
+      });
+      const result = await env.exec("ls -aF /dir");
+      expect(result.stdout).toBe("./\n../\n.hidden/\nfile.txt\n");
+      expect(result.stderr).toBe("");
+    });
+
+    it("should not double-append / in long format", async () => {
+      const env = new Bash({
+        files: {
+          "/dir/subdir/file.txt": "",
+          "/dir/plain.txt": ""
+        }
+      });
+      const result = await env.exec("ls -lF /dir");
+      // long format already appends / for dirs, -F should not double it
+      const lines = result.stdout.split("\n").filter((l) => l);
+      expect(lines[0]).toBe("total 2");
+      expect(lines[1]).toMatch(/-rw-r--r-- .+ plain\.txt$/);
+      expect(lines[2]).toMatch(/drwxr-xr-x .+ subdir\/$/);
+    });
+
+    it("should work with -d flag", async () => {
+      const env = new Bash({
+        files: { "/dir/file.txt": "" }
+      });
+      const result = await env.exec("ls -dF /dir");
+      expect(result.stdout).toBe("/dir/\n");
+      expect(result.stderr).toBe("");
+    });
+
+    it("should not append / to regular files", async () => {
+      const env = new Bash({
+        files: { "/dir/a.txt": "", "/dir/b.txt": "" }
+      });
+      const result = await env.exec("ls -F /dir");
+      expect(result.stdout).toBe("a.txt\nb.txt\n");
+      expect(result.stderr).toBe("");
+    });
+  });
+
   describe("-r flag (reverse)", () => {
     it("should reverse sort order", async () => {
       const env = new Bash({

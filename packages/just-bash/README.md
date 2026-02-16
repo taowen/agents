@@ -166,7 +166,7 @@ See the [bash-tool documentation](https://github.com/vercel-labs/bash-tool) for 
 
 ### File Operations
 
-`cat`, `cp`, `file`, `ln`, `ls`, `mkdir`, `mv`, `readlink`, `rm`, `rmdir`, `split`, `stat`, `touch`, `tree`
+`cat`, `cp`, `df`, `file`, `ln`, `ls`, `mkdir`, `mv`, `readlink`, `rm`, `rmdir`, `split`, `stat`, `touch`, `tree`
 
 ### Text Processing
 
@@ -182,7 +182,7 @@ See the [bash-tool documentation](https://github.com/vercel-labs/bash-tool) for 
 
 ### Shell Utilities
 
-`alias`, `bash`, `chmod`, `clear`, `date`, `expr`, `false`, `help`, `history`, `seq`, `sh`, `sleep`, `time`, `timeout`, `true`, `unalias`, `which`, `whoami`
+`alias`, `bash`, `chmod`, `clear`, `date`, `expr`, `false`, `help`, `history`, `id`, `seq`, `sh`, `sleep`, `time`, `timeout`, `true`, `uname`, `unalias`, `uptime`, `which`, `whoami`
 
 ### Network Commands
 

@@ -103,13 +103,24 @@ function getEncoding(
 
 export class AgentFsAdapter {
   private agentFs: AgentFS;
+  private rootPrefix: string;
 
-  constructor(agentFs: AgentFS) {
+  constructor(agentFs: AgentFS, rootPrefix: string = "") {
     this.agentFs = agentFs;
+    // Normalize: ensure starts with /, no trailing /
+    this.rootPrefix =
+      rootPrefix && rootPrefix !== "/"
+        ? (rootPrefix.startsWith("/") ? rootPrefix : `/${rootPrefix}`).replace(
+            /\/$/,
+            ""
+          )
+        : "";
   }
 
   private normalizePath(path: string): string {
-    if (!path || path === "/") return "/";
+    if (!path || path === "/") {
+      return this.rootPrefix || "/";
+    }
     let normalized =
       path.endsWith("/") && path !== "/" ? path.slice(0, -1) : path;
     if (!normalized.startsWith("/")) normalized = `/${normalized}`;
@@ -119,7 +130,13 @@ export class AgentFsAdapter {
       if (part === "..") resolved.pop();
       else resolved.push(part);
     }
-    return `/${resolved.join("/")}` || "/";
+    const relativePath = `/${resolved.join("/")}` || "/";
+    if (this.rootPrefix) {
+      return relativePath === "/"
+        ? this.rootPrefix
+        : `${this.rootPrefix}${relativePath}`;
+    }
+    return relativePath;
   }
 
   private dirname(path: string): string {

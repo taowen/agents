@@ -87,7 +87,11 @@ export type CommandName =
   | "hostname"
   | "od"
   | "time"
-  | "whoami";
+  | "whoami"
+  | "df"
+  | "id"
+  | "uname"
+  | "uptime";
 
 /** Network command names (only available when network is configured) */
 export type NetworkCommandName = "curl";
@@ -437,6 +441,22 @@ const commandLoaders: LazyCommandDef<CommandName>[] = [
   {
     name: "od",
     load: async () => (await import("./od/od.js")).od
+  },
+  {
+    name: "df",
+    load: async () => (await import("./df/df.js")).dfCommand
+  },
+  {
+    name: "id",
+    load: async () => (await import("./id/id.js")).idCommand
+  },
+  {
+    name: "uname",
+    load: async () => (await import("./uname/uname.js")).unameCommand
+  },
+  {
+    name: "uptime",
+    load: async () => (await import("./uptime/uptime.js")).uptimeCommand
   }
 ];
 

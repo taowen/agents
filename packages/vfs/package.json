@@ -1,0 +1,23 @@
+{
+  "name": "vfs",
+  "version": "0.0.0",
+  "private": true,
+  "type": "module",
+  "main": "src/index.ts",
+  "dependencies": {
+    "isomorphic-git": "^1.27.2",
+    "just-bash": "file:../just-bash"
+  },
+  "peerDependencies": {
+    "agentfs-sdk": ">=0.6.0"
+  },
+  "peerDependenciesMeta": {
+    "agentfs-sdk": {
+      "optional": true
+    }
+  },
+  "devDependencies": {
+    "agentfs-sdk": "^0.6.0",
+    "vitest": "^4.0.16"
+  }
+}

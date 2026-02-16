@@ -74,9 +74,9 @@ const result = await bash.exec("cat input.txt | grep pattern");
 
 **Data processing**: `jq` (JSON)
 
-**File operations**: `basename`, `chmod`, `cp`, `dirname`, `du`, `file`, `find`, `ln`, `ls`, `mkdir`, `mv`, `od`, `pwd`, `readlink`, `rm`, `rmdir`, `split`, `stat`, `touch`, `tree`
+**File operations**: `basename`, `chmod`, `cp`, `df`, `dirname`, `du`, `file`, `find`, `ln`, `ls`, `mkdir`, `mv`, `od`, `pwd`, `readlink`, `rm`, `rmdir`, `split`, `stat`, `touch`, `tree`
 
-**Utilities**: `alias`, `base64`, `bash`, `clear`, `curl`, `date`, `diff`, `echo`, `env`, `expr`, `false`, `help`, `history`, `hostname`, `html-to-markdown`, `md5sum`, `printenv`, `printf`, `seq`, `sh`, `sha1sum`, `sha256sum`, `sleep`, `tee`, `time`, `timeout`, `true`, `unalias`, `which`, `whoami`
+**Utilities**: `alias`, `base64`, `bash`, `clear`, `curl`, `date`, `diff`, `echo`, `env`, `expr`, `false`, `help`, `history`, `hostname`, `html-to-markdown`, `id`, `md5sum`, `printenv`, `printf`, `seq`, `sh`, `sha1sum`, `sha256sum`, `sleep`, `tee`, `time`, `timeout`, `true`, `uname`, `unalias`, `uptime`, `which`, `whoami`
 
 All commands support `--help` for usage details.
 

@@ -17,8 +17,8 @@
     "@phosphor-icons/react": "^2.1.10",
     "agentfs-sdk": "^0.6.0",
     "agents": "*",
-    "isomorphic-git": "^1.27.2",
-    "just-bash": "file:../../packages/just-bash"
+    "just-bash": "file:../../packages/just-bash",
+    "vfs": "file:../../packages/vfs"
   },
   "devDependencies": {
     "@tailwindcss/vite": "^4",

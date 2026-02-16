@@ -65,6 +65,7 @@ const lsHelp = {
     "-S                   sort by file size, largest first",
     "-t                   sort by time, newest first",
     "-1                   list one file per line",
+    "-F, --classify       append indicator (one of /*@) to entries",
     "    --help           display this help and exit"
   ]
 };
@@ -83,7 +84,8 @@ const argDefs = {
   sortBySize: { short: "S", type: "boolean" as const },
   directoryOnly: { short: "d", long: "directory", type: "boolean" as const },
   sortByTime: { short: "t", type: "boolean" as const },
-  onePerLine: { short: "1", type: "boolean" as const }
+  onePerLine: { short: "1", type: "boolean" as const },
+  classify: { short: "F", long: "classify", type: "boolean" as const }
 };
 
 export const lsCommand: Command = {
@@ -106,6 +108,7 @@ export const lsCommand: Command = {
     const sortBySize = parsed.result.flags.sortBySize;
     const directoryOnly = parsed.result.flags.directoryOnly;
     const _sortByTime = parsed.result.flags.sortByTime;
+    const classify = parsed.result.flags.classify;
     // Note: onePerLine is accepted but implicit in our output
     void parsed.result.flags.onePerLine;
 
@@ -143,7 +146,8 @@ export const lsCommand: Command = {
             const dateStr = formatDate(mtime);
             stdout += `${mode} 1 user user ${sizeStr} ${dateStr} ${path}${type}\n`;
           } else {
-            stdout += `${path}\n`;
+            const suffix = classify && stat.isDirectory ? "/" : "";
+            stdout += `${path}${suffix}\n`;
           }
         } catch {
           stderr += `ls: cannot access '${path}': No such file or directory\n`;
@@ -162,7 +166,8 @@ export const lsCommand: Command = {
           longFormat,
           reverse,
           humanReadable,
-          sortBySize
+          sortBySize,
+          classify
         );
         stdout += result.stdout;
         stderr += result.stderr;
@@ -178,7 +183,8 @@ export const lsCommand: Command = {
           paths.length > 1,
           reverse,
           humanReadable,
-          sortBySize
+          sortBySize,
+          classify
         );
         stdout += result.stdout;
         stderr += result.stderr;
@@ -198,7 +204,8 @@ async function listGlob(
   longFormat: boolean,
   reverse: boolean = false,
   humanReadable: boolean = false,
-  sortBySize: boolean = false
+  sortBySize: boolean = false,
+  classify: boolean = false
 ): Promise<ExecResult> {
   const showHidden = showAll || showAlmostAll;
   const allPaths = ctx.fs.getAllPaths();
@@ -272,6 +279,20 @@ async function listGlob(
     return { stdout: `${lines.join("\n")}\n`, stderr: "", exitCode: 0 };
   }
 
+  if (classify) {
+    const classified: string[] = [];
+    for (const match of matches) {
+      const fullPath = ctx.fs.resolvePath(ctx.cwd, match);
+      try {
+        const stat = await ctx.fs.stat(fullPath);
+        classified.push(stat.isDirectory ? `${match}/` : match);
+      } catch {
+        classified.push(match);
+      }
+    }
+    return { stdout: `${classified.join("\n")}\n`, stderr: "", exitCode: 0 };
+  }
+
   return { stdout: `${matches.join("\n")}\n`, stderr: "", exitCode: 0 };
 }
 
@@ -286,6 +307,7 @@ async function listPath(
   reverse: boolean = false,
   humanReadable: boolean = false,
   sortBySize: boolean = false,
+  classify: boolean = false,
   _isSubdir: boolean = false
 ): Promise<ExecResult> {
   const showHidden = showAll || showAlmostAll;
@@ -418,6 +440,23 @@ async function listPath(
       for (const { line } of entryStats) {
         stdout += line;
       }
+    } else if (classify) {
+      const classified: string[] = [];
+      for (const entry of entries) {
+        if (entry === "." || entry === "..") {
+          classified.push(entry + "/");
+          continue;
+        }
+        const entryPath =
+          fullPath === "/" ? `/${entry}` : `${fullPath}/${entry}`;
+        try {
+          const entryStat = await ctx.fs.stat(entryPath);
+          classified.push(entryStat.isDirectory ? `${entry}/` : entry);
+        } catch {
+          classified.push(entry);
+        }
+      }
+      stdout += classified.join("\n") + (classified.length ? "\n" : "");
     } else {
       stdout += entries.join("\n") + (entries.length ? "\n" : "");
     }
@@ -481,6 +520,7 @@ async function listPath(
               reverse,
               humanReadable,
               sortBySize,
+              classify,
               true
             );
             return { name: dir.name, result };
@@ -526,7 +566,8 @@ export const flagsForFuzzing: CommandFuzzInfo = {
     { flag: "-S", type: "boolean" },
     { flag: "-d", type: "boolean" },
     { flag: "-t", type: "boolean" },
-    { flag: "-1", type: "boolean" }
+    { flag: "-1", type: "boolean" },
+    { flag: "-F", type: "boolean" }
   ],
   needsFiles: true
 };

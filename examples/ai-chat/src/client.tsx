@@ -23,7 +23,10 @@ import {
   CheckCircleIcon,
   XCircleIcon,
   GearIcon,
-  CloudSunIcon
+  CloudSunIcon,
+  GithubLogoIcon,
+  XIcon,
+  ArrowSquareOutIcon
 } from "@phosphor-icons/react";
 
 function getMessageText(message: UIMessage): string {
@@ -33,10 +36,205 @@ function getMessageText(message: UIMessage): string {
     .join("");
 }
 
+function GitHubSetupModal({
+  open,
+  onClose
+}: {
+  open: boolean;
+  onClose: () => void;
+}) {
+  const [clientId, setClientId] = useState("");
+  const [clientSecret, setClientSecret] = useState("");
+  const [configured, setConfigured] = useState(false);
+  const [saving, setSaving] = useState(false);
+  const [error, setError] = useState("");
+
+  useEffect(() => {
+    if (open) {
+      setError("");
+      fetch("/oauth/github/config?agent_id=default")
+        .then((res) => res.json())
+        .then((data: { clientId?: string; configured?: boolean }) => {
+          if (data.clientId) setClientId(data.clientId);
+          setConfigured(!!data.configured);
+        })
+        .catch(() => {});
+    }
+  }, [open]);
+
+  const callbackUrl =
+    typeof window !== "undefined"
+      ? `${window.location.origin}/oauth/github/callback`
+      : "";
+
+  const handleSaveAndConnect = async () => {
+    if (!clientId.trim()) {
+      setError("Client ID is required");
+      return;
+    }
+    if (!clientSecret.trim() && !configured) {
+      setError("Client Secret is required");
+      return;
+    }
+    setSaving(true);
+    setError("");
+    try {
+      const body: Record<string, string> = { clientId: clientId.trim() };
+      if (clientSecret.trim()) body.clientSecret = clientSecret.trim();
+      const res = await fetch("/oauth/github/config?agent_id=default", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify(body)
+      });
+      if (!res.ok) throw new Error(await res.text());
+      window.location.href = "/oauth/github?agent_id=default";
+    } catch (e) {
+      setError(e instanceof Error ? e.message : "Save failed");
+      setSaving(false);
+    }
+  };
+
+  if (!open) return null;
+
+  const inputClass =
+    "w-full px-3 py-2 rounded-lg border border-kumo-line bg-kumo-elevated text-kumo-default text-sm focus:outline-none focus:ring-2 focus:ring-kumo-ring font-mono";
+
+  return (
+    <div
+      className="fixed inset-0 z-50 flex items-center justify-center bg-black/50"
+      onClick={onClose}
+    >
+      <div
+        className="w-full max-w-lg mx-4 rounded-xl ring ring-kumo-line overflow-hidden bg-kumo-base"
+        onClick={(e: React.MouseEvent) => e.stopPropagation()}
+      >
+        {/* Header */}
+        <div className="flex items-center justify-between px-5 py-4 border-b border-kumo-line">
+          <div className="flex items-center gap-2">
+            <GithubLogoIcon size={20} className="text-kumo-default" />
+            <span className="text-sm font-semibold text-kumo-default">
+              Connect GitHub
+            </span>
+          </div>
+          <button
+            onClick={onClose}
+            className="p-1 rounded hover:bg-kumo-elevated text-kumo-inactive hover:text-kumo-default transition-colors"
+          >
+            <XIcon size={18} />
+          </button>
+        </div>
+
+        <div className="px-5 py-4 space-y-4">
+          {/* Instructions */}
+          <div className="space-y-2 text-sm text-kumo-secondary">
+            <span className="text-xs font-semibold text-kumo-default">
+              Setup Instructions
+            </span>
+            <ol className="list-decimal list-inside space-y-1.5 text-kumo-secondary">
+              <li>
+                <a
+                  href="https://github.com/settings/applications/new"
+                  target="_blank"
+                  rel="noopener noreferrer"
+                  className="text-kumo-brand hover:underline inline-flex items-center gap-1"
+                >
+                  Create a GitHub OAuth App
+                  <ArrowSquareOutIcon size={12} />
+                </a>
+              </li>
+              <li>
+                Set <strong>Homepage URL</strong> to:{" "}
+                <code className="px-1 py-0.5 rounded bg-kumo-elevated text-xs">
+                  {typeof window !== "undefined" ? window.location.origin : ""}
+                </code>
+              </li>
+              <li>
+                Set <strong>Authorization callback URL</strong> to:
+                <div className="mt-1">
+                  <code className="block px-2 py-1 rounded bg-kumo-elevated text-xs break-all select-all">
+                    {callbackUrl}
+                  </code>
+                </div>
+              </li>
+              <li>
+                Copy the <strong>Client ID</strong> and generate a{" "}
+                <strong>Client Secret</strong> below
+              </li>
+            </ol>
+          </div>
+
+          {/* Form */}
+          <div className="space-y-3">
+            <div>
+              <label className="block text-xs font-medium text-kumo-secondary mb-1">
+                Client ID
+              </label>
+              <input
+                type="text"
+                value={clientId}
+                onChange={(e) => setClientId(e.target.value)}
+                placeholder="Ov23li..."
+                className={inputClass}
+              />
+            </div>
+            <div>
+              <label className="block text-xs font-medium text-kumo-secondary mb-1">
+                Client Secret
+                {configured && (
+                  <span className="ml-1 text-kumo-inactive font-normal">
+                    (leave blank to keep current)
+                  </span>
+                )}
+              </label>
+              <input
+                type="password"
+                value={clientSecret}
+                onChange={(e) => setClientSecret(e.target.value)}
+                placeholder={configured ? "********" : "Enter client secret"}
+                className={inputClass}
+              />
+            </div>
+          </div>
+
+          {/* Error */}
+          {error && <p className="text-xs text-red-500">{error}</p>}
+
+          {/* Actions */}
+          <div className="flex items-center justify-between pt-2">
+            {configured && (
+              <Button
+                variant="secondary"
+                size="sm"
+                onClick={() => {
+                  window.location.href = "/oauth/github?agent_id=default";
+                }}
+              >
+                Connect with existing config
+              </Button>
+            )}
+            <div className={configured ? "" : "ml-auto"}>
+              <Button
+                variant="primary"
+                size="sm"
+                icon={<GithubLogoIcon size={14} />}
+                onClick={handleSaveAndConnect}
+                loading={saving}
+              >
+                {configured ? "Save & Reconnect" : "Save & Connect"}
+              </Button>
+            </div>
+          </div>
+        </div>
+      </div>
+    </div>
+  );
+}
+
 function Chat() {
   const [connectionStatus, setConnectionStatus] =
     useState<ConnectionStatus>("connecting");
   const [input, setInput] = useState("");
+  const [showGitHubSetup, setShowGitHubSetup] = useState(false);
   const messagesEndRef = useRef<HTMLDivElement>(null);
 
   const agent = useAgent({
@@ -104,6 +302,13 @@ function Chat() {
           <div className="flex items-center gap-3">
             <ConnectionIndicator status={connectionStatus} />
             <ModeToggle />
+            <Button
+              variant="secondary"
+              icon={<GithubLogoIcon size={16} />}
+              onClick={() => setShowGitHubSetup(true)}
+            >
+              GitHub
+            </Button>
             <Button
               variant="secondary"
               icon={<TrashIcon size={16} />}
@@ -216,11 +421,7 @@ function Chat() {
                                     </Text>
                                   )}
                                   {bashOutput.stderr && (
-                                    <Text
-                                      size="xs"
-                                      variant="secondary"
-                                      className="text-kumo-negative"
-                                    >
+                                    <Text size="xs" variant="error">
                                       {bashOutput.stderr}
                                     </Text>
                                   )}
@@ -374,6 +575,12 @@ function Chat() {
           <PoweredByAgents />
         </div>
       </div>
+
+      {/* GitHub Setup Modal */}
+      <GitHubSetupModal
+        open={showGitHubSetup}
+        onClose={() => setShowGitHubSetup(false)}
+      />
     </div>
   );
 }
