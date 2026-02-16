@@ -2,10 +2,12 @@ import { createGoogleGenerativeAI } from "@ai-sdk/google";
 import { createOpenAICompatible } from "@ai-sdk/openai-compatible";
 import { AIChatAgent } from "@cloudflare/ai-chat";
 import type { Connection } from "agents";
+import type { Schedule } from "agents";
 import * as Sentry from "@sentry/cloudflare";
 import { instrumentDurableObjectWithSentry } from "@sentry/cloudflare";
 import {
   streamText,
+  generateText,
   convertToModelMessages,
   pruneMessages,
   tool,
@@ -306,6 +308,106 @@ class ChatAgentBase extends AIChatAgent {
   }
 
   /**
+   * Build the LLM model instance based on user settings.
+   */
+  private async getLlmModel() {
+    let provider: string = "builtin";
+
+    if (this.userId) {
+      const settings = await this.getCachedSettings();
+      if (settings?.llm_provider) provider = settings.llm_provider;
+    }
+
+    if (provider === "builtin") {
+      const apiKey = this.env.ARK_API_KEY;
+      const baseURL = "https://ark.cn-beijing.volces.com/api/v3";
+      const model = "doubao-seed-2-0-pro-260215";
+      return createOpenAICompatible({ name: "llm", baseURL, apiKey })(model);
+    }
+
+    let apiKey = this.env.GOOGLE_AI_API_KEY;
+    let baseURL = "https://generativelanguage.googleapis.com/v1beta";
+    let model = "gemini-2.0-flash";
+
+    if (this.userId) {
+      const settings = await this.getCachedSettings();
+      if (settings?.llm_api_key) apiKey = settings.llm_api_key;
+      if (settings?.llm_base_url) baseURL = settings.llm_base_url;
+      if (settings?.llm_model) model = settings.llm_model;
+    }
+
+    return provider === "openai-compatible"
+      ? createOpenAICompatible({ name: "llm", baseURL, apiKey })(model)
+      : createGoogleGenerativeAI({ baseURL, apiKey })(model);
+  }
+
+  /**
+   * Callback invoked by the DO alarm for scheduled/recurring tasks.
+   */
+  async executeScheduledTask(
+    payload: { description: string; prompt: string },
+    schedule: Schedule<{ description: string; prompt: string }>
+  ) {
+    // Restore state (memory may be empty after alarm wake)
+    if (!this.userId) {
+      const uid = await this.getUserId();
+      this.initBash(uid);
+    }
+
+    const model = await this.getLlmModel();
+    const bash = tool({
+      description: "Execute a bash command in a sandboxed virtual filesystem.",
+      inputSchema: z.object({
+        command: z.string().describe("The bash command to execute")
+      }),
+      execute: async ({ command }) => {
+        await this.ensureMounted();
+        const result = await this.bash.exec(command);
+        try {
+          await syncDirtyGitMounts(this.mountableFs, command);
+        } catch (e) {
+          result.stderr += `\ngit sync error: ${e instanceof Error ? e.message : e}`;
+        }
+        return {
+          stdout: result.stdout,
+          stderr: result.stderr,
+          exitCode: result.exitCode
+        };
+      }
+    });
+
+    const result = await generateText({
+      model,
+      system:
+        "You are a scheduled task executor. The following is a scheduled task you need to execute. Complete it and report the result.",
+      prompt: payload.prompt,
+      tools: {
+        bash,
+        browser: createBrowserTool(this.browserState, this.env.MYBROWSER)
+      },
+      maxSteps: 10
+    });
+
+    // Inject result into chat history
+    const userMsg = {
+      id: crypto.randomUUID(),
+      role: "user" as const,
+      parts: [
+        {
+          type: "text" as const,
+          text: `[Scheduled Task] ${payload.description}`
+        }
+      ]
+    };
+    const assistantMsg = {
+      id: crypto.randomUUID(),
+      role: "assistant" as const,
+      parts: [{ type: "text" as const, text: result.text }]
+    };
+    await this.persistMessages([...this.messages, userMsg, assistantMsg]);
+  }
+
+  /**
    * Extract userId from request header, with fallback to DO-local storage.
    */
   private async getUserId(request?: Request): Promise<string> {
@@ -358,39 +460,7 @@ class ChatAgentBase extends AIChatAgent {
         );
       }
 
-      // Read LLM settings from D1
-      let provider: string = "builtin";
-
-      if (this.userId) {
-        const settings = await this.getCachedSettings();
-        if (settings?.llm_provider) provider = settings.llm_provider;
-      }
-
-      let llmModel;
-      if (provider === "builtin") {
-        const apiKey = this.env.ARK_API_KEY;
-        const baseURL = "https://ark.cn-beijing.volces.com/api/v3";
-        const model = "doubao-seed-2-0-pro-260215";
-        llmModel = createOpenAICompatible({ name: "llm", baseURL, apiKey })(
-          model
-        );
-      } else {
-        let apiKey = this.env.GOOGLE_AI_API_KEY;
-        let baseURL = "https://generativelanguage.googleapis.com/v1beta";
-        let model = "gemini-2.0-flash";
-
-        if (this.userId) {
-          const settings = await this.getCachedSettings();
-          if (settings?.llm_api_key) apiKey = settings.llm_api_key;
-          if (settings?.llm_base_url) baseURL = settings.llm_base_url;
-          if (settings?.llm_model) model = settings.llm_model;
-        }
-
-        llmModel =
-          provider === "openai-compatible"
-            ? createOpenAICompatible({ name: "llm", baseURL, apiKey })(model)
-            : createGoogleGenerativeAI({ baseURL, apiKey })(model);
-      }
+      const llmModel = await this.getLlmModel();
 
       const messages = await Sentry.startSpan(
         { name: "convertMessages", op: "serialize" },
@@ -441,7 +511,11 @@ class ChatAgentBase extends AIChatAgent {
           "Each browser action returns a screenshot so you can see the page. " +
           "For sites requiring login: the user can export cookies from their own browser and provide them. " +
           "Use set_cookies with the cookies JSON, then goto the target URL to access as the authenticated user. " +
-          "Prefer curl for simple requests; use the browser for complex web pages that need JavaScript rendering.",
+          "Prefer curl for simple requests; use the browser for complex web pages that need JavaScript rendering. " +
+          "You can schedule tasks for yourself using the schedule_task (one-time) and schedule_recurring (cron) tools. " +
+          "Use manage_tasks to list or cancel scheduled tasks. " +
+          "When a scheduled task fires, you will automatically execute it and the result will appear in the chat. " +
+          "The user's timezone can be determined using the getUserTimezone client tool.",
         messages,
         tools: {
           bash: tool({
@@ -480,7 +554,136 @@ class ChatAgentBase extends AIChatAgent {
               );
             }
           }),
-          browser: createBrowserTool(this.browserState, this.env.MYBROWSER)
+          browser: createBrowserTool(this.browserState, this.env.MYBROWSER),
+          schedule_task: tool({
+            description:
+              "Schedule a one-time task. Provide EITHER delaySeconds (e.g. 60 for 1 minute) " +
+              "OR scheduledAt (ISO 8601 datetime). Prefer delaySeconds for relative times like 'in 5 minutes'.",
+            inputSchema: z.object({
+              description: z.string().describe("Brief description of the task"),
+              prompt: z
+                .string()
+                .describe(
+                  "The detailed prompt/instruction for the AI to execute when the task fires"
+                ),
+              delaySeconds: z
+                .number()
+                .optional()
+                .describe(
+                  "Delay in seconds from now. e.g. 60 = 1 minute, 3600 = 1 hour. Use this for relative times."
+                ),
+              scheduledAt: z
+                .string()
+                .optional()
+                .describe(
+                  "ISO 8601 datetime string for absolute time, e.g. '2025-06-01T09:00:00Z'"
+                )
+            }),
+            execute: async ({
+              description,
+              prompt,
+              delaySeconds,
+              scheduledAt
+            }) => {
+              let when: Date | number;
+              if (delaySeconds != null) {
+                if (delaySeconds <= 0)
+                  return { error: "delaySeconds must be positive" };
+                when = delaySeconds;
+              } else if (scheduledAt) {
+                when = new Date(scheduledAt);
+                if (when.getTime() <= Date.now())
+                  return { error: "Scheduled time must be in the future" };
+              } else {
+                return { error: "Provide either delaySeconds or scheduledAt" };
+              }
+              const s = await this.schedule(
+                when,
+                "executeScheduledTask" as any,
+                { description, prompt }
+              );
+              return {
+                success: true,
+                id: s.id,
+                scheduledAt: new Date(s.time * 1000).toISOString(),
+                description
+              };
+            }
+          }),
+          schedule_recurring: tool({
+            description:
+              "Schedule a recurring task using a cron expression. " +
+              "Examples: '0 9 * * *' = daily at 9am UTC, '0 */2 * * *' = every 2 hours, '0 9 * * 1-5' = weekdays at 9am UTC.",
+            inputSchema: z.object({
+              description: z
+                .string()
+                .describe("Brief description of the recurring task"),
+              prompt: z
+                .string()
+                .describe(
+                  "The detailed prompt/instruction for the AI to execute each time"
+                ),
+              cron: z
+                .string()
+                .describe(
+                  "Cron expression (5 fields: minute hour day-of-month month day-of-week)"
+                )
+            }),
+            execute: async ({ description, prompt, cron }) => {
+              const s = await this.schedule(
+                cron,
+                "executeScheduledTask" as any,
+                { description, prompt }
+              );
+              return {
+                success: true,
+                id: s.id,
+                cron,
+                description,
+                nextRun: new Date(s.time * 1000).toISOString()
+              };
+            }
+          }),
+          manage_tasks: tool({
+            description:
+              "List all scheduled tasks, or cancel a specific task by ID.",
+            inputSchema: z.object({
+              action: z.enum(["list", "cancel"]).describe("Action to perform"),
+              taskId: z
+                .string()
+                .optional()
+                .describe("Task ID to cancel (required for cancel action)")
+            }),
+            execute: async ({ action, taskId }) => {
+              if (action === "list") {
+                const schedules = this.getSchedules();
+                return schedules.map((s) => {
+                  let description = "";
+                  try {
+                    const p =
+                      typeof s.payload === "string"
+                        ? JSON.parse(s.payload)
+                        : s.payload;
+                    description = p.description || "";
+                  } catch {}
+                  return {
+                    id: s.id,
+                    type: s.type,
+                    description,
+                    nextRun: new Date(s.time * 1000).toISOString(),
+                    ...(s.type === "cron" ? { cron: (s as any).cron } : {})
+                  };
+                });
+              }
+              if (action === "cancel" && taskId) {
+                const ok = await this.cancelSchedule(taskId);
+                return ok
+                  ? { success: true, cancelled: taskId }
+                  : { error: "Task not found" };
+              }
+              return { error: "Invalid action or missing taskId" };
+            }
+          })
         },
         stopWhen: stepCountIs(10)
       });
