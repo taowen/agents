@@ -9,6 +9,7 @@ declare namespace Cloudflare {
     AI: Ai;
     ChatAgent: DurableObjectNamespace<import("./src/server").ChatAgent>;
     GOOGLE_AI_API_KEY: string;
+    MYBROWSER: Fetcher;
     GITHUB_CLIENT_ID?: string;
     GITHUB_CLIENT_SECRET?: string;
   }

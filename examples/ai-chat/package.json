@@ -12,6 +12,7 @@
   },
   "dependencies": {
     "@cloudflare/agents-ui": "*",
+    "@cloudflare/puppeteer": "^0.0.15",
     "@cloudflare/ai-chat": "*",
     "@cloudflare/kumo": "^1.5.0",
     "@phosphor-icons/react": "^2.1.10",

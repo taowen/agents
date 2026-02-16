@@ -21,5 +21,8 @@
       "tag": "v1"
     }
   ],
-  "name": "ai-chat-example"
+  "name": "ai-chat-example",
+  "browser": {
+    "binding": "MYBROWSER"
+  }
 }

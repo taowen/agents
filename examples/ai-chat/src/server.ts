@@ -18,6 +18,8 @@ import {
   syncDirtyGitMounts
 } from "vfs";
 import { Bash, InMemoryFs, MountableFs } from "just-bash";
+import puppeteer from "@cloudflare/puppeteer";
+import type { Browser, Page } from "@cloudflare/puppeteer";
 
 // ---- OAuth CSRF helpers ----
 
@@ -264,6 +266,9 @@ export class ChatAgent extends AIChatAgent {
   private mountableFs: MountableFs;
   private mounted = false;
   private mountPromise: Promise<void> | null = null;
+  private browser: Browser | null = null;
+  private page: Page | null = null;
+  private browserCloseTimeout: ReturnType<typeof setTimeout> | null = null;
 
   constructor(ctx: DurableObjectState, env: Env) {
     super(ctx, env);
@@ -314,6 +319,70 @@ export class ChatAgent extends AIChatAgent {
       );
     }
     await this.mountPromise;
+  }
+
+  private async getOrLaunchPage(): Promise<Page> {
+    // Reset idle timer
+    if (this.browserCloseTimeout) {
+      clearTimeout(this.browserCloseTimeout);
+      this.browserCloseTimeout = null;
+    }
+    this.browserCloseTimeout = setTimeout(
+      () => this.closeBrowser(),
+      5 * 60 * 1000
+    );
+
+    // Reuse existing if still valid
+    if (this.browser?.isConnected() && this.page && !this.page.isClosed()) {
+      return this.page;
+    }
+
+    // Clean up stale references
+    await this.closeBrowser();
+
+    this.browser = await puppeteer.launch(this.env.MYBROWSER, {
+      keep_alive: 600000
+    });
+    this.page = await this.browser.newPage();
+    await this.page.setUserAgent(
+      "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126.0.0.0 Safari/537.36"
+    );
+    await this.page.setViewport({ width: 1280, height: 720 });
+    return this.page;
+  }
+
+  private async closeBrowser(): Promise<void> {
+    if (this.browserCloseTimeout) {
+      clearTimeout(this.browserCloseTimeout);
+      this.browserCloseTimeout = null;
+    }
+    try {
+      if (this.page && !this.page.isClosed()) await this.page.close();
+    } catch {}
+    try {
+      if (this.browser?.isConnected()) await this.browser.close();
+    } catch {}
+    this.page = null;
+    this.browser = null;
+  }
+
+  private async capturePageState(page: Page): Promise<{
+    screenshot: string;
+    url: string;
+    title: string;
+    text: string;
+  }> {
+    const screenshot = (await page.screenshot({
+      encoding: "base64"
+    })) as string;
+    const title = await page.title();
+    const url = page.url();
+    const text = await page.evaluate(() => {
+      const body = document.body;
+      if (!body) return "";
+      return body.innerText.slice(0, 8000);
+    });
+    return { screenshot, url, title, text };
   }
 
   private async readAgentFsJson(path: string): Promise<Record<string, string>> {
@@ -417,7 +486,17 @@ export class ChatAgent extends AIChatAgent {
         "Git repos mounted via mount -t git are read-write. " +
         "Any file changes are automatically committed and pushed after each command. " +
         "If a GitHub account is connected, authentication is automatic. " +
-        "Unmount with: umount /mnt/<repo-name>.",
+        "Unmount with: umount /mnt/<repo-name>. " +
+        "You also have a browser tool for browsing real web pages. " +
+        "Use the browser tool when you need to interact with SPAs, JavaScript-rendered content, or pages that curl can't handle well. " +
+        "The browser tool supports actions: goto (navigate to URL), click (click an element by CSS selector), " +
+        "type (type text into an input by CSS selector), screenshot (capture current page), " +
+        "scroll (scroll up or down), extract (extract text from page or specific element), " +
+        "set_cookies (inject cookies for authentication - user provides cookie JSON), close (close browser). " +
+        "Each browser action returns a screenshot so you can see the page. " +
+        "For sites requiring login: the user can export cookies from their own browser and provide them. " +
+        "Use set_cookies with the cookies JSON, then goto the target URL to access as the authenticated user. " +
+        "Prefer curl for simple requests; use the browser for complex web pages that need JavaScript rendering.",
       // Prune old tool calls and reasoning to save tokens on long conversations
       messages: pruneMessages({
         messages: await convertToModelMessages(this.messages),
@@ -447,9 +526,253 @@ export class ChatAgent extends AIChatAgent {
               exitCode: result.exitCode
             };
           }
+        }),
+        browser: tool({
+          description:
+            "Browse web pages using a real browser. Supports navigation, clicking, typing, screenshots, scrolling, and text extraction. " +
+            "Use this for JavaScript-heavy pages, SPAs, or when you need to interact with a page. " +
+            "Each action returns a screenshot of the current page state.",
+          inputSchema: z.object({
+            action: z
+              .enum([
+                "goto",
+                "click",
+                "type",
+                "screenshot",
+                "scroll",
+                "extract",
+                "set_cookies",
+                "close"
+              ])
+              .describe("The browser action to perform"),
+            url: z
+              .string()
+              .optional()
+              .describe("URL to navigate to (for goto action)"),
+            selector: z
+              .string()
+              .optional()
+              .describe(
+                "CSS selector for the target element (for click, type, extract actions)"
+              ),
+            text: z
+              .string()
+              .optional()
+              .describe("Text to type (for type action)"),
+            direction: z
+              .enum(["up", "down"])
+              .optional()
+              .describe("Scroll direction (for scroll action)"),
+            cookies: z
+              .string()
+              .optional()
+              .describe(
+                "JSON array of cookie objects for set_cookies action. Each cookie needs: name, value, domain. Optional: path, expires, httpOnly, secure, sameSite."
+              )
+          }),
+          execute: async ({
+            action,
+            url,
+            selector,
+            text,
+            direction,
+            cookies
+          }) => {
+            try {
+              if (action === "close") {
+                await this.closeBrowser();
+                return {
+                  action,
+                  success: true,
+                  url: "",
+                  title: "",
+                  text: "Browser closed",
+                  screenshot: ""
+                };
+              }
+
+              const page = await this.getOrLaunchPage();
+
+              switch (action) {
+                case "goto": {
+                  if (!url)
+                    return {
+                      action,
+                      success: false,
+                      error: "url is required for goto action",
+                      url: "",
+                      title: "",
+                      text: "",
+                      screenshot: ""
+                    };
+                  await page.goto(url, {
+                    waitUntil: "networkidle0",
+                    timeout: 30000
+                  });
+                  const state = await this.capturePageState(page);
+                  return { action, success: true, ...state };
+                }
+                case "click": {
+                  if (!selector)
+                    return {
+                      action,
+                      success: false,
+                      error: "selector is required for click action",
+                      url: "",
+                      title: "",
+                      text: "",
+                      screenshot: ""
+                    };
+                  await page.waitForSelector(selector, { timeout: 5000 });
+                  await page.click(selector);
+                  try {
+                    await page.waitForNetworkIdle({ timeout: 5000 });
+                  } catch {}
+                  const state = await this.capturePageState(page);
+                  return { action, success: true, ...state };
+                }
+                case "type": {
+                  if (!selector)
+                    return {
+                      action,
+                      success: false,
+                      error: "selector is required for type action",
+                      url: "",
+                      title: "",
+                      text: "",
+                      screenshot: ""
+                    };
+                  if (!text)
+                    return {
+                      action,
+                      success: false,
+                      error: "text is required for type action",
+                      url: "",
+                      title: "",
+                      text: "",
+                      screenshot: ""
+                    };
+                  await page.waitForSelector(selector, { timeout: 5000 });
+                  await page.click(selector, { clickCount: 3 });
+                  await page.type(selector, text);
+                  const state = await this.capturePageState(page);
+                  return { action, success: true, ...state };
+                }
+                case "screenshot": {
+                  const state = await this.capturePageState(page);
+                  return { action, success: true, ...state };
+                }
+                case "scroll": {
+                  const scrollDir = direction === "up" ? -500 : 500;
+                  await page.evaluate((d) => window.scrollBy(0, d), scrollDir);
+                  await new Promise((r) => setTimeout(r, 500));
+                  const state = await this.capturePageState(page);
+                  return { action, success: true, ...state };
+                }
+                case "extract": {
+                  let extracted: string;
+                  if (selector) {
+                    extracted = await page.$eval(selector, (el) =>
+                      (el as HTMLElement).innerText.slice(0, 16000)
+                    );
+                  } else {
+                    extracted = await page.evaluate(() =>
+                      document.body.innerText.slice(0, 16000)
+                    );
+                  }
+                  const state = await this.capturePageState(page);
+                  return { action, success: true, ...state, text: extracted };
+                }
+                case "set_cookies": {
+                  if (!cookies)
+                    return {
+                      action,
+                      success: false,
+                      error: "cookies is required for set_cookies action",
+                      url: "",
+                      title: "",
+                      text: "",
+                      screenshot: ""
+                    };
+                  const parsed = JSON.parse(cookies);
+                  const cookieArray = Array.isArray(parsed) ? parsed : [parsed];
+                  await page.setCookie(...cookieArray);
+                  const state = await this.capturePageState(page);
+                  return {
+                    action,
+                    success: true,
+                    ...state,
+                    text: `Set ${cookieArray.length} cookie(s)`
+                  };
+                }
+                default:
+                  return {
+                    action,
+                    success: false,
+                    error: `Unknown action: ${action}`,
+                    url: "",
+                    title: "",
+                    text: "",
+                    screenshot: ""
+                  };
+              }
+            } catch (err) {
+              const errorMsg = err instanceof Error ? err.message : String(err);
+              // Try to capture current state even on error
+              let screenshot = "";
+              let pageUrl = "";
+              let pageTitle = "";
+              try {
+                if (this.page && !this.page.isClosed()) {
+                  const state = await this.capturePageState(this.page);
+                  screenshot = state.screenshot;
+                  pageUrl = state.url;
+                  pageTitle = state.title;
+                }
+              } catch {}
+              return {
+                action,
+                success: false,
+                error: errorMsg,
+                url: pageUrl,
+                title: pageTitle,
+                text: "",
+                screenshot
+              };
+            }
+          },
+          toModelOutput: (output) => {
+            const result = output as {
+              action: string;
+              success: boolean;
+              url: string;
+              title: string;
+              text: string;
+              screenshot: string;
+              error?: string;
+            };
+            const parts: Array<{ type: string; [key: string]: unknown }> = [];
+            // Text summary
+            const lines: string[] = [];
+            lines.push(`Action: ${result.action} | Success: ${result.success}`);
+            if (result.error) lines.push(`Error: ${result.error}`);
+            if (result.url) lines.push(`URL: ${result.url}`);
+            if (result.title) lines.push(`Title: ${result.title}`);
+            if (result.text) lines.push(`Text:\n${result.text}`);
+            parts.push({ type: "text", text: lines.join("\n") });
+            // Screenshot as image
+            if (result.screenshot) {
+              parts.push({
+                type: "image-data",
+                data: result.screenshot,
+                mediaType: "image/png"
+              });
+            }
+            return { type: "content", value: parts };
+          }
         })
       },
-      stopWhen: stepCountIs(5)
+      stopWhen: stepCountIs(10)
     });
 
     return result.toUIMessageStreamResponse();

@@ -368,6 +368,7 @@ function Chat() {
                     // Tool completed
                     if (part.state === "output-available") {
                       const isBash = toolName === "bash";
+                      const isBrowser = toolName === "browser";
                       const bashInput = part.input as
                         | { command?: string }
                         | undefined;
@@ -376,6 +377,26 @@ function Chat() {
                             stdout?: string;
                             stderr?: string;
                             exitCode?: number;
+                          }
+                        | undefined;
+                      const browserInput = part.input as
+                        | {
+                            action?: string;
+                            url?: string;
+                            selector?: string;
+                            text?: string;
+                            direction?: string;
+                          }
+                        | undefined;
+                      const browserOutput = part.output as
+                        | {
+                            action?: string;
+                            success?: boolean;
+                            url?: string;
+                            title?: string;
+                            text?: string;
+                            screenshot?: string;
+                            error?: string;
                           }
                         | undefined;
 
@@ -401,6 +422,14 @@ function Chat() {
                                     Exit {bashOutput.exitCode}
                                   </Badge>
                                 )
+                              ) : isBrowser && browserOutput ? (
+                                browserOutput.success ? (
+                                  <Badge variant="secondary">
+                                    {browserOutput.action}
+                                  </Badge>
+                                ) : (
+                                  <Badge variant="destructive">Failed</Badge>
+                                )
                               ) : (
                                 <Badge variant="secondary">Done</Badge>
                               )}
@@ -409,6 +438,25 @@ function Chat() {
                               <div className="font-mono bg-kumo-elevated rounded px-2 py-1 mb-1">
                                 <Text size="xs" variant="secondary">
                                   $ {bashInput.command}
+                                </Text>
+                              </div>
+                            )}
+                            {isBrowser && browserInput?.action && (
+                              <div className="font-mono bg-kumo-elevated rounded px-2 py-1 mb-1">
+                                <Text size="xs" variant="secondary">
+                                  {browserInput.action}
+                                  {browserInput.url
+                                    ? ` ${browserInput.url}`
+                                    : ""}
+                                  {browserInput.selector
+                                    ? ` ${browserInput.selector}`
+                                    : ""}
+                                  {browserInput.text
+                                    ? ` "${browserInput.text}"`
+                                    : ""}
+                                  {browserInput.direction
+                                    ? ` ${browserInput.direction}`
+                                    : ""}
                                 </Text>
                               </div>
                             )}
@@ -426,6 +474,37 @@ function Chat() {
                                     </Text>
                                   )}
                                 </>
+                              ) : isBrowser && browserOutput ? (
+                                <div className="space-y-2">
+                                  {browserOutput.error && (
+                                    <Text size="xs" variant="error">
+                                      {browserOutput.error}
+                                    </Text>
+                                  )}
+                                  {browserOutput.url && browserOutput.title && (
+                                    <Text size="xs" variant="secondary">
+                                      {browserOutput.title} —{" "}
+                                      {browserOutput.url}
+                                    </Text>
+                                  )}
+                                  {browserOutput.screenshot && (
+                                    <img
+                                      src={`data:image/png;base64,${browserOutput.screenshot}`}
+                                      alt="Browser screenshot"
+                                      className="rounded border border-kumo-line max-w-full"
+                                    />
+                                  )}
+                                  {browserOutput.text && (
+                                    <details className="text-xs">
+                                      <summary className="cursor-pointer text-kumo-secondary hover:text-kumo-default">
+                                        Extracted text
+                                      </summary>
+                                      <pre className="mt-1 p-2 bg-kumo-elevated rounded overflow-x-auto text-kumo-secondary">
+                                        {browserOutput.text}
+                                      </pre>
+                                    </details>
+                                  )}
+                                </div>
                               ) : (
                                 <Text size="xs" variant="secondary">
                                   {JSON.stringify(part.output, null, 2)}
