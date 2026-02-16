@@ -162,6 +162,18 @@ function Chat() {
 
                     // Tool completed
                     if (part.state === "output-available") {
+                      const isBash = toolName === "bash";
+                      const bashInput = part.input as
+                        | { command?: string }
+                        | undefined;
+                      const bashOutput = part.output as
+                        | {
+                            stdout?: string;
+                            stderr?: string;
+                            exitCode?: number;
+                          }
+                        | undefined;
+
                       return (
                         <div
                           key={part.toolCallId}
@@ -176,12 +188,48 @@ function Chat() {
                               <Text size="xs" variant="secondary" bold>
                                 {toolName}
                               </Text>
-                              <Badge variant="secondary">Done</Badge>
+                              {isBash && bashOutput ? (
+                                bashOutput.exitCode === 0 ? (
+                                  <Badge variant="secondary">Done</Badge>
+                                ) : (
+                                  <Badge variant="destructive">
+                                    Exit {bashOutput.exitCode}
+                                  </Badge>
+                                )
+                              ) : (
+                                <Badge variant="secondary">Done</Badge>
+                              )}
                             </div>
-                            <div className="font-mono">
-                              <Text size="xs" variant="secondary">
-                                {JSON.stringify(part.output, null, 2)}
-                              </Text>
+                            {isBash && bashInput?.command && (
+                              <div className="font-mono bg-kumo-elevated rounded px-2 py-1 mb-1">
+                                <Text size="xs" variant="secondary">
+                                  $ {bashInput.command}
+                                </Text>
+                              </div>
+                            )}
+                            <div className="font-mono whitespace-pre-wrap">
+                              {isBash && bashOutput ? (
+                                <>
+                                  {bashOutput.stdout && (
+                                    <Text size="xs" variant="secondary">
+                                      {bashOutput.stdout}
+                                    </Text>
+                                  )}
+                                  {bashOutput.stderr && (
+                                    <Text
+                                      size="xs"
+                                      variant="secondary"
+                                      className="text-kumo-negative"
+                                    >
+                                      {bashOutput.stderr}
+                                    </Text>
+                                  )}
+                                </>
+                              ) : (
+                                <Text size="xs" variant="secondary">
+                                  {JSON.stringify(part.output, null, 2)}
+                                </Text>
+                              )}
                             </div>
                           </Surface>
                         </div>

@@ -7,6 +7,7 @@
   "scripts": {
     "start": "vite dev",
     "deploy": "vite build && wrangler deploy",
+    "test": "vitest run",
     "types": "wrangler types env.d.ts --include-runtime false"
   },
   "dependencies": {
@@ -16,6 +17,7 @@
     "@phosphor-icons/react": "^2.1.10",
     "agentfs-sdk": "^0.6.0",
     "agents": "*",
+    "isomorphic-git": "^1.27.2",
     "just-bash": "file:../../packages/just-bash"
   },
   "devDependencies": {
