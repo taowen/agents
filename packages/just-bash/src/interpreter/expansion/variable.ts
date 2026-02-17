@@ -127,7 +127,7 @@ export async function getVariable(
     case "?":
       return String(ctx.state.lastExitCode);
     case "$":
-      return String(process.pid);
+      return String(typeof process !== "undefined" ? process.pid : 1);
     case "#":
       return ctx.state.env.get("#") || "0";
     case "@":
@@ -187,7 +187,10 @@ export async function getVariable(
     }
     case "EUID":
       // Effective user ID (same as UID in our simulated environment)
-      return String(process.geteuid?.() ?? getProcessInfo().uid);
+      return String(
+        (typeof process !== "undefined" ? process.geteuid?.() : undefined) ??
+          getProcessInfo().uid
+      );
     case "RANDOM":
       // Random number between 0 and 32767
       return String(Math.floor(Math.random() * 32768));

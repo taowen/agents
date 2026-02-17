@@ -256,8 +256,8 @@ export class Bash {
       lastArg: "", // $_ is initially empty (or could be shell name)
       startTime: Date.now(),
       lastBackgroundPid: 0,
-      bashPid: process.pid, // BASHPID starts as the main process PID
-      nextVirtualPid: process.pid + 1, // Counter for unique subshell PIDs
+      bashPid: typeof process !== "undefined" ? process.pid : 1,
+      nextVirtualPid: (typeof process !== "undefined" ? process.pid : 1) + 1,
       currentLine: 1, // $LINENO starts at 1
       options: {
         errexit: false,

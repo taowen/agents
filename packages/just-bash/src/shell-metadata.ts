@@ -26,11 +26,12 @@ export function getProcessInfo(): {
   uid: number;
   gid: number;
 } {
+  const hasProcess = typeof process !== "undefined";
   return {
-    pid: process.pid,
-    ppid: process.ppid,
-    uid: process.getuid?.() ?? 1000,
-    gid: process.getgid?.() ?? 1000
+    pid: hasProcess ? process.pid : 1,
+    ppid: hasProcess ? process.ppid : 0,
+    uid: (hasProcess ? process.getuid?.() : undefined) ?? 1000,
+    gid: (hasProcess ? process.getgid?.() : undefined) ?? 1000
   };
 }
 
