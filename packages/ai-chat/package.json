@@ -27,7 +27,7 @@
     "zod": "^4.3.6"
   },
   "peerDependencies": {
-    "agents": "^0.3.10 || ^0.4.0",
+    "agents": ">=0.3.10 <1.0.0",
     "ai": "^6.0.0",
     "react": "^19.0.0",
     "zod": "^3.25.0 || ^4.0.0"
@@ -52,6 +52,11 @@
       "types": "./dist/ai-chat-v5-migration.d.ts",
       "import": "./dist/ai-chat-v5-migration.js",
       "require": "./dist/ai-chat-v5-migration.js"
+    },
+    "./experimental/forever": {
+      "types": "./dist/experimental/forever.d.ts",
+      "import": "./dist/experimental/forever.js",
+      "require": "./dist/experimental/forever.js"
     }
   },
   "author": "Cloudflare Inc.",

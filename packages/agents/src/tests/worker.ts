@@ -22,11 +22,15 @@ export {
   TestOAuthAgent,
   TestCustomOAuthAgent,
   TestReadonlyAgent,
+  TestProtocolMessagesAgent,
   TestCallableAgent,
   TestParentAgent,
   TestChildAgent,
   TestQueueAgent,
-  TestRaceAgent
+  TestRaceAgent,
+  TestRetryAgent,
+  TestRetryDefaultsAgent,
+  TestFiberAgent
 } from "./agents";
 
 export type { TestState } from "./agents";
@@ -48,6 +52,7 @@ import type {
   TestMcpJurisdiction,
   TestDestroyScheduleAgent,
   TestReadonlyAgent,
+  TestProtocolMessagesAgent,
   TestScheduleAgent,
   TestWorkflowAgent,
   TestAddMcpServerAgent,
@@ -59,7 +64,10 @@ import type {
   TestNoIdentityAgent,
   TestCallableAgent,
   TestChildAgent,
-  TestQueueAgent
+  TestQueueAgent,
+  TestRetryAgent,
+  TestRetryDefaultsAgent,
+  TestFiberAgent
 } from "./agents";
 
 export type Env = {
@@ -72,6 +80,7 @@ export type Env = {
   TEST_MCP_JURISDICTION: DurableObjectNamespace<TestMcpJurisdiction>;
   TestDestroyScheduleAgent: DurableObjectNamespace<TestDestroyScheduleAgent>;
   TestReadonlyAgent: DurableObjectNamespace<TestReadonlyAgent>;
+  TestProtocolMessagesAgent: DurableObjectNamespace<TestProtocolMessagesAgent>;
   TestScheduleAgent: DurableObjectNamespace<TestScheduleAgent>;
   TestWorkflowAgent: DurableObjectNamespace<TestWorkflowAgent>;
   TestAddMcpServerAgent: DurableObjectNamespace<TestAddMcpServerAgent>;
@@ -84,6 +93,9 @@ export type Env = {
   TestCallableAgent: DurableObjectNamespace<TestCallableAgent>;
   TestChildAgent: DurableObjectNamespace<TestChildAgent>;
   TestQueueAgent: DurableObjectNamespace<TestQueueAgent>;
+  TestRetryAgent: DurableObjectNamespace<TestRetryAgent>;
+  TestRetryDefaultsAgent: DurableObjectNamespace<TestRetryDefaultsAgent>;
+  TestFiberAgent: DurableObjectNamespace<TestFiberAgent>;
   // Workflow bindings for integration testing
   TEST_WORKFLOW: Workflow;
   SIMPLE_WORKFLOW: Workflow;
