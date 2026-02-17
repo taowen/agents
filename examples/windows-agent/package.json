@@ -1,0 +1,20 @@
+{
+  "name": "@cloudflare/windows-agent-example",
+  "description": "Windows desktop AI agent — Electron shell + Cloudflare Worker LLM proxy + browser-side just-bash",
+  "private": true,
+  "type": "module",
+  "version": "0.0.0",
+  "scripts": {
+    "dev:web": "vite dev",
+    "dev:electron": "electron electron/main.js",
+    "dev": "echo \"Run 'npm run dev:web' first, then 'npm run dev:electron' in a second terminal\"",
+    "start": "vite dev",
+    "deploy": "vite build && wrangler deploy"
+  },
+  "dependencies": {
+    "just-bash": "file:../../packages/just-bash"
+  },
+  "devDependencies": {
+    "electron": "^40.0.0"
+  }
+}
