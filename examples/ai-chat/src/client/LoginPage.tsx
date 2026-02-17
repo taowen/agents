@@ -1,6 +1,105 @@
-import { CloudSunIcon } from "@phosphor-icons/react";
+import {
+  CloudSunIcon,
+  CopyIcon,
+  CheckIcon,
+  EnvelopeIcon,
+  SpinnerIcon
+} from "@phosphor-icons/react";
+import { useState, useEffect, useRef, useCallback } from "react";
+
+type EmailStep = "idle" | "waiting" | "confirm";
 
 export function LoginPage() {
+  const [emailStep, setEmailStep] = useState<EmailStep>("idle");
+  const [token, setToken] = useState("");
+  const [address, setAddress] = useState("");
+  const [senderEmail, setSenderEmail] = useState("");
+  const [copied, setCopied] = useState(false);
+  const [error, setError] = useState("");
+  const pollRef = useRef<ReturnType<typeof setInterval>>();
+
+  const stopPolling = useCallback(() => {
+    if (pollRef.current) {
+      clearInterval(pollRef.current);
+      pollRef.current = undefined;
+    }
+  }, []);
+
+  useEffect(() => {
+    return () => stopPolling();
+  }, [stopPolling]);
+
+  async function startEmailLogin() {
+    setError("");
+    try {
+      const res = await fetch("/auth/email/start", { method: "POST" });
+      const data = (await res.json()) as { token: string; address: string };
+      setToken(data.token);
+      setAddress(data.address);
+      setEmailStep("waiting");
+
+      // Start polling
+      pollRef.current = setInterval(async () => {
+        try {
+          const checkRes = await fetch(`/auth/email/check?token=${data.token}`);
+          const checkData = (await checkRes.json()) as {
+            status: string;
+            email?: string;
+          };
+          if (checkData.status === "received" && checkData.email) {
+            stopPolling();
+            setSenderEmail(checkData.email);
+            setEmailStep("confirm");
+          } else if (checkData.status === "expired") {
+            stopPolling();
+            setError("Token expired. Please try again.");
+            setEmailStep("idle");
+          }
+        } catch {
+          // ignore polling errors
+        }
+      }, 2000);
+    } catch {
+      setError("Failed to start email login");
+    }
+  }
+
+  async function confirmLogin() {
+    setError("");
+    try {
+      const res = await fetch(`/auth/email/confirm?token=${token}`, {
+        method: "POST"
+      });
+      if (res.ok) {
+        window.location.reload();
+      } else {
+        const text = await res.text();
+        setError(text || "Confirm failed");
+      }
+    } catch {
+      setError("Confirm request failed");
+    }
+  }
+
+  function cancelEmailLogin() {
+    stopPolling();
+    setEmailStep("idle");
+    setToken("");
+    setAddress("");
+    setSenderEmail("");
+    setError("");
+  }
+
+  async function copyAddress() {
+    try {
+      await navigator.clipboard.writeText(address);
+      setCopied(true);
+      setTimeout(() => setCopied(false), 2000);
+    } catch {
+      // fallback: select text
+    }
+  }
+
   return (
     <div className="flex items-center justify-center h-screen bg-kumo-elevated">
       <div className="w-full max-w-sm mx-4 rounded-xl ring ring-kumo-line overflow-hidden bg-kumo-base p-8 text-center">
@@ -35,6 +134,86 @@ export function LoginPage() {
           </svg>
           Sign in with Google
         </a>
+
+        {/* Divider */}
+        <div className="flex items-center gap-3 my-5">
+          <div className="flex-1 h-px bg-kumo-line" />
+          <span className="text-xs text-kumo-secondary">or</span>
+          <div className="flex-1 h-px bg-kumo-line" />
+        </div>
+
+        {/* Email login */}
+        {emailStep === "idle" && (
+          <button
+            onClick={startEmailLogin}
+            className="inline-flex items-center gap-2 px-5 py-2.5 rounded-lg ring ring-kumo-line text-kumo-default text-sm font-medium hover:bg-kumo-elevated transition-colors w-full justify-center"
+          >
+            <EnvelopeIcon size={18} className="shrink-0" />
+            Sign in with Email
+          </button>
+        )}
+
+        {emailStep === "waiting" && (
+          <div className="space-y-3">
+            <p className="text-sm text-kumo-secondary">
+              Send an email from your mailbox to the address below. Subject and
+              body can be anything.
+            </p>
+            <div className="flex items-center gap-2 bg-kumo-elevated rounded-lg px-3 py-2 ring ring-kumo-line">
+              <code className="text-xs text-kumo-default flex-1 text-left break-all">
+                {address}
+              </code>
+              <button
+                onClick={copyAddress}
+                className="shrink-0 p-1 rounded hover:bg-kumo-base transition-colors"
+                title="Copy address"
+              >
+                {copied ? (
+                  <CheckIcon size={16} className="text-green-500" />
+                ) : (
+                  <CopyIcon size={16} className="text-kumo-secondary" />
+                )}
+              </button>
+            </div>
+            <div className="flex items-center justify-center gap-2 text-sm text-kumo-secondary">
+              <SpinnerIcon size={16} className="animate-spin" />
+              Waiting for your email...
+            </div>
+            <button
+              onClick={cancelEmailLogin}
+              className="text-xs text-kumo-secondary hover:text-kumo-default transition-colors"
+            >
+              Cancel
+            </button>
+          </div>
+        )}
+
+        {emailStep === "confirm" && (
+          <div className="space-y-3">
+            <p className="text-sm text-kumo-default">
+              Received email from <strong>{senderEmail}</strong>
+            </p>
+            <p className="text-sm text-kumo-secondary">
+              Confirm to sign in with this email?
+            </p>
+            <div className="flex gap-2 justify-center">
+              <button
+                onClick={confirmLogin}
+                className="px-5 py-2 rounded-lg bg-kumo-contrast text-kumo-inverse text-sm font-medium hover:opacity-90 transition-opacity"
+              >
+                Confirm
+              </button>
+              <button
+                onClick={cancelEmailLogin}
+                className="px-5 py-2 rounded-lg ring ring-kumo-line text-kumo-default text-sm font-medium hover:bg-kumo-elevated transition-colors"
+              >
+                Cancel
+              </button>
+            </div>
+          </div>
+        )}
+
+        {error && <p className="mt-3 text-sm text-red-500">{error}</p>}
       </div>
     </div>
   );

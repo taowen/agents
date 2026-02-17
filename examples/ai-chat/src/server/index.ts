@@ -1,19 +1,19 @@
 import * as Sentry from "@sentry/cloudflare";
 import { routeAgentRequest } from "agents";
-import { handleAuthRoutes, requireAuth } from "./auth";
+import { handleAuthRoutes, requireAuth, handleIncomingEmail } from "./auth";
 import { handleApiRoutes } from "./api";
 import { handleGitHubOAuth } from "./github-oauth";
 
 export { ChatAgent } from "./chat-agent";
 
-export default Sentry.withSentry(
+const sentryHandler = Sentry.withSentry(
   (env: Env) => ({
     dsn: env.SENTRY_DSN,
     tracesSampleRate: 1.0
   }),
   {
     async fetch(request: Request, env: Env) {
-      // 1. Public auth routes (Google OAuth)
+      // 1. Public auth routes (Google OAuth + Email login)
       const authResponse = await handleAuthRoutes(request, env);
       if (authResponse) return authResponse;
 
@@ -50,3 +50,10 @@ export default Sentry.withSentry(
     }
   } satisfies ExportedHandler<Env>
 );
+
+export default {
+  ...sentryHandler,
+  async email(message: ForwardableEmailMessage, env: Env) {
+    await handleIncomingEmail(message, env);
+  }
+};

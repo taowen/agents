@@ -21,6 +21,9 @@
       "database_id": "615cce83-8d31-4a0e-922c-052bf499c1b1"
     }
   ],
+  "kv_namespaces": [
+    { "binding": "OTP_KV", "id": "2b36327718ac43e2a809b7112fccc17d" }
+  ],
   "r2_buckets": [
     {
       "binding": "R2",

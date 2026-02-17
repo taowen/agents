@@ -9,6 +9,8 @@ import { findOrCreateUser, getUser } from "./db";
 
 const COOKIE_NAME = "session";
 const COOKIE_MAX_AGE = 30 * 24 * 60 * 60; // 30 days in seconds
+const EMAIL_DOMAIN = "connect-screen.com";
+const EMAIL_TOKEN_TTL = 5 * 60; // 5 minutes in seconds
 
 // ---- HMAC helpers ----
 
@@ -263,7 +265,100 @@ export async function handleAuthRoutes(
     });
   }
 
+  // POST /auth/email/start — generate token, store in KV
+  if (url.pathname === "/auth/email/start" && request.method === "POST") {
+    const token = crypto.randomUUID().replace(/-/g, "").slice(0, 16);
+    await env.OTP_KV.put(
+      `email-login:${token}`,
+      JSON.stringify({ status: "pending" }),
+      { expirationTtl: EMAIL_TOKEN_TTL }
+    );
+    return Response.json({
+      token,
+      address: `login-${token}@${EMAIL_DOMAIN}`
+    });
+  }
+
+  // GET /auth/email/check?token= — poll KV status
+  if (url.pathname === "/auth/email/check" && request.method === "GET") {
+    const token = url.searchParams.get("token");
+    if (!token) {
+      return new Response("Missing token", { status: 400 });
+    }
+    const raw = await env.OTP_KV.get(`email-login:${token}`);
+    if (!raw) {
+      return Response.json({ status: "expired" });
+    }
+    const data = JSON.parse(raw) as { status: string; email?: string };
+    return Response.json(data);
+  }
+
+  // POST /auth/email/confirm?token= — confirm login, set session cookie
+  if (url.pathname === "/auth/email/confirm" && request.method === "POST") {
+    const token = url.searchParams.get("token");
+    if (!token) {
+      return new Response("Missing token", { status: 400 });
+    }
+    const raw = await env.OTP_KV.get(`email-login:${token}`);
+    if (!raw) {
+      return new Response("Token expired", { status: 410 });
+    }
+    const data = JSON.parse(raw) as { status: string; email?: string };
+    if (data.status !== "received" || !data.email) {
+      return new Response("Email not yet received", { status: 400 });
+    }
+
+    // Use email as user id (stable identifier)
+    const userId = `email:${data.email}`;
+    await findOrCreateUser(env.DB, {
+      id: userId,
+      email: data.email,
+      name: data.email.split("@")[0]
+    });
+
+    // Clean up KV
+    await env.OTP_KV.delete(`email-login:${token}`);
+
+    const cookie = await createSessionCookie(userId, env.AUTH_SECRET);
+    return new Response(JSON.stringify({ ok: true }), {
+      status: 200,
+      headers: {
+        "Content-Type": "application/json",
+        "Set-Cookie": cookie
+      }
+    });
+  }
+
   return null;
+}
+
+/**
+ * Handle incoming email from Cloudflare Email Routing.
+ * Extracts token from recipient address and sender email, updates KV.
+ */
+export async function handleIncomingEmail(
+  message: ForwardableEmailMessage,
+  env: Env
+): Promise<void> {
+  const to = message.to;
+  // Extract token from login-{token}@connect-screen.com
+  const match = to.match(/^login-([a-f0-9]+)@/i);
+  if (!match) return;
+
+  const token = match[1];
+  const from = message.from;
+
+  const raw = await env.OTP_KV.get(`email-login:${token}`);
+  if (!raw) return; // expired or invalid
+
+  const data = JSON.parse(raw) as { status: string };
+  if (data.status !== "pending") return; // already processed
+
+  await env.OTP_KV.put(
+    `email-login:${token}`,
+    JSON.stringify({ status: "received", email: from }),
+    { expirationTtl: EMAIL_TOKEN_TTL }
+  );
 }
 
 /**
