@@ -1,6 +1,8 @@
 # Windows Agent
 
-Electron desktop agent that combines a Cloudflare Worker LLM proxy with a browser-side AI chat UI. The React app runs inside an Electron `BrowserWindow`, with a preload bridge (`window.workWithWindows`) ready for future desktop capabilities (screenshots, shell commands, etc.).
+Electron desktop shell that loads the [AI Chat](../ai-chat/) web app at `https://ai.connect-screen.com/agent`. Authentication (Google OAuth) and LLM configuration are provided by the AI Chat service — no local API keys or Worker deployment needed.
+
+The `window.workWithWindows` preload bridge is the extensibility point for adding real desktop tools (desktopCapturer screenshots, child_process commands, etc.).
 
 ## How to run
 
@@ -10,37 +12,32 @@ Electron desktop agent that combines a Cloudflare Worker LLM proxy with a browse
 npm install
 ```
 
-2. Copy `.env.example` to `.env` and fill in your LLM credentials.
-
-3. Start the web server (Terminal 1):
+2. Start Electron:
 
 ```bash
-npm run dev:web
+npm run dev
 ```
 
-4. Start Electron (Terminal 2):
+The Electron window loads `https://ai.connect-screen.com/agent`. You'll be prompted to log in with Google OAuth on first launch.
+
+For local development against the ai-chat dev server:
 
 ```bash
-npm run dev:electron
+AGENT_URL=http://localhost:5173/agent npm run dev
 ```
-
-The Electron window loads the Vite dev server. You should see a green "Electron (win32) - bridge: pong" badge in the header, confirming the preload bridge is working.
-
-## Required env vars
-
-| Variable | Description |
-|---|---|
-| `LLM_BASE_URL` | Base URL of the LLM API (e.g. `https://api.openai.com`) |
-| `LLM_MODEL` | Model ID (e.g. `gpt-4o`) |
-| `LLM_API_KEY` | API key for the LLM provider |
 
 ## Architecture
 
 ```
-Electron (main.js + preload.js)
-  └─ BrowserWindow loads http://localhost:5173
-       └─ React chat UI + just-bash virtual shell
-            └─ LLM calls proxied via Cloudflare Worker (/api/v1/*)
+Electron (main.js + preload.cjs)
+  └─ BrowserWindow loads https://ai.connect-screen.com/agent
+       └─ React chat UI + just-bash virtual shell (runs in browser)
+            └─ LLM calls go directly to the configured provider
+               (config fetched from /api/llm/config, auth via session cookie)
 ```
 
-The `window.workWithWindows` preload bridge is the extensibility point for adding real desktop tools (desktopCapturer screenshots, child_process commands, etc.).
+The backend is provided by the `examples/ai-chat` Worker deployed at `ai.connect-screen.com`. It handles:
+
+- **Authentication** — Google OAuth + email-based login
+- **LLM configuration** — per-user provider/model/key settings via `/api/llm/config`
+- **No proxy needed** — the browser calls the LLM provider directly with the returned API key

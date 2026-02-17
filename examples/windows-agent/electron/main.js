@@ -4,7 +4,8 @@ import { fileURLToPath } from "node:url";
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 
-const VITE_DEV_URL = process.env.VITE_DEV_URL || "http://localhost:5178";
+const PROD_URL = "https://ai.connect-screen.com/agent";
+const APP_URL = process.env.AGENT_URL || PROD_URL;
 
 function createWindow() {
   const win = new BrowserWindow({
@@ -18,7 +19,7 @@ function createWindow() {
     }
   });
 
-  win.loadURL(VITE_DEV_URL);
+  win.loadURL(APP_URL);
 }
 
 app.whenReady().then(() => {

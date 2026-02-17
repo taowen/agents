@@ -2,6 +2,7 @@ import * as Sentry from "@sentry/cloudflare";
 import { routeAgentRequest } from "agents";
 import { handleAuthRoutes, requireAuth, handleIncomingEmail } from "./auth";
 import { handleApiRoutes } from "./api";
+import { handleLlmRoutes } from "./llm-proxy";
 import { handleGitHubOAuth } from "./github-oauth";
 
 export { ChatAgent } from "./chat-agent";
@@ -25,6 +26,10 @@ const sentryHandler = Sentry.withSentry(
       // 3. API routes (session/settings CRUD)
       const apiResponse = await handleApiRoutes(request, env, userId);
       if (apiResponse) return apiResponse;
+
+      // 3b. LLM config route (returns full LLM config for client-side calls)
+      const llmResponse = await handleLlmRoutes(request, env, userId);
+      if (llmResponse) return llmResponse;
 
       // 4. GitHub OAuth (D1-based, per-user)
       const ghResponse = await handleGitHubOAuth(request, env, userId);

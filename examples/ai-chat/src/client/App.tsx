@@ -4,6 +4,7 @@ import { SessionSidebar } from "./SessionSidebar";
 import { SettingsPage } from "./SettingsPage";
 import { MemoryPage } from "./MemoryPage";
 import { Chat } from "./Chat";
+import { WindowsAgent } from "./WindowsAgent";
 import { useAuth, useSessions } from "./api";
 
 export interface UserInfo {
@@ -188,6 +189,7 @@ function AuthenticatedApp({ user }: { user: UserInfo }) {
 
 export default function App() {
   const { user, authenticated, isLoading } = useAuth();
+  const isAgentPage = window.location.pathname === "/agent";
 
   if (isLoading) {
     return (
@@ -199,6 +201,10 @@ export default function App() {
 
   if (!authenticated) {
     return <LoginPage />;
+  }
+
+  if (isAgentPage) {
+    return <WindowsAgent />;
   }
 
   return (
