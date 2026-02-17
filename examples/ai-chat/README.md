@@ -12,8 +12,7 @@ A chat application built with `@cloudflare/ai-chat` featuring a sandboxed bash e
 - Persistent `/data` directory backed by R2 object storage (via `R2FsAdapter`, suitable for large files)
 - In-memory filesystem for everything outside persistent mounts (with pre-created `/mnt` for mount points)
 - `MountableFs` to combine persistent and ephemeral filesystems
-- Read-write Git repository mounting via `mount -t git <url> /mnt/<repo-name>` (auto commit & push)
-- `/etc/fstab` for declarative mount configuration
+- Read-write Git repository mounting via `mount -t git <url> /mnt/<repo-name>` (auto commit & push, auto-persisted to `/etc/fstab`)
 - Browser tool for interacting with JavaScript-rendered web pages
 - Scheduled/recurring task execution
 - Persistent memory system in `/home/user/.memory/`
@@ -25,6 +24,8 @@ A chat application built with `@cloudflare/ai-chat` featuring a sandboxed bash e
 - `useAgentChat` for chat interaction
 - Structured bash tool output rendering (command, stdout, stderr, exit code badge)
 - Tool part rendering (executing, completed, approval requested)
+- Interrupt: type and send during streaming to stop current response and start new one
+- Abort: stop button to cancel current response without sending
 - Kumo design system components
 
 ## Storage architecture

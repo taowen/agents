@@ -21,6 +21,7 @@ import {
   parseGitCredentials,
   findCredential,
   syncDirtyGitMounts,
+  createMountCommands,
   D1FsAdapter,
   R2FsAdapter
 } from "vfs";
@@ -31,9 +32,10 @@ import {
   createBrowserTool,
   type BrowserState
 } from "./browser-tool";
-import { createD1MountCommands } from "./mount-commands";
 import { createSessionsCommand } from "./session-commands";
 import { buildSystemPrompt } from "./system-prompt";
+import { MIME_TYPES, getExtension } from "../shared/file-utils";
+import { normalizePath } from "vfs";
 
 /**
  * AI Chat Agent with sandboxed bash tool via just-bash.
@@ -108,7 +110,7 @@ class ChatAgentBase extends AIChatAgent {
     this.bash = new Bash({
       fs,
       customCommands: [
-        ...createD1MountCommands(fs),
+        ...createMountCommands(fs),
         createSessionsCommand(db, userId, this.env.ChatAgent)
       ],
       cwd: "/home/user",
@@ -453,7 +455,105 @@ class ChatAgentBase extends AIChatAgent {
       const schedules = this.getSchedules();
       return Response.json(schedules);
     }
+    if (url.pathname.startsWith("/api/files")) {
+      return this.handleFileRequest(request);
+    }
     return super.onRequest(request);
+  }
+
+  /**
+   * Handle file manager API requests using the DO's MountableFs.
+   * This ensures the file manager sees the exact same filesystem as the bash agent,
+   * including git mounts under /mnt.
+   */
+  private async handleFileRequest(request: Request): Promise<Response> {
+    // Ensure bash + mounts are initialized
+    const uid = await this.getUserId(request);
+    this.initBash(uid);
+    await this.ensureMounted();
+
+    const url = new URL(request.url);
+    const fs = this.mountableFs;
+
+    try {
+      // GET /api/files/list?path=<dir>
+      if (url.pathname === "/api/files/list" && request.method === "GET") {
+        const rawPath = url.searchParams.get("path") || "/";
+        const path = normalizePath(rawPath);
+
+        const names = await fs.readdir(path);
+        const entries = await Promise.all(
+          names.map(async (name: string) => {
+            try {
+              const childPath = path === "/" ? `/${name}` : `${path}/${name}`;
+              const st = await fs.stat(childPath);
+              return {
+                name,
+                isDirectory: st.isDirectory,
+                size: st.size,
+                mtime: st.mtime?.toISOString() ?? null
+              };
+            } catch {
+              return { name, isDirectory: false, size: 0, mtime: null };
+            }
+          })
+        );
+        return Response.json({ entries });
+      }
+
+      // GET /api/files/content?path=<file>
+      if (url.pathname === "/api/files/content" && request.method === "GET") {
+        const rawPath = url.searchParams.get("path") || "";
+        const path = normalizePath(rawPath);
+        const buffer = await fs.readFileBuffer(path);
+        const ext = getExtension(rawPath);
+        const contentType = MIME_TYPES[ext] || "application/octet-stream";
+        return new Response(buffer, {
+          headers: { "Content-Type": contentType }
+        });
+      }
+
+      // PUT /api/files/content?path=<file>
+      if (url.pathname === "/api/files/content" && request.method === "PUT") {
+        const rawPath = url.searchParams.get("path") || "";
+        const path = normalizePath(rawPath);
+        const buffer = new Uint8Array(await request.arrayBuffer());
+        await fs.writeFile(path, buffer);
+        return Response.json({ ok: true });
+      }
+
+      // POST /api/files/mkdir
+      if (url.pathname === "/api/files/mkdir" && request.method === "POST") {
+        const body = (await request.json()) as { path?: string };
+        const rawPath = body.path || "";
+        const path = normalizePath(rawPath);
+        await fs.mkdir(path, { recursive: true });
+        return Response.json({ ok: true });
+      }
+
+      // DELETE /api/files?path=<path>&recursive=0|1
+      if (url.pathname === "/api/files" && request.method === "DELETE") {
+        const rawPath = url.searchParams.get("path") || "";
+        const path = normalizePath(rawPath);
+        const recursive = url.searchParams.get("recursive") === "1";
+        await fs.rm(path, { recursive });
+        return Response.json({ ok: true });
+      }
+
+      return Response.json({ error: "Not found" }, { status: 404 });
+    } catch (e: unknown) {
+      const msg = e instanceof Error ? e.message : String(e);
+      if (msg.includes("ENOENT")) {
+        return Response.json({ error: msg }, { status: 404 });
+      }
+      if (msg.includes("EISDIR")) {
+        return Response.json({ error: msg }, { status: 400 });
+      }
+      if (msg.includes("EBUSY")) {
+        return Response.json({ error: msg }, { status: 400 });
+      }
+      return Response.json({ error: msg }, { status: 500 });
+    }
   }
 
   async onConnect(

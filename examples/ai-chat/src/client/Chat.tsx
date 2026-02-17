@@ -11,6 +11,7 @@ import {
 } from "@cloudflare/agents-ui";
 import {
   PaperPlaneRightIcon,
+  StopIcon,
   TrashIcon,
   CloudSunIcon,
   ListIcon,
@@ -91,7 +92,8 @@ export function Chat({
     sendMessage,
     clearHistory,
     addToolApprovalResponse,
-    status
+    status,
+    stop
   } = useAgentChat({
     agent,
     body: {
@@ -119,7 +121,7 @@ export function Chat({
 
   const send = useCallback(async () => {
     const text = input.trim();
-    if (!text || isStreaming) return;
+    if (!text) return;
     setInput("");
 
     // Collect file parts from @references in text
@@ -137,12 +139,16 @@ export function Chat({
     ];
     for (const fp of fileParts) parts.push(fp);
 
+    if (isStreaming) {
+      stop();
+    }
+
     sendMessage({ role: "user", parts });
     if (!firstMessageSent.current) {
       firstMessageSent.current = true;
       onFirstMessage(text);
     }
-  }, [input, isStreaming, sendMessage, onFirstMessage]);
+  }, [input, isStreaming, sendMessage, stop, onFirstMessage]);
 
   const handleInsertFile = useCallback((path: string) => {
     setInput((prev) => {
@@ -163,21 +169,20 @@ export function Chat({
             >
               <ListIcon size={20} />
             </button>
-            <h1 className="text-lg font-semibold text-kumo-default">AI Chat</h1>
-            <Badge variant="secondary" className="hidden sm:inline-flex">
-              <CloudSunIcon size={12} weight="bold" className="mr-1" />
-              Tools + Approval
-            </Badge>
+            <h1 className="text-sm sm:text-lg font-semibold text-kumo-default">
+              Work With Your Agent
+            </h1>
           </div>
           <div className="flex items-center gap-3">
             <ConnectionIndicator status={connectionStatus} />
-            <button
+            <Button
+              variant="secondary"
+              icon={<FolderIcon size={16} />}
               onClick={() => setFileManagerOpen(true)}
-              className="p-1.5 rounded-lg hover:bg-kumo-elevated text-kumo-secondary hover:text-kumo-default transition-colors"
               title="Files"
             >
-              <FolderIcon size={18} />
-            </button>
+              Files
+            </Button>
             <ModeToggle />
             <Button
               variant="secondary"
@@ -286,19 +291,33 @@ export function Chat({
                   send();
                 }
               }}
-              placeholder="Try: What's the weather in Paris?"
-              disabled={!isConnected || isStreaming}
+              placeholder={
+                isStreaming
+                  ? "Type to interrupt..."
+                  : "Try: What's the weather in Paris?"
+              }
+              disabled={!isConnected}
               rows={2}
               className="flex-1 !ring-0 focus:!ring-0 !shadow-none !bg-transparent !outline-none"
             />
+            {isStreaming && (
+              <Button
+                type="button"
+                variant="secondary"
+                shape="square"
+                aria-label="Stop generation"
+                icon={<StopIcon size={18} />}
+                onClick={() => stop()}
+                className="mb-0.5"
+              />
+            )}
             <Button
               type="submit"
               variant="primary"
               shape="square"
               aria-label="Send message"
-              disabled={!input.trim() || !isConnected || isStreaming}
+              disabled={!input.trim() || !isConnected}
               icon={<PaperPlaneRightIcon size={18} />}
-              loading={isStreaming}
               className="mb-0.5"
             />
           </div>

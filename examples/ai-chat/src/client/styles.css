@@ -35,4 +35,14 @@ body,
   --tw-prose-bold: inherit;
   --tw-prose-counters: inherit;
   --tw-prose-bullets: inherit;
+  --tw-prose-links: inherit;
+  --tw-prose-code: inherit;
+  --tw-prose-pre-code: inherit;
+  --tw-prose-pre-bg: var(--color-kumo-elevated);
+  --tw-prose-quotes: inherit;
+  --tw-prose-quote-borders: currentColor;
+  --tw-prose-captions: inherit;
+  --tw-prose-th-borders: currentColor;
+  --tw-prose-td-borders: currentColor;
+  --tw-prose-hr: currentColor;
 }

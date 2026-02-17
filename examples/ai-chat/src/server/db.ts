@@ -65,6 +65,16 @@ export async function getUser(
     .first<User>();
 }
 
+export async function getUserByEmail(
+  db: D1Database,
+  email: string
+): Promise<User | null> {
+  return db
+    .prepare("SELECT * FROM users WHERE email = ?")
+    .bind(email)
+    .first<User>();
+}
+
 export async function listSessions(
   db: D1Database,
   userId: string

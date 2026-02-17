@@ -12,8 +12,11 @@ import { defineCommand } from "just-bash";
 import type { CustomCommand, MountableFs } from "just-bash";
 import type { AgentFS } from "agentfs-sdk/cloudflare";
 import { AgentFsAdapter } from "./agentfs-adapter";
+import { D1FsAdapter } from "./d1-fs-adapter";
+import { R2FsAdapter } from "./r2-fs-adapter";
 import { GitFs } from "./git-fs";
 import { parseGitCredentials, findCredential } from "./git-credentials";
+import { parseFstab } from "./fstab";
 import type { MountOptions } from "./mount";
 
 /**
@@ -43,7 +46,9 @@ export function createMountCommands(
       const mounts = mountableFs.getMounts();
       const lines = mounts.map((m) => {
         let fsType = "unknown";
-        if (m.filesystem instanceof AgentFsAdapter) fsType = "agentfs";
+        if (m.filesystem instanceof D1FsAdapter) fsType = "d1fs";
+        else if (m.filesystem instanceof R2FsAdapter) fsType = "r2fs";
+        else if (m.filesystem instanceof AgentFsAdapter) fsType = "agentfs";
         else if (m.filesystem instanceof GitFs) fsType = "git";
         return `${fsType} on ${m.mountPoint}`;
       });
@@ -107,6 +112,22 @@ export function createMountCommands(
     } catch (err) {
       const msg = err instanceof Error ? err.message : String(err);
       return { stdout: "", stderr: `umount: ${msg}\n`, exitCode: 1 };
+    }
+
+    // Auto-remove from /etc/fstab
+    try {
+      const fstab = (await mountableFs.readFile("/etc/fstab", {
+        encoding: "utf8"
+      })) as string;
+      const lines = fstab.split("\n");
+      const filtered = lines.filter((line) => {
+        const t = line.trim();
+        if (!t || t.startsWith("#")) return true;
+        return t.split(/\s+/)[1] !== mountpoint;
+      });
+      await mountableFs.writeFile("/etc/fstab", filtered.join("\n"));
+    } catch {
+      /* non-fatal: fstab cleanup failure should not break umount */
     }
 
     return { stdout: "", stderr: "", exitCode: 0 };
@@ -210,7 +231,37 @@ async function mountGit(
 
   // Eagerly clone so errors surface at mount time
   return gitFs.init().then(
-    () => ({ stdout: "", stderr: "", exitCode: 0 }),
+    async () => {
+      // Auto-persist to /etc/fstab
+      try {
+        let fstab: string;
+        try {
+          fstab = (await mountableFs.readFile("/etc/fstab", {
+            encoding: "utf8"
+          })) as string;
+        } catch {
+          fstab = "";
+        }
+        const exists = parseFstab(fstab).some(
+          (e) => e.mountPoint === mountpoint
+        );
+        if (!exists) {
+          // Build options field: ref, depth (omit defaults and credentials)
+          const optParts: string[] = [];
+          if (ref !== "main") optParts.push(`ref=${ref}`);
+          if (depth !== 1) optParts.push(`depth=${depth}`);
+          const optsField =
+            optParts.length > 0 ? optParts.join(",") : "defaults";
+          const fstabLine = `${url}  ${mountpoint}  git  ${optsField}  0  0`;
+          if (!fstab.endsWith("\n")) fstab += "\n";
+          fstab += fstabLine + "\n";
+          await mountableFs.writeFile("/etc/fstab", fstab);
+        }
+      } catch {
+        /* non-fatal: fstab persist failure should not break mount */
+      }
+      return { stdout: "", stderr: "", exitCode: 0 };
+    },
     (err) => {
       // Unmount on failure so the mount point isn't left in a broken state
       try {

@@ -5,7 +5,7 @@
  * HMAC-SHA256 signed with AUTH_SECRET env var.
  */
 
-import { findOrCreateUser, getUser } from "./db";
+import { findOrCreateUser, getUser, getUserByEmail } from "./db";
 
 const COOKIE_NAME = "session";
 const COOKIE_MAX_AGE = 30 * 24 * 60 * 60; // 30 days in seconds
@@ -308,13 +308,16 @@ export async function handleAuthRoutes(
       return new Response("Email not yet received", { status: 400 });
     }
 
-    // Use email as user id (stable identifier)
-    const userId = `email:${data.email}`;
-    await findOrCreateUser(env.DB, {
-      id: userId,
-      email: data.email,
-      name: data.email.split("@")[0]
-    });
+    // Reuse existing user if one already exists with this email (e.g. from Google OAuth)
+    const existing = await getUserByEmail(env.DB, data.email);
+    const userId = existing ? existing.id : `email:${data.email}`;
+    if (!existing) {
+      await findOrCreateUser(env.DB, {
+        id: userId,
+        email: data.email,
+        name: data.email.split("@")[0]
+      });
+    }
 
     // Clean up KV
     await env.OTP_KV.delete(`email-login:${token}`);

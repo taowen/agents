@@ -31,25 +31,15 @@ export function buildSystemPrompt(params: {
       "Files in /data persist across sessions (stored in R2 object storage, suitable for large files). " +
       "Files outside these directories only persist within the current session.",
 
-    // fstab / git mounts
-    "/etc/fstab controls what gets mounted on startup. " +
-      "To add a persistent git mount, append to /etc/fstab: " +
-      'echo "https://github.com/user/repo  /mnt/repo  git  ref=main,depth=1  0  0" >> /etc/fstab ' +
-      "(it will be mounted on the next session). " +
-      "You can also mount git repos dynamically for the current session: " +
-      "mkdir -p /mnt/<repo-name> && mount -t git <url> /mnt/<repo-name>. " +
+    // Git mounts (auto-persisted)
+    "mount -t git <url> /mnt/<repo-name> mounts a git repo. " +
+      "The mount is automatically persisted to /etc/fstab, so it will be restored on the next session. " +
+      "umount /mnt/<repo-name> unmounts and automatically removes it from /etc/fstab. " +
       "IMPORTANT: Always mount under /mnt/<name>, never directly to /mnt itself. " +
       "Do NOT mount inside /home/user as it would conflict with persistent storage. " +
       "Options via -o: ref (branch/tag, default main), depth (clone depth, default 1), username, password. " +
-      "For private repos: mount -t git -o username=user,password=token <url> /mnt/<repo-name>. " +
-      "If a GitHub account is connected (via Settings), " +
-      "private GitHub repos are automatically authenticated when mounting.",
-
-    // Git read-write
-    "Git repos mounted via mount -t git are read-write. " +
-      "Any file changes are automatically committed and pushed after each command. " +
-      "If a GitHub account is connected, authentication is automatic. " +
-      "Unmount with: umount /mnt/<repo-name>.",
+      "For private repos: if a GitHub account is connected (via Settings), authentication is automatic. " +
+      "Git mounts are read-write — file changes are automatically committed and pushed after each command.",
 
     // Browser tool
     "You also have a browser tool for browsing real web pages. " +

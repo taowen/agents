@@ -1,6 +1,6 @@
 import { forwardRef } from "react";
 import { Button } from "@cloudflare/kumo";
-import { SunIcon, MoonIcon, MonitorIcon } from "@phosphor-icons/react";
+import { SunIcon, MoonIcon } from "@phosphor-icons/react";
 import { useTheme } from "./hooks";
 
 /* ── ConnectionStatus ──
@@ -44,39 +44,26 @@ export function ConnectionIndicator({ status }: ConnectionStatusProps) {
 }
 
 /* ── ModeToggle ──
-   Cycles through system → light → dark theme modes.
+   Toggles between light and dark theme modes.
    Requires <ThemeProvider> from "@cloudflare/agents-ui/hooks". */
 
 export function ModeToggle() {
   const { mode, setMode } = useTheme();
 
-  const cycle = () => {
-    const modes = ["system", "light", "dark"] as const;
-    const idx = modes.indexOf(mode);
-    setMode(modes[(idx + 1) % modes.length]);
+  const toggle = () => {
+    setMode(mode === "light" ? "dark" : "light");
   };
 
   const icon =
-    mode === "light" ? (
-      <SunIcon size={16} />
-    ) : mode === "dark" ? (
-      <MoonIcon size={16} />
-    ) : (
-      <MonitorIcon size={16} />
-    );
-
-  const label =
-    mode === "light" ? "Light" : mode === "dark" ? "Dark" : "System";
+    mode === "light" ? <SunIcon size={16} /> : <MoonIcon size={16} />;
 
   return (
     <Button
       variant="secondary"
       icon={icon}
-      onClick={cycle}
-      title={`Theme: ${label}`}
-    >
-      {label}
-    </Button>
+      onClick={toggle}
+      title={mode === "light" ? "Light" : "Dark"}
+    />
   );
 }
 

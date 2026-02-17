@@ -116,7 +116,11 @@ export class WebSocketChatTransport<
           type: MessageType.CF_AGENT_CHAT_REQUEST_CANCEL
         })
       );
-      this.activeRequestIds?.delete(requestId);
+      // Keep requestId in activeRequestIds so the onAgentMessage broadcast
+      // handler continues to skip remaining chunks for this request.
+      // Without this, chunks arriving between cancel and server acknowledgment
+      // would be processed as broadcast messages, making the stream appear
+      // to continue after stop().
       abortController.abort();
     });
 
