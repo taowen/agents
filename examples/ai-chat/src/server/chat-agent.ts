@@ -17,14 +17,14 @@ import { z } from "zod";
 import {
   parseFstab,
   DEFAULT_FSTAB,
-  GitFs,
-  parseGitCredentials,
-  findCredential,
   syncDirtyGitMounts,
   createMountCommands,
+  mountEntry,
   D1FsAdapter,
-  R2FsAdapter
+  R2FsAdapter,
+  GoogleDriveFsAdapter
 } from "vfs";
+import type { FsTypeRegistry, FstabEntry } from "vfs";
 import { Bash, InMemoryFs, MountableFs } from "just-bash";
 import { getSettings, type UserSettings } from "./db";
 import {
@@ -81,8 +81,37 @@ class ChatAgentBase extends AIChatAgent {
   }
 
   /**
+   * Build the filesystem type registry for fstab-driven mounting.
+   */
+  private buildFsTypeRegistry(): FsTypeRegistry {
+    return {
+      d1: (entry: FstabEntry) =>
+        new D1FsAdapter(this.env.DB, this.userId!, entry.mountPoint),
+      r2: (entry: FstabEntry) =>
+        this.env.R2
+          ? new R2FsAdapter(this.env.R2, this.userId!, entry.mountPoint)
+          : null,
+      // Legacy compat: treat agentfs as d1
+      agentfs: (entry: FstabEntry) =>
+        new D1FsAdapter(this.env.DB, this.userId!, entry.mountPoint),
+      gdrive: (entry: FstabEntry) =>
+        this.env.GOOGLE_CLIENT_ID && this.env.GOOGLE_CLIENT_SECRET
+          ? new GoogleDriveFsAdapter(
+              this.env.DB,
+              this.userId!,
+              entry.mountPoint,
+              this.env.GOOGLE_CLIENT_ID,
+              this.env.GOOGLE_CLIENT_SECRET,
+              entry.options.root_folder_id || undefined
+            )
+          : null
+    };
+  }
+
+  /**
    * Initialize bash + filesystem for the given userId.
-   * Must be called before first bash exec.
+   * Phase 1 (bootstrap): only mount /etc → D1 so fstab can be read.
+   * Phase 2 (doFstabMount): reads fstab and mounts remaining entries.
    */
   private initBash(userId: string): void {
     if (this.bash && this.userId === userId) return;
@@ -94,23 +123,19 @@ class ChatAgentBase extends AIChatAgent {
     const fs = new MountableFs({ base: inMemoryFs });
     this.mountableFs = fs;
 
-    // Mount /etc and /home/user via D1FsAdapter
+    // Phase 1: bootstrap — mount only /etc so fstab can be read
     const etcFs = new D1FsAdapter(db, userId, "/etc");
-    fs.mount("/etc", etcFs);
+    fs.mount("/etc", etcFs, "d1");
 
-    const homeFs = new D1FsAdapter(db, userId, "/home/user");
-    fs.mount("/home/user", homeFs);
-
-    // Mount /data via R2 (if R2 binding is available)
-    if (this.env.R2) {
-      const dataFs = new R2FsAdapter(this.env.R2, userId, "/data");
-      fs.mount("/data", dataFs);
-    }
+    const mountOptions = {
+      fsTypeRegistry: this.buildFsTypeRegistry(),
+      protectedMounts: ["/etc", "/home/user", "/data"]
+    };
 
     this.bash = new Bash({
       fs,
       customCommands: [
-        ...createMountCommands(fs),
+        ...createMountCommands(fs, undefined, mountOptions),
         createSessionsCommand(db, userId, this.env.ChatAgent)
       ],
       cwd: "/home/user",
@@ -149,15 +174,16 @@ class ChatAgentBase extends AIChatAgent {
   }
 
   /**
-   * Read /etc/fstab via D1FsAdapter, parse entries, mount git entries.
+   * Read /etc/fstab via D1FsAdapter, parse entries, mount remaining entries.
+   * Phase 2 of the two-phase boot: /etc is already mounted from Phase 1.
    */
   private async doFstabMount(): Promise<void> {
     return Sentry.startSpan({ name: "doFstabMount", op: "mount" }, async () => {
       const db = this.env.DB;
       const userId = this.userId!;
 
-      // Batch: check /etc, read fstab, check /home/user, read git-credentials — 1 round trip
-      const [etcRow, fstabRow, homeRow, credRow] = await Sentry.startSpan(
+      // Batch: check /etc, read fstab, check /home/user — 1 round trip
+      const [etcRow, fstabRow, homeRow] = await Sentry.startSpan(
         { name: "fstab.batchRead", op: "db.query" },
         () =>
           db.batch([
@@ -171,12 +197,7 @@ class ChatAgentBase extends AIChatAgent {
               .bind(userId, "/etc/fstab"),
             db
               .prepare("SELECT 1 FROM files WHERE user_id=? AND path=?")
-              .bind(userId, "/home/user"),
-            db
-              .prepare(
-                "SELECT CAST(content AS TEXT) as content FROM files WHERE user_id=? AND path=?"
-              )
-              .bind(userId, "/etc/git-credentials")
+              .bind(userId, "/home/user")
           ])
       );
 
@@ -247,76 +268,57 @@ class ChatAgentBase extends AIChatAgent {
         );
       }
 
-      let gitCredentials: string | null = null;
-      const credResult = credRow.results[0] as
-        | { content: string | null }
-        | undefined;
-      if (credResult?.content) {
-        gitCredentials = credResult.content;
+      // Migration: auto-upgrade old agentfs-only fstab to new d1/r2 format
+      let entries = parseFstab(fstabContent);
+      const hasD1OrR2 = entries.some((e) => e.type === "d1" || e.type === "r2");
+      if (!hasD1OrR2) {
+        // Preserve git mount lines, replace everything else with new default
+        const gitLines = fstabContent.split("\n").filter((line) => {
+          const t = line.trim();
+          if (!t || t.startsWith("#")) return false;
+          return t.split(/\s+/)[2] === "git";
+        });
+        fstabContent = DEFAULT_FSTAB;
+        if (gitLines.length > 0) {
+          fstabContent += gitLines.join("\n") + "\n";
+        }
+        // Write upgraded fstab back to D1
+        try {
+          const encoded = new TextEncoder().encode(fstabContent);
+          await db
+            .prepare(
+              `INSERT INTO files (user_id, path, parent_path, name, content, is_directory, mode, size, mtime)
+               VALUES (?, ?, ?, ?, ?, 0, 33188, ?, unixepoch('now'))
+               ON CONFLICT(user_id, path) DO UPDATE SET content=excluded.content, size=excluded.size, mtime=unixepoch('now')`
+            )
+            .bind(
+              userId,
+              "/etc/fstab",
+              "/etc",
+              "fstab",
+              encoded,
+              encoded.length
+            )
+            .run();
+        } catch (e) {
+          console.error("fstab migration write failed:", e);
+        }
+        entries = parseFstab(fstabContent);
       }
 
-      const entries = parseFstab(fstabContent);
+      // Mount all entries using mountEntry from vfs (skips /etc which is already mounted)
+      const mountOptions = {
+        fsTypeRegistry: this.buildFsTypeRegistry(),
+        protectedMounts: ["/etc", "/home/user", "/data"]
+      };
       for (const entry of entries) {
-        if (entry.type === "agentfs") continue;
-
-        if (entry.type === "git") {
-          const ref = entry.options.ref || "main";
-          const depth = entry.options.depth
-            ? parseInt(entry.options.depth, 10)
-            : 1;
-
-          let username = entry.options.username;
-          let password = entry.options.password;
-
-          if (!username && gitCredentials) {
-            try {
-              const creds = parseGitCredentials(gitCredentials);
-              const match = findCredential(creds, entry.device);
-              if (match) {
-                username = match.username;
-                password = match.password;
-              }
-            } catch (e) {
-              Sentry.captureException(e, { level: "warning" });
-            }
-          }
-
-          const onAuth = username
-            ? () => ({ username: username!, password })
-            : undefined;
-
-          const gitFs = new GitFs({
-            url: entry.device,
-            ref,
-            depth: isNaN(depth) || depth < 1 ? 1 : depth,
-            onAuth
-          });
-
-          try {
-            this.mountableFs.mount(entry.mountPoint, gitFs);
-          } catch (e) {
-            const msg = e instanceof Error ? e.message : String(e);
-            if (msg.includes("already mounted")) continue;
-            console.error(`fstab: failed to mount ${entry.mountPoint}: ${msg}`);
-            continue;
-          }
-
-          try {
-            await Sentry.startSpan(
-              { name: `git.clone ${entry.mountPoint}`, op: "git" },
-              () => gitFs.init()
-            );
-          } catch (e) {
-            const msg = e instanceof Error ? e.message : String(e);
-            console.error(
-              `fstab: clone failed for ${entry.device} at ${entry.mountPoint}: ${msg}`
-            );
-            try {
-              this.mountableFs.unmount(entry.mountPoint);
-            } catch (unmountErr) {
-              Sentry.captureException(unmountErr, { level: "warning" });
-            }
-          }
+        try {
+          await Sentry.startSpan(
+            { name: `mount ${entry.mountPoint} (${entry.type})`, op: "mount" },
+            () => mountEntry(entry, null, this.mountableFs, mountOptions)
+          );
+        } catch (e) {
+          console.error(`fstab: mount failed for ${entry.mountPoint}:`, e);
         }
       }
     });

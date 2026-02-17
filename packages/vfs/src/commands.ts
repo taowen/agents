@@ -5,6 +5,7 @@
  *   mount                              — list mounts
  *   mount -t git [-o ...] <url> <mp>   — mount a git repo
  *   mount -t agentfs [-o ...] <dev> <mp> — mount an agentfs path
+ *   mount -t <type> <dev> <mp>         — mount via FsTypeRegistry
  *   umount <mountpoint>
  */
 
@@ -12,8 +13,6 @@ import { defineCommand } from "just-bash";
 import type { CustomCommand, MountableFs } from "just-bash";
 import type { AgentFS } from "agentfs-sdk/cloudflare";
 import { AgentFsAdapter } from "./agentfs-adapter";
-import { D1FsAdapter } from "./d1-fs-adapter";
-import { R2FsAdapter } from "./r2-fs-adapter";
 import { GitFs } from "./git-fs";
 import { parseGitCredentials, findCredential } from "./git-credentials";
 import { parseFstab } from "./fstab";
@@ -45,11 +44,7 @@ export function createMountCommands(
     if (args.length === 0) {
       const mounts = mountableFs.getMounts();
       const lines = mounts.map((m) => {
-        let fsType = "unknown";
-        if (m.filesystem instanceof D1FsAdapter) fsType = "d1fs";
-        else if (m.filesystem instanceof R2FsAdapter) fsType = "r2fs";
-        else if (m.filesystem instanceof AgentFsAdapter) fsType = "agentfs";
-        else if (m.filesystem instanceof GitFs) fsType = "git";
+        const fsType = m.fsType || "unknown";
         return `${fsType} on ${m.mountPoint}`;
       });
       return {
@@ -87,6 +82,8 @@ export function createMountCommands(
       return mountGit(mountableFs, positional, optsRaw, ctx, options);
     } else if (type === "agentfs") {
       return mountAgentFs(mountableFs, agentFs, positional);
+    } else if (options?.fsTypeRegistry?.[type]) {
+      return mountViaRegistry(mountableFs, type, positional, optsRaw, options);
     } else {
       return {
         stdout: "",
@@ -106,6 +103,14 @@ export function createMountCommands(
     }
 
     const mountpoint = args[0];
+
+    if (options?.protectedMounts?.includes(mountpoint)) {
+      return {
+        stdout: "",
+        stderr: `umount: ${mountpoint}: cannot unmount (protected)\n`,
+        exitCode: 1
+      };
+    }
 
     try {
       mountableFs.unmount(mountpoint);
@@ -223,7 +228,7 @@ async function mountGit(
   });
 
   try {
-    mountableFs.mount(mountpoint, gitFs);
+    mountableFs.mount(mountpoint, gitFs, "git");
   } catch (err) {
     const msg = err instanceof Error ? err.message : String(err);
     return { stdout: "", stderr: `mount: ${msg}\n`, exitCode: 1 };
@@ -307,10 +312,81 @@ function mountAgentFs(
   const adapter = new AgentFsAdapter(agentFs, mountpoint);
 
   try {
-    mountableFs.mount(mountpoint, adapter);
+    mountableFs.mount(mountpoint, adapter, "agentfs");
   } catch (err) {
     const msg = err instanceof Error ? err.message : String(err);
     return { stdout: "", stderr: `mount: ${msg}\n`, exitCode: 1 };
+  }
+
+  return { stdout: "", stderr: "", exitCode: 0 };
+}
+
+// ---- mount -t <registry-type> ----
+
+async function mountViaRegistry(
+  mountableFs: MountableFs,
+  type: string,
+  positional: string[],
+  optsRaw: string | undefined,
+  mountOptions: MountOptions
+) {
+  if (positional.length < 2) {
+    return {
+      stdout: "",
+      stderr: `mount: usage: mount -t ${type} [-o options] <device> <mountpoint>\n`,
+      exitCode: 1
+    };
+  }
+
+  const device = positional[0];
+  const mountpoint = positional[1];
+  const opts = optsRaw ? parseOpts(optsRaw) : {};
+
+  const factory = mountOptions.fsTypeRegistry![type];
+  const filesystem = factory({
+    device,
+    mountPoint: mountpoint,
+    type,
+    options: { ...opts, defaults: "" },
+    dump: 0,
+    pass: 0
+  });
+
+  if (!filesystem) {
+    return {
+      stdout: "",
+      stderr: `mount: filesystem type '${type}' not available\n`,
+      exitCode: 1
+    };
+  }
+
+  try {
+    mountableFs.mount(mountpoint, filesystem, type);
+  } catch (err) {
+    const msg = err instanceof Error ? err.message : String(err);
+    return { stdout: "", stderr: `mount: ${msg}\n`, exitCode: 1 };
+  }
+
+  // Auto-persist to /etc/fstab
+  try {
+    let fstab: string;
+    try {
+      fstab = (await mountableFs.readFile("/etc/fstab", {
+        encoding: "utf8"
+      })) as string;
+    } catch {
+      fstab = "";
+    }
+    const exists = parseFstab(fstab).some((e) => e.mountPoint === mountpoint);
+    if (!exists) {
+      const optsField = optsRaw || "defaults";
+      const fstabLine = `${device}  ${mountpoint}  ${type}  ${optsField}  0  0`;
+      if (!fstab.endsWith("\n")) fstab += "\n";
+      fstab += fstabLine + "\n";
+      await mountableFs.writeFile("/etc/fstab", fstab);
+    }
+  } catch {
+    /* non-fatal: fstab persist failure should not break mount */
   }
 
   return { stdout: "", stderr: "", exitCode: 0 };

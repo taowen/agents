@@ -149,8 +149,13 @@ export const lsCommand: Command = {
             const suffix = classify && stat.isDirectory ? "/" : "";
             stdout += `${path}${suffix}\n`;
           }
-        } catch {
-          stderr += `ls: cannot access '${path}': No such file or directory\n`;
+        } catch (e) {
+          const emsg = e instanceof Error ? e.message : String(e);
+          if (emsg.includes("EACCES") || emsg.includes("EPERM")) {
+            stderr += `ls: cannot access '${path}': ${emsg}\n`;
+          } else {
+            stderr += `ls: cannot access '${path}': No such file or directory\n`;
+          }
           exitCode = 2;
         }
         continue;
@@ -543,7 +548,15 @@ async function listPath(
     }
 
     return { stdout, stderr: "", exitCode: 0 };
-  } catch {
+  } catch (err) {
+    const msg = err instanceof Error ? err.message : String(err);
+    if (msg.includes("EACCES") || msg.includes("EPERM")) {
+      return {
+        stdout: "",
+        stderr: `ls: ${path}: ${msg}\n`,
+        exitCode: 2
+      };
+    }
     return {
       stdout: "",
       stderr: `ls: ${path}: No such file or directory\n`,

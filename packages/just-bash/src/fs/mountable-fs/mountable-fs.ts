@@ -19,6 +19,8 @@ export interface MountConfig {
   mountPoint: string;
   /** The filesystem to mount at this path */
   filesystem: IFileSystem;
+  /** Optional filesystem type label (e.g. "d1", "r2", "git") */
+  fsType?: string;
 }
 
 /**
@@ -37,6 +39,7 @@ export interface MountableFsOptions {
 interface MountEntry {
   mountPoint: string;
   filesystem: IFileSystem;
+  fsType?: string;
 }
 
 /**
@@ -62,8 +65,8 @@ export class MountableFs implements IFileSystem {
 
     // Add initial mounts
     if (options?.mounts) {
-      for (const { mountPoint, filesystem } of options.mounts) {
-        this.mount(mountPoint, filesystem);
+      for (const { mountPoint, filesystem, fsType } of options.mounts) {
+        this.mount(mountPoint, filesystem, fsType);
       }
     }
   }
@@ -75,7 +78,7 @@ export class MountableFs implements IFileSystem {
    * @param filesystem - The filesystem to mount
    * @throws Error if mounting at root '/' or inside an existing mount
    */
-  mount(mountPoint: string, filesystem: IFileSystem): void {
+  mount(mountPoint: string, filesystem: IFileSystem, fsType?: string): void {
     // Validate original path first (before normalization)
     this.validateMountPath(mountPoint);
 
@@ -86,7 +89,8 @@ export class MountableFs implements IFileSystem {
 
     this.mounts.set(normalized, {
       mountPoint: normalized,
-      filesystem
+      filesystem,
+      fsType
     });
   }
 
@@ -109,10 +113,15 @@ export class MountableFs implements IFileSystem {
   /**
    * Get all current mounts.
    */
-  getMounts(): ReadonlyArray<{ mountPoint: string; filesystem: IFileSystem }> {
+  getMounts(): ReadonlyArray<{
+    mountPoint: string;
+    filesystem: IFileSystem;
+    fsType?: string;
+  }> {
     return Array.from(this.mounts.values()).map((entry) => ({
       mountPoint: entry.mountPoint,
-      filesystem: entry.filesystem
+      filesystem: entry.filesystem,
+      fsType: entry.fsType
     }));
   }
 

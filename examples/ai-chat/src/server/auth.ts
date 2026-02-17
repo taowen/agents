@@ -154,7 +154,11 @@ export async function handleAuthRoutes(
     googleUrl.searchParams.set("client_id", env.GOOGLE_CLIENT_ID);
     googleUrl.searchParams.set("redirect_uri", redirectUri);
     googleUrl.searchParams.set("response_type", "code");
-    googleUrl.searchParams.set("scope", "openid email profile");
+    googleUrl.searchParams.set(
+      "scope",
+      "openid email profile https://www.googleapis.com/auth/drive"
+    );
+    googleUrl.searchParams.set("access_type", "offline");
     googleUrl.searchParams.set("state", state);
     return Response.redirect(googleUrl.toString(), 302);
   }
@@ -187,6 +191,8 @@ export async function handleAuthRoutes(
 
     const tokenData = (await tokenRes.json()) as {
       access_token?: string;
+      refresh_token?: string;
+      expires_in?: number;
       error?: string;
     };
     if (!tokenData.access_token) {
@@ -221,6 +227,9 @@ export async function handleAuthRoutes(
       name: profile.name,
       picture: profile.picture
     });
+
+    // Store Google Drive credentials (access_token + refresh_token)
+    await storeGDriveCredentials(env.DB, profile.id, tokenData);
 
     // Set session cookie and redirect
     const cookie = await createSessionCookie(profile.id, env.AUTH_SECRET);
@@ -362,6 +371,98 @@ export async function handleIncomingEmail(
     JSON.stringify({ status: "received", email: from }),
     { expirationTtl: EMAIL_TOKEN_TTL }
   );
+}
+
+/**
+ * Store Google Drive credentials in D1 as /etc/gdrive-credentials.json.
+ * If refresh_token is present (first login or re-consent), store full credentials.
+ * If absent (subsequent logins), update only access_token + expires_at.
+ */
+async function storeGDriveCredentials(
+  db: D1Database,
+  userId: string,
+  tokenData: {
+    access_token?: string;
+    refresh_token?: string;
+    expires_in?: number;
+  }
+): Promise<void> {
+  if (!tokenData.access_token) return;
+
+  const expiresAt = Date.now() + (tokenData.expires_in || 3600) * 1000;
+
+  let credentials: {
+    access_token: string;
+    refresh_token: string;
+    expires_at: number;
+  };
+
+  if (tokenData.refresh_token) {
+    // First authorization or re-consent: store everything
+    credentials = {
+      access_token: tokenData.access_token,
+      refresh_token: tokenData.refresh_token,
+      expires_at: expiresAt
+    };
+  } else {
+    // Subsequent login: keep existing refresh_token, update access_token
+    try {
+      const row = await db
+        .prepare(
+          "SELECT CAST(content AS TEXT) as content FROM files WHERE user_id = ? AND path = ?"
+        )
+        .bind(userId, "/etc/gdrive-credentials.json")
+        .first<{ content: string | null }>();
+      if (row?.content) {
+        const existing = JSON.parse(row.content) as { refresh_token?: string };
+        credentials = {
+          access_token: tokenData.access_token,
+          refresh_token: existing.refresh_token || "",
+          expires_at: expiresAt
+        };
+      } else {
+        // No existing credentials and no refresh_token — store what we have
+        credentials = {
+          access_token: tokenData.access_token,
+          refresh_token: "",
+          expires_at: expiresAt
+        };
+      }
+    } catch {
+      credentials = {
+        access_token: tokenData.access_token,
+        refresh_token: "",
+        expires_at: expiresAt
+      };
+    }
+  }
+
+  const content = JSON.stringify(credentials);
+  const encoded = new TextEncoder().encode(content);
+
+  await db.batch([
+    db
+      .prepare(
+        `INSERT OR IGNORE INTO files (user_id, path, parent_path, name, content, is_directory, mode, size, mtime)
+         VALUES (?, ?, ?, ?, NULL, 1, 16877, 0, unixepoch('now'))`
+      )
+      .bind(userId, "/etc", "/", "etc"),
+    db
+      .prepare(
+        `INSERT INTO files (user_id, path, parent_path, name, content, is_directory, mode, size, mtime)
+         VALUES (?, ?, ?, ?, ?, 0, 33188, ?, unixepoch('now'))
+         ON CONFLICT(user_id, path) DO UPDATE SET
+           content = excluded.content, size = excluded.size, mtime = unixepoch('now')`
+      )
+      .bind(
+        userId,
+        "/etc/gdrive-credentials.json",
+        "/etc",
+        "gdrive-credentials.json",
+        encoded,
+        encoded.length
+      )
+  ]);
 }
 
 /**

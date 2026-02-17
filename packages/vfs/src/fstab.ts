@@ -16,7 +16,9 @@ export interface FstabEntry {
 
 export const DEFAULT_FSTAB = `# /etc/fstab - virtual filesystem table
 # <device>  <mountpoint>  <type>  <options>  <dump>  <pass>
-none  /home/user  agentfs  defaults  0  0
+none  /etc        d1  defaults  0  0
+none  /home/user  d1  defaults  0  0
+none  /data       r2  defaults  0  0
 `;
 
 /**

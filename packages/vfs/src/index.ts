@@ -7,7 +7,7 @@ export type { GitFsOptions } from "./git-fs";
 export { parseFstab, parseOptions, DEFAULT_FSTAB } from "./fstab";
 export type { FstabEntry } from "./fstab";
 export { mountFstabEntries, mountEntry } from "./mount";
-export type { MountOptions } from "./mount";
+export type { MountOptions, FsFactory, FsTypeRegistry } from "./mount";
 export { createMountCommands } from "./commands";
 export { createMockGitServer } from "./mock-git-server";
 export {
@@ -25,3 +25,5 @@ export {
   verifyOAuthState
 } from "./github-oauth";
 export type { GitHubOAuthDeps } from "./github-oauth";
+export { GoogleDriveFsAdapter } from "./gdrive-fs-adapter";
+export { handleGDriveOAuth } from "./gdrive-oauth";

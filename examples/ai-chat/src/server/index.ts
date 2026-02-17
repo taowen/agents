@@ -4,6 +4,7 @@ import { handleAuthRoutes, requireAuth, handleIncomingEmail } from "./auth";
 import { handleApiRoutes } from "./api";
 import { handleLlmRoutes } from "./llm-proxy";
 import { handleGitHubOAuth } from "./github-oauth";
+import { handleGDriveOAuth } from "vfs";
 
 export { ChatAgent } from "./chat-agent";
 
@@ -34,6 +35,10 @@ const sentryHandler = Sentry.withSentry(
       // 4. GitHub OAuth (D1-based, per-user)
       const ghResponse = await handleGitHubOAuth(request, env, userId);
       if (ghResponse) return ghResponse;
+
+      // 4b. Google Drive OAuth
+      const gdriveResponse = await handleGDriveOAuth(request, env, userId);
+      if (gdriveResponse) return gdriveResponse;
 
       // 5. Route to ChatAgent DO with userId + sessionId headers injected
       const headers = new Headers(request.headers);

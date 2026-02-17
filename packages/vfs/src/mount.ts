@@ -11,7 +11,13 @@ import { GitFs } from "./git-fs";
 import { parseFstab, DEFAULT_FSTAB } from "./fstab";
 import { parseGitCredentials, findCredential } from "./git-credentials";
 import type { FstabEntry } from "./fstab";
-import type { MountableFs } from "just-bash";
+import type { IFileSystem, MountableFs } from "just-bash";
+
+/** Factory that creates a filesystem from an fstab entry, or null to skip. */
+export type FsFactory = (entry: FstabEntry) => IFileSystem | null;
+
+/** Registry mapping fstab type names to filesystem factories. */
+export type FsTypeRegistry = Record<string, FsFactory>;
 
 /** Recursively ensure a directory path exists in AgentFS. */
 async function ensureDirRecursive(
@@ -33,6 +39,10 @@ async function ensureDirRecursive(
 
 export interface MountOptions {
   gitHttp?: any; // optional: inject mock HTTP transport for testing
+  /** Registry of filesystem factories keyed by fstab type name. */
+  fsTypeRegistry?: FsTypeRegistry;
+  /** Mount points that cannot be umounted (e.g. ["/etc"]). */
+  protectedMounts?: string[];
 }
 
 /**
@@ -40,24 +50,29 @@ export interface MountOptions {
  * If /etc/fstab doesn't exist, writes the default one first.
  */
 export async function mountFstabEntries(
-  agentFs: AgentFS,
+  agentFs: AgentFS | null,
   mountableFs: MountableFs,
   options?: MountOptions
 ): Promise<void> {
-  // Ensure /etc directory exists in AgentFS
-  await ensureDirRecursive(agentFs, "/etc");
+  if (agentFs) {
+    // Ensure /etc directory exists in AgentFS
+    await ensureDirRecursive(agentFs, "/etc");
+  }
 
   // Read /etc/fstab — if missing, write default
   let fstabContent: string;
   try {
-    const data = await agentFs.readFile("/etc/fstab");
-    fstabContent =
-      typeof data === "string" ? data : new TextDecoder().decode(data);
+    const data = await mountableFs.readFile("/etc/fstab", { encoding: "utf8" });
+    fstabContent = typeof data === "string" ? data : String(data);
   } catch (e) {
     const msg = e instanceof Error ? e.message : String(e);
     if (msg.includes("ENOENT") || msg.includes("not found")) {
       fstabContent = DEFAULT_FSTAB;
-      await agentFs.writeFile("/etc/fstab", fstabContent);
+      try {
+        await mountableFs.writeFile("/etc/fstab", fstabContent);
+      } catch {
+        // /etc may not be mounted yet during bootstrap
+      }
     } else {
       throw e;
     }
@@ -75,14 +90,18 @@ export async function mountFstabEntries(
  */
 export async function mountEntry(
   entry: FstabEntry,
-  agentFs: AgentFS,
+  agentFs: AgentFS | null,
   mountableFs: MountableFs,
   options?: MountOptions
 ): Promise<void> {
   if (entry.type === "agentfs") {
+    if (!agentFs) {
+      console.error(`fstab: agentfs not available for ${entry.mountPoint}`);
+      return;
+    }
     const adapter = new AgentFsAdapter(agentFs, entry.mountPoint);
     try {
-      mountableFs.mount(entry.mountPoint, adapter);
+      mountableFs.mount(entry.mountPoint, adapter, "agentfs");
     } catch (e) {
       const msg = e instanceof Error ? e.message : String(e);
       // Already mounted (e.g. /etc) — skip
@@ -95,8 +114,8 @@ export async function mountEntry(
     const ref = entry.options.ref || "main";
     const depth = entry.options.depth ? parseInt(entry.options.depth, 10) : 1;
 
-    let username = entry.options.username;
-    let password = entry.options.password;
+    let username: string | undefined = entry.options.username;
+    let password: string | undefined = entry.options.password;
 
     // Fallback: read /etc/git-credentials
     if (!username) {
@@ -126,7 +145,7 @@ export async function mountEntry(
     });
 
     try {
-      mountableFs.mount(entry.mountPoint, gitFs);
+      mountableFs.mount(entry.mountPoint, gitFs, "git");
     } catch (e) {
       const msg = e instanceof Error ? e.message : String(e);
       if (msg.includes("already mounted")) return;
@@ -147,6 +166,18 @@ export async function mountEntry(
       } catch {
         /* ignore */
       }
+    }
+  } else if (options?.fsTypeRegistry?.[entry.type]) {
+    // Registry-based mounting for types like d1, r2, etc.
+    const factory = options.fsTypeRegistry[entry.type];
+    const filesystem = factory(entry);
+    if (!filesystem) return; // factory declined (e.g. R2 binding not available)
+    try {
+      mountableFs.mount(entry.mountPoint, filesystem, entry.type);
+    } catch (e) {
+      const msg = e instanceof Error ? e.message : String(e);
+      if (msg.includes("already mounted")) return;
+      console.error(`fstab: failed to mount ${entry.mountPoint}: ${msg}`);
     }
   }
 }

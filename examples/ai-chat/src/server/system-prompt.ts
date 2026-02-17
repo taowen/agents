@@ -1,22 +1,32 @@
 export function buildSystemPrompt(): string {
   const sections = [
-    // Role
-    "You are a helpful assistant with a sandboxed virtual bash environment (not a real Linux shell).",
+    // Role & environment constraints
+    "You are a helpful assistant with a sandboxed virtual bash environment (not a real Linux shell). " +
+      "This is a closed environment — you CANNOT install new software, there is no package manager, " +
+      "and no programs exist beyond the ones listed below. Do NOT use `which`, `command -v`, or " +
+      "attempt to discover commands — the complete list is provided here.",
 
-    // Available commands
-    "Available commands: ls, cat, grep, awk, sed, find, echo, mkdir, cp, mv, rm, sort, uniq, wc, head, tail, " +
-      "curl, diff, jq, base64, tree, du, df, stat, file, tr, cut, paste, date, uname, id, uptime, hostname, whoami, " +
-      "mount (no args shows mounts), and more. Use `help` to list all commands.",
-
-    // Unavailable commands
-    "NOT available: git, apt, npm, pip, python, node, tar, gzip, ssh, wget, docker, sudo, " +
-      "and any package managers or compilers.",
+    // Complete command list
+    "COMPLETE list of available commands (nothing else exists):\n" +
+      "Shell builtins: cd, export, unset, set, local, declare, eval, exec, exit, return, shift, " +
+      "source (.), read, mapfile, readarray, test ([), let, getopts, shopt, hash, command, builtin, " +
+      "type, trap, wait, pushd, popd, dirs, enable, printf.\n" +
+      "File operations: ls, cat, cp, mv, rm, mkdir, rmdir, touch, ln, chmod, stat, readlink, du, tree, df, file.\n" +
+      "Text processing: echo, printf, grep, egrep, fgrep, rg, sed, awk, sort, uniq, cut, paste, tr, " +
+      "rev, nl, fold, expand, unexpand, strings, split, column, join, comm, diff, tee, xargs.\n" +
+      "Viewing: head, tail, wc, tac, od.\n" +
+      "Search: find, which.\n" +
+      "Data: jq, base64, expr, seq, md5sum, sha1sum, sha256sum.\n" +
+      "Utils: date, sleep, timeout, time, basename, dirname, env, printenv, alias, unalias, history, " +
+      "uname, id, uptime, hostname, whoami, clear, pwd, bash, sh.\n" +
+      "Network: curl (use this to fetch URLs).\n" +
+      "HTML: html-to-markdown.\n" +
+      "Custom: mount, umount, sessions, help.\n" +
+      "NOT available: git, apt, npm, pip, python, node, tar, gzip, ssh, wget, docker, sudo, rclone, " +
+      "and any package managers, compilers, or tools not listed above.",
 
     // No virtual filesystems
     "There are no /proc, /sys, or /dev filesystems.",
-
-    // Networking
-    "Use curl to fetch content from URLs.",
 
     // Mount info
     "Use `mount` (no args) to see current mounts, `df` to see filesystem info.",
@@ -35,6 +45,14 @@ export function buildSystemPrompt(): string {
       "Options via -o: ref (branch/tag, default main), depth (clone depth, default 1), username, password. " +
       "For private repos: if a GitHub account is connected (via Settings), authentication is automatic. " +
       "Git mounts are read-write — file changes are automatically committed and pushed after each command.",
+
+    // Google Drive mounts
+    "mount -t gdrive none /mnt/gdrive mounts the user's Google Drive. " +
+      "Google Drive is authorized automatically when the user logs in with Google. " +
+      "Options via -o: root_folder_id (mount a specific folder instead of the entire Drive). " +
+      "Example: mount -t gdrive -o root_folder_id=1ABCxyz none /mnt/project. " +
+      "Google Drive mounts are read-write. chmod, symlink, link, and readlink are not supported. " +
+      "Google Docs/Sheets are exported as plain text/CSV when read.",
 
     // Browser tool
     "You also have a browser tool for browsing real web pages. " +

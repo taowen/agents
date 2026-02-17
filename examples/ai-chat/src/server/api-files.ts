@@ -1,6 +1,6 @@
 /**
  * File Manager API routes.
- * Routes by filesystem type:
+ * Routes by filesystem type derived from fstab:
  * - git mount paths → forward to ChatAgent DO
  * - D1/R2 paths → handle directly in Worker
  * - virtual paths (/, /home) → synthetic directory listing
@@ -11,15 +11,17 @@ import {
   DEFAULT_FSTAB,
   D1FsAdapter,
   R2FsAdapter,
+  GoogleDriveFsAdapter,
   normalizePath
 } from "vfs";
+import type { FstabEntry } from "vfs";
 import { MIME_TYPES, getExtension } from "../shared/file-utils";
 
-/** Read /etc/fstab and ensure base D1 directories exist (single batch). */
+/** Read /etc/fstab and ensure base D1 directories exist (single batch). Returns parsed entries. */
 async function readFstabAndEnsureDirs(
   db: D1Database,
   userId: string
-): Promise<string> {
+): Promise<{ fstabContent: string; entries: FstabEntry[] }> {
   const mkdirSql = `INSERT OR IGNORE INTO files (user_id, path, parent_path, name, content, is_directory, mode, size, mtime)
      VALUES (?, ?, ?, ?, NULL, 1, 16877, 0, unixepoch('now'))`;
   const results = await db.batch([
@@ -33,7 +35,8 @@ async function readFstabAndEnsureDirs(
     db.prepare(mkdirSql).bind(userId, "/home/user", "/home", "user")
   ]);
   const row = results[0].results[0] as { content: string | null } | undefined;
-  return row?.content || DEFAULT_FSTAB;
+  const fstabContent = row?.content || DEFAULT_FSTAB;
+  return { fstabContent, entries: parseFstab(fstabContent) };
 }
 
 /** Check if path equals or is nested under any mount point. */
@@ -79,23 +82,76 @@ function forwardToDO(
   );
 }
 
-const D1_MOUNTS = ["/etc", "/home/user"];
-
-/** Resolve a D1/R2 adapter and the path relative to the mount root. */
-function resolveAdapter(
+/** Find the longest matching fstab entry for a given path. */
+function findMatchingEntry(
   path: string,
-  env: Env,
-  userId: string
-): { adapter: D1FsAdapter | R2FsAdapter; relPath: string } | null {
-  for (const mp of D1_MOUNTS) {
-    if (path === mp || path.startsWith(mp + "/")) {
-      const relPath = path === mp ? "/" : path.slice(mp.length);
-      return { adapter: new D1FsAdapter(env.DB, userId, mp), relPath };
+  entries: FstabEntry[]
+): { entry: FstabEntry; relPath: string } | null {
+  let bestEntry: FstabEntry | null = null;
+  let bestLength = 0;
+
+  for (const entry of entries) {
+    const mp = entry.mountPoint;
+    if (path === mp) {
+      return { entry, relPath: "/" };
+    }
+    if (path.startsWith(mp + "/") && mp.length > bestLength) {
+      bestEntry = entry;
+      bestLength = mp.length;
     }
   }
-  if (env.R2 && (path === "/data" || path.startsWith("/data/"))) {
-    const relPath = path === "/data" ? "/" : path.slice("/data".length);
-    return { adapter: new R2FsAdapter(env.R2, userId, "/data"), relPath };
+
+  if (bestEntry) {
+    return {
+      entry: bestEntry,
+      relPath: path.slice(bestLength)
+    };
+  }
+  return null;
+}
+
+/** Resolve a D1/R2/GDrive adapter based on fstab entry type. */
+function resolveAdapter(
+  path: string,
+  entries: FstabEntry[],
+  env: Env,
+  userId: string
+): {
+  adapter: D1FsAdapter | R2FsAdapter | GoogleDriveFsAdapter;
+  relPath: string;
+} | null {
+  const match = findMatchingEntry(path, entries);
+  if (!match) return null;
+
+  const { entry, relPath } = match;
+  if (entry.type === "d1" || entry.type === "agentfs") {
+    return {
+      adapter: new D1FsAdapter(env.DB, userId, entry.mountPoint),
+      relPath
+    };
+  }
+  if (entry.type === "r2" && env.R2) {
+    return {
+      adapter: new R2FsAdapter(env.R2, userId, entry.mountPoint),
+      relPath
+    };
+  }
+  if (
+    entry.type === "gdrive" &&
+    env.GOOGLE_CLIENT_ID &&
+    env.GOOGLE_CLIENT_SECRET
+  ) {
+    return {
+      adapter: new GoogleDriveFsAdapter(
+        env.DB,
+        userId,
+        entry.mountPoint,
+        env.GOOGLE_CLIENT_ID,
+        env.GOOGLE_CLIENT_SECRET,
+        entry.options.root_folder_id || undefined
+      ),
+      relPath
+    };
   }
   return null;
 }
@@ -108,11 +164,12 @@ export async function handleFileRoutes(
   const url = new URL(request.url);
   if (!url.pathname.startsWith("/api/files")) return null;
 
-  // Read fstab to find git mount points (also ensures /etc, /home, /home/user exist)
-  const fstabContent = await readFstabAndEnsureDirs(env.DB, userId);
-  const gitMounts = parseFstab(fstabContent)
+  // Read fstab to discover all mount points and their types
+  const { entries } = await readFstabAndEnsureDirs(env.DB, userId);
+  const gitMounts = entries
     .filter((e) => e.type === "git")
     .map((e) => e.mountPoint);
+  const allMounts = entries.map((e) => e.mountPoint);
 
   // Extract target path (mkdir has path in body, others in query)
   let path: string;
@@ -147,8 +204,7 @@ export async function handleFileRoutes(
   }
 
   // D1/R2 or virtual → handle in Worker
-  const allMounts = [...D1_MOUNTS, ...(env.R2 ? ["/data"] : []), ...gitMounts];
-  const resolved = resolveAdapter(path, env, userId);
+  const resolved = resolveAdapter(path, entries, env, userId);
 
   try {
     // GET /api/files/list
@@ -175,7 +231,7 @@ export async function handleFileRoutes(
       const { adapter, relPath } = resolved;
       // Real listing from adapter (use relative path)
       const names = await adapter.readdir(relPath);
-      const entries = await Promise.all(
+      const dirEntries = await Promise.all(
         names.map(async (name: string) => {
           try {
             const child = relPath === "/" ? `/${name}` : `${relPath}/${name}`;
@@ -196,7 +252,7 @@ export async function handleFileRoutes(
       const existing = new Set(names);
       for (const vName of getVirtualChildren(path, gitMounts)) {
         if (!existing.has(vName)) {
-          entries.push({
+          dirEntries.push({
             name: vName,
             isDirectory: true,
             size: 0,
@@ -205,7 +261,7 @@ export async function handleFileRoutes(
         }
       }
 
-      return Response.json({ entries });
+      return Response.json({ entries: dirEntries });
     }
 
     // GET /api/files/content
@@ -216,7 +272,7 @@ export async function handleFileRoutes(
       const buffer = await resolved.adapter.readFileBuffer(resolved.relPath);
       const ext = getExtension(path);
       const contentType = MIME_TYPES[ext] || "application/octet-stream";
-      return new Response(buffer, {
+      return new Response(buffer as unknown as BodyInit, {
         headers: { "Content-Type": contentType }
       });
     }
