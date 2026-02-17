@@ -15,9 +15,9 @@ import type { Connection } from "agents";
 import { MessageType } from "./types";
 
 /** Number of chunks to buffer before flushing to SQLite */
-const CHUNK_BUFFER_SIZE = 10;
+const CHUNK_BUFFER_SIZE = 1000;
 /** Maximum buffer size to prevent memory issues on rapid reconnections */
-const CHUNK_BUFFER_MAX_SIZE = 100;
+const CHUNK_BUFFER_MAX_SIZE = 2000;
 /** Maximum age for a "streaming" stream before considering it stale (ms) - 5 minutes */
 const STREAM_STALE_THRESHOLD_MS = 5 * 60 * 1000;
 /** Default cleanup interval for old streams (ms) - every 10 minutes */
