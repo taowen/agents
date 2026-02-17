@@ -18,6 +18,7 @@ declare namespace Cloudflare {
     GITHUB_CLIENT_ID?: string;
     GITHUB_CLIENT_SECRET?: string;
     SENTRY_DSN?: string;
+    R2?: R2Bucket;
   }
 }
 interface Env extends Cloudflare.Env {}

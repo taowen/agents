@@ -2,7 +2,7 @@ import { useCallback, useState, useEffect, useRef } from "react";
 import { useAgent } from "agents/react";
 import { useAgentChat } from "@cloudflare/ai-chat/react";
 import { isToolUIPart } from "ai";
-import type { UIMessage } from "ai";
+import type { UIMessage, FileUIPart } from "ai";
 import { Button, Badge, InputArea, Empty } from "@cloudflare/kumo";
 import {
   ConnectionIndicator,
@@ -13,9 +13,44 @@ import {
   PaperPlaneRightIcon,
   TrashIcon,
   CloudSunIcon,
-  ListIcon
+  ListIcon,
+  FolderIcon
 } from "@phosphor-icons/react";
+import ReactMarkdown from "react-markdown";
+import remarkGfm from "remark-gfm";
 import { ToolOutput } from "./ToolOutput";
+import { FileManagerPanel } from "./FileManagerPanel";
+import {
+  IMAGE_EXTENSIONS,
+  MIME_TYPES,
+  getExtension
+} from "../shared/file-utils";
+
+const AT_REF_REGEX = /@(\/[\w./-]+\.\w+)/g;
+
+async function fetchImageAsFileUIPart(
+  path: string
+): Promise<FileUIPart | null> {
+  const ext = getExtension(path);
+  if (!IMAGE_EXTENSIONS.has(ext)) return null;
+  const mediaType = MIME_TYPES[ext] || "application/octet-stream";
+  try {
+    const res = await fetch(
+      `/api/files/content?path=${encodeURIComponent(path)}`
+    );
+    if (!res.ok) return null;
+    const blob = await res.blob();
+    const dataUrl = await new Promise<string>((resolve) => {
+      const reader = new FileReader();
+      reader.onloadend = () => resolve(reader.result as string);
+      reader.readAsDataURL(blob);
+    });
+    const filename = path.split("/").pop() || path;
+    return { type: "file", mediaType, url: dataUrl, filename };
+  } catch {
+    return null;
+  }
+}
 
 function getMessageText(message: UIMessage): string {
   return message.parts
@@ -36,6 +71,7 @@ export function Chat({
   const [connectionStatus, setConnectionStatus] =
     useState<ConnectionStatus>("connecting");
   const [input, setInput] = useState("");
+  const [fileManagerOpen, setFileManagerOpen] = useState(false);
   const messagesEndRef = useRef<HTMLDivElement>(null);
   const firstMessageSent = useRef(false);
 
@@ -81,16 +117,39 @@ export function Chat({
     messagesEndRef.current?.scrollIntoView({ behavior: "smooth" });
   }, [messages]);
 
-  const send = useCallback(() => {
+  const send = useCallback(async () => {
     const text = input.trim();
     if (!text || isStreaming) return;
     setInput("");
-    sendMessage({ role: "user", parts: [{ type: "text", text }] });
+
+    // Collect file parts from @references in text
+    const refPaths: string[] = [];
+    for (const m of text.matchAll(AT_REF_REGEX)) {
+      refPaths.push(m[1]);
+    }
+    const refResults = await Promise.all(
+      refPaths.map((p) => fetchImageAsFileUIPart(p))
+    );
+    const fileParts = refResults.filter(Boolean) as FileUIPart[];
+
+    const parts: Array<{ type: "text"; text: string } | FileUIPart> = [
+      { type: "text", text }
+    ];
+    for (const fp of fileParts) parts.push(fp);
+
+    sendMessage({ role: "user", parts });
     if (!firstMessageSent.current) {
       firstMessageSent.current = true;
       onFirstMessage(text);
     }
   }, [input, isStreaming, sendMessage, onFirstMessage]);
+
+  const handleInsertFile = useCallback((path: string) => {
+    setInput((prev) => {
+      const prefix = prev.length > 0 && !prev.endsWith(" ") ? " " : "";
+      return prev + prefix + "@" + path;
+    });
+  }, []);
 
   return (
     <div className="flex flex-col h-screen bg-kumo-elevated">
@@ -112,6 +171,13 @@ export function Chat({
           </div>
           <div className="flex items-center gap-3">
             <ConnectionIndicator status={connectionStatus} />
+            <button
+              onClick={() => setFileManagerOpen(true)}
+              className="p-1.5 rounded-lg hover:bg-kumo-elevated text-kumo-secondary hover:text-kumo-default transition-colors"
+              title="Files"
+            >
+              <FolderIcon size={18} />
+            </button>
             <ModeToggle />
             <Button
               variant="secondary"
@@ -154,13 +220,25 @@ export function Chat({
                   <div className="flex justify-end">
                     <div className="max-w-[85%] px-4 py-2.5 rounded-2xl rounded-br-md bg-kumo-contrast text-kumo-inverse leading-relaxed">
                       {getMessageText(message)}
+                      {message.parts
+                        .filter((p) => p.type === "file")
+                        .map((p, i) => (
+                          <img
+                            key={i}
+                            src={(p as FileUIPart).url}
+                            alt={(p as FileUIPart).filename || "attachment"}
+                            className="max-w-full rounded mt-2"
+                          />
+                        ))}
                     </div>
                   </div>
                 ) : (
                   <div className="flex justify-start">
                     <div className="max-w-[85%] px-4 py-2.5 rounded-2xl rounded-bl-md bg-kumo-base text-kumo-default leading-relaxed">
-                      <div className="whitespace-pre-wrap">
-                        {getMessageText(message)}
+                      <div className="prose prose-sm max-w-none">
+                        <ReactMarkdown remarkPlugins={[remarkGfm]}>
+                          {getMessageText(message)}
+                        </ReactMarkdown>
                         {isLastAssistant && isStreaming && (
                           <span className="inline-block w-0.5 h-[1em] bg-kumo-brand ml-0.5 align-text-bottom animate-blink-cursor" />
                         )}
@@ -226,6 +304,12 @@ export function Chat({
           </div>
         </form>
       </div>
+
+      <FileManagerPanel
+        open={fileManagerOpen}
+        onClose={() => setFileManagerOpen(false)}
+        onInsertFile={handleInsertFile}
+      />
     </div>
   );
 }

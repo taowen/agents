@@ -1,4 +1,7 @@
 export { AgentFsAdapter } from "./agentfs-adapter";
+export { D1FsAdapter } from "./d1-fs-adapter";
+export { R2FsAdapter } from "./r2-fs-adapter";
+export { normalizePath, parentPath, baseName } from "./fs-helpers";
 export { GitFs } from "./git-fs";
 export type { GitFsOptions } from "./git-fs";
 export { parseFstab, parseOptions, DEFAULT_FSTAB } from "./fstab";

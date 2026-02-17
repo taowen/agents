@@ -1,5 +1,9 @@
-import { generateOAuthState, verifyOAuthState, upsertCredential } from "vfs";
-import { D1FsAdapter } from "./d1-fs-adapter";
+import {
+  generateOAuthState,
+  verifyOAuthState,
+  upsertCredential,
+  D1FsAdapter
+} from "vfs";
 import { getSettings, upsertSettings as upsertSettingsDb } from "./db";
 
 export async function handleGitHubOAuth(

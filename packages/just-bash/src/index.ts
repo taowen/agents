@@ -21,6 +21,7 @@ export {
 // Custom commands API
 export type { CustomCommand, LazyCommand } from "./custom-commands.js";
 export { defineCommand } from "./custom-commands.js";
+export { toBuffer, fromBuffer, getEncoding } from "./fs/encoding.js";
 export { InMemoryFs } from "./fs/in-memory-fs/index.js";
 export type {
   BufferEncoding,
@@ -34,8 +35,10 @@ export type {
   FsStat,
   InitialFiles,
   MkdirOptions,
+  ReadFileOptions,
   RmOptions,
-  SymlinkEntry
+  SymlinkEntry,
+  WriteFileOptions
 } from "./fs/interface.js";
 export {
   MountableFs,

@@ -20,10 +20,11 @@ import {
   GitFs,
   parseGitCredentials,
   findCredential,
-  syncDirtyGitMounts
+  syncDirtyGitMounts,
+  D1FsAdapter,
+  R2FsAdapter
 } from "vfs";
 import { Bash, InMemoryFs, MountableFs } from "just-bash";
-import { D1FsAdapter } from "./d1-fs-adapter";
 import { getSettings, type UserSettings } from "./db";
 import {
   createBrowserState,
@@ -32,6 +33,7 @@ import {
 } from "./browser-tool";
 import { createD1MountCommands } from "./mount-commands";
 import { createSessionsCommand } from "./session-commands";
+import { buildSystemPrompt } from "./system-prompt";
 
 /**
  * AI Chat Agent with sandboxed bash tool via just-bash.
@@ -96,6 +98,12 @@ class ChatAgentBase extends AIChatAgent {
 
     const homeFs = new D1FsAdapter(db, userId, "/home/user");
     fs.mount("/home/user", homeFs);
+
+    // Mount /data via R2 (if R2 binding is available)
+    if (this.env.R2) {
+      const dataFs = new R2FsAdapter(this.env.R2, userId, "/data");
+      fs.mount("/data", dataFs);
+    }
 
     this.bash = new Bash({
       fs,
@@ -360,26 +368,6 @@ class ChatAgentBase extends AIChatAgent {
     }
 
     const model = await this.getLlmModel();
-    const bash = tool({
-      description: "Execute a bash command in a sandboxed virtual filesystem.",
-      inputSchema: z.object({
-        command: z.string().describe("The bash command to execute")
-      }),
-      execute: async ({ command }) => {
-        await this.ensureMounted();
-        const result = await this.bash.exec(command);
-        try {
-          await syncDirtyGitMounts(this.mountableFs, command);
-        } catch (e) {
-          result.stderr += `\ngit sync error: ${e instanceof Error ? e.message : e}`;
-        }
-        return {
-          stdout: result.stdout,
-          stderr: result.stderr,
-          exitCode: result.exitCode
-        };
-      }
-    });
 
     const result = await generateText({
       model,
@@ -387,7 +375,7 @@ class ChatAgentBase extends AIChatAgent {
         "You are a scheduled task executor. The following is a scheduled task you need to execute. Complete it and report the result.",
       prompt: payload.prompt,
       tools: {
-        bash,
+        bash: this.createBashTool(),
         browser: createBrowserTool(this.browserState, this.env.MYBROWSER)
       },
       maxSteps: 10
@@ -618,6 +606,205 @@ class ChatAgentBase extends AIChatAgent {
     }
   }
 
+  private createBashTool() {
+    return tool({
+      description:
+        "Execute a bash command in a sandboxed virtual filesystem. " +
+        "Supports ls, grep, awk, sed, find, cat, echo, mkdir, cp, mv, sort, uniq, wc, head, tail, curl, and more. " +
+        "Use curl to fetch content from URLs. Files persist across commands within the session.",
+      inputSchema: z.object({
+        command: z.string().describe("The bash command to execute")
+      }),
+      execute: async ({ command }) => {
+        return Sentry.startSpan(
+          { name: `bash: ${command.slice(0, 80)}`, op: "tool.bash" },
+          async () => {
+            await Sentry.startSpan({ name: "ensureMounted", op: "mount" }, () =>
+              this.ensureMounted()
+            );
+            const result = await Sentry.startSpan(
+              { name: "bash.exec", op: "exec" },
+              () => this.bash.exec(command)
+            );
+            try {
+              await Sentry.startSpan({ name: "gitSync", op: "git" }, () =>
+                syncDirtyGitMounts(this.mountableFs, command)
+              );
+            } catch (e) {
+              result.stderr += `\ngit sync error: ${e instanceof Error ? e.message : e}`;
+            }
+            return {
+              stdout: result.stdout,
+              stderr: result.stderr,
+              exitCode: result.exitCode
+            };
+          }
+        );
+      }
+    });
+  }
+
+  private async readMemoryBlock(): Promise<string> {
+    const memPaths: [string, string][] = [
+      ["/home/user/.memory/profile.md", "User Profile"],
+      ["/home/user/.memory/preferences.md", "User Preferences"],
+      ["/home/user/.memory/entities.md", "Known Entities"]
+    ];
+    try {
+      const memResults = await this.env.DB.batch(
+        memPaths.map(([p]) =>
+          this.env.DB.prepare(
+            "SELECT CAST(content AS TEXT) as content FROM files WHERE user_id=? AND path=?"
+          ).bind(this.userId!, p)
+        )
+      );
+      const sections: string[] = [];
+      for (let i = 0; i < memPaths.length; i++) {
+        const row = memResults[i].results[0] as
+          | { content: string | null }
+          | undefined;
+        if (row?.content) {
+          sections.push(`## ${memPaths[i][1]}\n${row.content}`);
+        }
+      }
+      if (sections.length > 0) {
+        return "\n\n# Memory\n" + sections.join("\n\n");
+      }
+    } catch (e) {
+      console.error("memory read:", e);
+    }
+    return "";
+  }
+
+  private createTools() {
+    return {
+      bash: this.createBashTool(),
+      browser: createBrowserTool(this.browserState, this.env.MYBROWSER),
+      schedule_task: tool({
+        description:
+          "Schedule a one-time task. Provide EITHER delaySeconds (e.g. 60 for 1 minute) " +
+          "OR scheduledAt (ISO 8601 datetime). Prefer delaySeconds for relative times like 'in 5 minutes'.",
+        inputSchema: z.object({
+          description: z.string().describe("Brief description of the task"),
+          prompt: z
+            .string()
+            .describe(
+              "The detailed prompt/instruction for the AI to execute when the task fires"
+            ),
+          delaySeconds: z
+            .number()
+            .optional()
+            .describe(
+              "Delay in seconds from now. e.g. 60 = 1 minute, 3600 = 1 hour. Use this for relative times."
+            ),
+          scheduledAt: z
+            .string()
+            .optional()
+            .describe(
+              "ISO 8601 datetime string for absolute time, e.g. '2025-06-01T09:00:00Z'"
+            )
+        }),
+        execute: async ({ description, prompt, delaySeconds, scheduledAt }) => {
+          let when: Date | number;
+          if (delaySeconds != null) {
+            if (delaySeconds <= 0)
+              return { error: "delaySeconds must be positive" };
+            when = delaySeconds;
+          } else if (scheduledAt) {
+            when = new Date(scheduledAt);
+            if (when.getTime() <= Date.now())
+              return { error: "Scheduled time must be in the future" };
+          } else {
+            return { error: "Provide either delaySeconds or scheduledAt" };
+          }
+          const s = await this.schedule(when, "executeScheduledTask" as any, {
+            description,
+            prompt
+          });
+          return {
+            success: true,
+            id: s.id,
+            scheduledAt: new Date(s.time * 1000).toISOString(),
+            description
+          };
+        }
+      }),
+      schedule_recurring: tool({
+        description:
+          "Schedule a recurring task using a cron expression. " +
+          "Examples: '0 9 * * *' = daily at 9am UTC, '0 */2 * * *' = every 2 hours, '0 9 * * 1-5' = weekdays at 9am UTC.",
+        inputSchema: z.object({
+          description: z
+            .string()
+            .describe("Brief description of the recurring task"),
+          prompt: z
+            .string()
+            .describe(
+              "The detailed prompt/instruction for the AI to execute each time"
+            ),
+          cron: z
+            .string()
+            .describe(
+              "Cron expression (5 fields: minute hour day-of-month month day-of-week)"
+            )
+        }),
+        execute: async ({ description, prompt, cron }) => {
+          const s = await this.schedule(cron, "executeScheduledTask" as any, {
+            description,
+            prompt
+          });
+          return {
+            success: true,
+            id: s.id,
+            cron,
+            description,
+            nextRun: new Date(s.time * 1000).toISOString()
+          };
+        }
+      }),
+      manage_tasks: tool({
+        description:
+          "List all scheduled tasks, or cancel a specific task by ID.",
+        inputSchema: z.object({
+          action: z.enum(["list", "cancel"]).describe("Action to perform"),
+          taskId: z
+            .string()
+            .optional()
+            .describe("Task ID to cancel (required for cancel action)")
+        }),
+        execute: async ({ action, taskId }) => {
+          if (action === "list") {
+            const schedules = this.getSchedules();
+            return schedules.map((s) => {
+              let description = "";
+              try {
+                const p =
+                  typeof s.payload === "string"
+                    ? JSON.parse(s.payload)
+                    : s.payload;
+                description = p.description || "";
+              } catch {}
+              return {
+                id: s.id,
+                type: s.type,
+                description,
+                nextRun: new Date(s.time * 1000).toISOString(),
+                ...(s.type === "cron" ? { cron: (s as any).cron } : {})
+              };
+            });
+          }
+          if (action === "cancel" && taskId) {
+            const ok = await this.cancelSchedule(taskId);
+            return ok
+              ? { success: true, cancelled: taskId }
+              : { error: "Task not found" };
+          }
+          return { error: "Invalid action or missing taskId" };
+        }
+      })
+    };
+  }
+
   async onChatMessage() {
     return Sentry.startSpan({ name: "onChatMessage", op: "chat" }, async () => {
       // Ensure we have userId + sessionUuid (may need recovery after hibernation)
@@ -640,37 +827,7 @@ class ChatAgentBase extends AIChatAgent {
       );
 
       const llmModel = await this.getLlmModel();
-
-      // Read persistent memory files (single D1 batch)
-      const memPaths: [string, string][] = [
-        ["/home/user/.memory/profile.md", "User Profile"],
-        ["/home/user/.memory/preferences.md", "User Preferences"],
-        ["/home/user/.memory/entities.md", "Known Entities"]
-      ];
-      let memoryBlock = "";
-      try {
-        const memResults = await this.env.DB.batch(
-          memPaths.map(([p]) =>
-            this.env.DB.prepare(
-              "SELECT CAST(content AS TEXT) as content FROM files WHERE user_id=? AND path=?"
-            ).bind(this.userId!, p)
-          )
-        );
-        const sections: string[] = [];
-        for (let i = 0; i < memPaths.length; i++) {
-          const row = memResults[i].results[0] as
-            | { content: string | null }
-            | undefined;
-          if (row?.content) {
-            sections.push(`## ${memPaths[i][1]}\n${row.content}`);
-          }
-        }
-        if (sections.length > 0) {
-          memoryBlock = "\n\n# Memory\n" + sections.join("\n\n");
-        }
-      } catch (e) {
-        console.error("memory read:", e);
-      }
+      const memoryBlock = await this.readMemoryBlock();
 
       const messages = await Sentry.startSpan(
         { name: "convertMessages", op: "serialize" },
@@ -684,231 +841,12 @@ class ChatAgentBase extends AIChatAgent {
 
       const result = streamText({
         model: llmModel,
-        system:
-          "You are a helpful assistant with a sandboxed virtual bash environment (not a real Linux shell). " +
-          "Available commands: ls, cat, grep, awk, sed, find, echo, mkdir, cp, mv, rm, sort, uniq, wc, head, tail, " +
-          "curl, diff, jq, base64, tree, du, df, stat, file, tr, cut, paste, date, uname, id, uptime, hostname, whoami, " +
-          "mount (no args shows mounts), and more. Use `help` to list all commands. " +
-          "NOT available: git, apt, npm, pip, python, node, tar, gzip, ssh, wget, docker, sudo, " +
-          "and any package managers or compilers. " +
-          "There are no /proc, /sys, or /dev filesystems. " +
-          "Use curl to fetch content from URLs. " +
-          "Use `mount` (no args) to see current mounts, `df` to see filesystem info. " +
-          "Files in /home/user and /etc persist across sessions (stored in durable storage). " +
-          "Files outside these directories only persist within the current session. " +
-          "/etc/fstab controls what gets mounted on startup. " +
-          "To add a persistent git mount, append to /etc/fstab: " +
-          'echo "https://github.com/user/repo  /mnt/repo  git  ref=main,depth=1  0  0" >> /etc/fstab ' +
-          "(it will be mounted on the next session). " +
-          "You can also mount git repos dynamically for the current session: " +
-          "mkdir -p /mnt/<repo-name> && mount -t git <url> /mnt/<repo-name>. " +
-          "IMPORTANT: Always mount under /mnt/<name>, never directly to /mnt itself. " +
-          "Do NOT mount inside /home/user as it would conflict with persistent storage. " +
-          "Options via -o: ref (branch/tag, default main), depth (clone depth, default 1), username, password. " +
-          "For private repos: mount -t git -o username=user,password=token <url> /mnt/<repo-name>. " +
-          "If a GitHub account is connected (via Settings), " +
-          "private GitHub repos are automatically authenticated when mounting. " +
-          "Git repos mounted via mount -t git are read-write. " +
-          "Any file changes are automatically committed and pushed after each command. " +
-          "If a GitHub account is connected, authentication is automatic. " +
-          "Unmount with: umount /mnt/<repo-name>. " +
-          "You also have a browser tool for browsing real web pages. " +
-          "Use the browser tool when you need to interact with SPAs, JavaScript-rendered content, or pages that curl can't handle well. " +
-          "The browser tool supports actions: goto (navigate to URL), click (click an element by CSS selector), " +
-          "type (type text into an input by CSS selector), screenshot (capture current page), " +
-          "scroll (scroll up or down), extract (extract text from page or specific element), " +
-          "set_cookies (inject cookies for authentication - user provides cookie JSON), close (close browser). " +
-          "Each browser action returns a screenshot so you can see the page. " +
-          "For sites requiring login: the user can export cookies from their own browser and provide them. " +
-          "Use set_cookies with the cookies JSON, then goto the target URL to access as the authenticated user. " +
-          "Prefer curl for simple requests; use the browser for complex web pages that need JavaScript rendering. " +
-          "You can schedule tasks for yourself using the schedule_task (one-time) and schedule_recurring (cron) tools. " +
-          "Use manage_tasks to list or cancel scheduled tasks. " +
-          "When a scheduled task fires, you will automatically execute it and the result will appear in the chat. " +
-          "The user's timezone can be determined using the getUserTimezone client tool. " +
-          `Your conversation history is saved to /home/user/.chat/${this.sessionDir}/ as per-message files ` +
-          "(e.g. 0001-user.md, 0002-assistant.md) with tool outputs in tools/. " +
-          "Each session directory has a .meta.md file with title, date, and session UUID. " +
-          "Use ls, cat, or grep on these when you need earlier context. " +
-          "Use the `sessions` command to browse all sessions (supports --last N, --date YYYY-MM, keyword search). " +
-          "Other sessions are in sibling directories under /home/user/.chat/. " +
-          "You have a persistent memory system in /home/user/.memory/ with three files: " +
-          "profile.md (user's name, role, background), " +
-          "preferences.md (coding style, communication habits), " +
-          "entities.md (frequently mentioned projects, people, companies). " +
-          "When you learn important facts about the user, update the relevant file using " +
-          "echo '- fact' >> /home/user/.memory/preferences.md (or profile.md/entities.md). " +
-          "These memory files are automatically loaded into your context at the start of each session." +
-          memoryBlock,
+        system: buildSystemPrompt({
+          sessionDir: this.sessionDir,
+          memoryBlock
+        }),
         messages,
-        tools: {
-          bash: tool({
-            description:
-              "Execute a bash command in a sandboxed virtual filesystem. " +
-              "Supports ls, grep, awk, sed, find, cat, echo, mkdir, cp, mv, sort, uniq, wc, head, tail, curl, and more. " +
-              "Use curl to fetch content from URLs. Files persist across commands within the session.",
-            inputSchema: z.object({
-              command: z.string().describe("The bash command to execute")
-            }),
-            execute: async ({ command }) => {
-              return Sentry.startSpan(
-                { name: `bash: ${command.slice(0, 80)}`, op: "tool.bash" },
-                async () => {
-                  await Sentry.startSpan(
-                    { name: "ensureMounted", op: "mount" },
-                    () => this.ensureMounted()
-                  );
-                  const result = await Sentry.startSpan(
-                    { name: "bash.exec", op: "exec" },
-                    () => this.bash.exec(command)
-                  );
-                  try {
-                    await Sentry.startSpan({ name: "gitSync", op: "git" }, () =>
-                      syncDirtyGitMounts(this.mountableFs, command)
-                    );
-                  } catch (e) {
-                    result.stderr += `\ngit sync error: ${e instanceof Error ? e.message : e}`;
-                  }
-                  return {
-                    stdout: result.stdout,
-                    stderr: result.stderr,
-                    exitCode: result.exitCode
-                  };
-                }
-              );
-            }
-          }),
-          browser: createBrowserTool(this.browserState, this.env.MYBROWSER),
-          schedule_task: tool({
-            description:
-              "Schedule a one-time task. Provide EITHER delaySeconds (e.g. 60 for 1 minute) " +
-              "OR scheduledAt (ISO 8601 datetime). Prefer delaySeconds for relative times like 'in 5 minutes'.",
-            inputSchema: z.object({
-              description: z.string().describe("Brief description of the task"),
-              prompt: z
-                .string()
-                .describe(
-                  "The detailed prompt/instruction for the AI to execute when the task fires"
-                ),
-              delaySeconds: z
-                .number()
-                .optional()
-                .describe(
-                  "Delay in seconds from now. e.g. 60 = 1 minute, 3600 = 1 hour. Use this for relative times."
-                ),
-              scheduledAt: z
-                .string()
-                .optional()
-                .describe(
-                  "ISO 8601 datetime string for absolute time, e.g. '2025-06-01T09:00:00Z'"
-                )
-            }),
-            execute: async ({
-              description,
-              prompt,
-              delaySeconds,
-              scheduledAt
-            }) => {
-              let when: Date | number;
-              if (delaySeconds != null) {
-                if (delaySeconds <= 0)
-                  return { error: "delaySeconds must be positive" };
-                when = delaySeconds;
-              } else if (scheduledAt) {
-                when = new Date(scheduledAt);
-                if (when.getTime() <= Date.now())
-                  return { error: "Scheduled time must be in the future" };
-              } else {
-                return { error: "Provide either delaySeconds or scheduledAt" };
-              }
-              const s = await this.schedule(
-                when,
-                "executeScheduledTask" as any,
-                { description, prompt }
-              );
-              return {
-                success: true,
-                id: s.id,
-                scheduledAt: new Date(s.time * 1000).toISOString(),
-                description
-              };
-            }
-          }),
-          schedule_recurring: tool({
-            description:
-              "Schedule a recurring task using a cron expression. " +
-              "Examples: '0 9 * * *' = daily at 9am UTC, '0 */2 * * *' = every 2 hours, '0 9 * * 1-5' = weekdays at 9am UTC.",
-            inputSchema: z.object({
-              description: z
-                .string()
-                .describe("Brief description of the recurring task"),
-              prompt: z
-                .string()
-                .describe(
-                  "The detailed prompt/instruction for the AI to execute each time"
-                ),
-              cron: z
-                .string()
-                .describe(
-                  "Cron expression (5 fields: minute hour day-of-month month day-of-week)"
-                )
-            }),
-            execute: async ({ description, prompt, cron }) => {
-              const s = await this.schedule(
-                cron,
-                "executeScheduledTask" as any,
-                { description, prompt }
-              );
-              return {
-                success: true,
-                id: s.id,
-                cron,
-                description,
-                nextRun: new Date(s.time * 1000).toISOString()
-              };
-            }
-          }),
-          manage_tasks: tool({
-            description:
-              "List all scheduled tasks, or cancel a specific task by ID.",
-            inputSchema: z.object({
-              action: z.enum(["list", "cancel"]).describe("Action to perform"),
-              taskId: z
-                .string()
-                .optional()
-                .describe("Task ID to cancel (required for cancel action)")
-            }),
-            execute: async ({ action, taskId }) => {
-              if (action === "list") {
-                const schedules = this.getSchedules();
-                return schedules.map((s) => {
-                  let description = "";
-                  try {
-                    const p =
-                      typeof s.payload === "string"
-                        ? JSON.parse(s.payload)
-                        : s.payload;
-                    description = p.description || "";
-                  } catch {}
-                  return {
-                    id: s.id,
-                    type: s.type,
-                    description,
-                    nextRun: new Date(s.time * 1000).toISOString(),
-                    ...(s.type === "cron" ? { cron: (s as any).cron } : {})
-                  };
-                });
-              }
-              if (action === "cancel" && taskId) {
-                const ok = await this.cancelSchedule(taskId);
-                return ok
-                  ? { success: true, cancelled: taskId }
-                  : { error: "Task not found" };
-              }
-              return { error: "Invalid action or missing taskId" };
-            }
-          })
-        },
+        tools: this.createTools(),
         stopWhen: stepCountIs(10)
       });
 

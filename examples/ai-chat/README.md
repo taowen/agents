@@ -1,17 +1,22 @@
 # AI Chat Example
 
-A chat application built with `@cloudflare/ai-chat` featuring a sandboxed bash environment with persistent storage and read-only Git repository mounting.
+A chat application built with `@cloudflare/ai-chat` featuring a sandboxed bash environment with persistent storage (D1 + R2) and read-write Git repository mounting.
 
 ## What it demonstrates
 
-**Server (`src/server.ts`):**
+**Server (`src/server/`):**
 
 - `toUIMessageStreamResponse()` -- the simplest streaming pattern
 - Sandboxed bash tool via `just-bash` (ls, grep, awk, sed, curl, jq, etc.)
-- Persistent `/home/user` directory backed by Durable Object SQLite (via `agentfs-sdk`)
-- In-memory filesystem for everything outside `/home/user` (with pre-created `/mnt` for mount points)
+- Persistent `/home/user` and `/etc` directories backed by D1 (via `D1FsAdapter`)
+- Persistent `/data` directory backed by R2 object storage (via `R2FsAdapter`, suitable for large files)
+- In-memory filesystem for everything outside persistent mounts (with pre-created `/mnt` for mount points)
 - `MountableFs` to combine persistent and ephemeral filesystems
-- Read-only Git repository mounting via `mount -t git <url> /mnt/<repo-name>`
+- Read-write Git repository mounting via `mount -t git <url> /mnt/<repo-name>` (auto commit & push)
+- `/etc/fstab` for declarative mount configuration
+- Browser tool for interacting with JavaScript-rendered web pages
+- Scheduled/recurring task execution
+- Persistent memory system in `/home/user/.memory/`
 - `pruneMessages()` for managing LLM context in long conversations
 - `maxPersistedMessages` for storage management
 
@@ -22,6 +27,17 @@ A chat application built with `@cloudflare/ai-chat` featuring a sandboxed bash e
 - Tool part rendering (executing, completed, approval requested)
 - Kumo design system components
 
+## Storage architecture
+
+| Mount point | Backend | Best for |
+|-------------|---------|----------|
+| `/home/user` | D1 (SQL) | Config, scripts, small text files |
+| `/etc` | D1 (SQL) | System config (fstab, git-credentials) |
+| `/data` | R2 (object storage) | Large files, binary data |
+| `/mnt/*` | Git / in-memory | Git repos, temporary files |
+
+All storage is scoped per user — D1 uses a `user_id` column, R2 uses a `{userId}/` key prefix.
+
 ## Running
 
 ```bash
@@ -31,11 +47,18 @@ npm run dev
 
 Requires a `GOOGLE_AI_API_KEY` environment variable for Gemini 3 Flash.
 
+### Cloudflare resources
+
+- **D1 database** — created automatically or via `wrangler d1 create ai-chat-db`
+- **R2 bucket** — requires R2 enabled on your Cloudflare account, then `wrangler r2 bucket create ai-chat-files`
+
 ## Try it
 
 - "List files in /home/user" -- bash command execution
 - "Create a file called notes.txt with some content" -- files in /home/user persist across sessions
+- "Save a large dataset to /data/export.csv" -- R2-backed storage for big files
 - "Fetch https://example.com and save it" -- curl support with network access
 - "Show me the disk usage of /home/user" -- persistent storage inspection
-- "Mount https://github.com/user/repo and list its files" -- read-only Git repo browsing
+- "Mount https://github.com/user/repo and list its files" -- read-write Git repo browsing
+- Run `mount` -- see all active filesystem mounts (d1fs, r2fs, git)
 - Have a long conversation -- old tool calls are pruned from LLM context automatically

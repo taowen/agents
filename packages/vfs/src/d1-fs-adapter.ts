@@ -6,108 +6,26 @@
  * pattern-matches on.
  */
 
-type BufferEncoding =
-  | "utf8"
-  | "utf-8"
-  | "ascii"
-  | "binary"
-  | "base64"
-  | "hex"
-  | "latin1";
+/// <reference types="@cloudflare/workers-types" />
 
-interface ReadFileOptions {
-  encoding?: BufferEncoding | null;
-}
+import type {
+  IFileSystem,
+  BufferEncoding,
+  FsStat,
+  MkdirOptions,
+  RmOptions,
+  CpOptions,
+  ReadFileOptions,
+  WriteFileOptions
+} from "just-bash";
+import { toBuffer, fromBuffer, getEncoding } from "just-bash";
+import {
+  parentPath,
+  baseName,
+  normalizePath as normalizePathBase
+} from "./fs-helpers";
 
-interface WriteFileOptions {
-  encoding?: BufferEncoding;
-}
-
-interface FsStat {
-  isFile: boolean;
-  isDirectory: boolean;
-  isSymbolicLink: boolean;
-  mode: number;
-  size: number;
-  mtime: Date;
-}
-
-interface MkdirOptions {
-  recursive?: boolean;
-}
-
-interface RmOptions {
-  recursive?: boolean;
-  force?: boolean;
-}
-
-interface CpOptions {
-  recursive?: boolean;
-}
-
-// ---- Helpers ----
-
-const textEncoder = new TextEncoder();
-const textDecoder = new TextDecoder();
-
-function toBuffer(content: string | Uint8Array, encoding?: string): Uint8Array {
-  if (content instanceof Uint8Array) return content;
-  switch (encoding) {
-    case "base64":
-      return Uint8Array.from(atob(content), (c) => c.charCodeAt(0));
-    case "hex": {
-      const bytes = new Uint8Array(content.length / 2);
-      for (let i = 0; i < content.length; i += 2) {
-        bytes[i / 2] = parseInt(content.slice(i, i + 2), 16);
-      }
-      return bytes;
-    }
-    case "binary":
-    case "latin1":
-      return Uint8Array.from(content, (c) => c.charCodeAt(0));
-    default:
-      return textEncoder.encode(content);
-  }
-}
-
-function fromBuffer(buffer: Uint8Array, encoding?: string): string {
-  switch (encoding) {
-    case "base64":
-      return btoa(String.fromCharCode(...buffer));
-    case "hex":
-      return Array.from(buffer)
-        .map((b) => b.toString(16).padStart(2, "0"))
-        .join("");
-    case "binary":
-    case "latin1":
-      return String.fromCharCode(...buffer);
-    default:
-      return textDecoder.decode(buffer);
-  }
-}
-
-function getEncoding(
-  options?: ReadFileOptions | WriteFileOptions | BufferEncoding | null
-): string | undefined {
-  if (options === null || options === undefined) return undefined;
-  if (typeof options === "string") return options;
-  return (options as { encoding?: string }).encoding ?? undefined;
-}
-
-function parentPath(p: string): string {
-  if (p === "/") return "/";
-  const last = p.lastIndexOf("/");
-  return last === 0 ? "/" : p.slice(0, last);
-}
-
-function baseName(p: string): string {
-  const last = p.lastIndexOf("/");
-  return last === -1 ? p : p.slice(last + 1);
-}
-
-// ---- D1FsAdapter ----
-
-export class D1FsAdapter {
+export class D1FsAdapter implements IFileSystem {
   private db: D1Database;
   private userId: string;
   private rootPrefix: string;
@@ -125,19 +43,7 @@ export class D1FsAdapter {
   }
 
   private normalizePath(path: string): string {
-    if (!path || path === "/") {
-      return this.rootPrefix || "/";
-    }
-    let normalized =
-      path.endsWith("/") && path !== "/" ? path.slice(0, -1) : path;
-    if (!normalized.startsWith("/")) normalized = `/${normalized}`;
-    const parts = normalized.split("/").filter((p) => p && p !== ".");
-    const resolved: string[] = [];
-    for (const part of parts) {
-      if (part === "..") resolved.pop();
-      else resolved.push(part);
-    }
-    const relativePath = `/${resolved.join("/")}` || "/";
+    const relativePath = normalizePathBase(path);
     if (this.rootPrefix) {
       return relativePath === "/"
         ? this.rootPrefix

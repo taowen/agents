@@ -1,7 +1,12 @@
-import { GitFs, parseGitCredentials, findCredential } from "vfs";
+import {
+  GitFs,
+  parseGitCredentials,
+  findCredential,
+  D1FsAdapter,
+  R2FsAdapter
+} from "vfs";
 import { MountableFs, defineCommand } from "just-bash";
 import type { CustomCommand } from "just-bash";
-import { D1FsAdapter } from "./d1-fs-adapter";
 
 /**
  * Create mount/umount commands for the D1-backed filesystem.
@@ -18,6 +23,7 @@ export function createD1MountCommands(
         const lines = mounts.map((m) => {
           let fsType = "unknown";
           if (m.filesystem instanceof D1FsAdapter) fsType = "d1fs";
+          else if (m.filesystem instanceof R2FsAdapter) fsType = "r2fs";
           else if (m.filesystem instanceof GitFs) fsType = "git";
           return `${fsType} on ${m.mountPoint}`;
         });

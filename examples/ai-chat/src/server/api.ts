@@ -13,6 +13,7 @@ import {
   upsertSettings
 } from "./db";
 import type { UserSettings } from "./db";
+import { handleFileRoutes } from "./api-files";
 
 export async function handleApiRoutes(
   request: Request,
@@ -196,6 +197,10 @@ export async function handleApiRoutes(
     await env.DB.batch(stmts);
     return Response.json({ ok: true });
   }
+
+  // File Manager routes
+  const fileResponse = await handleFileRoutes(request, env, userId);
+  if (fileResponse) return fileResponse;
 
   return null;
 }
