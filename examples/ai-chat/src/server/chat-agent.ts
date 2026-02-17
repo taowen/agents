@@ -415,7 +415,7 @@ class ChatAgentBase extends AIChatAgent {
       parts: [
         {
           type: "text" as const,
-          text: `[Scheduled Task] ${payload.description}`
+          text: `[Scheduled Task] ${new Date().toISOString()} - ${payload.description}`
         }
       ]
     };
