@@ -15,14 +15,24 @@ import {
 } from "vfs";
 import { MIME_TYPES, getExtension } from "../shared/file-utils";
 
-/** Read /etc/fstab content from D1. */
-async function readFstab(db: D1Database, userId: string): Promise<string> {
-  const row = await db
-    .prepare(
-      "SELECT CAST(content AS TEXT) as content FROM files WHERE user_id=? AND path=?"
-    )
-    .bind(userId, "/etc/fstab")
-    .first<{ content: string | null }>();
+/** Read /etc/fstab and ensure base D1 directories exist (single batch). */
+async function readFstabAndEnsureDirs(
+  db: D1Database,
+  userId: string
+): Promise<string> {
+  const mkdirSql = `INSERT OR IGNORE INTO files (user_id, path, parent_path, name, content, is_directory, mode, size, mtime)
+     VALUES (?, ?, ?, ?, NULL, 1, 16877, 0, unixepoch('now'))`;
+  const results = await db.batch([
+    db
+      .prepare(
+        "SELECT CAST(content AS TEXT) as content FROM files WHERE user_id=? AND path=?"
+      )
+      .bind(userId, "/etc/fstab"),
+    db.prepare(mkdirSql).bind(userId, "/etc", "/", "etc"),
+    db.prepare(mkdirSql).bind(userId, "/home", "/", "home"),
+    db.prepare(mkdirSql).bind(userId, "/home/user", "/home", "user")
+  ]);
+  const row = results[0].results[0] as { content: string | null } | undefined;
   return row?.content || DEFAULT_FSTAB;
 }
 
@@ -71,19 +81,21 @@ function forwardToDO(
 
 const D1_MOUNTS = ["/etc", "/home/user"];
 
-/** Resolve a D1/R2 adapter for the path, or null if no match. */
+/** Resolve a D1/R2 adapter and the path relative to the mount root. */
 function resolveAdapter(
   path: string,
   env: Env,
   userId: string
-): D1FsAdapter | R2FsAdapter | null {
+): { adapter: D1FsAdapter | R2FsAdapter; relPath: string } | null {
   for (const mp of D1_MOUNTS) {
     if (path === mp || path.startsWith(mp + "/")) {
-      return new D1FsAdapter(env.DB, userId, mp);
+      const relPath = path === mp ? "/" : path.slice(mp.length);
+      return { adapter: new D1FsAdapter(env.DB, userId, mp), relPath };
     }
   }
   if (env.R2 && (path === "/data" || path.startsWith("/data/"))) {
-    return new R2FsAdapter(env.R2, userId, "/data");
+    const relPath = path === "/data" ? "/" : path.slice("/data".length);
+    return { adapter: new R2FsAdapter(env.R2, userId, "/data"), relPath };
   }
   return null;
 }
@@ -96,8 +108,8 @@ export async function handleFileRoutes(
   const url = new URL(request.url);
   if (!url.pathname.startsWith("/api/files")) return null;
 
-  // Read fstab to find git mount points
-  const fstabContent = await readFstab(env.DB, userId);
+  // Read fstab to find git mount points (also ensures /etc, /home, /home/user exist)
+  const fstabContent = await readFstabAndEnsureDirs(env.DB, userId);
   const gitMounts = parseFstab(fstabContent)
     .filter((e) => e.type === "git")
     .map((e) => e.mountPoint);
@@ -136,12 +148,12 @@ export async function handleFileRoutes(
 
   // D1/R2 or virtual → handle in Worker
   const allMounts = [...D1_MOUNTS, ...(env.R2 ? ["/data"] : []), ...gitMounts];
-  const adapter = resolveAdapter(path, env, userId);
+  const resolved = resolveAdapter(path, env, userId);
 
   try {
     // GET /api/files/list
     if (url.pathname === "/api/files/list" && request.method === "GET") {
-      if (!adapter) {
+      if (!resolved) {
         // Virtual directory (e.g. "/" or "/home")
         const children = getVirtualChildren(path, allMounts);
         if (children.length === 0) {
@@ -160,12 +172,13 @@ export async function handleFileRoutes(
         });
       }
 
-      // Real listing from adapter
-      const names = await adapter.readdir(path);
+      const { adapter, relPath } = resolved;
+      // Real listing from adapter (use relative path)
+      const names = await adapter.readdir(relPath);
       const entries = await Promise.all(
         names.map(async (name: string) => {
           try {
-            const child = path === "/" ? `/${name}` : `${path}/${name}`;
+            const child = relPath === "/" ? `/${name}` : `${relPath}/${name}`;
             const st = await adapter.stat(child);
             return {
               name,
@@ -197,10 +210,10 @@ export async function handleFileRoutes(
 
     // GET /api/files/content
     if (url.pathname === "/api/files/content" && request.method === "GET") {
-      if (!adapter) {
+      if (!resolved) {
         return Response.json({ error: `ENOENT: ${path}` }, { status: 404 });
       }
-      const buffer = await adapter.readFileBuffer(path);
+      const buffer = await resolved.adapter.readFileBuffer(resolved.relPath);
       const ext = getExtension(path);
       const contentType = MIME_TYPES[ext] || "application/octet-stream";
       return new Response(buffer, {
@@ -210,39 +223,39 @@ export async function handleFileRoutes(
 
     // PUT /api/files/content
     if (url.pathname === "/api/files/content" && request.method === "PUT") {
-      if (!adapter) {
+      if (!resolved) {
         return Response.json(
           { error: `ENOENT: no filesystem at ${path}` },
           { status: 404 }
         );
       }
       const buffer = new Uint8Array(await request.arrayBuffer());
-      await adapter.writeFile(path, buffer);
+      await resolved.adapter.writeFile(resolved.relPath, buffer);
       return Response.json({ ok: true });
     }
 
     // POST /api/files/mkdir
     if (url.pathname === "/api/files/mkdir" && request.method === "POST") {
-      if (!adapter) {
+      if (!resolved) {
         return Response.json(
           { error: `ENOENT: no filesystem at ${path}` },
           { status: 404 }
         );
       }
-      await adapter.mkdir(path, { recursive: true });
+      await resolved.adapter.mkdir(resolved.relPath, { recursive: true });
       return Response.json({ ok: true });
     }
 
     // DELETE /api/files
     if (url.pathname === "/api/files" && request.method === "DELETE") {
-      if (!adapter) {
+      if (!resolved) {
         return Response.json(
           { error: `ENOENT: no filesystem at ${path}` },
           { status: 404 }
         );
       }
       const recursive = url.searchParams.get("recursive") === "1";
-      await adapter.rm(path, { recursive });
+      await resolved.adapter.rm(resolved.relPath, { recursive });
       return Response.json({ ok: true });
     }
 
