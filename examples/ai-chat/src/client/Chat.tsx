@@ -97,18 +97,8 @@ export function Chat({
   } = useAgentChat({
     agent,
     body: {
-      clientVersion: "1.0.0"
-    },
-    onToolCall: async ({ toolCall, addToolOutput }) => {
-      if (toolCall.toolName === "getUserTimezone") {
-        addToolOutput({
-          toolCallId: toolCall.toolCallId,
-          output: {
-            timezone: Intl.DateTimeFormat().resolvedOptions().timeZone,
-            localTime: new Date().toLocaleTimeString()
-          }
-        });
-      }
+      clientVersion: "1.0.0",
+      timezone: Intl.DateTimeFormat().resolvedOptions().timeZone
     }
   });
 
@@ -251,6 +241,27 @@ export function Chat({
                     </div>
                   </div>
                 )}
+
+                {!isUser &&
+                  (message as any).metadata?.usage &&
+                  (() => {
+                    const u = (message as any).metadata.usage;
+                    const cached = u.cacheReadTokens || 0;
+                    const uncached = (u.inputTokens || 0) - cached;
+                    const output = u.outputTokens || 0;
+                    return (
+                      <div className="text-[11px] text-kumo-tertiary mt-1 ml-1 font-mono">
+                        <span className="text-green-500">{cached}</span>
+                        <span className="opacity-50"> cached </span>
+                        <span className="opacity-50">| </span>
+                        <span>{uncached}</span>
+                        <span className="opacity-50"> input </span>
+                        <span className="opacity-50">| </span>
+                        <span className="text-blue-500">{output}</span>
+                        <span className="opacity-50"> output</span>
+                      </div>
+                    );
+                  })()}
 
                 {message.parts
                   .filter((part) => isToolUIPart(part))

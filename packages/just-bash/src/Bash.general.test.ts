@@ -550,6 +550,28 @@ describe("Bash General", () => {
       expect(envVars.FOO).toBe("bar");
       expect(envVars.BAZ).toBe("qux");
     });
+
+    it("should set environment variable with setEnv()", async () => {
+      const env = new Bash();
+      env.setEnv("MY_VAR", "hello");
+      const result = await env.exec("echo $MY_VAR");
+      expect(result.stdout).toBe("hello\n");
+      expect(result.exitCode).toBe(0);
+    });
+
+    it("should overwrite existing env with setEnv()", async () => {
+      const env = new Bash({ env: { FOO: "old" } });
+      env.setEnv("FOO", "new");
+      const result = await env.exec("echo $FOO");
+      expect(result.stdout).toBe("new\n");
+      expect(result.exitCode).toBe(0);
+    });
+
+    it("should reflect setEnv() in getEnv()", async () => {
+      const env = new Bash();
+      env.setEnv("X", "42");
+      expect(env.getEnv().X).toBe("42");
+    });
   });
 
   describe("empty and whitespace", () => {

@@ -337,7 +337,12 @@ class ChatAgentBase extends AIChatAgent {
       const apiKey = this.env.ARK_API_KEY;
       const baseURL = "https://ark.cn-beijing.volces.com/api/v3";
       const model = "doubao-seed-2-0-pro-260215";
-      return createOpenAICompatible({ name: "llm", baseURL, apiKey })(model);
+      return createOpenAICompatible({
+        name: "llm",
+        baseURL,
+        apiKey,
+        includeUsage: true
+      })(model);
     }
 
     let apiKey = this.env.GOOGLE_AI_API_KEY;
@@ -352,16 +357,31 @@ class ChatAgentBase extends AIChatAgent {
     }
 
     return provider === "openai-compatible"
-      ? createOpenAICompatible({ name: "llm", baseURL, apiKey })(model)
+      ? createOpenAICompatible({
+          name: "llm",
+          baseURL,
+          apiKey,
+          includeUsage: true
+        })(model)
       : createGoogleGenerativeAI({ baseURL, apiKey })(model);
   }
 
   /**
    * Callback invoked by the DO alarm for scheduled/recurring tasks.
    */
+  /** Read the user's timezone from DO storage, defaulting to UTC. */
+  private async getTimezone(): Promise<string> {
+    const stored = await this.ctx.storage.get<string>("timezone");
+    return stored || "UTC";
+  }
+
   async executeScheduledTask(
-    payload: { description: string; prompt: string },
-    schedule: Schedule<{ description: string; prompt: string }>
+    payload: { description: string; prompt: string; timezone?: string },
+    schedule: Schedule<{
+      description: string;
+      prompt: string;
+      timezone?: string;
+    }>
   ) {
     // Restore state (memory may be empty after alarm wake)
     if (!this.userId) {
@@ -371,10 +391,15 @@ class ChatAgentBase extends AIChatAgent {
 
     const model = await this.getLlmModel();
 
+    const now = new Date();
+    const tz = payload.timezone || (await this.getTimezone());
+
     const result = await generateText({
       model,
       system:
-        "You are a scheduled task executor. The following is a scheduled task you need to execute. Complete it and report the result.",
+        "You are a scheduled task executor. Execute the task and report the result.\n" +
+        `Current UTC time: ${now.toISOString()}\n` +
+        `User timezone: ${tz}`,
       prompt: payload.prompt,
       tools: {
         bash: this.createBashTool(),
@@ -817,9 +842,11 @@ class ChatAgentBase extends AIChatAgent {
           } else {
             return { error: "Provide either delaySeconds or scheduledAt" };
           }
+          const tz = await this.getTimezone();
           const s = await this.schedule(when, "executeScheduledTask" as any, {
             description,
-            prompt
+            prompt,
+            timezone: tz
           });
           return {
             success: true,
@@ -849,9 +876,11 @@ class ChatAgentBase extends AIChatAgent {
             )
         }),
         execute: async ({ description, prompt, cron }) => {
+          const tz = await this.getTimezone();
           const s = await this.schedule(cron, "executeScheduledTask" as any, {
             description,
-            prompt
+            prompt,
+            timezone: tz
           });
           return {
             success: true,
@@ -905,7 +934,10 @@ class ChatAgentBase extends AIChatAgent {
     };
   }
 
-  async onChatMessage() {
+  async onChatMessage(
+    _onFinish?: unknown,
+    options?: { body?: Record<string, unknown> }
+  ) {
     return Sentry.startSpan({ name: "onChatMessage", op: "chat" }, async () => {
       // Ensure we have userId + sessionUuid (may need recovery after hibernation)
       if (!this.userId) {
@@ -920,6 +952,19 @@ class ChatAgentBase extends AIChatAgent {
       if (!this.sessionUuid) {
         await this.getSessionUuid();
       }
+
+      // Persist client-reported timezone for scheduled tasks and hibernation recovery
+      const clientTz = options?.body?.timezone;
+      if (typeof clientTz === "string" && clientTz) {
+        await this.ctx.storage.put("timezone", clientTz);
+      }
+      const timezone =
+        (typeof clientTz === "string" && clientTz) ||
+        (await this.getTimezone());
+
+      // Configure bash TZ env var and /etc/timezone so commands discover time natively
+      this.bash.setEnv("TZ", timezone);
+      await this.mountableFs.writeFile("/etc/timezone", timezone + "\n");
 
       // Fire-and-forget: sync chat history to /home/user/.chat/
       this.writeChatHistory().catch((e) =>
@@ -939,18 +984,40 @@ class ChatAgentBase extends AIChatAgent {
           })
       );
 
+      // Inject dynamic context as a system message so the static system prompt stays cacheable
+      const dynamicContext = [
+        `Chat history directory: /home/user/.chat/${this.sessionDir}/`,
+        memoryBlock
+      ]
+        .filter(Boolean)
+        .join("\n");
+      messages.unshift({ role: "system", content: dynamicContext });
+
       const result = streamText({
         model: llmModel,
-        system: buildSystemPrompt({
-          sessionDir: this.sessionDir,
-          memoryBlock
-        }),
+        system: buildSystemPrompt(),
         messages,
         tools: this.createTools(),
         stopWhen: stepCountIs(10)
       });
 
-      return result.toUIMessageStreamResponse();
+      return result.toUIMessageStreamResponse({
+        messageMetadata: ({ part }) => {
+          if (part.type === "finish") {
+            return {
+              usage: {
+                inputTokens: part.totalUsage.inputTokens,
+                outputTokens: part.totalUsage.outputTokens,
+                cacheReadTokens:
+                  part.totalUsage.inputTokenDetails?.cacheReadTokens,
+                cacheWriteTokens:
+                  part.totalUsage.inputTokenDetails?.cacheWriteTokens
+              }
+            };
+          }
+          return undefined;
+        }
+      });
     });
   }
 }

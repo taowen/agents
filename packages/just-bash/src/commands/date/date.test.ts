@@ -263,4 +263,84 @@ describe("date", () => {
       expect(result.exitCode).toBe(0);
     });
   });
+
+  describe("TZ environment variable", () => {
+    it("should show timezone abbreviation with TZ set", async () => {
+      const env = new Bash({ env: { TZ: "Asia/Shanghai" } });
+      const result = await env.exec("date +%Z");
+      // Intl may return "CST" or "GMT+8" depending on runtime
+      expect(result.stdout).toMatch(/^(CST|GMT\+8)\n$/);
+      expect(result.exitCode).toBe(0);
+    });
+
+    it("should show +0800 offset for Asia/Shanghai", async () => {
+      const env = new Bash({ env: { TZ: "Asia/Shanghai" } });
+      const result = await env.exec("date +%z");
+      expect(result.stdout).toBe("+0800\n");
+      expect(result.exitCode).toBe(0);
+    });
+
+    it("should show UTC offset for UTC timezone", async () => {
+      const env = new Bash({ env: { TZ: "UTC" } });
+      const result = await env.exec("date +%z");
+      expect(result.stdout).toBe("+0000\n");
+      expect(result.exitCode).toBe(0);
+    });
+
+    it("should show correct date in a fixed timezone", async () => {
+      const env = new Bash({ env: { TZ: "UTC" } });
+      // Use a fixed date at UTC midnight
+      const result = await env.exec("date -d '2025-06-15T00:00:00Z' +%F");
+      expect(result.stdout).toBe("2025-06-15\n");
+      expect(result.exitCode).toBe(0);
+    });
+
+    it("should shift date with TZ for a known UTC time", async () => {
+      const env = new Bash({ env: { TZ: "Asia/Shanghai" } });
+      // UTC midnight should be 08:00 in Asia/Shanghai (UTC+8)
+      const result = await env.exec("date -d '2025-06-15T00:00:00Z' +%H");
+      expect(result.stdout).toBe("08\n");
+      expect(result.exitCode).toBe(0);
+    });
+
+    it("should ignore TZ when -u is used", async () => {
+      const env = new Bash({ env: { TZ: "Asia/Shanghai" } });
+      const result = await env.exec("date -u +%Z");
+      expect(result.stdout).toBe("UTC\n");
+      expect(result.exitCode).toBe(0);
+    });
+
+    it("should ignore TZ when -u is used for offset", async () => {
+      const env = new Bash({ env: { TZ: "Asia/Shanghai" } });
+      const result = await env.exec("date -u +%z");
+      expect(result.stdout).toBe("+0000\n");
+      expect(result.exitCode).toBe(0);
+    });
+
+    it("should respect TZ set via setEnv()", async () => {
+      const env = new Bash();
+      env.setEnv("TZ", "Asia/Shanghai");
+      const result = await env.exec("date +%Z");
+      // Intl may return "CST" or "GMT+8" depending on runtime
+      expect(result.stdout).toMatch(/^(CST|GMT\+8)\n$/);
+      expect(result.exitCode).toBe(0);
+    });
+
+    it("should respect TZ set via export in bash", async () => {
+      const env = new Bash();
+      const result = await env.exec(
+        "export TZ=UTC; date -d '2025-06-15T12:00:00Z' +%H"
+      );
+      expect(result.stdout).toBe("12\n");
+      expect(result.exitCode).toBe(0);
+    });
+
+    it("should handle negative offset timezone", async () => {
+      const env = new Bash({ env: { TZ: "America/New_York" } });
+      const result = await env.exec("date +%z");
+      // New York is either -0500 (EST) or -0400 (EDT)
+      expect(result.stdout).toMatch(/^-0[45]00\n$/);
+      expect(result.exitCode).toBe(0);
+    });
+  });
 });

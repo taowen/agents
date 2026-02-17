@@ -1666,14 +1666,22 @@ export class AIChatAgent<
             // See: https://github.com/cloudflare/agents/issues/677
             let eventToSend: unknown = data;
             if (data.type === "finish" && "finishReason" in data) {
-              const { finishReason, ...rest } = data as {
+              const {
+                finishReason,
+                messageMetadata: existingMeta,
+                ...rest
+              } = data as {
                 finishReason: string;
+                messageMetadata?: Record<string, unknown>;
                 [key: string]: unknown;
               };
               eventToSend = {
                 ...rest,
                 type: "finish",
-                messageMetadata: { finishReason }
+                messageMetadata: {
+                  ...(existingMeta as Record<string, unknown>),
+                  finishReason
+                }
               };
             }
 

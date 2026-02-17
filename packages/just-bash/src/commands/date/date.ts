@@ -4,6 +4,7 @@
 
 import type { Command, CommandContext, ExecResult } from "../../types.js";
 import { hasHelpFlag, showHelp, unknownOption } from "../help.js";
+import { getDatePartsInTz, getTzName, getTzOffset } from "../tz-utils.js";
 
 const dateHelp = {
   name: "date",
@@ -38,13 +39,8 @@ function pad(n: number, w = 2): string {
   return String(n).padStart(w, "0");
 }
 
-function tzOffset(d: Date): string {
-  const off = -d.getTimezoneOffset();
-  const sign = off >= 0 ? "+" : "-";
-  return `${sign}${pad(Math.floor(Math.abs(off) / 60))}${pad(Math.abs(off) % 60)}`;
-}
-
-function formatDate(d: Date, fmt: string, utc: boolean): string {
+function formatDate(d: Date, fmt: string, utc: boolean, tz?: string): string {
+  // g uses 0-based month to match existing format specifier logic (%m = g.m+1)
   const g = utc
     ? {
         Y: d.getUTCFullYear(),
@@ -55,15 +51,28 @@ function formatDate(d: Date, fmt: string, utc: boolean): string {
         S: d.getUTCSeconds(),
         w: d.getUTCDay()
       }
-    : {
-        Y: d.getFullYear(),
-        m: d.getMonth(),
-        D: d.getDate(),
-        H: d.getHours(),
-        M: d.getMinutes(),
-        S: d.getSeconds(),
-        w: d.getDay()
-      };
+    : tz
+      ? (() => {
+          const p = getDatePartsInTz(d, tz);
+          return {
+            Y: p.year,
+            m: p.month - 1,
+            D: p.day,
+            H: p.hour,
+            M: p.minute,
+            S: p.second,
+            w: p.weekday
+          };
+        })()
+      : {
+          Y: d.getFullYear(),
+          m: d.getMonth(),
+          D: d.getDate(),
+          H: d.getHours(),
+          M: d.getMinutes(),
+          S: d.getSeconds(),
+          w: d.getDay()
+        };
 
   let r = "",
     i = 0;
@@ -139,10 +148,14 @@ function formatDate(d: Date, fmt: string, utc: boolean): string {
           r += g.Y;
           break;
         case "z":
-          r += utc ? "+0000" : tzOffset(d);
+          r += utc ? "+0000" : getTzOffset(d, tz);
           break;
         case "Z":
-          r += utc ? "UTC" : Intl.DateTimeFormat().resolvedOptions().timeZone;
+          r += utc
+            ? "UTC"
+            : tz
+              ? getTzName(d, tz)
+              : Intl.DateTimeFormat().resolvedOptions().timeZone;
           break;
         default:
           r += `%${s}`;
@@ -168,7 +181,7 @@ function parseDate(s: string): Date | null {
 
 export const dateCommand: Command = {
   name: "date",
-  async execute(args: string[], _ctx: CommandContext): Promise<ExecResult> {
+  async execute(args: string[], ctx: CommandContext): Promise<ExecResult> {
     if (hasHelpFlag(args)) return showHelp(dateHelp);
 
     let utc = false,
@@ -204,11 +217,14 @@ export const dateCommand: Command = {
         exitCode: 1
       };
 
+    // Read TZ env var (ignored when -u is set)
+    const tz = !utc ? ctx.env.get("TZ") : undefined;
+
     let out: string;
-    if (fmt) out = formatDate(date, fmt, utc);
-    else if (iso) out = formatDate(date, "%Y-%m-%dT%H:%M:%S%z", utc);
-    else if (rfc) out = formatDate(date, "%a, %d %b %Y %H:%M:%S %z", utc);
-    else out = formatDate(date, "%a %b %e %H:%M:%S %Z %Y", utc);
+    if (fmt) out = formatDate(date, fmt, utc, tz);
+    else if (iso) out = formatDate(date, "%Y-%m-%dT%H:%M:%S%z", utc, tz);
+    else if (rfc) out = formatDate(date, "%a, %d %b %Y %H:%M:%S %z", utc, tz);
+    else out = formatDate(date, "%a %b %e %H:%M:%S %Z %Y", utc, tz);
 
     return { stdout: `${out}\n`, stderr: "", exitCode: 0 };
   }

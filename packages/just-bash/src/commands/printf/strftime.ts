@@ -4,6 +4,8 @@
  * Handles date/time formatting for printf's %(...)T directive.
  */
 
+import { getDatePartsInTz, getTzName, getTzOffset } from "../tz-utils.js";
+
 /**
  * Format a timestamp using strftime-like format string.
  */
@@ -40,77 +42,6 @@ export function formatStrftime(
 }
 
 /**
- * Get date/time parts in a specific timezone using Intl.DateTimeFormat.
- * Returns an object with year, month, day, hour, minute, second, weekday.
- */
-function getDatePartsInTimezone(
-  date: Date,
-  tz?: string
-): {
-  year: number;
-  month: number;
-  day: number;
-  hour: number;
-  minute: number;
-  second: number;
-  weekday: number;
-} {
-  const options: Intl.DateTimeFormatOptions = {
-    year: "numeric",
-    month: "2-digit",
-    day: "2-digit",
-    hour: "2-digit",
-    minute: "2-digit",
-    second: "2-digit",
-    weekday: "short",
-    hour12: false,
-    timeZone: tz
-  };
-
-  try {
-    const formatter = new Intl.DateTimeFormat("en-US", options);
-    const parts = formatter.formatToParts(date);
-
-    const getValue = (type: string): string =>
-      parts.find((p) => p.type === type)?.value ?? "";
-
-    // Convert weekday abbreviation to number (0=Sunday, 6=Saturday)
-    // Map prevents prototype pollution
-    const weekdayMap = new Map<string, number>([
-      ["Sun", 0],
-      ["Mon", 1],
-      ["Tue", 2],
-      ["Wed", 3],
-      ["Thu", 4],
-      ["Fri", 5],
-      ["Sat", 6]
-    ]);
-    const weekdayStr = getValue("weekday");
-
-    return {
-      year: Number.parseInt(getValue("year"), 10) || date.getFullYear(),
-      month: Number.parseInt(getValue("month"), 10) || date.getMonth() + 1,
-      day: Number.parseInt(getValue("day"), 10) || date.getDate(),
-      hour: Number.parseInt(getValue("hour"), 10) || date.getHours(),
-      minute: Number.parseInt(getValue("minute"), 10) || date.getMinutes(),
-      second: Number.parseInt(getValue("second"), 10) || date.getSeconds(),
-      weekday: weekdayMap.get(weekdayStr) ?? date.getDay()
-    };
-  } catch {
-    // Fall back to local time if timezone is invalid
-    return {
-      year: date.getFullYear(),
-      month: date.getMonth() + 1,
-      day: date.getDate(),
-      hour: date.getHours(),
-      minute: date.getMinutes(),
-      second: date.getSeconds(),
-      weekday: date.getDay()
-    };
-  }
-}
-
-/**
  * Format a single strftime directive.
  */
 function formatStrftimeDirective(
@@ -118,7 +49,7 @@ function formatStrftimeDirective(
   directive: string,
   tz?: string
 ): string | null {
-  const parts = getDatePartsInTimezone(date, tz);
+  const parts = getDatePartsInTz(date, tz);
 
   const pad = (n: number, width = 2): string => String(n).padStart(width, "0");
 
@@ -267,76 +198,13 @@ function formatStrftimeDirective(
     case "Y":
       return String(parts.year);
     case "z":
-      return getTimezoneOffset(date, tz);
+      return getTzOffset(date, tz);
     case "Z":
-      return getTimezoneName(date, tz);
+      return getTzName(date, tz);
     case "%":
       return "%";
     default:
       return null;
-  }
-}
-
-/**
- * Get the timezone offset in +/-HHMM format.
- */
-function getTimezoneOffset(date: Date, tz?: string): string {
-  if (!tz) {
-    // Use local timezone
-    const offset = -date.getTimezoneOffset();
-    const sign = offset >= 0 ? "+" : "-";
-    const hours = Math.floor(Math.abs(offset) / 60);
-    const mins = Math.abs(offset) % 60;
-    return `${sign}${String(hours).padStart(2, "0")}${String(mins).padStart(2, "0")}`;
-  }
-
-  // For named timezone, we need to get the offset at this specific time
-  // This is complex because timezones have DST
-  try {
-    // Get time string with timezone
-    const formatter = new Intl.DateTimeFormat("en-US", {
-      timeZone: tz,
-      timeZoneName: "longOffset"
-    });
-    const parts = formatter.formatToParts(date);
-    const tzPart = parts.find((p) => p.type === "timeZoneName");
-    if (tzPart) {
-      // Value is like "GMT-08:00" or "GMT+05:30"
-      const match = tzPart.value.match(/GMT([+-])(\d{2}):(\d{2})/);
-      if (match) {
-        return `${match[1]}${match[2]}${match[3]}`;
-      }
-      // Check for UTC case
-      if (tzPart.value === "GMT" || tzPart.value === "UTC") {
-        return "+0000";
-      }
-    }
-  } catch {
-    // Fall through to local offset
-  }
-
-  // Fallback to local timezone offset
-  const offset = -date.getTimezoneOffset();
-  const sign = offset >= 0 ? "+" : "-";
-  const hours = Math.floor(Math.abs(offset) / 60);
-  const mins = Math.abs(offset) % 60;
-  return `${sign}${String(hours).padStart(2, "0")}${String(mins).padStart(2, "0")}`;
-}
-
-/**
- * Get the timezone name abbreviation.
- */
-function getTimezoneName(date: Date, tz?: string): string {
-  try {
-    const formatter = new Intl.DateTimeFormat("en-US", {
-      timeZone: tz,
-      timeZoneName: "short"
-    });
-    const parts = formatter.formatToParts(date);
-    const tzPart = parts.find((p) => p.type === "timeZoneName");
-    return tzPart?.value ?? "UTC";
-  } catch {
-    return "UTC";
   }
 }
 

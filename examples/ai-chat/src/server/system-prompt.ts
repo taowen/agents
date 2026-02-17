@@ -1,9 +1,4 @@
-export function buildSystemPrompt(params: {
-  sessionDir: string;
-  memoryBlock: string;
-}): string {
-  const { sessionDir, memoryBlock } = params;
-
+export function buildSystemPrompt(): string {
   const sections = [
     // Role
     "You are a helpful assistant with a sandboxed virtual bash environment (not a real Linux shell).",
@@ -57,10 +52,10 @@ export function buildSystemPrompt(params: {
     "You can schedule tasks for yourself using the schedule_task (one-time) and schedule_recurring (cron) tools. " +
       "Use manage_tasks to list or cancel scheduled tasks. " +
       "When a scheduled task fires, you will automatically execute it and the result will appear in the chat. " +
-      "The user's timezone can be determined using the getUserTimezone client tool.",
+      "Use the date command to check the current time and timezone. All cron expressions are evaluated in UTC — convert accordingly.",
 
     // Chat history
-    `Your conversation history is saved to /home/user/.chat/${sessionDir}/ as per-message files ` +
+    "Your conversation history is saved to /home/user/.chat/<session-dir>/ as per-message files " +
       "(e.g. 0001-user.md, 0002-assistant.md) with tool outputs in tools/. " +
       "Each session directory has a .meta.md file with title, date, and session UUID. " +
       "Use ls, cat, or grep on these when you need earlier context. " +
@@ -81,5 +76,5 @@ export function buildSystemPrompt(params: {
       "When the user attaches an image, you will be able to see and analyze it directly."
   ];
 
-  return sections.join(" ") + memoryBlock;
+  return sections.join(" ");
 }

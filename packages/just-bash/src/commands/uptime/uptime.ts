@@ -7,15 +7,20 @@
  */
 
 import type { Command, CommandContext, ExecResult } from "../../types.js";
+import { getDatePartsInTz } from "../tz-utils.js";
 
 async function uptimeExecute(
   _args: string[],
-  _ctx: CommandContext
+  ctx: CommandContext
 ): Promise<ExecResult> {
   const now = new Date();
-  const hh = String(now.getHours()).padStart(2, "0");
-  const mm = String(now.getMinutes()).padStart(2, "0");
-  const ss = String(now.getSeconds()).padStart(2, "0");
+  const tz = ctx.env.get("TZ");
+
+  const parts = getDatePartsInTz(now, tz);
+  const hh = String(parts.hour).padStart(2, "0");
+  const mm = String(parts.minute).padStart(2, "0");
+  const ss = String(parts.second).padStart(2, "0");
+
   return {
     stdout: ` ${hh}:${mm}:${ss} up 0 min,  1 user,  load average: 0.00, 0.00, 0.00\n`,
     stderr: "",

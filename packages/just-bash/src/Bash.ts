@@ -610,6 +610,10 @@ export class Bash {
     return mapToRecord(this.state.env);
   }
 
+  setEnv(key: string, value: string): void {
+    this.state.env.set(key, value);
+  }
+
   // biome-ignore lint/suspicious/noExplicitAny: accepts any plugin for untyped API
   registerTransformPlugin(plugin: TransformPlugin<any>): void {
     this.transformPlugins.push(plugin);
