@@ -88,3 +88,20 @@ export function useSettings() {
   } = useSWR<Settings>("/api/settings", fetcher);
   return { settings, isLoading, mutateSettings };
 }
+
+// --- Memory ---
+
+export interface MemoryFiles {
+  profile: string;
+  preferences: string;
+  entities: string;
+}
+
+export function useMemory() {
+  const {
+    data: memory,
+    isLoading,
+    mutate: mutateMemory
+  } = useSWR<MemoryFiles>("/api/memory", fetcher);
+  return { memory, isLoading, mutateMemory };
+}

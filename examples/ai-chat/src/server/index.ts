@@ -30,9 +30,14 @@ export default Sentry.withSentry(
       const ghResponse = await handleGitHubOAuth(request, env, userId);
       if (ghResponse) return ghResponse;
 
-      // 5. Route to ChatAgent DO with userId header injected
+      // 5. Route to ChatAgent DO with userId + sessionId headers injected
       const headers = new Headers(request.headers);
       headers.set("x-user-id", userId);
+      const url = new URL(request.url);
+      const nameMatch = url.pathname.match(/\/agents\/[^/]+\/([^/?]+)/);
+      if (nameMatch) {
+        headers.set("x-session-id", decodeURIComponent(nameMatch[1]));
+      }
       const agentReq = new Request(request.url, {
         method: request.method,
         headers,

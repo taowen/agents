@@ -2,6 +2,7 @@ import { Suspense, useState, useEffect, useRef } from "react";
 import { LoginPage } from "./LoginPage";
 import { SessionSidebar } from "./SessionSidebar";
 import { SettingsPage } from "./SettingsPage";
+import { MemoryPage } from "./MemoryPage";
 import { Chat } from "./Chat";
 import { useAuth, useSessions } from "./api";
 
@@ -16,7 +17,7 @@ function AuthenticatedApp({ user }: { user: UserInfo }) {
   const { sessions, isLoading, createSession, deleteSession, renameSession } =
     useSessions();
   const [activeSessionId, setActiveSessionId] = useState<string | null>(null);
-  const [view, setView] = useState<"chat" | "settings">("chat");
+  const [view, setView] = useState<"chat" | "settings" | "memory">("chat");
   const [sidebarOpen, setSidebarOpen] = useState(false);
   const autoCreatingRef = useRef(false);
 
@@ -130,6 +131,10 @@ function AuthenticatedApp({ user }: { user: UserInfo }) {
     onOpenSettings: () => {
       setView("settings");
       setSidebarOpen(false);
+    },
+    onOpenMemory: () => {
+      setView("memory");
+      setSidebarOpen(false);
     }
   };
 
@@ -156,6 +161,11 @@ function AuthenticatedApp({ user }: { user: UserInfo }) {
       <div className="flex-1 min-w-0">
         {view === "settings" ? (
           <SettingsPage
+            onBack={() => setView("chat")}
+            onOpenSidebar={() => setSidebarOpen(true)}
+          />
+        ) : view === "memory" ? (
+          <MemoryPage
             onBack={() => setView("chat")}
             onOpenSidebar={() => setSidebarOpen(true)}
           />

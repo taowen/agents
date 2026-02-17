@@ -2,6 +2,7 @@ import { useState } from "react";
 import {
   PlusIcon,
   GearIcon,
+  BrainIcon,
   TrashIcon,
   ChatCircleIcon,
   SignOutIcon,
@@ -32,6 +33,7 @@ interface SessionSidebarProps {
   onDeleteSession: (id: string) => void;
   onRenameSession: (id: string, title: string) => void;
   onOpenSettings: () => void;
+  onOpenMemory: () => void;
 }
 
 export function SessionSidebar({
@@ -42,7 +44,8 @@ export function SessionSidebar({
   onSelectSession,
   onDeleteSession,
   onRenameSession,
-  onOpenSettings
+  onOpenSettings,
+  onOpenMemory
 }: SessionSidebarProps) {
   const [editingId, setEditingId] = useState<string | null>(null);
   const [editTitle, setEditTitle] = useState("");
@@ -149,6 +152,15 @@ export function SessionSidebar({
 
       {/* Bottom section */}
       <div className="border-t border-kumo-line p-3 space-y-2">
+        {/* Memory link */}
+        <button
+          onClick={onOpenMemory}
+          className="flex items-center gap-2 w-full px-3 py-2 rounded-lg text-sm text-kumo-secondary hover:bg-kumo-elevated hover:text-kumo-default transition-colors"
+        >
+          <BrainIcon size={14} />
+          <span>Memory</span>
+        </button>
+
         {/* Settings link */}
         <button
           onClick={onOpenSettings}

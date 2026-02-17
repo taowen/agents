@@ -31,6 +31,7 @@ import {
   type BrowserState
 } from "./browser-tool";
 import { createD1MountCommands } from "./mount-commands";
+import { createSessionsCommand } from "./session-commands";
 
 /**
  * AI Chat Agent with sandboxed bash tool via just-bash.
@@ -45,6 +46,7 @@ class ChatAgentBase extends AIChatAgent {
   private mountPromise: Promise<void> | null = null;
   private browserState: BrowserState;
   private userId: string | null = null;
+  private sessionUuid: string | null = null;
   private cachedSettings: {
     data: UserSettings | null;
     fetchedAt: number;
@@ -97,7 +99,10 @@ class ChatAgentBase extends AIChatAgent {
 
     this.bash = new Bash({
       fs,
-      customCommands: createD1MountCommands(fs),
+      customCommands: [
+        ...createD1MountCommands(fs),
+        createSessionsCommand(db, userId, this.env.ChatAgent)
+      ],
       cwd: "/home/user",
       network: { dangerouslyAllowFullInternetAccess: true },
       executionLimits: {
@@ -425,6 +430,27 @@ class ChatAgentBase extends AIChatAgent {
     throw new Error("No userId available");
   }
 
+  /**
+   * Extract sessionUuid from request header, with fallback to DO-local storage.
+   */
+  private async getSessionUuid(request?: Request): Promise<string | null> {
+    if (request) {
+      const sid = request.headers.get("x-session-id");
+      if (sid) {
+        await this.ctx.storage.put("sessionUuid", sid);
+        this.sessionUuid = sid;
+        return sid;
+      }
+    }
+    if (this.sessionUuid) return this.sessionUuid;
+    const stored = await this.ctx.storage.get<string>("sessionUuid");
+    if (stored) {
+      this.sessionUuid = stored;
+      return stored;
+    }
+    return null;
+  }
+
   onError(connection: Connection, error: unknown): void {
     console.error("ChatAgent error:", error);
     if (error instanceof Error) {
@@ -446,15 +472,155 @@ class ChatAgentBase extends AIChatAgent {
     connection: import("agents").Connection,
     ctx: import("agents").ConnectionContext
   ) {
-    // Capture userId from the initial WebSocket upgrade request
+    // Capture userId + sessionUuid from the initial WebSocket upgrade request
     const uid = await this.getUserId(ctx.request);
+    await this.getSessionUuid(ctx.request);
     this.initBash(uid);
     return super.onConnect(connection, ctx);
   }
 
+  /** Short session directory name derived from the DO ID. */
+  private get sessionDir(): string {
+    return this.ctx.id.toString().slice(0, 12);
+  }
+
+  /**
+   * Write chat history to /home/user/.chat/{sessionDir}/ as per-message files.
+   * All writes use INSERT OR IGNORE — only new messages actually hit disk.
+   */
+  private async writeChatHistory() {
+    const userId = this.userId;
+    if (!userId || this.messages.length === 0) return;
+    const db = this.env.DB;
+    const enc = new TextEncoder();
+    const sd = this.sessionDir;
+    const base = `/home/user/.chat/${sd}`;
+    const toolsDir = `${base}/tools`;
+
+    const mkdirSql = `INSERT OR IGNORE INTO files (user_id, path, parent_path, name, content, is_directory, mode, size, mtime)
+       VALUES (?, ?, ?, ?, NULL, 1, 16877, 0, unixepoch('now'))`;
+    const fileSql = `INSERT OR IGNORE INTO files (user_id, path, parent_path, name, content, is_directory, mode, size, mtime)
+       VALUES (?, ?, ?, ?, ?, 0, 33188, ?, unixepoch('now'))`;
+
+    const stmts: D1PreparedStatement[] = [
+      db
+        .prepare(mkdirSql)
+        .bind(userId, "/home/user/.chat", "/home/user", ".chat"),
+      db.prepare(mkdirSql).bind(userId, base, "/home/user/.chat", sd),
+      db.prepare(mkdirSql).bind(userId, toolsDir, base, "tools"),
+      // Ensure .memory/ directory exists
+      db
+        .prepare(mkdirSql)
+        .bind(userId, "/home/user/.memory", "/home/user", ".memory")
+    ];
+
+    // Write .meta.md (INSERT OR IGNORE — only on first write)
+    const firstUserMsg = this.messages.find((m) => m.role === "user");
+    let title = "Untitled";
+    if (firstUserMsg) {
+      for (const part of firstUserMsg.parts) {
+        if (part.type === "text" && part.text) {
+          title = part.text.slice(0, 100).replace(/\n/g, " ");
+          break;
+        }
+      }
+    }
+    const date = new Date().toISOString().slice(0, 10);
+    const sessionUuid = this.sessionUuid || "unknown";
+    const metaContent = `title: ${title}\ndate: ${date}\nsession: ${sessionUuid}\n`;
+    const metaBuf = enc.encode(metaContent);
+    stmts.push(
+      db
+        .prepare(fileSql)
+        .bind(
+          userId,
+          `${base}/.meta.md`,
+          base,
+          ".meta.md",
+          metaBuf,
+          metaBuf.length
+        )
+    );
+
+    for (let i = 0; i < this.messages.length; i++) {
+      const msg = this.messages[i];
+      const num = String(i + 1).padStart(4, "0");
+      let text = "";
+
+      for (const part of msg.parts) {
+        if (part.type === "text") {
+          text += part.text + "\n";
+        } else if ("toolCallId" in part && part.toolCallId) {
+          const p = part as {
+            type: string;
+            toolCallId: string;
+            toolName?: string;
+            input?: Record<string, unknown>;
+            output?: unknown;
+          };
+          const toolName = p.toolName || p.type.replace("tool-", "");
+          const shortId = p.toolCallId.slice(0, 8);
+          const inputStr =
+            toolName === "bash" && p.input?.command
+              ? `\`${p.input.command}\``
+              : JSON.stringify(p.input || {}).slice(0, 100);
+          text += `[${toolName}(${inputStr}) → tools/${shortId}.txt]\n`;
+
+          if (p.output != null) {
+            let output: string;
+            if (
+              toolName === "bash" &&
+              typeof p.output === "object" &&
+              p.output !== null
+            ) {
+              const r = p.output as {
+                stdout?: string;
+                stderr?: string;
+                exitCode?: number;
+              };
+              output = `$ exit ${r.exitCode ?? "?"}\n`;
+              if (r.stdout) output += r.stdout;
+              if (r.stderr) output += `\n--- stderr ---\n${r.stderr}`;
+            } else {
+              output =
+                typeof p.output === "string"
+                  ? p.output
+                  : JSON.stringify(p.output, null, 2);
+            }
+            const buf = enc.encode(output);
+            stmts.push(
+              db
+                .prepare(fileSql)
+                .bind(
+                  userId,
+                  `${toolsDir}/${shortId}.txt`,
+                  toolsDir,
+                  `${shortId}.txt`,
+                  buf,
+                  buf.length
+                )
+            );
+          }
+        }
+      }
+
+      const fileName = `${num}-${msg.role}.md`;
+      const buf = enc.encode(text);
+      stmts.push(
+        db
+          .prepare(fileSql)
+          .bind(userId, `${base}/${fileName}`, base, fileName, buf, buf.length)
+      );
+    }
+
+    for (let i = 0; i < stmts.length; i += 100) {
+      await db.batch(stmts.slice(i, i + 100));
+    }
+  }
+
   async onChatMessage() {
     return Sentry.startSpan({ name: "onChatMessage", op: "chat" }, async () => {
-      // Ensure we have userId (may need recovery after hibernation)
+      // Ensure we have userId + sessionUuid (may need recovery after hibernation)
       if (!this.userId) {
         await Sentry.startSpan(
           { name: "getUserId", op: "db.query" },
@@ -464,8 +630,47 @@ class ChatAgentBase extends AIChatAgent {
           }
         );
       }
+      if (!this.sessionUuid) {
+        await this.getSessionUuid();
+      }
+
+      // Fire-and-forget: sync chat history to /home/user/.chat/
+      this.writeChatHistory().catch((e) =>
+        console.error("writeChatHistory:", e)
+      );
 
       const llmModel = await this.getLlmModel();
+
+      // Read persistent memory files (single D1 batch)
+      const memPaths: [string, string][] = [
+        ["/home/user/.memory/profile.md", "User Profile"],
+        ["/home/user/.memory/preferences.md", "User Preferences"],
+        ["/home/user/.memory/entities.md", "Known Entities"]
+      ];
+      let memoryBlock = "";
+      try {
+        const memResults = await this.env.DB.batch(
+          memPaths.map(([p]) =>
+            this.env.DB.prepare(
+              "SELECT CAST(content AS TEXT) as content FROM files WHERE user_id=? AND path=?"
+            ).bind(this.userId!, p)
+          )
+        );
+        const sections: string[] = [];
+        for (let i = 0; i < memPaths.length; i++) {
+          const row = memResults[i].results[0] as
+            | { content: string | null }
+            | undefined;
+          if (row?.content) {
+            sections.push(`## ${memPaths[i][1]}\n${row.content}`);
+          }
+        }
+        if (sections.length > 0) {
+          memoryBlock = "\n\n# Memory\n" + sections.join("\n\n");
+        }
+      } catch (e) {
+        console.error("memory read:", e);
+      }
 
       const messages = await Sentry.startSpan(
         { name: "convertMessages", op: "serialize" },
@@ -520,7 +725,21 @@ class ChatAgentBase extends AIChatAgent {
           "You can schedule tasks for yourself using the schedule_task (one-time) and schedule_recurring (cron) tools. " +
           "Use manage_tasks to list or cancel scheduled tasks. " +
           "When a scheduled task fires, you will automatically execute it and the result will appear in the chat. " +
-          "The user's timezone can be determined using the getUserTimezone client tool.",
+          "The user's timezone can be determined using the getUserTimezone client tool. " +
+          `Your conversation history is saved to /home/user/.chat/${this.sessionDir}/ as per-message files ` +
+          "(e.g. 0001-user.md, 0002-assistant.md) with tool outputs in tools/. " +
+          "Each session directory has a .meta.md file with title, date, and session UUID. " +
+          "Use ls, cat, or grep on these when you need earlier context. " +
+          "Use the `sessions` command to browse all sessions (supports --last N, --date YYYY-MM, keyword search). " +
+          "Other sessions are in sibling directories under /home/user/.chat/. " +
+          "You have a persistent memory system in /home/user/.memory/ with three files: " +
+          "profile.md (user's name, role, background), " +
+          "preferences.md (coding style, communication habits), " +
+          "entities.md (frequently mentioned projects, people, companies). " +
+          "When you learn important facts about the user, update the relevant file using " +
+          "echo '- fact' >> /home/user/.memory/preferences.md (or profile.md/entities.md). " +
+          "These memory files are automatically loaded into your context at the start of each session." +
+          memoryBlock,
         messages,
         tools: {
           bash: tool({
