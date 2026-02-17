@@ -20,6 +20,7 @@
     "agentfs-sdk": "^0.6.0",
     "agents": "*",
     "just-bash": "file:../../packages/just-bash",
+    "swr": "^2.4.0",
     "vfs": "file:../../packages/vfs"
   },
   "devDependencies": {

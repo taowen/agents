@@ -1,8 +1,9 @@
-import { Suspense, useState, useEffect } from "react";
+import { Suspense, useState, useEffect, useRef } from "react";
 import { LoginPage } from "./LoginPage";
-import { SessionSidebar, type SessionInfo } from "./SessionSidebar";
+import { SessionSidebar } from "./SessionSidebar";
 import { SettingsPage } from "./SettingsPage";
 import { Chat } from "./Chat";
+import { useAuth, useSessions } from "./api";
 
 export interface UserInfo {
   id: string;
@@ -12,33 +13,37 @@ export interface UserInfo {
 }
 
 function AuthenticatedApp({ user }: { user: UserInfo }) {
-  const [sessions, setSessions] = useState<SessionInfo[]>([]);
+  const { sessions, isLoading, createSession, deleteSession, renameSession } =
+    useSessions();
   const [activeSessionId, setActiveSessionId] = useState<string | null>(null);
   const [view, setView] = useState<"chat" | "settings">("chat");
   const [sidebarOpen, setSidebarOpen] = useState(false);
+  const autoCreatingRef = useRef(false);
 
-  // Load sessions on mount
+  // Select first session when sessions load and nothing is active
   useEffect(() => {
-    fetch("/api/sessions")
-      .then((res) => res.json())
-      .then((data: SessionInfo[]) => {
-        setSessions(data);
-        if (data.length > 0) {
-          setActiveSessionId(data[0].id);
-        }
-      })
-      .catch(console.error);
-  }, []);
+    if (sessions && sessions.length > 0 && activeSessionId === null) {
+      setActiveSessionId(sessions[0].id);
+    }
+  }, [sessions, activeSessionId]);
+
+  // Auto-create first session if none exist (only after loading completes)
+  useEffect(() => {
+    if (
+      !isLoading &&
+      sessions &&
+      sessions.length === 0 &&
+      activeSessionId === null &&
+      !autoCreatingRef.current
+    ) {
+      autoCreatingRef.current = true;
+      handleNewSession();
+    }
+  }, [isLoading, sessions, activeSessionId]);
 
   const handleNewSession = async () => {
     try {
-      const res = await fetch("/api/sessions", {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({})
-      });
-      const session = (await res.json()) as SessionInfo;
-      setSessions((prev) => [session, ...prev]);
+      const session = await createSession();
       setActiveSessionId(session.id);
       setView("chat");
     } catch (e) {
@@ -48,10 +53,40 @@ function AuthenticatedApp({ user }: { user: UserInfo }) {
 
   const handleDeleteSession = async (id: string) => {
     try {
-      await fetch(`/api/sessions/${id}`, { method: "DELETE" });
-      setSessions((prev) => prev.filter((s) => s.id !== id));
+      // Check for pending scheduled tasks before deleting
+      const schedRes = await fetch(`/api/sessions/${id}/schedules`);
+      if (schedRes.ok) {
+        const schedules = (await schedRes.json()) as {
+          id: string;
+          type: string;
+          payload?: string | { description?: string };
+          time: number;
+          cron?: string;
+        }[];
+        if (schedules.length > 0) {
+          const lines = schedules.map((s) => {
+            let desc = "";
+            try {
+              const p =
+                typeof s.payload === "string"
+                  ? JSON.parse(s.payload)
+                  : s.payload;
+              desc = p?.description || "unnamed task";
+            } catch {
+              desc = "unnamed task";
+            }
+            const when = new Date(s.time * 1000).toLocaleString();
+            return `- ${desc} (${s.type === "cron" ? `cron: ${s.cron}` : when})`;
+          });
+          const confirmed = window.confirm(
+            `This session has scheduled tasks that will be cancelled:\n\n${lines.join("\n")}\n\nContinue?`
+          );
+          if (!confirmed) return;
+        }
+      }
+      await deleteSession(id);
       if (activeSessionId === id) {
-        const remaining = sessions.filter((s) => s.id !== id);
+        const remaining = (sessions ?? []).filter((s) => s.id !== id);
         setActiveSessionId(remaining.length > 0 ? remaining[0].id : null);
       }
     } catch (e) {
@@ -59,32 +94,26 @@ function AuthenticatedApp({ user }: { user: UserInfo }) {
     }
   };
 
+  const handleRenameSession = async (id: string, title: string) => {
+    try {
+      await renameSession(id, title);
+    } catch (e) {
+      console.error("Failed to rename session:", e);
+    }
+  };
+
   const handleFirstMessage = async (text: string) => {
     if (!activeSessionId) return;
     const title = text.length > 50 ? text.slice(0, 50) + "..." : text;
     try {
-      await fetch(`/api/sessions/${activeSessionId}`, {
-        method: "PATCH",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ title })
-      });
-      setSessions((prev) =>
-        prev.map((s) => (s.id === activeSessionId ? { ...s, title } : s))
-      );
+      await renameSession(activeSessionId, title);
     } catch (e) {
       console.error("Failed to update session title:", e);
     }
   };
 
-  // Auto-create first session if none exist
-  useEffect(() => {
-    if (sessions.length === 0 && activeSessionId === null) {
-      handleNewSession();
-    }
-  }, [sessions.length, activeSessionId]);
-
   const sidebarProps = {
-    sessions,
+    sessions: sessions ?? [],
     activeSessionId,
     user,
     onNewSession: () => {
@@ -97,6 +126,7 @@ function AuthenticatedApp({ user }: { user: UserInfo }) {
       setSidebarOpen(false);
     },
     onDeleteSession: handleDeleteSession,
+    onRenameSession: handleRenameSession,
     onOpenSettings: () => {
       setView("settings");
       setSidebarOpen(false);
@@ -147,26 +177,9 @@ function AuthenticatedApp({ user }: { user: UserInfo }) {
 }
 
 export default function App() {
-  const [authState, setAuthState] = useState<
-    "loading" | "unauthenticated" | "authenticated"
-  >("loading");
-  const [user, setUser] = useState<UserInfo | null>(null);
+  const { user, authenticated, isLoading } = useAuth();
 
-  useEffect(() => {
-    fetch("/auth/status")
-      .then((res) => res.json())
-      .then((data: { authenticated: boolean; user?: UserInfo }) => {
-        if (data.authenticated && data.user) {
-          setUser(data.user);
-          setAuthState("authenticated");
-        } else {
-          setAuthState("unauthenticated");
-        }
-      })
-      .catch(() => setAuthState("unauthenticated"));
-  }, []);
-
-  if (authState === "loading") {
+  if (isLoading) {
     return (
       <div className="flex items-center justify-center h-screen text-kumo-inactive">
         Loading...
@@ -174,7 +187,7 @@ export default function App() {
     );
   }
 
-  if (authState === "unauthenticated") {
+  if (!authenticated) {
     return <LoginPage />;
   }
 

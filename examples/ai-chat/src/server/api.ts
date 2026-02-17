@@ -74,6 +74,17 @@ export async function handleApiRoutes(
     return Response.json({ ok: true });
   }
 
+  // GET /api/sessions/:id/schedules
+  const schedulesMatch = url.pathname.match(
+    /^\/api\/sessions\/([^/]+)\/schedules$/
+  );
+  if (schedulesMatch && request.method === "GET") {
+    const sessionId = schedulesMatch[1];
+    const id = env.ChatAgent.idFromName(sessionId);
+    const stub = env.ChatAgent.get(id);
+    return stub.fetch(new Request("http://agent/get-schedules"));
+  }
+
   // DELETE /api/sessions/:id
   const deleteMatch = url.pathname.match(/^\/api\/sessions\/([^/]+)$/);
   if (deleteMatch && request.method === "DELETE") {

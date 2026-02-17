@@ -7,23 +7,16 @@ import {
   ListIcon
 } from "@phosphor-icons/react";
 import { Button, Text } from "@cloudflare/kumo";
+import { useSettings, type Settings } from "./api";
 
 interface SettingsPageProps {
   onBack: () => void;
   onOpenSidebar?: () => void;
 }
 
-interface Settings {
-  github_client_id?: string;
-  github_configured?: boolean;
-  llm_api_key_set?: boolean;
-  llm_provider?: string;
-  llm_base_url?: string;
-  llm_model?: string;
-}
-
 export function SettingsPage({ onBack, onOpenSidebar }: SettingsPageProps) {
-  const [settings, setSettings] = useState<Settings>({});
+  const { settings: fetchedSettings, mutateSettings } = useSettings();
+  const settings = fetchedSettings ?? {};
   const [llmApiKey, setLlmApiKey] = useState("");
   const [llmProvider, setLlmProvider] = useState("builtin");
   const [llmBaseUrl, setLlmBaseUrl] = useState("");
@@ -34,18 +27,18 @@ export function SettingsPage({ onBack, onOpenSidebar }: SettingsPageProps) {
   const [saved, setSaved] = useState(false);
   const [error, setError] = useState("");
 
+  // Sync form fields when settings load
   useEffect(() => {
-    fetch("/api/settings")
-      .then((res) => res.json())
-      .then((data: Settings) => {
-        setSettings(data);
-        if (data.llm_provider) setLlmProvider(data.llm_provider);
-        if (data.llm_base_url) setLlmBaseUrl(data.llm_base_url);
-        if (data.llm_model) setLlmModel(data.llm_model);
-        if (data.github_client_id) setGithubClientId(data.github_client_id);
-      })
-      .catch(() => {});
-  }, []);
+    if (fetchedSettings) {
+      if (fetchedSettings.llm_provider)
+        setLlmProvider(fetchedSettings.llm_provider);
+      if (fetchedSettings.llm_base_url)
+        setLlmBaseUrl(fetchedSettings.llm_base_url);
+      if (fetchedSettings.llm_model) setLlmModel(fetchedSettings.llm_model);
+      if (fetchedSettings.github_client_id)
+        setGithubClientId(fetchedSettings.github_client_id);
+    }
+  }, [fetchedSettings]);
 
   const handleSave = async () => {
     setSaving(true);
@@ -68,11 +61,7 @@ export function SettingsPage({ onBack, onOpenSidebar }: SettingsPageProps) {
       });
       if (!res.ok) throw new Error(await res.text());
       setSaved(true);
-      // Refresh settings display
-      const updated = (await fetch("/api/settings").then((r) =>
-        r.json()
-      )) as Settings;
-      setSettings(updated);
+      await mutateSettings();
       setLlmApiKey("");
       setGithubClientSecret("");
     } catch (e) {

@@ -7,7 +7,6 @@ import { Button, Badge, InputArea, Empty } from "@cloudflare/kumo";
 import {
   ConnectionIndicator,
   ModeToggle,
-  PoweredByAgents,
   type ConnectionStatus
 } from "@cloudflare/agents-ui";
 import {
@@ -226,9 +225,6 @@ export function Chat({
             />
           </div>
         </form>
-        <div className="flex justify-center pb-3">
-          <PoweredByAgents />
-        </div>
       </div>
     </div>
   );

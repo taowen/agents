@@ -1,9 +1,11 @@
+import { useState } from "react";
 import {
   PlusIcon,
   GearIcon,
   TrashIcon,
   ChatCircleIcon,
-  SignOutIcon
+  SignOutIcon,
+  PencilSimpleIcon
 } from "@phosphor-icons/react";
 import { Button, Text } from "@cloudflare/kumo";
 
@@ -28,6 +30,7 @@ interface SessionSidebarProps {
   onNewSession: () => void;
   onSelectSession: (id: string) => void;
   onDeleteSession: (id: string) => void;
+  onRenameSession: (id: string, title: string) => void;
   onOpenSettings: () => void;
 }
 
@@ -38,8 +41,28 @@ export function SessionSidebar({
   onNewSession,
   onSelectSession,
   onDeleteSession,
+  onRenameSession,
   onOpenSettings
 }: SessionSidebarProps) {
+  const [editingId, setEditingId] = useState<string | null>(null);
+  const [editTitle, setEditTitle] = useState("");
+
+  const startEditing = (session: SessionInfo) => {
+    setEditingId(session.id);
+    setEditTitle(session.title);
+  };
+
+  const commitEdit = () => {
+    if (editingId && editTitle.trim()) {
+      onRenameSession(editingId, editTitle.trim());
+    }
+    setEditingId(null);
+  };
+
+  const cancelEdit = () => {
+    setEditingId(null);
+  };
+
   return (
     <div className="w-64 h-screen flex flex-col bg-kumo-base border-r border-kumo-line">
       {/* New Chat button */}
@@ -59,6 +82,7 @@ export function SessionSidebar({
       <div className="flex-1 overflow-y-auto px-2 space-y-0.5">
         {sessions.map((session) => {
           const isActive = session.id === activeSessionId;
+          const isEditing = editingId === session.id;
           return (
             <div
               key={session.id}
@@ -67,22 +91,50 @@ export function SessionSidebar({
                   ? "bg-kumo-elevated text-kumo-default"
                   : "text-kumo-secondary hover:bg-kumo-elevated/50 hover:text-kumo-default"
               }`}
-              onClick={() => onSelectSession(session.id)}
+              onClick={() => !isEditing && onSelectSession(session.id)}
             >
               <ChatCircleIcon
                 size={14}
                 className="shrink-0 text-kumo-inactive"
               />
-              <span className="flex-1 truncate">{session.title}</span>
-              <button
-                className="opacity-0 group-hover:opacity-100 p-0.5 rounded hover:bg-kumo-line text-kumo-inactive hover:text-kumo-default transition-all"
-                onClick={(e) => {
-                  e.stopPropagation();
-                  onDeleteSession(session.id);
-                }}
-              >
-                <TrashIcon size={12} />
-              </button>
+              {isEditing ? (
+                <input
+                  className="flex-1 min-w-0 bg-kumo-base border border-kumo-line rounded px-1 py-0.5 text-sm text-kumo-default outline-none focus:border-kumo-brand"
+                  value={editTitle}
+                  onChange={(e) => setEditTitle(e.target.value)}
+                  onKeyDown={(e) => {
+                    if (e.key === "Enter") commitEdit();
+                    if (e.key === "Escape") cancelEdit();
+                  }}
+                  onBlur={commitEdit}
+                  onClick={(e) => e.stopPropagation()}
+                  autoFocus
+                />
+              ) : (
+                <span className="flex-1 min-w-0 truncate">{session.title}</span>
+              )}
+              {!isEditing && (
+                <>
+                  <button
+                    className="shrink-0 opacity-0 group-hover:opacity-100 p-1 rounded hover:bg-kumo-line text-kumo-inactive hover:text-kumo-default transition-opacity"
+                    onClick={(e) => {
+                      e.stopPropagation();
+                      startEditing(session);
+                    }}
+                  >
+                    <PencilSimpleIcon size={12} />
+                  </button>
+                  <button
+                    className="shrink-0 opacity-0 group-hover:opacity-100 p-1 rounded hover:bg-kumo-line text-kumo-inactive hover:text-kumo-default transition-opacity"
+                    onClick={(e) => {
+                      e.stopPropagation();
+                      onDeleteSession(session.id);
+                    }}
+                  >
+                    <TrashIcon size={12} />
+                  </button>
+                </>
+              )}
             </div>
           );
         })}

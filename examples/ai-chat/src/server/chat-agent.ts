@@ -434,6 +434,11 @@ class ChatAgentBase extends AIChatAgent {
   }
 
   async onRequest(request: Request): Promise<Response> {
+    const url = new URL(request.url);
+    if (url.pathname.endsWith("/get-schedules")) {
+      const schedules = this.getSchedules();
+      return Response.json(schedules);
+    }
     return super.onRequest(request);
   }
 
