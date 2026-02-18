@@ -3,7 +3,9 @@ import { AgentFS } from "agentfs-sdk";
 import { Bash, InMemoryFs, MountableFs } from "just-bash";
 import { AgentFsAdapter } from "./agentfs-adapter";
 import { mountFstabEntries } from "./mount";
+import type { MountOptions } from "./mount";
 import { createMockGitServer } from "./mock-git-server";
+import { MockR2Bucket } from "./mock-r2-bucket";
 
 /** Helper: create a fresh AgentFS + MountableFs + Bash for each test. */
 async function createTestEnv() {
@@ -16,40 +18,48 @@ async function createTestEnv() {
 
   // /etc is always hardcoded-mounted (same as server.ts)
   const etcFs = new AgentFsAdapter(agentFs, "/etc");
-  mountableFs.mount("/etc", etcFs);
+  mountableFs.mount("/etc", etcFs, "agentfs");
 
   const bash = new Bash({ fs: mountableFs, cwd: "/home/user" });
 
-  return { agentFs, mountableFs, bash };
+  /** Default mount options providing d1 factory backed by AgentFS. */
+  const defaultMountOpts: MountOptions = {
+    fsTypeRegistry: {
+      d1: (entry) => new AgentFsAdapter(agentFs, entry.mountPoint)
+    }
+  };
+
+  return { agentFs, mountableFs, bash, defaultMountOpts };
 }
 
 describe("mount — fstab integration", () => {
   let agentFs: any;
   let mountableFs: MountableFs;
   let bash: Bash;
+  let defaultMountOpts: MountOptions;
 
   beforeEach(async () => {
-    ({ agentFs, mountableFs, bash } = await createTestEnv());
+    ({ agentFs, mountableFs, bash, defaultMountOpts } = await createTestEnv());
   });
 
-  it("default fstab: cat /etc/fstab contains /home/user agentfs", async () => {
-    await mountFstabEntries(agentFs, mountableFs);
+  it("default fstab: cat /etc/fstab contains /home/user d1", async () => {
+    await mountFstabEntries(agentFs, mountableFs, defaultMountOpts);
 
     const result = await bash.exec("cat /etc/fstab");
     expect(result.exitCode).toBe(0);
     expect(result.stdout).toContain("/home/user");
-    expect(result.stdout).toContain("agentfs");
+    expect(result.stdout).toContain("d1");
   });
 
   it("default fstab: /home/user is accessible", async () => {
-    await mountFstabEntries(agentFs, mountableFs);
+    await mountFstabEntries(agentFs, mountableFs, defaultMountOpts);
 
     const result = await bash.exec("ls /home/user");
     expect(result.exitCode).toBe(0);
   });
 
   it("default fstab: files in /home/user are read/writable", async () => {
-    await mountFstabEntries(agentFs, mountableFs);
+    await mountFstabEntries(agentFs, mountableFs, defaultMountOpts);
 
     const write = await bash.exec(
       "echo hello > /home/user/test.txt && cat /home/user/test.txt"
@@ -59,7 +69,7 @@ describe("mount — fstab integration", () => {
   });
 
   it("persistence: written files are readable via AgentFS directly", async () => {
-    await mountFstabEntries(agentFs, mountableFs);
+    await mountFstabEntries(agentFs, mountableFs, defaultMountOpts);
 
     await bash.exec("echo myhost > /etc/hostname");
 
@@ -71,7 +81,7 @@ describe("mount — fstab integration", () => {
   });
 
   it("persistence: /home/user files stored in AgentFS", async () => {
-    await mountFstabEntries(agentFs, mountableFs);
+    await mountFstabEntries(agentFs, mountableFs, defaultMountOpts);
 
     await bash.exec("echo hello > /home/user/test.txt");
 
@@ -109,7 +119,12 @@ describe("mount — fstab integration", () => {
       Buffer.from(`${url}  /mnt/repo  git  ref=main,depth=1  0  0\n`)
     );
 
-    await mountFstabEntries(agentFs, mountableFs, { gitHttp: http });
+    const r2Bucket = new MockR2Bucket() as unknown as R2Bucket;
+    await mountFstabEntries(agentFs, mountableFs, {
+      gitHttp: http,
+      r2Bucket,
+      userId: "test-user"
+    });
 
     const ls = await bash.exec("ls /mnt/repo");
     expect(ls.exitCode).toBe(0);

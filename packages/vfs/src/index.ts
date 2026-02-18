@@ -18,7 +18,6 @@ export {
   upsertCredential
 } from "./git-credentials";
 export type { GitCredential } from "./git-credentials";
-export { syncDirtyGitMounts } from "./sync";
 export {
   createGitHubOAuthRoutes,
   handleGitHubOAuthDORequest,
@@ -27,3 +26,4 @@ export {
 } from "./github-oauth";
 export type { GitHubOAuthDeps } from "./github-oauth";
 export { GoogleDriveFsAdapter } from "./gdrive-fs-adapter";
+export { MockR2Bucket } from "./mock-r2-bucket";

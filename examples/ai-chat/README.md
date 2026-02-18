@@ -1,6 +1,6 @@
 # AI Chat Example
 
-A chat application built with `@cloudflare/ai-chat` featuring a sandboxed bash environment with persistent storage (D1 + R2), read-write Git repository mounting, and an optional Electron shell for controlling Windows desktops.
+A chat application built with `@cloudflare/ai-chat` featuring a sandboxed bash environment with persistent storage (D1 + R2), read-write Git repository mounting, and an optional Electron shell or standalone CLI for controlling Windows desktops.
 
 ## What it demonstrates
 
@@ -32,33 +32,51 @@ A chat application built with `@cloudflare/ai-chat` featuring a sandboxed bash e
 - `useBridgeViewer` — shows connected devices and activity logs in the sidebar
 - Capability-based Electron detection (`!!window.workWithWindows`) instead of URL path checks
 
+**Shared (`src/shared/`):**
+
+- `agent-loop.ts` — unified agent loop with tool definitions (bash, screen_control, window_control), shared between Electron bridge and standalone CLI
+- `action-aliases.ts` — normalized mouse/keyboard action handling
+- `screen-control-types.ts` — type definitions for screen automation
+- `file-utils.ts` — shared file utilities
+
 **Electron (`electron/`):**
 
-- `main.js` — IPC handlers for Win32 screen/window control (screenshot, click, type, key press, scroll, window management) via PowerShell
+- `main.ts` — Electron main process (TypeScript, run via tsx). IPC handlers for Win32 screen/window control via PowerShell, filesystem operations delegated to `NodeFsAdapter`
 - `preload.cjs` — `contextBridge` exposing `window.workWithWindows` to the renderer
+- `node-fs-adapter.ts` — `IFileSystem` implementation backed by `node:fs/promises`, with unix-to-windows path translation (used by both Electron IPC and standalone)
+- `detect-drives.ts` — detects available Windows drives (A:-Z:) and WSL distros at startup
+- `standalone.ts` — headless Node.js CLI entry point, mounts real Windows drives via `MountableFs` + `NodeFsAdapter`
+- `win-automation.ts` — PowerShell automation module (zero Electron dependencies)
 
 ## Architecture
 
 ```
 Browser (any device)                    Cloudflare Worker
   App.tsx                               (ai.connect-screen.com)
-    │                                     │
-    ├─ useAgentChat ──── WebSocket ────> ChatAgent DO
-    │                                     │  ├─ bash tool (just-bash)
-    ├─ useBridgeViewer ─ WebSocket ────> BridgeManager DO
-    │  (device list, activity logs)       │  (relays messages)
-    │                                     │
-Electron (Windows)                        │
-  App.tsx                                 │
-    ├─ useAgentChat ──── WebSocket ────> ChatAgent DO
-    │                                     │  sends screen_control requests
-    ├─ useBridge ─────── WebSocket ────> BridgeManager DO
-    │  (registers as device,              │  (routes requests to device)
-    │   executes screen_control           │
-    │   via window.workWithWindows)       │
-    │                                     │
-  preload.cjs                             │
-    └─ window.workWithWindows ──────> main.js (IPC → PowerShell)
+    |                                     |
+    +- useAgentChat ---- WebSocket ----> ChatAgent DO
+    |                                     |  +- bash tool (just-bash)
+    +- useBridgeViewer - WebSocket ----> BridgeManager DO
+    |  (device list, activity logs)       |  (relays messages)
+    |                                     |
+Electron (Windows)                        |
+  App.tsx                                 |
+    +- useAgentChat ---- WebSocket ----> ChatAgent DO
+    |                                     |  sends screen_control requests
+    +- useBridge ------- WebSocket ----> BridgeManager DO
+    |  (registers as device,              |  (routes requests to device)
+    |   executes screen_control           |
+    |   via window.workWithWindows)       |
+    |                                     |
+  preload.cjs                             |
+    +- window.workWithWindows ------> main.ts (IPC -> NodeFsAdapter / PowerShell)
+
+Standalone (Windows, no Electron)
+  standalone.ts
+    +- createAgentLoop (src/shared/agent-loop.ts)
+    |    +- bash tool (just-bash + MountableFs + NodeFsAdapter)
+    |    +- screen_control (win-automation.ts -> PowerShell)
+    +- detectDrives() -> mounts /mnt/c, /mnt/d, /mnt/wsl, ...
 ```
 
 When `window.workWithWindows` is detected, the client automatically registers as a remote desktop device via `useBridge`. Any client can view connected devices and agent activity via `useBridgeViewer` in the sidebar.
@@ -71,6 +89,7 @@ When `window.workWithWindows` is detected, the client automatically registers as
 | `/etc` | D1 (SQL) | System config (fstab, git-credentials) |
 | `/data` | R2 (object storage) | Large files, binary data |
 | `/mnt/*` | Git / in-memory | Git repos, temporary files |
+| `/mnt/c`, `/mnt/d`, ... | NodeFsAdapter (local disk) | Standalone/Electron: real Windows drives |
 
 All storage is scoped per user — D1 uses a `user_id` column, R2 uses a `{userId}/` key prefix.
 
@@ -103,7 +122,7 @@ Requires a `GOOGLE_AI_API_KEY` environment variable for Gemini 3 Flash.
 bash examples/ai-chat/run-on-windows.sh
 ```
 
-The Electron step copies `electron/` to a Windows temp directory (`%TEMP%\windows-agent-build`) with a minimal `package.json` to avoid UNC path and monorepo workspace issues.
+The Electron step copies `electron/` to a Windows temp directory (`%TEMP%\windows-agent-build`) with a minimal `package.json` (includes tsx for TypeScript support) to avoid UNC path and monorepo workspace issues.
 
 ### Launch Electron only (skip deploy)
 
@@ -126,7 +145,7 @@ AGENT_URL=http://localhost:5173 npm run electron:dev
 
 ### Debugging
 
-Electron renderer `console.log` output is captured to a file by `main.js`:
+Electron renderer `console.log` output is captured to a file by `main.ts`:
 
 ```
 %TEMP%\windows-agent-build\electron\renderer.log
@@ -142,8 +161,12 @@ cat "/mnt/c/Users/$USER/AppData/Local/Temp/windows-agent-build/electron/renderer
 
 A lightweight Node.js CLI that runs the screenshot/automation agent directly on Windows, without Electron or Cloudflare Worker deployment. Useful for quick local testing.
 
+The standalone agent mounts real Windows drives (`/mnt/c`, `/mnt/d`, etc.) via `NodeFsAdapter`, giving the bash environment full read/write access to the local filesystem.
+
 ```
-standalone.ts → win-automation.ts → PowerShell scripts
+standalone.ts -> MountableFs + NodeFsAdapter (local drives)
+              -> agent-loop.ts (shared with Electron bridge)
+              -> win-automation.ts -> PowerShell scripts
 ```
 
 ### Prerequisites
@@ -188,6 +211,9 @@ bash run-standalone-on-windows.sh "List all visible windows"
 
 # Multi-step
 bash run-standalone-on-windows.sh "Open notepad and type hello"
+
+# Local filesystem access
+bash run-standalone-on-windows.sh "Run ls /mnt/c to see what's on the C drive"
 ```
 
 ### Logs and screenshots
@@ -211,8 +237,8 @@ When the agent misbehaves, follow this workflow to diagnose the issue:
 Each click/move/annotate log line shows the full coordinate translation:
 
 ```
-[agent] screen: click norm(250,230)→pixel(282,151)→desktop(1200,293) → success
-[agent] screen: annotate norm(250,230)→pixel(282,151) → 1126x655
+[agent] screen: click norm(250,230)->pixel(282,151)->desktop(1200,293) -> success
+[agent] screen: annotate norm(250,230)->pixel(282,151) -> 1126x655
 ```
 
 - `norm(250,230)` — what the model output (0-1000 normalized range)
@@ -250,7 +276,9 @@ explorer.exe "C:\Users\%USERNAME%\AppData\Local\Temp\windows-agent-standalone\lo
 ### How it works
 
 - `electron/win-automation.ts` — PowerShell automation module (zero Electron dependencies)
-- `electron/agent-core.ts` — Platform-agnostic agent loop with dependency injection
+- `src/shared/agent-loop.ts` — platform-agnostic agent loop with dependency injection (shared with Electron bridge)
+- `electron/node-fs-adapter.ts` — `IFileSystem` backed by `node:fs/promises` (used by both standalone and Electron main process)
+- `electron/detect-drives.ts` — detects Windows drives and WSL distros, returns mount points
 - `electron/standalone.ts` — CLI entry point that wires everything together
 - `run-standalone.ps1` — Windows-side launcher (copies files to temp dir, npm install, runs tsx)
 - `run-standalone-on-windows.sh` — WSL-side launcher (builds just-bash, packs tarball, calls PS1)

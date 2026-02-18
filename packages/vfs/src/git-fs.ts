@@ -4,53 +4,24 @@
  * Uses isomorphic-git to shallow-clone (depth=1, noCheckout) into an in-memory
  * fs adapter, then serves readdir/readFile/stat directly from the packfile.
  *
- * Writes are buffered in an overlay. Call commitAndPush() to materialize the
- * overlay into the git working directory, commit, and push to the remote.
+ * Overlay writes are persisted to R2 via R2FsAdapter, surviving DO hibernation.
+ * Git pack data and metadata are stored as /.git/pack.json and /.git/meta.json.
  */
 
 import git from "isomorphic-git";
 import http from "isomorphic-git/http/web";
-
-// ---- Types matching just-bash IFileSystem ----
-
-type BufferEncoding =
-  | "utf8"
-  | "utf-8"
-  | "ascii"
-  | "binary"
-  | "base64"
-  | "hex"
-  | "latin1";
-
-interface ReadFileOptions {
-  encoding?: BufferEncoding | null;
-}
-
-interface WriteFileOptions {
-  encoding?: BufferEncoding;
-}
-
-interface FsStat {
-  isFile: boolean;
-  isDirectory: boolean;
-  isSymbolicLink: boolean;
-  mode: number;
-  size: number;
-  mtime: Date;
-}
-
-interface MkdirOptions {
-  recursive?: boolean;
-}
-
-interface RmOptions {
-  recursive?: boolean;
-  force?: boolean;
-}
-
-interface CpOptions {
-  recursive?: boolean;
-}
+import type {
+  BufferEncoding,
+  ReadFileOptions,
+  WriteFileOptions,
+  FsStat,
+  MkdirOptions,
+  RmOptions,
+  CpOptions
+} from "just-bash";
+import { toBuffer, fromBuffer, getEncoding } from "just-bash";
+import { R2FsAdapter } from "./r2-fs-adapter";
+import { createIsomorphicGitMemFs } from "./isomorphic-git-memfs";
 
 // ---- Public types ----
 
@@ -64,35 +35,6 @@ export interface GitStatus {
 
 const textEncoder = new TextEncoder();
 const textDecoder = new TextDecoder();
-
-function toBuffer(content: string | Uint8Array, encoding?: string): Uint8Array {
-  if (content instanceof Uint8Array) return content;
-  return textEncoder.encode(content);
-}
-
-function fromBuffer(buffer: Uint8Array, encoding?: string): string {
-  switch (encoding) {
-    case "base64":
-      return btoa(String.fromCharCode(...buffer));
-    case "hex":
-      return Array.from(buffer)
-        .map((b) => b.toString(16).padStart(2, "0"))
-        .join("");
-    case "binary":
-    case "latin1":
-      return String.fromCharCode(...buffer);
-    default:
-      return textDecoder.decode(buffer);
-  }
-}
-
-function getEncoding(
-  options?: ReadFileOptions | WriteFileOptions | BufferEncoding | null
-): string | undefined {
-  if (options === null || options === undefined) return undefined;
-  if (typeof options === "string") return options;
-  return (options as { encoding?: string }).encoding ?? undefined;
-}
 
 function normalizePath(path: string): string {
   if (!path || path === "/") return "/";
@@ -136,147 +78,9 @@ function eexist(syscall: string, path: string): Error {
   return err;
 }
 
-// ---- Minimal in-memory fs for isomorphic-git ----
-
-interface MemStat {
-  type: "file" | "dir" | "symlink";
-  mode: number;
-  size: number;
-  mtimeMs: number;
-  mtime: Date;
-  ctimeMs: number;
-  ctime: Date;
-  dev: number;
-  ino: number;
-  uid: number;
-  gid: number;
-  isFile(): boolean;
-  isDirectory(): boolean;
-  isSymbolicLink(): boolean;
-}
-
-function createIsomorphicGitMemFs() {
-  const files = new Map<string, Uint8Array>();
-  const dirs = new Set<string>(["/", "."]);
-
-  function ensureParent(filepath: string) {
-    const parts = filepath.split("/");
-    for (let i = 1; i < parts.length; i++) {
-      const dir = parts.slice(0, i).join("/") || "/";
-      dirs.add(dir);
-    }
-  }
-
-  function makeStat(type: "file" | "dir" | "symlink", size: number): MemStat {
-    const now = Date.now();
-    return {
-      type,
-      mode: type === "dir" ? 0o40755 : 0o100644,
-      size,
-      mtimeMs: now,
-      mtime: new Date(now),
-      ctimeMs: now,
-      ctime: new Date(now),
-      dev: 0,
-      ino: 0,
-      uid: 0,
-      gid: 0,
-      isFile() {
-        return type === "file";
-      },
-      isDirectory() {
-        return type === "dir";
-      },
-      isSymbolicLink() {
-        return type === "symlink";
-      }
-    };
-  }
-
-  return {
-    async readFile(filepath: string, opts?: any): Promise<Uint8Array | string> {
-      const data = files.get(filepath);
-      if (data === undefined) {
-        const err = new Error(
-          `ENOENT: no such file or directory, open '${filepath}'`
-        );
-        (err as any).code = "ENOENT";
-        throw err;
-      }
-      // When encoding is requested (e.g. 'utf8'), return string like Node.js fs
-      const encoding = typeof opts === "string" ? opts : opts?.encoding;
-      if (encoding) return textDecoder.decode(data);
-      return data;
-    },
-    async writeFile(
-      filepath: string,
-      data: Uint8Array | string,
-      _opts?: any
-    ): Promise<void> {
-      ensureParent(filepath);
-      const buf = typeof data === "string" ? textEncoder.encode(data) : data;
-      files.set(filepath, new Uint8Array(buf));
-    },
-    async mkdir(filepath: string, _opts?: any): Promise<void> {
-      dirs.add(filepath);
-    },
-    async rmdir(filepath: string): Promise<void> {
-      dirs.delete(filepath);
-    },
-    async unlink(filepath: string): Promise<void> {
-      files.delete(filepath);
-    },
-    async stat(filepath: string): Promise<MemStat> {
-      if (dirs.has(filepath)) return makeStat("dir", 0);
-      if (files.has(filepath))
-        return makeStat("file", files.get(filepath)!.length);
-      const err = new Error(
-        `ENOENT: no such file or directory, stat '${filepath}'`
-      );
-      (err as any).code = "ENOENT";
-      throw err;
-    },
-    async lstat(filepath: string): Promise<MemStat> {
-      return this.stat(filepath);
-    },
-    async readdir(filepath: string): Promise<string[]> {
-      const prefix = filepath === "/" || filepath === "." ? "" : filepath + "/";
-      const entries = new Set<string>();
-      for (const f of files.keys()) {
-        if (prefix && !f.startsWith(prefix)) continue;
-        if (!prefix && f.includes("/")) {
-          entries.add(f.split("/")[0]);
-          continue;
-        }
-        const rest = prefix ? f.slice(prefix.length) : f;
-        if (rest && !rest.includes("/")) entries.add(rest);
-        else if (rest) entries.add(rest.split("/")[0]);
-      }
-      for (const d of dirs) {
-        if (d === filepath || d === "/" || d === ".") continue;
-        if (prefix && !d.startsWith(prefix)) continue;
-        const rest = prefix ? d.slice(prefix.length) : d;
-        if (rest && !rest.includes("/")) entries.add(rest);
-        else if (rest) entries.add(rest.split("/")[0]);
-      }
-      return [...entries];
-    },
-    async readlink(filepath: string): Promise<string> {
-      const data = files.get(filepath);
-      if (data === undefined) {
-        const err = new Error(
-          `ENOENT: no such file or directory, readlink '${filepath}'`
-        );
-        (err as any).code = "ENOENT";
-        throw err;
-      }
-      return textDecoder.decode(data);
-    },
-    async symlink(target: string, filepath: string): Promise<void> {
-      ensureParent(filepath);
-      files.set(filepath, textEncoder.encode(target));
-    }
-  };
+/** Check if a normalized path is inside /.git/ (internal state, not user files). */
+function isGitInternal(normalized: string): boolean {
+  return normalized === "/.git" || normalized.startsWith("/.git/");
 }
 
 // ---- Tree entry from isomorphic-git ----
@@ -297,6 +101,18 @@ export interface GitFsOptions {
   depth?: number;
   onAuth?: () => { username: string; password?: string };
   http?: any; // optional: inject mock HTTP transport for testing
+  r2Bucket: R2Bucket;
+  userId: string;
+  mountPoint: string; // e.g. "/mnt/repo"
+}
+
+interface GitMetadata {
+  commitOid: string;
+  remoteOid: string | null;
+  ref: string;
+  url: string;
+  commitMtime: number; // epoch ms
+  deleted: string[];
 }
 
 // ---- GitFs ----
@@ -317,10 +133,9 @@ export class GitFs {
   private initPromise: Promise<void> | null = null;
   private treeCache = new Map<string, GitTreeEntry[]>();
 
-  // ---- Overlay state ----
-  private overlay = new Map<string, Uint8Array>(); // new/modified files
-  private overlayDirs = new Set<string>(); // new directories
-  private deleted = new Set<string>(); // deleted paths
+  // ---- Overlay persisted in R2 ----
+  private r2Fs: R2FsAdapter;
+  private deleted = new Set<string>(); // deleted paths (persisted in meta.json)
 
   private static readonly DIR = "/repo";
   private static readonly GITDIR = "/repo/.git";
@@ -332,13 +147,20 @@ export class GitFs {
     this.depth = opts.depth ?? 1;
     this.onAuth = opts.onAuth;
     this.httpTransport = opts.http ?? http;
+    this.r2Fs = new R2FsAdapter(opts.r2Bucket, opts.userId, opts.mountPoint);
   }
 
   // ---- Public: overlay status and URL ----
 
   /** Returns true if there are uncommitted overlay changes. */
-  isDirty(): boolean {
-    return this.overlay.size > 0 || this.deleted.size > 0;
+  async isDirty(): Promise<boolean> {
+    if (this.deleted.size > 0) return true;
+    try {
+      const entries = await this.r2Fs.readdir("/");
+      return entries.some((e) => e !== ".git");
+    } catch {
+      return false;
+    }
   }
 
   /** Expose the remote URL (for credential lookup). */
@@ -363,7 +185,9 @@ export class GitFs {
     const added: string[] = [];
     const deleted: string[] = [];
 
-    for (const path of this.overlay.keys()) {
+    const overlayFiles = await this.getOverlayFiles();
+
+    for (const path of overlayFiles) {
       const gitPath = toGitPath(path);
       try {
         await git.readBlob({
@@ -386,6 +210,35 @@ export class GitFs {
     return { modified, added, deleted };
   }
 
+  /** Get all overlay file paths (excluding .git/ internals). */
+  private async getOverlayFiles(): Promise<string[]> {
+    const files: string[] = [];
+    const walk = async (dir: string) => {
+      let entries: string[];
+      try {
+        entries = await this.r2Fs.readdir(dir);
+      } catch {
+        return;
+      }
+      for (const name of entries) {
+        if (name === ".git") continue;
+        const childPath = dir === "/" ? `/${name}` : `${dir}/${name}`;
+        try {
+          const st = await this.r2Fs.stat(childPath);
+          if (st.isDirectory) {
+            await walk(childPath);
+          } else {
+            files.push(childPath);
+          }
+        } catch {
+          // skip
+        }
+      }
+    };
+    await walk("/");
+    return files;
+  }
+
   /**
    * Commit overlay changes without pushing.
    * Returns the new commit OID.
@@ -396,7 +249,8 @@ export class GitFs {
   ): Promise<string> {
     await this.ensureInitialized();
 
-    if (!this.isDirty()) {
+    const dirty = await this.isDirty();
+    if (!dirty) {
       throw new Error("nothing to commit, working tree clean");
     }
 
@@ -411,13 +265,15 @@ export class GitFs {
     });
 
     // 2. Materialize overlay files into memFs working directory
-    for (const [path, content] of this.overlay) {
+    const overlayFiles = await this.getOverlayFiles();
+    for (const path of overlayFiles) {
+      const content = await this.readFileBuffer(path);
       const fsPath = `${DIR}${path}`;
       await this.memFs.writeFile(fsPath, content);
     }
 
     // 3. Stage added/modified files
-    for (const path of this.overlay.keys()) {
+    for (const path of overlayFiles) {
       const gitPath = toGitPath(path);
       await git.add({
         fs: this.memFs,
@@ -453,11 +309,27 @@ export class GitFs {
 
     // 6. Clear overlay and caches
     this.treeCache.clear();
-    this.overlay.clear();
-    this.overlayDirs.clear();
+    await this.clearR2Overlay();
     this.deleted.clear();
 
+    // 7. Persist pack + metadata to R2
+    await this.savePackToR2();
+    await this.saveMetadata();
+
     return this.commitOid;
+  }
+
+  /** Remove all non-.git/ overlay entries from R2. */
+  private async clearR2Overlay(): Promise<void> {
+    try {
+      const entries = await this.r2Fs.readdir("/");
+      for (const name of entries) {
+        if (name === ".git") continue;
+        await this.r2Fs.rm(`/${name}`, { recursive: true, force: true });
+      }
+    } catch {
+      // no entries
+    }
   }
 
   /**
@@ -477,6 +349,7 @@ export class GitFs {
     });
 
     this.remoteOid = this.commitOid;
+    await this.saveMetadata();
   }
 
   // ---- Init ----
@@ -501,7 +374,64 @@ export class GitFs {
     await this.initPromise;
   }
 
+  // ---- R2 pack/metadata serialization ----
+
+  private async savePackToR2(): Promise<void> {
+    const snap = this.memFs._snapshot();
+    await this.r2Fs.writeFile("/.git/pack.json", JSON.stringify(snap));
+  }
+
+  private async loadPackFromR2(): Promise<boolean> {
+    try {
+      const data = await this.r2Fs.readFile("/.git/pack.json", {
+        encoding: "utf8"
+      });
+      const snap = JSON.parse(data as string);
+      this.memFs._restore(snap);
+      return true;
+    } catch {
+      return false;
+    }
+  }
+
+  private async saveMetadata(): Promise<void> {
+    const meta: GitMetadata = {
+      commitOid: this.commitOid!,
+      remoteOid: this.remoteOid,
+      ref: this.ref!,
+      url: this.url,
+      commitMtime: this.commitMtime.getTime(),
+      deleted: [...this.deleted]
+    };
+    await this.r2Fs.writeFile("/.git/meta.json", JSON.stringify(meta));
+  }
+
+  private async loadMetadata(): Promise<GitMetadata | null> {
+    try {
+      const data = await this.r2Fs.readFile("/.git/meta.json", {
+        encoding: "utf8"
+      });
+      return JSON.parse(data as string) as GitMetadata;
+    } catch {
+      return null;
+    }
+  }
+
   private async doInit(): Promise<void> {
+    // Try restoring from R2 first (survives hibernation)
+    const meta = await this.loadMetadata();
+    if (meta) {
+      const packLoaded = await this.loadPackFromR2();
+      if (packLoaded) {
+        this.commitOid = meta.commitOid;
+        this.remoteOid = meta.remoteOid;
+        this.ref = meta.ref;
+        this.commitMtime = new Date(meta.commitMtime);
+        this.deleted = new Set(meta.deleted);
+        return;
+      }
+    }
+
     // Auto-detect default branch if not specified
     if (!this.ref) {
       const info = await git.getRemoteInfo({
@@ -548,6 +478,10 @@ export class GitFs {
     }
 
     this.remoteOid = this.commitOid;
+
+    // Persist to R2 after initial clone
+    await this.savePackToR2();
+    await this.saveMetadata();
   }
 
   // ---- Internal tree/blob reading ----
@@ -596,16 +530,6 @@ export class GitFs {
 
   // ---- Overlay helpers ----
 
-  /** Ensure parent directories exist in the overlay. */
-  private ensureOverlayParents(filePath: string): void {
-    const parts = filePath.split("/").filter(Boolean);
-    for (let i = 1; i < parts.length; i++) {
-      const dir = "/" + parts.slice(0, i).join("/");
-      this.overlayDirs.add(dir);
-      this.deleted.delete(dir);
-    }
-  }
-
   /** Check if a path (or any ancestor) is in the deleted set. */
   private isDeleted(normalizedPath: string): boolean {
     if (this.deleted.has(normalizedPath)) return true;
@@ -620,26 +544,18 @@ export class GitFs {
 
   /**
    * Collect overlay entries that are direct children of a directory.
+   * Excludes .git/ internal entries.
    */
-  private getOverlayChildren(dirPath: string): Set<string> {
-    const prefix = dirPath === "/" ? "/" : dirPath + "/";
+  private async getOverlayChildren(dirPath: string): Promise<Set<string>> {
     const children = new Set<string>();
-
-    for (const path of this.overlay.keys()) {
-      if (path.startsWith(prefix)) {
-        const rest = path.slice(prefix.length);
-        const name = rest.split("/")[0];
-        if (name) children.add(name);
+    try {
+      const entries = await this.r2Fs.readdir(dirPath);
+      for (const name of entries) {
+        if (name !== ".git") children.add(name);
       }
+    } catch {
+      // ENOENT — no overlay dir
     }
-    for (const path of this.overlayDirs) {
-      if (path.startsWith(prefix)) {
-        const rest = path.slice(prefix.length);
-        const name = rest.split("/")[0];
-        if (name) children.add(name);
-      }
-    }
-
     return children;
   }
 
@@ -657,9 +573,14 @@ export class GitFs {
   async readFileBuffer(path: string): Promise<Uint8Array> {
     const normalized = normalizePath(path);
 
-    // Check overlay first
-    const overlayData = this.overlay.get(normalized);
-    if (overlayData !== undefined) return overlayData;
+    // Check R2 overlay first (skip .git/ internals)
+    if (!isGitInternal(normalized)) {
+      try {
+        return await this.r2Fs.readFileBuffer(normalized);
+      } catch {
+        // not in overlay — fall through
+      }
+    }
 
     // Check if deleted
     if (this.isDeleted(normalized)) throw enoent("open", path);
@@ -689,15 +610,21 @@ export class GitFs {
   async exists(path: string): Promise<boolean> {
     const normalized = normalizePath(path);
 
-    // Check overlay
-    if (this.overlay.has(normalized)) return true;
-    if (this.overlayDirs.has(normalized)) return true;
+    // .git/ internals are hidden from the user
+    if (isGitInternal(normalized)) return false;
+
+    // Check R2 overlay
+    try {
+      if (await this.r2Fs.exists(normalized)) return true;
+    } catch {
+      // fall through
+    }
 
     // Check if deleted
     if (this.isDeleted(normalized)) return false;
 
     // Check if overlay children exist under this path (making it a virtual dir)
-    const overlayChildren = this.getOverlayChildren(normalized);
+    const overlayChildren = await this.getOverlayChildren(normalized);
     if (overlayChildren.size > 0) return true;
 
     // Fall through to git tree
@@ -708,22 +635,16 @@ export class GitFs {
   async stat(path: string): Promise<FsStat> {
     const normalized = normalizePath(path);
 
-    // Check overlay files
-    const overlayData = this.overlay.get(normalized);
-    if (overlayData !== undefined) {
-      return {
-        isFile: true,
-        isDirectory: false,
-        isSymbolicLink: false,
-        mode: 0o100644,
-        size: overlayData.length,
-        mtime: new Date()
-      };
+    // Check R2 overlay first (skip .git/ internals)
+    if (!isGitInternal(normalized)) {
+      try {
+        return await this.r2Fs.stat(normalized);
+      } catch {
+        // not in R2 overlay — fall through
+      }
     }
 
-    // Check overlay directories
-    if (this.overlayDirs.has(normalized) || normalized === "/") {
-      // Also check if there are overlay children
+    if (normalized === "/") {
       return {
         isFile: false,
         isDirectory: true,
@@ -735,7 +656,7 @@ export class GitFs {
     }
 
     // Check overlay children (path is a virtual directory containing overlay files)
-    const overlayChildren = this.getOverlayChildren(normalized);
+    const overlayChildren = await this.getOverlayChildren(normalized);
 
     // Check if deleted
     if (this.isDeleted(normalized)) {
@@ -809,7 +730,7 @@ export class GitFs {
     const normalized = normalizePath(path);
 
     // Collect overlay children for this directory
-    const overlayChildren = this.getOverlayChildren(normalized);
+    const overlayChildren = await this.getOverlayChildren(normalized);
 
     // Check if deleted — but overlay may have re-created it
     const pathDeleted = this.isDeleted(normalized);
@@ -834,11 +755,7 @@ export class GitFs {
       } catch (e) {
         // If it's an ENOENT/ENOTDIR we generated, and there are overlay children, ignore
         const code = (e as any)?.code;
-        if (
-          overlayChildren.size === 0 &&
-          !this.overlayDirs.has(normalized) &&
-          normalized !== "/"
-        ) {
+        if (overlayChildren.size === 0 && normalized !== "/") {
           throw e;
         }
         if (
@@ -849,10 +766,7 @@ export class GitFs {
           throw e;
         }
       }
-    } else if (
-      overlayChildren.size === 0 &&
-      !this.overlayDirs.has(normalized)
-    ) {
+    } else if (overlayChildren.size === 0) {
       throw enoent("scandir", path);
     }
 
@@ -874,13 +788,6 @@ export class GitFs {
 
   async readlink(path: string): Promise<string> {
     const normalized = normalizePath(path);
-
-    // Overlay files are not symlinks
-    if (this.overlay.has(normalized)) {
-      const err = new Error(`EINVAL: invalid argument, readlink '${path}'`);
-      (err as any).code = "EINVAL";
-      throw err;
-    }
 
     if (this.isDeleted(normalized)) throw enoent("readlink", path);
 
@@ -911,7 +818,7 @@ export class GitFs {
     return [];
   }
 
-  // ---- IFileSystem: write operations (overlay-backed) ----
+  // ---- IFileSystem: write operations (R2-backed) ----
 
   async writeFile(
     path: string,
@@ -920,9 +827,10 @@ export class GitFs {
   ): Promise<void> {
     const normalized = normalizePath(path);
     const buf = toBuffer(content, getEncoding(options));
-    this.overlay.set(normalized, buf);
-    this.ensureOverlayParents(normalized);
-    this.deleted.delete(normalized);
+    await this.r2Fs.writeFile(normalized, buf);
+    if (this.deleted.delete(normalized)) {
+      await this.saveMetadata();
+    }
   }
 
   async appendFile(
@@ -933,7 +841,7 @@ export class GitFs {
     const normalized = normalizePath(path);
     const appendBuf = toBuffer(content, getEncoding(options));
 
-    // Read existing content (overlay or git tree)
+    // Read existing content (R2 overlay or git tree)
     let existing: Uint8Array;
     try {
       existing = await this.readFileBuffer(path);
@@ -946,57 +854,55 @@ export class GitFs {
     merged.set(existing, 0);
     merged.set(appendBuf, existing.length);
 
-    this.overlay.set(normalized, merged);
-    this.ensureOverlayParents(normalized);
-    this.deleted.delete(normalized);
+    await this.r2Fs.writeFile(normalized, merged);
+    if (this.deleted.delete(normalized)) {
+      await this.saveMetadata();
+    }
   }
 
   async mkdir(path: string, options?: MkdirOptions): Promise<void> {
     const normalized = normalizePath(path);
 
     if (options?.recursive) {
-      // mkdir -p: create all parent dirs, silently succeed if exists
+      await this.r2Fs.mkdir(normalized, { recursive: true });
       const parts = normalized.split("/").filter(Boolean);
+      let changed = false;
       for (let i = 1; i <= parts.length; i++) {
         const dir = "/" + parts.slice(0, i).join("/");
-        this.overlayDirs.add(dir);
-        this.deleted.delete(dir);
+        if (this.deleted.delete(dir)) changed = true;
       }
+      if (changed) await this.saveMetadata();
       return;
     }
 
-    // Check if already exists
-    const exists = await this.exists(normalized);
-    if (exists) throw eexist("mkdir", path);
-
-    this.overlayDirs.add(normalized);
-    this.ensureOverlayParents(normalized);
-    this.deleted.delete(normalized);
+    const pathExists = await this.exists(normalized);
+    if (pathExists) throw eexist("mkdir", path);
+    // Use recursive: true for R2 to avoid double-normalization issue in R2FsAdapter
+    await this.r2Fs.mkdir(normalized, { recursive: true });
+    if (this.deleted.delete(normalized)) {
+      await this.saveMetadata();
+    }
   }
 
   async rm(path: string, options?: RmOptions): Promise<void> {
     const normalized = normalizePath(path);
 
-    const exists = await this.exists(normalized);
-    if (!exists) {
+    const pathExists = await this.exists(normalized);
+    if (!pathExists) {
       if (options?.force) return;
       throw enoent("rm", path);
     }
 
-    // Remove from overlay
-    this.overlay.delete(normalized);
-    this.overlayDirs.delete(normalized);
+    // Remove from R2 overlay
+    try {
+      await this.r2Fs.rm(normalized, options);
+    } catch {
+      // may not exist in R2 (only in git tree)
+    }
 
-    // If recursive, remove all children from overlay
+    // Clean child deleted entries when recursive
     if (options?.recursive) {
       const prefix = normalized + "/";
-      for (const key of [...this.overlay.keys()]) {
-        if (key.startsWith(prefix)) this.overlay.delete(key);
-      }
-      for (const key of [...this.overlayDirs]) {
-        if (key.startsWith(prefix)) this.overlayDirs.delete(key);
-      }
-      // Also remove children from deleted set since parent covers them
       for (const key of [...this.deleted]) {
         if (key.startsWith(prefix)) this.deleted.delete(key);
       }
@@ -1004,6 +910,7 @@ export class GitFs {
 
     // Mark as deleted (so git tree entries are hidden)
     this.deleted.add(normalized);
+    await this.saveMetadata();
   }
 
   async cp(src: string, dest: string, options?: CpOptions): Promise<void> {
@@ -1039,9 +946,10 @@ export class GitFs {
     // Symlink creation in overlay not supported — store as a regular file
     const normalized = normalizePath(_linkPath);
     const buf = textEncoder.encode(_target);
-    this.overlay.set(normalized, buf);
-    this.ensureOverlayParents(normalized);
-    this.deleted.delete(normalized);
+    await this.r2Fs.writeFile(normalized, buf);
+    if (this.deleted.delete(normalized)) {
+      await this.saveMetadata();
+    }
   }
 
   async link(existingPath: string, newPath: string): Promise<void> {

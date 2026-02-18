@@ -4,6 +4,7 @@ import { Bash, InMemoryFs, MountableFs } from "just-bash";
 import { AgentFsAdapter } from "./agentfs-adapter";
 import { createMountCommands } from "./commands";
 import { createMockGitServer } from "./mock-git-server";
+import { MockR2Bucket } from "./mock-r2-bucket";
 
 /** Helper: create a fresh AgentFS + MountableFs + Bash for each test. */
 async function createTestEnv(opts?: { withAgentFs?: boolean }) {
@@ -16,7 +17,7 @@ async function createTestEnv(opts?: { withAgentFs?: boolean }) {
 
   // /etc is always hardcoded-mounted (same as server.ts)
   const etcFs = new AgentFsAdapter(agentFs, "/etc");
-  mountableFs.mount("/etc", etcFs);
+  mountableFs.mount("/etc", etcFs, "agentfs");
 
   const cmds = createMountCommands(
     mountableFs,
@@ -87,7 +88,12 @@ describe("mount -t git", () => {
       "src/index.ts": "export default 42;"
     });
 
-    const cmds = createMountCommands(mountableFs, undefined, { gitHttp: http });
+    const r2Bucket = new MockR2Bucket() as unknown as R2Bucket;
+    const cmds = createMountCommands(mountableFs, undefined, {
+      gitHttp: http,
+      r2Bucket,
+      userId: "test-user"
+    });
     const gitBash = new Bash({
       fs: mountableFs,
       customCommands: cmds,

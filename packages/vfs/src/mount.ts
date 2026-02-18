@@ -43,6 +43,10 @@ export interface MountOptions {
   fsTypeRegistry?: FsTypeRegistry;
   /** Mount points that cannot be umounted (e.g. ["/etc"]). */
   protectedMounts?: string[];
+  /** R2 bucket for GitFs overlay persistence. */
+  r2Bucket?: R2Bucket;
+  /** User ID for scoping R2 keys. */
+  userId?: string;
 }
 
 /**
@@ -136,12 +140,22 @@ export async function mountEntry(
 
     const onAuth = username ? () => ({ username, password }) : undefined;
 
+    if (!options?.r2Bucket || !options?.userId) {
+      console.error(
+        `fstab: git mount ${entry.mountPoint} requires r2Bucket and userId`
+      );
+      return;
+    }
+
     const gitFs = new GitFs({
       url: entry.device,
       ref,
       depth: isNaN(depth) || depth < 1 ? 1 : depth,
       onAuth,
-      http: options?.gitHttp
+      http: options?.gitHttp,
+      r2Bucket: options.r2Bucket,
+      userId: options.userId,
+      mountPoint: entry.mountPoint
     });
 
     try {

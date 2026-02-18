@@ -219,12 +219,24 @@ async function mountGit(
     ? () => ({ username: username!, password })
     : undefined;
 
+  if (!mountOptions?.r2Bucket || !mountOptions?.userId) {
+    return {
+      stdout: "",
+      stderr:
+        "mount: git mount requires r2Bucket and userId in mount options\n",
+      exitCode: 1
+    };
+  }
+
   const gitFs = new GitFs({
     url,
     ref,
     depth,
     onAuth,
-    http: mountOptions?.gitHttp
+    http: mountOptions?.gitHttp,
+    r2Bucket: mountOptions.r2Bucket,
+    userId: mountOptions.userId,
+    mountPoint: mountpoint
   });
 
   try {

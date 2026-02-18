@@ -135,7 +135,9 @@ class ChatAgentBase extends AIChatAgent {
 
     const mountOptions = {
       fsTypeRegistry: this.buildFsTypeRegistry(),
-      protectedMounts: ["/etc", "/home/user", "/data"]
+      protectedMounts: ["/etc", "/home/user", "/data"],
+      r2Bucket: this.env.R2,
+      userId
     };
 
     this.bash = new Bash({
@@ -316,7 +318,9 @@ class ChatAgentBase extends AIChatAgent {
       // Mount all entries using mountEntry from vfs (skips /etc which is already mounted)
       const mountOptions = {
         fsTypeRegistry: this.buildFsTypeRegistry(),
-        protectedMounts: ["/etc", "/home/user", "/data"]
+        protectedMounts: ["/etc", "/home/user", "/data"],
+        r2Bucket: this.env.R2,
+        userId
       };
       for (const entry of entries) {
         try {

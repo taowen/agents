@@ -1,6 +1,7 @@
 import { describe, it, expect, beforeAll } from "vitest";
 import { GitFs } from "./git-fs";
 import { createMockGitServer } from "./mock-git-server";
+import { MockR2Bucket } from "./mock-r2-bucket";
 
 describe("GitFs (local mock)", () => {
   let fs: GitFs;
@@ -10,7 +11,15 @@ describe("GitFs (local mock)", () => {
       "README.md": "Test content",
       "src/index.ts": "export default 42;"
     });
-    fs = new GitFs({ url, ref: "main", http });
+    const r2Bucket = new MockR2Bucket() as unknown as R2Bucket;
+    fs = new GitFs({
+      url,
+      ref: "main",
+      http,
+      r2Bucket,
+      userId: "test-user",
+      mountPoint: "/mnt/repo"
+    });
     await fs.init();
   });
 
@@ -64,7 +73,7 @@ describe("GitFs (local mock)", () => {
     await fs.writeFile("/foo", "bar");
     const content = await fs.readFile("/foo");
     expect(content).toBe("bar");
-    expect(fs.isDirty()).toBe(true);
+    expect(await fs.isDirty()).toBe(true);
   });
 
   it("overlay file appears in readdir", async () => {
