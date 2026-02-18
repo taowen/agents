@@ -189,7 +189,7 @@ function AuthenticatedApp({ user }: { user: UserInfo }) {
 
 export default function App() {
   const { user, authenticated, isLoading } = useAuth();
-  const isAgentPage = window.location.pathname === "/agent";
+  const isAgentPage = window.location.pathname === "/windows-agent";
 
   if (isLoading) {
     return (

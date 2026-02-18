@@ -3,42 +3,146 @@ import { createOpenAICompatible } from "@ai-sdk/openai-compatible";
 import { createGoogleGenerativeAI } from "@ai-sdk/google";
 import type { LanguageModel } from "ai";
 import type { ModelMessage } from "ai";
-import { streamText, stepCountIs, tool } from "ai";
+import { streamText, tool } from "ai";
 import { Bash, InMemoryFs } from "just-bash";
 import { z } from "zod";
 import { ModeToggle } from "@cloudflare/agents-ui";
 import type { LlmConfig } from "../server/llm-proxy";
 import "./windows-agent.css";
 
+// ---- Types ----
+
+interface ScreenControlParams {
+  action: string;
+  x?: number;
+  y?: number;
+  text?: string;
+  key?: string;
+  modifiers?: string[];
+  button?: string;
+  doubleClick?: boolean;
+  direction?: string;
+  amount?: number;
+}
+
+interface ScreenControlResult {
+  success: boolean;
+  error?: string;
+  width?: number;
+  height?: number;
+  base64?: string;
+  action?: string;
+  [key: string]: unknown;
+}
+
+interface WorkWithWindows {
+  ping: () => string;
+  platform: string;
+  screenControl: (params: ScreenControlParams) => Promise<ScreenControlResult>;
+}
+
+declare global {
+  interface Window {
+    workWithWindows?: WorkWithWindows;
+  }
+}
+
 // ---- Agent logic (runs in-browser) ----
 
 interface AgentCallbacks {
   onTextDelta: (delta: string) => void;
-  onToolCall: (command: string) => void;
-  onToolResult: (result: {
-    stdout: string;
-    stderr: string;
-    exitCode: number;
-  }) => void;
+  onToolCall: (toolName: string, input: Record<string, unknown>) => void;
+  onToolResult: (toolName: string, result: unknown) => void;
 }
 
 const fs = new InMemoryFs();
 const bash = new Bash({ fs, cwd: "/home" });
 
-const bashTool = tool({
+const bashToolDef = tool({
   description: "Execute a bash command in the browser-side virtual filesystem",
-  inputSchema: z.object({
+  parameters: z.object({
     command: z.string().describe("The bash command to execute")
-  }),
-  execute: async ({ command }) => {
-    const result = await bash.exec(command);
+  })
+});
+
+const screenToolDef = tool({
+  description:
+    "Control the Windows desktop screen. Take screenshots, click, type, press keys, move mouse, and scroll. " +
+    "Use 'screenshot' first to see what's on screen, then interact with elements by their pixel coordinates. " +
+    "Coordinates are in physical pixels from top-left (0,0).",
+  parameters: z.object({
+    action: z
+      .enum([
+        "screenshot",
+        "click",
+        "mouse_move",
+        "type",
+        "key_press",
+        "scroll"
+      ])
+      .describe("The screen action to perform"),
+    x: z
+      .number()
+      .optional()
+      .describe("X coordinate in pixels (for click, mouse_move, scroll)"),
+    y: z
+      .number()
+      .optional()
+      .describe("Y coordinate in pixels (for click, mouse_move, scroll)"),
+    text: z.string().optional().describe("Text to type (for type action)"),
+    key: z
+      .string()
+      .optional()
+      .describe(
+        "Key name to press, e.g. 'enter', 'tab', 'a', 'f5' (for key_press action)"
+      ),
+    modifiers: z
+      .array(z.string())
+      .optional()
+      .describe(
+        "Modifier keys to hold, e.g. ['ctrl', 'shift'] (for key_press action)"
+      ),
+    button: z
+      .enum(["left", "right", "middle"])
+      .optional()
+      .describe("Mouse button (for click action, default: left)"),
+    doubleClick: z
+      .boolean()
+      .optional()
+      .describe("Double-click (for click action, default: false)"),
+    direction: z
+      .enum(["up", "down"])
+      .optional()
+      .describe("Scroll direction (for scroll action, default: down)"),
+    amount: z
+      .number()
+      .optional()
+      .describe("Scroll amount in notches (for scroll action, default: 3)")
+  })
+});
+
+async function executeBash(command: string) {
+  const result = await bash.exec(command);
+  return {
+    stdout: result.stdout,
+    stderr: result.stderr,
+    exitCode: result.exitCode
+  };
+}
+
+async function executeScreen(
+  input: ScreenControlParams
+): Promise<ScreenControlResult> {
+  if (!window.workWithWindows?.screenControl) {
     return {
-      stdout: result.stdout,
-      stderr: result.stderr,
-      exitCode: result.exitCode
+      success: false,
+      error: "Screen control is only available in the Electron desktop app",
+      action: input.action
     };
   }
-});
+  const result = await window.workWithWindows.screenControl(input);
+  return { ...result, action: input.action };
+}
 
 const history: ModelMessage[] = [];
 
@@ -74,44 +178,150 @@ async function chat(userMessage: string, callbacks: AgentCallbacks) {
 
   const model = await getModel();
 
-  const result = streamText({
-    model,
-    system:
-      "You are a helpful assistant with access to a bash shell running in a virtual filesystem. " +
-      "The filesystem is an in-memory virtual filesystem. You can create files, run commands, etc. " +
-      "The working directory is /home. " +
-      "You are running inside an Electron desktop application on Windows.",
-    messages: history,
-    tools: { bash: bashTool },
-    stopWhen: stepCountIs(10)
-  });
+  const hasScreenControl = !!window.workWithWindows?.screenControl;
 
-  for await (const event of result.fullStream) {
-    switch (event.type) {
-      case "text-delta":
-        callbacks.onTextDelta(event.text);
-        break;
-      case "tool-call":
-        if (event.toolName === "bash") {
-          callbacks.onToolCall((event.input as { command: string }).command);
-        }
-        break;
-      case "tool-result":
-        if (event.toolName === "bash") {
-          callbacks.onToolResult(
-            event.output as {
-              stdout: string;
-              stderr: string;
-              exitCode: number;
-            }
+  const systemPrompt =
+    "You are a helpful assistant running inside an Electron desktop application on Windows. " +
+    "You have access to a bash shell running in a virtual in-memory filesystem (working directory: /home). " +
+    (hasScreenControl
+      ? "You also have access to the Windows desktop screen. You can take screenshots to see what's on screen, " +
+        "then click, type, press keys, move the mouse, and scroll to interact with any application. " +
+        "Always take a screenshot first to understand the current screen state before performing actions. " +
+        "Use pixel coordinates from the screenshot to target UI elements."
+      : "");
+
+  const tools = { bash: bashToolDef, screen: screenToolDef };
+
+  for (let step = 0; step < 10; step++) {
+    // Single-step streamText (no stopWhen / maxSteps)
+    const result = streamText({
+      model,
+      system: systemPrompt,
+      messages: history,
+      tools
+    });
+
+    // Collect tool calls from the stream
+    const toolCalls: Array<{
+      toolCallId: string;
+      toolName: string;
+      args: Record<string, unknown>;
+    }> = [];
+
+    for await (const event of result.fullStream) {
+      switch (event.type) {
+        case "text-delta":
+          callbacks.onTextDelta(event.text);
+          break;
+        case "tool-call": {
+          const tcArgs = (event as any).input ?? (event as any).args ?? {};
+          console.log(
+            "[agent] tool-call:",
+            event.toolName,
+            JSON.stringify(tcArgs)
           );
+          toolCalls.push({
+            toolCallId: event.toolCallId,
+            toolName: event.toolName,
+            args: tcArgs as Record<string, unknown>
+          });
+          callbacks.onToolCall(
+            event.toolName,
+            tcArgs as Record<string, unknown>
+          );
+          break;
         }
-        break;
+      }
+    }
+
+    // Push assistant message(s) from this step
+    const response = await result.response;
+    history.push(...response.messages);
+
+    // No tool calls → model is done
+    if (toolCalls.length === 0) break;
+
+    // Execute each tool call and push results into history
+    console.log(
+      "[agent] step",
+      step,
+      "toolCalls:",
+      JSON.stringify(
+        toolCalls.map((t) => ({
+          id: t.toolCallId,
+          name: t.toolName,
+          args: t.args
+        }))
+      )
+    );
+    for (const tc of toolCalls) {
+      let toolResultContent: string;
+
+      if (tc.toolName === "bash") {
+        const bashResult = await executeBash(
+          (tc.args as { command: string }).command
+        );
+        callbacks.onToolResult(tc.toolName, bashResult);
+        toolResultContent = JSON.stringify(bashResult);
+      } else if (tc.toolName === "screen") {
+        const screenResult = await executeScreen(
+          tc.args as ScreenControlParams
+        );
+        callbacks.onToolResult(tc.toolName, screenResult);
+
+        // Build text summary (without base64)
+        const lines: string[] = [];
+        lines.push(
+          `Action: ${screenResult.action ?? "screenshot"} | Success: ${screenResult.success}`
+        );
+        if (screenResult.error) lines.push(`Error: ${screenResult.error}`);
+        if (screenResult.width && screenResult.height)
+          lines.push(`Screen: ${screenResult.width}x${screenResult.height}`);
+        toolResultContent = lines.join("\n");
+
+        // Inject screenshot as a user message so the model can see the image
+        if (screenResult.base64) {
+          history.push({
+            role: "tool" as const,
+            content: [
+              {
+                type: "tool-result" as const,
+                toolCallId: tc.toolCallId,
+                toolName: tc.toolName,
+                output: { type: "text", value: toolResultContent }
+              }
+            ]
+          });
+          history.push({
+            role: "user",
+            content: [
+              { type: "text", text: "Here is the screenshot:" },
+              {
+                type: "image",
+                image: screenResult.base64,
+                mediaType: "image/png"
+              }
+            ]
+          });
+          continue; // skip the default tool-result push below
+        }
+      } else {
+        toolResultContent = "Unknown tool";
+      }
+
+      history.push({
+        role: "tool" as const,
+        content: [
+          {
+            type: "tool-result" as const,
+            toolCallId: tc.toolCallId,
+            toolName: tc.toolName,
+            output: { type: "text", value: toolResultContent }
+          }
+        ]
+      });
     }
   }
-
-  const response = await result.response;
-  history.push(...response.messages);
 }
 
 function resetAgent() {
@@ -121,27 +331,25 @@ function resetAgent() {
 
 // ---- UI ----
 
-interface ToolInvocation {
+interface BashInvocation {
+  type: "bash";
   command: string;
   result?: { stdout: string; stderr: string; exitCode: number };
 }
+
+interface ScreenInvocation {
+  type: "screen";
+  action: string;
+  params: Record<string, unknown>;
+  result?: ScreenControlResult;
+}
+
+type ToolInvocation = BashInvocation | ScreenInvocation;
 
 interface Message {
   role: "user" | "assistant";
   text: string;
   toolInvocations: ToolInvocation[];
-}
-
-/** Detect the Electron preload bridge */
-interface WorkWithWindows {
-  ping: () => string;
-  platform: string;
-}
-
-declare global {
-  interface Window {
-    workWithWindows?: WorkWithWindows;
-  }
 }
 
 export function WindowsAgent() {
@@ -158,7 +366,10 @@ export function WindowsAgent() {
     if (window.workWithWindows) {
       const pong = window.workWithWindows.ping();
       const platform = window.workWithWindows.platform;
-      setElectronStatus(`Electron (${platform}) - bridge: ${pong}`);
+      const hasScreen = !!window.workWithWindows.screenControl;
+      setElectronStatus(
+        `Electron (${platform}) - bridge: ${pong}${hasScreen ? " + screen" : ""}`
+      );
     }
   }, []);
 
@@ -213,15 +424,45 @@ export function WindowsAgent() {
           currentTextRef.current += delta;
           scheduleFlush();
         },
-        onToolCall(command) {
-          currentToolsRef.current.push({ command });
+        onToolCall(toolName, toolInput) {
+          console.log(
+            "[UI] onToolCall:",
+            toolName,
+            "input:",
+            JSON.stringify(toolInput)
+          );
+          if (toolName === "bash") {
+            currentToolsRef.current.push({
+              type: "bash",
+              command: (toolInput as { command: string }).command
+            });
+          } else if (toolName === "screen") {
+            const { action, ...params } = toolInput as {
+              action: string;
+              [k: string]: unknown;
+            };
+            currentToolsRef.current.push({
+              type: "screen",
+              action,
+              params
+            });
+          }
           scheduleFlush();
         },
-        onToolResult(result) {
+        onToolResult(toolName, result) {
           const tools = currentToolsRef.current;
           for (let i = tools.length - 1; i >= 0; i--) {
-            if (!tools[i].result) {
-              tools[i].result = result;
+            const inv = tools[i];
+            if (toolName === "bash" && inv.type === "bash" && !inv.result) {
+              inv.result = result as {
+                stdout: string;
+                stderr: string;
+                exitCode: number;
+              };
+              break;
+            }
+            if (toolName === "screen" && inv.type === "screen" && !inv.result) {
+              inv.result = result as ScreenControlResult;
               break;
             }
           }
@@ -258,9 +499,7 @@ export function WindowsAgent() {
         <div className="wa-header-left">
           <h1 className="wa-title">Windows Agent</h1>
           {electronStatus ? (
-            <span className="wa-badge wa-badge-electron">
-              {electronStatus}
-            </span>
+            <span className="wa-badge wa-badge-electron">{electronStatus}</span>
           ) : (
             <span className="wa-badge wa-badge-browser">Browser mode</span>
           )}
@@ -285,23 +524,73 @@ export function WindowsAgent() {
             </div>
             {msg.toolInvocations.map((invocation, j) => (
               <div key={j} className="wa-tool">
-                <div className="wa-tool-command">$ {invocation.command}</div>
-                {invocation.result ? (
-                  <pre className="wa-tool-result">
-                    {invocation.result.stdout}
-                    {invocation.result.stderr && (
-                      <span className="wa-tool-stderr">
-                        {invocation.result.stderr}
-                      </span>
+                {invocation.type === "bash" ? (
+                  <>
+                    <div className="wa-tool-command">
+                      $ {invocation.command}
+                    </div>
+                    {invocation.result ? (
+                      <pre className="wa-tool-result">
+                        {invocation.result.stdout}
+                        {invocation.result.stderr && (
+                          <span className="wa-tool-stderr">
+                            {invocation.result.stderr}
+                          </span>
+                        )}
+                        {invocation.result.exitCode !== 0 && (
+                          <span className="wa-tool-exitcode">
+                            exit code: {invocation.result.exitCode}
+                          </span>
+                        )}
+                      </pre>
+                    ) : (
+                      <div className="wa-tool-running">Running...</div>
                     )}
-                    {invocation.result.exitCode !== 0 && (
-                      <span className="wa-tool-exitcode">
-                        exit code: {invocation.result.exitCode}
-                      </span>
-                    )}
-                  </pre>
+                  </>
                 ) : (
-                  <div className="wa-tool-running">Running...</div>
+                  <>
+                    <div className="wa-tool-command">
+                      screen: {invocation.action}
+                      {Object.keys(invocation.params).length > 0 && (
+                        <span className="wa-tool-params">
+                          {" "}
+                          (
+                          {Object.entries(invocation.params)
+                            .map(([k, v]) => `${k}=${JSON.stringify(v)}`)
+                            .join(", ")}
+                          )
+                        </span>
+                      )}
+                    </div>
+                    {invocation.result ? (
+                      <div className="wa-tool-result">
+                        {invocation.result.success ? (
+                          <>
+                            {invocation.result.base64 && (
+                              <img
+                                src={`data:image/png;base64,${invocation.result.base64}`}
+                                alt="Screenshot"
+                                className="wa-screenshot"
+                              />
+                            )}
+                            {invocation.result.width &&
+                              invocation.result.height && (
+                                <div className="wa-tool-info">
+                                  Screen: {invocation.result.width}x
+                                  {invocation.result.height}
+                                </div>
+                              )}
+                          </>
+                        ) : (
+                          <span className="wa-tool-stderr">
+                            Error: {invocation.result.error}
+                          </span>
+                        )}
+                      </div>
+                    ) : (
+                      <div className="wa-tool-running">Running...</div>
+                    )}
+                  </>
                 )}
               </div>
             ))}
