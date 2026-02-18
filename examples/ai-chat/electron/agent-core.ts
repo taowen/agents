@@ -16,7 +16,7 @@ import type {
 
 const bashToolDef = tool({
   description: "Execute a bash command in a virtual in-memory filesystem",
-  parameters: z.object({
+  inputSchema: z.object({
     command: z.string().describe("The bash command to execute")
   })
 });
@@ -24,10 +24,11 @@ const bashToolDef = tool({
 const screenToolDef = tool({
   description:
     "Control the Windows desktop screen. Take screenshots, click, type, press keys, move mouse, and scroll. " +
-    "Use 'screenshot' first to see what's on screen, then interact with elements by their pixel coordinates. " +
-    "Coordinates are in physical pixels from top-left (0,0). " +
+    "Use 'screenshot' first to see what's on screen, then interact with elements using normalized 0-1000 coordinates. " +
+    "Coordinates use a normalized 0-1000 range: the image is divided into a 1000x1000 grid, top-left is (0,0), bottom-right is (999,999). " +
+    "The system automatically converts these to actual pixel positions. " +
     "Use 'annotate' with x,y to draw a red crosshair on the last screenshot — verify your target before clicking.",
-  parameters: z.object({
+  inputSchema: z.object({
     action: z
       .enum([
         "screenshot",
@@ -39,8 +40,14 @@ const screenToolDef = tool({
         "annotate"
       ])
       .describe("The screen action to perform"),
-    x: z.number().optional().describe("X coordinate in pixels"),
-    y: z.number().optional().describe("Y coordinate in pixels"),
+    x: z
+      .number()
+      .optional()
+      .describe("X coordinate in normalized 0-1000 range"),
+    y: z
+      .number()
+      .optional()
+      .describe("Y coordinate in normalized 0-1000 range"),
     text: z.string().optional().describe("Text to type"),
     key: z.string().optional().describe("Key name to press"),
     modifiers: z.array(z.string()).optional().describe("Modifier keys"),
@@ -60,7 +67,7 @@ const windowToolDef = tool({
     "move/resize, minimize/maximize/restore, or take a screenshot of a single window. " +
     "Use list_windows first to discover windows and their handles. " +
     "Use window_screenshot to capture just one window (smaller image than full desktop screenshot).",
-  parameters: z.object({
+  inputSchema: z.object({
     action: z.enum([
       "list_windows",
       "focus_window",
@@ -97,6 +104,16 @@ export function createAgent(deps: AgentDeps) {
   const history: ModelMessage[] = [];
   let stepCounter = 0;
   let lastScreenshotBase64: string | null = null;
+  let lastScreenshotWidth: number = 0;
+  let lastScreenshotHeight: number = 0;
+
+  /** Convert normalized 0-1000 coords to pixel coords based on last screenshot size */
+  function normToPixel(normX: number, normY: number): { x: number; y: number } {
+    return {
+      x: Math.round((normX / 1000) * lastScreenshotWidth),
+      y: Math.round((normY / 1000) * lastScreenshotHeight)
+    };
+  }
 
   async function executeBash(command: string) {
     const result = await bash.exec(command);
@@ -121,23 +138,30 @@ export function createAgent(deps: AgentDeps) {
     return { ...result, action: input.action };
   }
 
-  function formatScreenLog(result: ScreenControlResult): string {
+  function formatScreenLog(
+    result: ScreenControlResult,
+    normX?: number,
+    normY?: number
+  ): string {
     const action = result.action ?? "screenshot";
     if (!result.success)
       return `[agent] screen: ${action} → error: ${result.error}`;
     if (action === "click" || action === "mouse_move") {
-      const coords = `(${result.x},${result.y})`;
+      const norm = normX !== undefined ? `norm(${normX},${normY})→` : "";
+      const pixel = `pixel(${result.x},${result.y})`;
       const desktop =
         result.desktopX !== undefined
           ? `→desktop(${result.desktopX},${result.desktopY})`
           : "";
-      return `[agent] screen: ${action} ${coords}${desktop} → success`;
+      return `[agent] screen: ${action} ${norm}${pixel}${desktop} → success`;
     }
     if (action === "screenshot" && result.width) {
       return `[agent] screen: screenshot → ${result.width}x${result.height}`;
     }
     if (action === "annotate" && result.width) {
-      return `[agent] screen: annotate (${result.x ?? "?"},${result.y ?? "?"}) → ${result.width}x${result.height}`;
+      const norm = normX !== undefined ? `norm(${normX},${normY})→` : "";
+      const pixel = `pixel(${result.x ?? "?"},${result.y ?? "?"})`;
+      return `[agent] screen: annotate ${norm}${pixel} → ${result.width}x${result.height}`;
     }
     if (action === "scroll") {
       return `[agent] screen: scroll ${result.direction} ${result.amount}${result.desktopX !== undefined ? ` at desktop(${result.desktopX},${result.desktopY})` : ""} → success`;
@@ -189,11 +213,16 @@ export function createAgent(deps: AgentDeps) {
       "move/resize, minimize/maximize/restore, and take a screenshot of a single window. " +
       "Use win({ action: 'list_windows' }) to discover windows and their handles. " +
       "Use win({ action: 'window_screenshot', handle: ... }) to capture just one window (smaller image, and coordinates in subsequent click/move/scroll are automatically translated to desktop coordinates). " +
+      "\n\nCOORDINATE SYSTEM:\n" +
+      "All coordinates (x, y) for the screen tool use a normalized 0-1000 range. " +
+      "The image is divided into a 1000x1000 grid: top-left is (0, 0), bottom-right is (999, 999). " +
+      "For example, the center of the image is (500, 500). " +
+      "The system automatically translates these normalized coordinates to actual pixel positions — you never need to know the pixel resolution.\n" +
       "\n\nIMPORTANT workflow rules:\n" +
       "1. BEFORE every action (click, type, key_press), take a screenshot or window_screenshot first to see the current state. Never assume a previous action succeeded — always verify visually.\n" +
       "2. After each click or key_press, take another screenshot to confirm the expected result happened.\n" +
       "3. If a screenshot shows the wrong window is in front, use win({ action: 'focus_window' }) to bring the target window back, then take another screenshot to confirm.\n" +
-      "4. Use pixel coordinates from the MOST RECENT screenshot to target UI elements. Never reuse coordinates from an earlier screenshot.\n" +
+      "4. Use normalized coordinates from the MOST RECENT screenshot to target UI elements. Never reuse coordinates from an earlier screenshot.\n" +
       "5. After completing the task, provide a concise text summary of what you did and the result. Do NOT include base64 image data in your text response.\n" +
       "6. Before clicking, use screen({ action: 'annotate', x, y }) to draw a red crosshair on the last screenshot and verify the target coordinates are correct. If the marker is off-target, adjust coordinates before clicking.";
 
@@ -256,13 +285,37 @@ export function createAgent(deps: AgentDeps) {
           );
           toolResultContent = JSON.stringify(bashResult);
         } else if (tc.toolName === "screen") {
-          const screenArgs = tc.args as ScreenControlParams;
+          const screenArgs = tc.args as unknown as ScreenControlParams;
+          let logNormX: number | undefined;
+          let logNormY: number | undefined;
+
+          // Convert normalized 0-1000 coords to pixel coords for actions that use x/y
+          const coordActions = ["click", "mouse_move", "scroll", "annotate"];
+          if (
+            coordActions.includes(screenArgs.action) &&
+            screenArgs.x !== undefined &&
+            screenArgs.y !== undefined &&
+            lastScreenshotWidth > 0 &&
+            lastScreenshotHeight > 0
+          ) {
+            logNormX = screenArgs.x;
+            logNormY = screenArgs.y;
+            const pixel = normToPixel(screenArgs.x, screenArgs.y);
+            screenArgs.x = pixel.x;
+            screenArgs.y = pixel.y;
+          }
+
           // Inject stored screenshot for annotate action
           if (screenArgs.action === "annotate" && lastScreenshotBase64) {
             screenArgs.base64 = lastScreenshotBase64;
+            // Pass normalized coords for the annotation label
+            if (logNormX !== undefined) {
+              screenArgs.normX = logNormX;
+              screenArgs.normY = logNormY;
+            }
           }
           const screenResult = await executeScreen(screenArgs);
-          onLog?.(formatScreenLog(screenResult));
+          onLog?.(formatScreenLog(screenResult, logNormX, logNormY));
 
           const lines: string[] = [];
           lines.push(
@@ -274,9 +327,13 @@ export function createAgent(deps: AgentDeps) {
           toolResultContent = lines.join("\n");
 
           if (screenResult.base64) {
-            // Store base64 for future annotate calls (but not from annotate itself)
+            // Store base64 and dimensions for future annotate calls (but not from annotate itself)
             if (screenResult.action !== "annotate") {
               lastScreenshotBase64 = screenResult.base64;
+              if (screenResult.width && screenResult.height) {
+                lastScreenshotWidth = screenResult.width;
+                lastScreenshotHeight = screenResult.height;
+              }
             }
 
             onScreenshot?.(
@@ -316,8 +373,12 @@ export function createAgent(deps: AgentDeps) {
             continue;
           }
         } else if (tc.toolName === "win") {
-          const winResult = await executeWindow(tc.args as ScreenControlParams);
-          onLog?.(formatWinLog(winResult, tc.args as ScreenControlParams));
+          const winResult = await executeWindow(
+            tc.args as unknown as ScreenControlParams
+          );
+          onLog?.(
+            formatWinLog(winResult, tc.args as unknown as ScreenControlParams)
+          );
 
           if (winResult.action === "list_windows") {
             const windows = winResult.windows || [];
@@ -334,8 +395,12 @@ export function createAgent(deps: AgentDeps) {
               lines.push(`Window size: ${winResult.width}x${winResult.height}`);
             toolResultContent = lines.join("\n");
 
-            // Store base64 for future annotate calls
+            // Store base64 and dimensions for future annotate/coordinate calls
             lastScreenshotBase64 = winResult.base64;
+            if (winResult.width && winResult.height) {
+              lastScreenshotWidth = winResult.width;
+              lastScreenshotHeight = winResult.height;
+            }
 
             onScreenshot?.(currentStep, "window_screenshot", winResult.base64);
 
@@ -388,6 +453,25 @@ export function createAgent(deps: AgentDeps) {
         });
       }
     }
+
+    // Always do a final summary step without tools
+    history.push({
+      role: "user",
+      content: "Summarize what you did and the result."
+    });
+    const summary = streamText({
+      model: deps.model,
+      system: systemPrompt,
+      messages: history
+    });
+    finalText = "";
+    for await (const event of summary.fullStream) {
+      if (event.type === "text-delta") {
+        finalText += event.text;
+      }
+    }
+    const summaryResp = await summary.response;
+    history.push(...summaryResp.messages);
 
     return finalText || "[Agent completed without text output]";
   }

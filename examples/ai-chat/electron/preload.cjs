@@ -15,6 +15,29 @@ contextBridge.exposeInMainWorld("workWithWindows", {
 
   /** Screen control — maps action names to IPC channels */
   screenControl: (params) => {
+    // Normalize common LLM action name variants
+    const actionAliases = {
+      press_key: "key_press",
+      keypress: "key_press",
+      move: "mouse_move",
+      move_mouse: "mouse_move",
+      focus: "focus_window",
+      activate: "focus_window",
+      activate_window: "focus_window",
+      resize: "resize_window",
+      move_window: "resize_window",
+      minimize: "minimize_window",
+      maximize: "maximize_window",
+      restore: "restore_window",
+      list: "list_windows",
+      double_click: "click"
+    };
+    const originalAction = params.action;
+    params = {
+      ...params,
+      action: actionAliases[params.action] || params.action
+    };
+    if (originalAction === "double_click") params.doubleClick = true;
     const channelMap = {
       screenshot: "screen:screenshot",
       click: "screen:mouse-click",

@@ -472,6 +472,25 @@ async function runLocalAgent(
     }
   }
 
+  // Always do a final summary step without tools
+  agentHistory.push({
+    role: "user",
+    content: "Summarize what you did and the result."
+  });
+  const summary = streamText({
+    model,
+    system: systemPrompt,
+    messages: agentHistory
+  });
+  finalText = "";
+  for await (const event of summary.fullStream) {
+    if (event.type === "text-delta") {
+      finalText += event.text;
+    }
+  }
+  const summaryResp = await summary.response;
+  agentHistory.push(...summaryResp.messages);
+
   return finalText || "[Agent completed without text output]";
 }
 

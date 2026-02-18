@@ -32,6 +32,8 @@ export interface ScreenControlParams {
   title?: string;
   width?: number;
   height?: number;
+  normX?: number;
+  normY?: number;
 }
 
 export interface ScreenControlResult {
@@ -422,14 +424,19 @@ async function handleAnnotate(
     fs.writeFileSync(tmpFile, Buffer.from(base64, "base64"));
 
     try {
+      const env: Record<string, string> = {
+        IMAGE_PATH: tmpFile,
+        X: String(Math.round(x)),
+        Y: String(Math.round(y))
+      };
+      if (params.normX !== undefined && params.normY !== undefined) {
+        env.NORM_X = String(params.normX);
+        env.NORM_Y = String(params.normY);
+      }
       const { stdout } = await runPowerShell(script("annotate-image.ps1"), {
         timeout: 15000,
         maxBuffer: 20 * 1024 * 1024,
-        env: {
-          IMAGE_PATH: tmpFile,
-          X: String(Math.round(x)),
-          Y: String(Math.round(y))
-        }
+        env
       });
       const lines = stdout.split(/\r?\n/);
       const [width, height] = lines[0].split("x").map(Number);
@@ -460,7 +467,10 @@ const actionAliases: Record<string, string> = {
   move: "mouse_move",
   move_mouse: "mouse_move",
   focus: "focus_window",
+  activate: "focus_window",
+  activate_window: "focus_window",
   resize: "resize_window",
+  move_window: "resize_window",
   minimize: "minimize_window",
   maximize: "maximize_window",
   restore: "restore_window",

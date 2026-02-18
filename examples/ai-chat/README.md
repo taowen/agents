@@ -200,6 +200,52 @@ Every run saves structured logs and screenshots to a fixed directory:
 Contents:
 - `agent.log` — timestamped log of every step, tool call, and result (including coordinate translations)
 - `step-NN-<action>.png` — screenshots the agent captured during normal operation
+- `step-NN-annotate.png` — annotated screenshots with red crosshair showing where the model intends to click
+
+### Debugging with logs and screenshots
+
+When the agent misbehaves, follow this workflow to diagnose the issue:
+
+**1. Read `agent.log` and trace the coordinate chain**
+
+Each click/move/annotate log line shows the full coordinate translation:
+
+```
+[agent] screen: click norm(250,230)→pixel(282,151)→desktop(1200,293) → success
+[agent] screen: annotate norm(250,230)→pixel(282,151) → 1126x655
+```
+
+- `norm(250,230)` — what the model output (0-1000 normalized range)
+- `pixel(282,151)` — converted using `norm / 1000 * screenshot_size`
+- `desktop(1200,293)` — pixel + window offset (from last `window_screenshot`)
+
+If the pixel or desktop coords look wrong, check whether the screenshot dimensions changed between steps.
+
+**2. Check annotate screenshots to verify targeting**
+
+`step-NN-annotate.png` shows a red crosshair at the exact pixel position where the agent will click. The label shows the normalized coordinates (e.g., `(norm: 250, 230)`). Compare the crosshair position against the UI element the agent is trying to target. If the crosshair is off, the coordinate conversion may be wrong; if the crosshair is on-target but the action fails, the issue is elsewhere.
+
+**3. Compare before/after screenshots to verify click effects**
+
+Walk through the screenshots in order:
+- `step-02-window_screenshot.png` — state before click
+- `step-03-annotate.png` — where the agent plans to click (crosshair)
+- `step-05-window_screenshot.png` — state after click
+
+If the UI didn't change as expected despite correct crosshair placement, common causes include:
+- **Double-click toggling**: The model clicks the same target twice (first click selects, second click deselects). This happens when the model doesn't trust its first click and retries.
+- **Focus stealing**: `focus_window` followed immediately by `click` — the focus event may consume the click. Adding a delay or taking a screenshot between focus and click helps.
+- **Stale coordinates**: The model reuses coordinates from an earlier screenshot after the window has moved or resized.
+
+**4. Quick commands**
+
+```bash
+# Check the log
+cat /mnt/c/Users/$USER/AppData/Local/Temp/windows-agent-standalone/logs/agent.log
+
+# Open screenshots (from Windows)
+explorer.exe "C:\Users\%USERNAME%\AppData\Local\Temp\windows-agent-standalone\logs"
+```
 
 ### How it works
 

@@ -21,8 +21,12 @@ $gfx.DrawLine($pen, $x, ($y - $arm), $x, ($y + $arm))
 $r = 12
 $gfx.DrawEllipse($pen, ($x - $r), ($y - $r), ($r * 2), ($r * 2))
 
-# Label text
-$label = "($x, $y)"
+# Label text — show normalized coords if available, else pixel coords
+if ($env:NORM_X -and $env:NORM_Y) {
+    $label = "(norm: $($env:NORM_X), $($env:NORM_Y))"
+} else {
+    $label = "($x, $y)"
+}
 $font = New-Object System.Drawing.Font("Arial", 12, [System.Drawing.FontStyle]::Bold)
 $brush = New-Object System.Drawing.SolidBrush([System.Drawing.Color]::Red)
 $bgBrush = New-Object System.Drawing.SolidBrush([System.Drawing.Color]::FromArgb(200, 255, 255, 255))
