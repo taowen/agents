@@ -26,22 +26,19 @@ if (-not (Test-Path $WorkDir)) {
 
 # Copy TypeScript sources
 Write-Host "==> Syncing files to $WorkDir ..." -ForegroundColor Cyan
-$ElectronSrc = Join-Path $ProjectDir "electron"
 $ElectronDest = Join-Path $WorkDir "electron"
 
 if (-not (Test-Path $ElectronDest)) {
     New-Item -ItemType Directory -Path $ElectronDest | Out-Null
 }
-Copy-Item (Join-Path $ElectronSrc "win-automation.ts") -Destination $ElectronDest -Force
-Copy-Item (Join-Path $ElectronSrc "agent-core.ts") -Destination $ElectronDest -Force
-Copy-Item (Join-Path $ElectronSrc "standalone.ts") -Destination $ElectronDest -Force
+Copy-Item (Join-Path $ProjectDir "electron\*") -Destination $ElectronDest -Recurse -Force
 
-# Copy scripts directory
-$ScriptsDest = Join-Path $ElectronDest "scripts"
-if (-not (Test-Path $ScriptsDest)) {
-    New-Item -ItemType Directory -Path $ScriptsDest | Out-Null
+# Copy src/shared directory (agent-loop, types, aliases)
+$SharedDest = Join-Path $WorkDir "src\shared"
+if (-not (Test-Path $SharedDest)) {
+    New-Item -ItemType Directory -Path $SharedDest -Force | Out-Null
 }
-Copy-Item (Join-Path (Join-Path $ElectronSrc "scripts") "*") -Destination $ScriptsDest -Recurse -Force
+Copy-Item (Join-Path $ProjectDir "src\shared\*") -Destination $SharedDest -Recurse -Force
 
 # Determine just-bash dependency value
 $justBashDep = '"^2.10.0"'

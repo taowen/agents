@@ -15,7 +15,8 @@ import fs from "node:fs";
 import path from "node:path";
 import os from "node:os";
 import { screenControl } from "./win-automation.ts";
-import { createAgent } from "./agent-core.ts";
+import { createAgentLoop } from "../src/shared/agent-loop.ts";
+import { Bash, InMemoryFs } from "just-bash";
 import { createOpenAICompatible } from "@ai-sdk/openai-compatible";
 import { createGoogleGenerativeAI } from "@ai-sdk/google";
 import type { LanguageModel } from "ai";
@@ -90,7 +91,14 @@ function saveScreenshot(step: number, action: string, base64: string) {
 
 // ---- Run agent ----
 
-const agent = createAgent({ screenControlFn: screenControl, model });
+const bash = new Bash({ fs: new InMemoryFs(), cwd: "/home" });
+
+const agent = createAgentLoop({
+  getModel: () => model,
+  executeBash: (cmd) => bash.exec(cmd),
+  executeScreenControl: screenControl,
+  maxSteps: 20
+});
 
 log(`[standalone] Provider: ${provider}`);
 log(`[standalone] Model: ${modelName}`);
@@ -99,7 +107,10 @@ log(`[standalone] Log dir: ${logDir}`);
 log("");
 
 try {
-  const response = await agent.runAgent(prompt, log, saveScreenshot);
+  const response = await agent.runAgent(prompt, {
+    onLog: log,
+    onScreenshot: saveScreenshot
+  });
   log("");
   log("[standalone] Done.");
   console.log(response);

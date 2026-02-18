@@ -9,44 +9,21 @@ import fs from "node:fs";
 import os from "node:os";
 import { fileURLToPath } from "node:url";
 
+import type {
+  ScreenControlParams,
+  ScreenControlResult
+} from "../src/shared/screen-control-types.ts";
+import {
+  normalizeAction,
+  isDoubleClickAlias
+} from "../src/shared/action-aliases.ts";
+
+export type { ScreenControlParams, ScreenControlResult };
+
 const execFileAsync = promisify(execFile);
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const SCRIPTS_DIR = path.join(__dirname, "scripts");
-
-// ---- Types ----
-
-export interface ScreenControlParams {
-  action: string;
-  x?: number;
-  y?: number;
-  text?: string;
-  key?: string;
-  modifiers?: string[];
-  button?: string;
-  doubleClick?: boolean;
-  direction?: string;
-  amount?: number;
-  base64?: string;
-  handle?: number;
-  title?: string;
-  width?: number;
-  height?: number;
-  normX?: number;
-  normY?: number;
-}
-
-export interface ScreenControlResult {
-  success: boolean;
-  error?: string;
-  width?: number;
-  height?: number;
-  base64?: string;
-  action?: string;
-  windows?: Array<Record<string, unknown>>;
-  message?: string;
-  [key: string]: unknown;
-}
 
 // ---- Virtual key code mapping ----
 
@@ -460,31 +437,12 @@ const stateMap: Record<string, string> = {
   restore_window: "restore"
 };
 
-// Alias map for common LLM misspellings of action names
-const actionAliases: Record<string, string> = {
-  press_key: "key_press",
-  keypress: "key_press",
-  move: "mouse_move",
-  move_mouse: "mouse_move",
-  focus: "focus_window",
-  activate: "focus_window",
-  activate_window: "focus_window",
-  resize: "resize_window",
-  move_window: "resize_window",
-  minimize: "minimize_window",
-  maximize: "maximize_window",
-  restore: "restore_window",
-  list: "list_windows",
-  double_click: "click"
-};
-
 export async function screenControl(
   params: ScreenControlParams
 ): Promise<ScreenControlResult> {
-  const action = actionAliases[params.action] ?? params.action;
+  const action = normalizeAction(params.action);
 
-  // If original action was double_click, force doubleClick flag
-  if (params.action === "double_click") {
+  if (isDoubleClickAlias(params.action)) {
     params = { ...params, doubleClick: true };
   }
 
