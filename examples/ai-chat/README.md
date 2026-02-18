@@ -138,6 +138,92 @@ Read from WSL:
 cat "/mnt/c/Users/$USER/AppData/Local/Temp/windows-agent-build/electron/renderer.log"
 ```
 
+## Standalone Windows Agent (no Electron, no deploy)
+
+A lightweight Node.js CLI that runs the screenshot/automation agent directly on Windows, without Electron or Cloudflare Worker deployment. Useful for quick local testing.
+
+```
+standalone.ts → win-automation.ts → PowerShell scripts
+```
+
+### Prerequisites
+
+- Windows (or WSL with `powershell.exe` accessible)
+- Node.js 18+
+- LLM API access (OpenAI-compatible or Google)
+
+### Quick start (from WSL)
+
+```bash
+# Set LLM config
+export LLM_PROVIDER=google          # or "openai-compatible"
+export LLM_API_KEY=your-key
+export LLM_MODEL=gemini-2.5-flash   # or your model name
+# export LLM_BASE_URL=https://...   # required for openai-compatible
+
+# Build just-bash and launch
+bash examples/ai-chat/run-standalone-on-windows.sh "Take a screenshot and describe what you see"
+```
+
+### Quick start (from Windows PowerShell)
+
+If `just-bash` is published to npm, you can run directly on the Windows side:
+
+```powershell
+$env:LLM_PROVIDER = "google"
+$env:LLM_API_KEY = "your-key"
+$env:LLM_MODEL = "gemini-2.5-flash"
+
+powershell -ExecutionPolicy Bypass -File run-standalone.ps1 "List all visible windows"
+```
+
+### Example commands
+
+```bash
+# Screenshot test
+bash run-standalone-on-windows.sh "Take a screenshot and describe what you see"
+
+# Window list
+bash run-standalone-on-windows.sh "List all visible windows"
+
+# Multi-step
+bash run-standalone-on-windows.sh "Open notepad and type hello"
+```
+
+### Debugging the standalone agent
+
+Set `DEBUG_DIR` to capture focus-transition logs and screenshots from every step:
+
+```bash
+DEBUG_DIR=/tmp/agent-debug bash examples/ai-chat/run-standalone-on-windows.sh "找到微信窗口并截图"
+```
+
+This produces:
+
+| File | Contents |
+|------|----------|
+| `focus-log.txt` | BEFORE/AFTER foreground window handle + title for every tool call |
+| `stepN-action.png` | Screenshot saved whenever a screenshot/window_screenshot action returns an image |
+
+Example `focus-log.txt`:
+
+```
+[step0] BEFORE list_windows: foreground = 525760 "Visual Studio Code"
+[step0] AFTER  list_windows: foreground = 525760 "Visual Studio Code"
+[step1] BEFORE focus_window: foreground = 525760 "Visual Studio Code"
+[step1] AFTER  focus_window: foreground = 67336 "Weixin"
+[step2] BEFORE window_screenshot: foreground = 67336 "Weixin"
+[step2] AFTER  window_screenshot: foreground = 67336 "Weixin"
+```
+
+### How it works
+
+- `electron/win-automation.ts` — PowerShell automation module (zero Electron dependencies)
+- `electron/agent-core.ts` — Platform-agnostic agent loop with dependency injection
+- `electron/standalone.ts` — CLI entry point that wires everything together
+- `run-standalone.ps1` — Windows-side launcher (copies files to temp dir, npm install, runs tsx)
+- `run-standalone-on-windows.sh` — WSL-side launcher (builds just-bash, packs tarball, calls PS1)
+
 ## Try it
 
 - "List files in /home/user" -- bash command execution

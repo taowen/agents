@@ -40,18 +40,21 @@ const sentryHandler = Sentry.withSentry(
       const headers = new Headers(request.headers);
       headers.set("x-user-id", userId);
       const url = new URL(request.url);
-      const agentMatch = url.pathname.match(/\/agents\/([^/]+)\/([^/?]+)/);
+      const agentMatch = url.pathname.match(
+        /\/agents\/([^/]+)\/([^/?]+)(\/.*)?/
+      );
       if (agentMatch) {
         const agentName = agentMatch[1];
+        const restOfPath = agentMatch[3] || "";
         if (agentName === "bridge-manager") {
           // BridgeManager: DO name = userId only (shared across all sessions)
-          url.pathname = `/agents/${agentName}/${encodeURIComponent(userId)}`;
+          url.pathname = `/agents/${agentName}/${encodeURIComponent(userId)}${restOfPath}`;
         } else {
           // ChatAgent: DO name = userId:sessionId for per-session isolation
           const sessionId = decodeURIComponent(agentMatch[2]);
           headers.set("x-session-id", sessionId);
           const isolatedName = encodeURIComponent(`${userId}:${sessionId}`);
-          url.pathname = `/agents/${agentName}/${isolatedName}`;
+          url.pathname = `/agents/${agentName}/${isolatedName}${restOfPath}`;
         }
       }
       const agentReq = new Request(url.toString(), {

@@ -1,10 +1,20 @@
 . "$PSScriptRoot\common.ps1"
 
-if ($env:HWND) {
-    $hwnd = [IntPtr][long]$env:HWND
+function Focus-Window($hwnd) {
     [WinWindow]::ShowWindow($hwnd, [WinWindow]::SW_RESTORE) | Out-Null
     Start-Sleep -Milliseconds 50
+    # Simulate Alt press/release to bypass SetForegroundWindow restriction.
+    # Windows only allows the current foreground process to change foreground;
+    # a brief Alt key event tricks the OS into allowing it from any process.
+    [WinInput]::keybd_event(0xA4, 0, 0, [IntPtr]::Zero)     # Alt down
+    [WinInput]::keybd_event(0xA4, 0, [WinInput]::KEYEVENTF_KEYUP, [IntPtr]::Zero)  # Alt up
     [WinWindow]::SetForegroundWindow($hwnd) | Out-Null
+    Start-Sleep -Milliseconds 100
+}
+
+if ($env:HWND) {
+    $hwnd = [IntPtr][long]$env:HWND
+    Focus-Window $hwnd
     Write-Output "focused handle $($env:HWND)"
 } elseif ($env:TITLE) {
     $proc = Get-Process | Where-Object {
@@ -12,9 +22,7 @@ if ($env:HWND) {
     } | Select-Object -First 1
     if ($proc) {
         $hwnd = $proc.MainWindowHandle
-        [WinWindow]::ShowWindow($hwnd, [WinWindow]::SW_RESTORE) | Out-Null
-        Start-Sleep -Milliseconds 50
-        [WinWindow]::SetForegroundWindow($hwnd) | Out-Null
+        Focus-Window $hwnd
         Write-Output "focused $($proc.MainWindowTitle)"
     } else {
         [Console]::Error.WriteLine("No window found matching '$($env:TITLE)'")

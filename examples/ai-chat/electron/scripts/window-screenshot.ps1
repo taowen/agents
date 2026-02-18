@@ -24,5 +24,5 @@ $gfx.Dispose()
 
 $base64 = Resize-AndEncode $bmp
 
-Write-Output "${w}x${h}"
+Write-Output "$($rect.Left),$($rect.Top),${w}x${h}"
 Write-Output $base64
