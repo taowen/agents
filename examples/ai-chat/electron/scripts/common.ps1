@@ -67,23 +67,10 @@ public class WinWindow {
 }
 "@ -ErrorAction SilentlyContinue
 
-function Resize-AndEncode($bmp) {
-    $maxW = 1280
-    $outBmp = $bmp
-    if ($bmp.Width -gt $maxW) {
-        $ratio = $maxW / $bmp.Width
-        $newH = [int]($bmp.Height * $ratio)
-        $outBmp = New-Object System.Drawing.Bitmap($maxW, $newH)
-        $g = [System.Drawing.Graphics]::FromImage($outBmp)
-        $g.InterpolationMode = [System.Drawing.Drawing2D.InterpolationMode]::HighQualityBicubic
-        $g.DrawImage($bmp, 0, 0, $maxW, $newH)
-        $g.Dispose()
-        $bmp.Dispose()
-    }
-
+function Encode-Bitmap($bmp) {
     $ms = New-Object System.IO.MemoryStream
-    $outBmp.Save($ms, [System.Drawing.Imaging.ImageFormat]::Png)
-    $outBmp.Dispose()
+    $bmp.Save($ms, [System.Drawing.Imaging.ImageFormat]::Png)
+    $bmp.Dispose()
 
     $bytes = $ms.ToArray()
     $ms.Dispose()

@@ -509,6 +509,21 @@ class ChatAgentBase extends AIChatAgent {
     const fs = this.mountableFs;
 
     try {
+      // GET /api/files/stat?path=<path>
+      if (url.pathname === "/api/files/stat" && request.method === "GET") {
+        const rawPath = url.searchParams.get("path") || "/";
+        const path = normalizePath(rawPath);
+        const st = await fs.stat(path);
+        return Response.json({
+          isFile: st.isFile,
+          isDirectory: st.isDirectory,
+          isSymbolicLink: st.isSymbolicLink,
+          mode: st.mode,
+          size: st.size,
+          mtime: st.mtime?.toISOString() ?? null
+        });
+      }
+
       // GET /api/files/list?path=<dir>
       if (url.pathname === "/api/files/list" && request.method === "GET") {
         const rawPath = url.searchParams.get("path") || "/";

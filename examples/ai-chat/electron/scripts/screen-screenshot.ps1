@@ -8,7 +8,7 @@ $gfx = [System.Drawing.Graphics]::FromImage($bmp)
 $gfx.CopyFromScreen($screen.Location, [System.Drawing.Point]::Empty, $screen.Size)
 $gfx.Dispose()
 
-$base64 = Resize-AndEncode $bmp
+$base64 = Encode-Bitmap $bmp
 
 Write-Output "$($screen.Width)x$($screen.Height)"
 Write-Output $base64

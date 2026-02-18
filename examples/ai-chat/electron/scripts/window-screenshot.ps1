@@ -22,7 +22,7 @@ $hdc = $gfx.GetHdc()
 $gfx.ReleaseHdc($hdc)
 $gfx.Dispose()
 
-$base64 = Resize-AndEncode $bmp
+$base64 = Encode-Bitmap $bmp
 
 Write-Output "$($rect.Left),$($rect.Top),${w}x${h}"
 Write-Output $base64

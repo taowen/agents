@@ -3,8 +3,9 @@ import { createOpenAICompatible } from "@ai-sdk/openai-compatible";
 import { createGoogleGenerativeAI } from "@ai-sdk/google";
 import type { LanguageModel, ModelMessage } from "ai";
 import { streamText, tool } from "ai";
-import { Bash, InMemoryFs, MountableFs } from "just-bash";
+import { Bash, InMemoryFs, MountableFs, defineCommand } from "just-bash";
 import { WindowsFsAdapter } from "./windows-fs-adapter";
+import { HttpFsAdapter } from "./http-fs-adapter";
 import { z } from "zod";
 import type { LlmConfig } from "../server/llm-proxy";
 
@@ -62,7 +63,31 @@ declare global {
 // ---- Local agent logic (runs in-browser, triggered by bridge messages) ----
 
 const mountableFs = new MountableFs({ base: new InMemoryFs() });
-const bash = new Bash({ fs: mountableFs, cwd: "/home" });
+
+const mountCmd = defineCommand("mount", async (args) => {
+  if (args.length > 0) {
+    return {
+      stdout: "",
+      stderr: "mount: read-only (use the cloud agent to manage mounts)\n",
+      exitCode: 1
+    };
+  }
+  const mounts = mountableFs.getMounts();
+  const lines = mounts.map(
+    (m) => `${m.fsType || "unknown"} on ${m.mountPoint}`
+  );
+  return {
+    stdout: lines.length ? lines.join("\n") + "\n" : "",
+    stderr: "",
+    exitCode: 0
+  };
+});
+
+const bash = new Bash({
+  fs: mountableFs,
+  cwd: "/home",
+  customCommands: [mountCmd]
+});
 
 let windowsMountsInitialized = false;
 let mountedDriveDescriptions: string[] = [];
@@ -85,6 +110,16 @@ async function initWindowsMounts() {
   } catch (err) {
     console.error("Failed to init Windows mounts:", err);
   }
+}
+
+let cloudMountInitialized = false;
+
+function initCloudMount() {
+  if (cloudMountInitialized) return;
+  cloudMountInitialized = true;
+
+  const adapter = new HttpFsAdapter();
+  mountableFs.mount("/cloud", adapter, "http");
 }
 
 const bashToolDef = tool({
@@ -228,6 +263,7 @@ async function runLocalAgent(
   onLog?: (msg: string) => void
 ): Promise<string> {
   await initWindowsMounts();
+  initCloudMount();
   agentHistory.push({ role: "user", content: userMessage });
 
   const model = await getModel();
@@ -241,10 +277,17 @@ async function runLocalAgent(
         "File writes are real — they modify the host filesystem. Be cautious with rm and destructive operations. "
       : "You have access to a bash shell (virtual in-memory filesystem). ";
 
+  const cloudFsDescription =
+    "You also have access to the main agent's cloud filesystem mounted at /cloud. " +
+    "/cloud/home/user contains the user's files, /cloud/data is cloud storage, " +
+    "and /cloud/mnt/ may contain mounted git repositories. " +
+    "You can read files from the cloud or copy them to the local Windows filesystem. ";
+
   const systemPrompt =
     "You are a remote desktop agent running on a Windows machine. " +
     "You receive instructions from a central AI assistant and execute them on the local desktop. " +
     fsDescription +
+    cloudFsDescription +
     (hasScreenControl
       ? "You also have the Windows desktop screen. You can take screenshots, click, type, press keys, move the mouse, and scroll. " +
         "You also have a 'win' tool for window management: list visible windows, focus/activate, " +

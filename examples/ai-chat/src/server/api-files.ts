@@ -207,6 +207,34 @@ export async function handleFileRoutes(
   const resolved = resolveAdapter(path, entries, env, userId);
 
   try {
+    // GET /api/files/stat
+    if (url.pathname === "/api/files/stat" && request.method === "GET") {
+      if (!resolved) {
+        // Virtual directory — check if any mount children exist
+        const children = getVirtualChildren(path, allMounts);
+        if (children.length > 0) {
+          return Response.json({
+            isFile: false,
+            isDirectory: true,
+            isSymbolicLink: false,
+            mode: 0o755,
+            size: 0,
+            mtime: null
+          });
+        }
+        return Response.json({ error: `ENOENT: ${path}` }, { status: 404 });
+      }
+      const st = await resolved.adapter.stat(resolved.relPath);
+      return Response.json({
+        isFile: st.isFile,
+        isDirectory: st.isDirectory,
+        isSymbolicLink: st.isSymbolicLink,
+        mode: st.mode,
+        size: st.size,
+        mtime: st.mtime?.toISOString() ?? null
+      });
+    }
+
     // GET /api/files/list
     if (url.pathname === "/api/files/list" && request.method === "GET") {
       if (!resolved) {

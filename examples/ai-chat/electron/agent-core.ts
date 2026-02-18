@@ -25,7 +25,8 @@ const screenToolDef = tool({
   description:
     "Control the Windows desktop screen. Take screenshots, click, type, press keys, move mouse, and scroll. " +
     "Use 'screenshot' first to see what's on screen, then interact with elements by their pixel coordinates. " +
-    "Coordinates are in physical pixels from top-left (0,0).",
+    "Coordinates are in physical pixels from top-left (0,0). " +
+    "Use 'annotate' with x,y to draw a red crosshair on the last screenshot — verify your target before clicking.",
   parameters: z.object({
     action: z
       .enum([
@@ -34,7 +35,8 @@ const screenToolDef = tool({
         "mouse_move",
         "type",
         "key_press",
-        "scroll"
+        "scroll",
+        "annotate"
       ])
       .describe("The screen action to perform"),
     x: z.number().optional().describe("X coordinate in pixels"),
@@ -94,6 +96,7 @@ export function createAgent(deps: AgentDeps) {
   const bash = new Bash({ fs, cwd: "/home" });
   const history: ModelMessage[] = [];
   let stepCounter = 0;
+  let lastScreenshotBase64: string | null = null;
 
   async function executeBash(command: string) {
     const result = await bash.exec(command);
@@ -132,6 +135,9 @@ export function createAgent(deps: AgentDeps) {
     }
     if (action === "screenshot" && result.width) {
       return `[agent] screen: screenshot → ${result.width}x${result.height}`;
+    }
+    if (action === "annotate" && result.width) {
+      return `[agent] screen: annotate (${result.x ?? "?"},${result.y ?? "?"}) → ${result.width}x${result.height}`;
     }
     if (action === "scroll") {
       return `[agent] screen: scroll ${result.direction} ${result.amount}${result.desktopX !== undefined ? ` at desktop(${result.desktopX},${result.desktopY})` : ""} → success`;
@@ -188,7 +194,8 @@ export function createAgent(deps: AgentDeps) {
       "2. After each click or key_press, take another screenshot to confirm the expected result happened.\n" +
       "3. If a screenshot shows the wrong window is in front, use win({ action: 'focus_window' }) to bring the target window back, then take another screenshot to confirm.\n" +
       "4. Use pixel coordinates from the MOST RECENT screenshot to target UI elements. Never reuse coordinates from an earlier screenshot.\n" +
-      "5. After completing the task, provide a concise text summary of what you did and the result. Do NOT include base64 image data in your text response.";
+      "5. After completing the task, provide a concise text summary of what you did and the result. Do NOT include base64 image data in your text response.\n" +
+      "6. Before clicking, use screen({ action: 'annotate', x, y }) to draw a red crosshair on the last screenshot and verify the target coordinates are correct. If the marker is off-target, adjust coordinates before clicking.";
 
     const tools = {
       bash: bashToolDef,
@@ -249,9 +256,12 @@ export function createAgent(deps: AgentDeps) {
           );
           toolResultContent = JSON.stringify(bashResult);
         } else if (tc.toolName === "screen") {
-          const screenResult = await executeScreen(
-            tc.args as ScreenControlParams
-          );
+          const screenArgs = tc.args as ScreenControlParams;
+          // Inject stored screenshot for annotate action
+          if (screenArgs.action === "annotate" && lastScreenshotBase64) {
+            screenArgs.base64 = lastScreenshotBase64;
+          }
+          const screenResult = await executeScreen(screenArgs);
           onLog?.(formatScreenLog(screenResult));
 
           const lines: string[] = [];
@@ -264,6 +274,11 @@ export function createAgent(deps: AgentDeps) {
           toolResultContent = lines.join("\n");
 
           if (screenResult.base64) {
+            // Store base64 for future annotate calls (but not from annotate itself)
+            if (screenResult.action !== "annotate") {
+              lastScreenshotBase64 = screenResult.base64;
+            }
+
             onScreenshot?.(
               currentStep,
               screenResult.action ?? "screenshot",
@@ -284,7 +299,13 @@ export function createAgent(deps: AgentDeps) {
             history.push({
               role: "user",
               content: [
-                { type: "text", text: "Here is the screenshot:" },
+                {
+                  type: "text",
+                  text:
+                    screenResult.action === "annotate"
+                      ? "Here is the annotated screenshot with crosshair:"
+                      : "Here is the screenshot:"
+                },
                 {
                   type: "image",
                   image: screenResult.base64,
@@ -312,6 +333,9 @@ export function createAgent(deps: AgentDeps) {
             if (winResult.width && winResult.height)
               lines.push(`Window size: ${winResult.width}x${winResult.height}`);
             toolResultContent = lines.join("\n");
+
+            // Store base64 for future annotate calls
+            lastScreenshotBase64 = winResult.base64;
 
             onScreenshot?.(currentStep, "window_screenshot", winResult.base64);
 

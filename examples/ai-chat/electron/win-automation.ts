@@ -5,6 +5,8 @@
 import { execFile } from "node:child_process";
 import { promisify } from "node:util";
 import path from "node:path";
+import fs from "node:fs";
+import os from "node:os";
 import { fileURLToPath } from "node:url";
 
 const execFileAsync = promisify(execFile);
@@ -25,6 +27,7 @@ export interface ScreenControlParams {
   doubleClick?: boolean;
   direction?: string;
   amount?: number;
+  base64?: string;
   handle?: number;
   title?: string;
   width?: number;
@@ -403,6 +406,45 @@ async function handleWindowScreenshot(
   }
 }
 
+// ---- Annotate handler ----
+
+async function handleAnnotate(
+  params: ScreenControlParams
+): Promise<ScreenControlResult> {
+  try {
+    const { x, y, base64 } = params;
+    if (!base64)
+      return { success: false, error: "No screenshot available to annotate" };
+    if (x === undefined || y === undefined)
+      return { success: false, error: "x and y are required for annotate" };
+
+    const tmpFile = path.join(os.tmpdir(), `annotate-${Date.now()}.png`);
+    fs.writeFileSync(tmpFile, Buffer.from(base64, "base64"));
+
+    try {
+      const { stdout } = await runPowerShell(script("annotate-image.ps1"), {
+        timeout: 15000,
+        maxBuffer: 20 * 1024 * 1024,
+        env: {
+          IMAGE_PATH: tmpFile,
+          X: String(Math.round(x)),
+          Y: String(Math.round(y))
+        }
+      });
+      const lines = stdout.split(/\r?\n/);
+      const [width, height] = lines[0].split("x").map(Number);
+      const annotatedBase64 = lines.slice(1).join("");
+      return { success: true, width, height, base64: annotatedBase64, x, y };
+    } finally {
+      try {
+        fs.unlinkSync(tmpFile);
+      } catch {}
+    }
+  } catch (err: any) {
+    return { success: false, error: err.message };
+  }
+}
+
 // ---- Unified dispatch (same interface as preload.cjs screenControl) ----
 
 const stateMap: Record<string, string> = {
@@ -422,7 +464,8 @@ const actionAliases: Record<string, string> = {
   minimize: "minimize_window",
   maximize: "maximize_window",
   restore: "restore_window",
-  list: "list_windows"
+  list: "list_windows",
+  double_click: "click"
 };
 
 export async function screenControl(
@@ -430,11 +473,18 @@ export async function screenControl(
 ): Promise<ScreenControlResult> {
   const action = actionAliases[params.action] ?? params.action;
 
+  // If original action was double_click, force doubleClick flag
+  if (params.action === "double_click") {
+    params = { ...params, doubleClick: true };
+  }
+
   switch (action) {
     case "screenshot":
       return handleScreenshot();
     case "click":
       return handleMouseClick(params);
+    case "annotate":
+      return handleAnnotate(params);
     case "mouse_move":
       return handleMouseMove(params);
     case "type":
