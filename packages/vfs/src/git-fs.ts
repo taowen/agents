@@ -295,7 +295,7 @@ export interface GitFsOptions {
 
 export class GitFs {
   private url: string;
-  private ref: string;
+  private ref: string | undefined;
   private corsProxy?: string;
   private depth: number;
   private onAuth?: () => { username: string; password?: string };
@@ -318,7 +318,7 @@ export class GitFs {
 
   constructor(opts: GitFsOptions) {
     this.url = opts.url;
-    this.ref = opts.ref ?? "main";
+    this.ref = opts.ref;
     this.corsProxy = opts.corsProxy;
     this.depth = opts.depth ?? 1;
     this.onAuth = opts.onAuth;
@@ -335,6 +335,11 @@ export class GitFs {
   /** Expose the remote URL (for credential lookup). */
   getUrl(): string {
     return this.url;
+  }
+
+  /** Expose the resolved ref (available after init). */
+  getRef(): string | undefined {
+    return this.ref;
   }
 
   // ---- Init ----
@@ -360,6 +365,17 @@ export class GitFs {
   }
 
   private async doInit(): Promise<void> {
+    // Auto-detect default branch if not specified
+    if (!this.ref) {
+      const info = await git.getRemoteInfo({
+        http: this.httpTransport,
+        url: this.url,
+        corsProxy: this.corsProxy,
+        onAuth: this.onAuth
+      });
+      this.ref = info.HEAD ?? "main";
+    }
+
     await git.clone({
       fs: this.memFs,
       http: this.httpTransport,

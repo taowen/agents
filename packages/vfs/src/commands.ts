@@ -161,7 +161,7 @@ async function mountGit(
   const url = positional[0];
   const mountpoint = positional[1];
   const opts = optsRaw ? parseOpts(optsRaw) : {};
-  const ref = opts.ref || "main";
+  const ref = opts.ref || undefined;
   const depth = opts.depth ? parseInt(opts.depth, 10) : 1;
 
   if (isNaN(depth) || depth < 1) {
@@ -253,7 +253,9 @@ async function mountGit(
         if (!exists) {
           // Build options field: ref, depth (omit defaults and credentials)
           const optParts: string[] = [];
-          if (ref !== "main") optParts.push(`ref=${ref}`);
+          const resolvedRef = gitFs.getRef();
+          if (resolvedRef && resolvedRef !== "main")
+            optParts.push(`ref=${resolvedRef}`);
           if (depth !== 1) optParts.push(`depth=${depth}`);
           const optsField =
             optParts.length > 0 ? optParts.join(",") : "defaults";
