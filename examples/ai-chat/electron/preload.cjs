@@ -19,10 +19,15 @@ contextBridge.exposeInMainWorld("workWithWindows", {
       list_windows: "window:list-windows",
       focus_window: "window:focus-window",
       resize_window: "window:resize-window",
-      minimize_window: "window:minimize-window",
-      maximize_window: "window:maximize-window",
-      restore_window: "window:restore-window",
+      minimize_window: "window:set-state",
+      maximize_window: "window:set-state",
+      restore_window: "window:set-state",
       window_screenshot: "window:screenshot"
+    };
+    const stateMap = {
+      minimize_window: "minimize",
+      maximize_window: "maximize",
+      restore_window: "restore"
     };
     const channel = channelMap[params.action];
     if (!channel) {
@@ -32,6 +37,8 @@ contextBridge.exposeInMainWorld("workWithWindows", {
       });
     }
     const { action, ...rest } = params;
+    const state = stateMap[action];
+    if (state) rest.state = state;
     return ipcRenderer.invoke(channel, rest);
   }
 });

@@ -8,82 +8,10 @@ import fs from "node:fs";
 const execFileAsync = promisify(execFile);
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
+const SCRIPTS_DIR = path.join(__dirname, "scripts");
 
 const PROD_URL = "https://ai.connect-screen.com";
 const APP_URL = process.env.AGENT_URL || PROD_URL;
-
-// Shared Win32 P/Invoke C# code for input simulation
-const WIN_INPUT_CS = `
-Add-Type -TypeDefinition @"
-using System;
-using System.Runtime.InteropServices;
-
-public class WinInput {
-    [DllImport("user32.dll")]
-    public static extern bool SetCursorPos(int x, int y);
-
-    [DllImport("user32.dll")]
-    public static extern void mouse_event(uint dwFlags, int dx, int dy, int dwData, IntPtr dwExtraInfo);
-
-    [DllImport("user32.dll")]
-    public static extern void keybd_event(byte bVk, byte bScan, uint dwFlags, IntPtr dwExtraInfo);
-
-    public const uint MOUSEEVENTF_LEFTDOWN = 0x0002;
-    public const uint MOUSEEVENTF_LEFTUP = 0x0004;
-    public const uint MOUSEEVENTF_RIGHTDOWN = 0x0008;
-    public const uint MOUSEEVENTF_RIGHTUP = 0x0010;
-    public const uint MOUSEEVENTF_MIDDLEDOWN = 0x0020;
-    public const uint MOUSEEVENTF_MIDDLEUP = 0x0040;
-    public const uint MOUSEEVENTF_WHEEL = 0x0800;
-
-    public const uint KEYEVENTF_KEYUP = 0x0002;
-}
-"@ -ErrorAction SilentlyContinue
-`;
-
-// Shared Win32 P/Invoke C# code for window management
-const WIN_WINDOW_CS = `
-Add-Type -TypeDefinition @"
-using System;
-using System.Runtime.InteropServices;
-
-public class WinWindow {
-    [StructLayout(LayoutKind.Sequential)]
-    public struct RECT {
-        public int Left, Top, Right, Bottom;
-    }
-
-    [DllImport("user32.dll")]
-    public static extern bool SetForegroundWindow(IntPtr hWnd);
-
-    [DllImport("user32.dll")]
-    public static extern bool ShowWindow(IntPtr hWnd, int nCmdShow);
-
-    [DllImport("user32.dll")]
-    public static extern bool MoveWindow(IntPtr hWnd, int X, int Y, int nWidth, int nHeight, bool bRepaint);
-
-    [DllImport("user32.dll")]
-    public static extern bool GetWindowRect(IntPtr hWnd, out RECT lpRect);
-
-    [DllImport("user32.dll")]
-    public static extern bool IsIconic(IntPtr hWnd);
-
-    [DllImport("user32.dll")]
-    public static extern bool IsZoomed(IntPtr hWnd);
-
-    [DllImport("user32.dll")]
-    public static extern bool IsWindowVisible(IntPtr hWnd);
-
-    [DllImport("user32.dll")]
-    public static extern bool PrintWindow(IntPtr hWnd, IntPtr hdcBlt, uint nFlags);
-
-    public const int SW_MINIMIZE = 6;
-    public const int SW_MAXIMIZE = 3;
-    public const int SW_RESTORE = 9;
-    public const uint PW_RENDERFULLCONTENT = 2;
-}
-"@ -ErrorAction SilentlyContinue
-`;
 
 // Virtual key code mapping for special keys
 const VK_MAP = {
@@ -111,7 +39,6 @@ const VK_MAP = {
   f5: 0x74,
   f6: 0x75,
   f7: 0x76,
-  f8: 0x77,
   f8: 0x77,
   f9: 0x78,
   f10: 0x79,
@@ -152,14 +79,25 @@ function getVkCode(key) {
   return null;
 }
 
+function script(name) {
+  return path.join(SCRIPTS_DIR, name);
+}
+
 async function runPowerShell(
-  script,
-  { timeout = 5000, maxBuffer = 1024 * 1024 } = {}
+  scriptPath,
+  { env = {}, timeout = 5000, maxBuffer = 1024 * 1024 } = {}
 ) {
   const { stdout, stderr } = await execFileAsync(
     "powershell.exe",
-    ["-NoProfile", "-NonInteractive", "-Command", script],
-    { timeout, maxBuffer, windowsHide: true }
+    [
+      "-NoProfile",
+      "-NonInteractive",
+      "-ExecutionPolicy",
+      "Bypass",
+      "-File",
+      scriptPath
+    ],
+    { timeout, maxBuffer, windowsHide: true, env: { ...process.env, ...env } }
   );
   return { stdout: stdout.trim(), stderr: stderr.trim() };
 }
@@ -167,156 +105,69 @@ async function runPowerShell(
 // --- IPC Handlers ---
 
 function setupScreenHandlers() {
-  // Screenshot: captures the primary screen and returns dimensions + base64 PNG
   ipcMain.handle("screen:screenshot", async () => {
     try {
-      const script = `
-Add-Type -AssemblyName System.Drawing
-Add-Type -AssemblyName System.Windows.Forms
-
-$screen = [System.Windows.Forms.Screen]::PrimaryScreen.Bounds
-$bmp = New-Object System.Drawing.Bitmap($screen.Width, $screen.Height)
-$gfx = [System.Drawing.Graphics]::FromImage($bmp)
-$gfx.CopyFromScreen($screen.Location, [System.Drawing.Point]::Empty, $screen.Size)
-$gfx.Dispose()
-
-# Resize to max 1280px wide to reduce base64 size
-$maxW = 1280
-$outBmp = $bmp
-if ($bmp.Width -gt $maxW) {
-    $ratio = $maxW / $bmp.Width
-    $newH = [int]($bmp.Height * $ratio)
-    $outBmp = New-Object System.Drawing.Bitmap($maxW, $newH)
-    $g = [System.Drawing.Graphics]::FromImage($outBmp)
-    $g.InterpolationMode = [System.Drawing.Drawing2D.InterpolationMode]::HighQualityBicubic
-    $g.DrawImage($bmp, 0, 0, $maxW, $newH)
-    $g.Dispose()
-    $bmp.Dispose()
-}
-
-$ms = New-Object System.IO.MemoryStream
-$outBmp.Save($ms, [System.Drawing.Imaging.ImageFormat]::Png)
-$outBmp.Dispose()
-
-$bytes = $ms.ToArray()
-$ms.Dispose()
-
-Write-Output "$($screen.Width)x$($screen.Height)"
-Write-Output ([Convert]::ToBase64String($bytes))
-`;
-      const { stdout } = await runPowerShell(script, {
+      const { stdout } = await runPowerShell(script("screen-screenshot.ps1"), {
         timeout: 15000,
         maxBuffer: 20 * 1024 * 1024
       });
       const lines = stdout.split(/\r?\n/);
-      const dimensions = lines[0]; // e.g. "1920x1080"
+      const [width, height] = lines[0].split("x").map(Number);
       const base64 = lines.slice(1).join("");
-      const [width, height] = dimensions.split("x").map(Number);
       return { success: true, width, height, base64 };
     } catch (err) {
       return { success: false, error: err.message };
     }
   });
 
-  // Mouse click at (x, y)
   ipcMain.handle("screen:mouse-click", async (_event, params) => {
     try {
       const { x, y, button = "left", doubleClick = false } = params;
-      let downFlag, upFlag;
-      switch (button) {
-        case "right":
-          downFlag = "MOUSEEVENTF_RIGHTDOWN";
-          upFlag = "MOUSEEVENTF_RIGHTUP";
-          break;
-        case "middle":
-          downFlag = "MOUSEEVENTF_MIDDLEDOWN";
-          upFlag = "MOUSEEVENTF_MIDDLEUP";
-          break;
-        default:
-          downFlag = "MOUSEEVENTF_LEFTDOWN";
-          upFlag = "MOUSEEVENTF_LEFTUP";
-      }
-      const clickCount = doubleClick ? 2 : 1;
-      let clickScript = "";
-      for (let i = 0; i < clickCount; i++) {
-        clickScript += `
-[WinInput]::mouse_event([WinInput]::${downFlag}, 0, 0, 0, [IntPtr]::Zero)
-[WinInput]::mouse_event([WinInput]::${upFlag}, 0, 0, 0, [IntPtr]::Zero)
-`;
-        if (i < clickCount - 1) {
-          clickScript += "Start-Sleep -Milliseconds 50\n";
+      const flags = {
+        left: { down: 0x0002, up: 0x0004 },
+        right: { down: 0x0008, up: 0x0010 },
+        middle: { down: 0x0020, up: 0x0040 }
+      };
+      const f = flags[button] || flags.left;
+      await runPowerShell(script("screen-click.ps1"), {
+        env: {
+          X: String(Math.round(x)),
+          Y: String(Math.round(y)),
+          DOWN_FLAG: String(f.down),
+          UP_FLAG: String(f.up),
+          CLICK_COUNT: String(doubleClick ? 2 : 1)
         }
-      }
-      const script = `${WIN_INPUT_CS}
-[WinInput]::SetCursorPos(${Math.round(x)}, ${Math.round(y)})
-Start-Sleep -Milliseconds 10
-${clickScript}
-Write-Output "clicked ${button} at ${x},${y}"
-`;
-      await runPowerShell(script);
+      });
       return { success: true, action: "click", x, y, button, doubleClick };
     } catch (err) {
       return { success: false, error: err.message };
     }
   });
 
-  // Mouse move to (x, y)
   ipcMain.handle("screen:mouse-move", async (_event, params) => {
     try {
       const { x, y } = params;
-      const script = `${WIN_INPUT_CS}
-[WinInput]::SetCursorPos(${Math.round(x)}, ${Math.round(y)})
-Write-Output "moved to ${x},${y}"
-`;
-      await runPowerShell(script);
+      await runPowerShell(script("screen-move.ps1"), {
+        env: { X: String(Math.round(x)), Y: String(Math.round(y)) }
+      });
       return { success: true, action: "mouse_move", x, y };
     } catch (err) {
       return { success: false, error: err.message };
     }
   });
 
-  // Type text via clipboard (supports Unicode)
   ipcMain.handle("screen:keyboard-type", async (_event, params) => {
     try {
       const { text } = params;
-      // Escape single quotes for PowerShell by doubling them
-      const escaped = text.replace(/'/g, "''");
-      const script = `${WIN_INPUT_CS}
-Add-Type -AssemblyName System.Windows.Forms
-
-# Save current clipboard
-$saved = $null
-try { $saved = [System.Windows.Forms.Clipboard]::GetText() } catch {}
-
-# Set text to clipboard and paste
-[System.Windows.Forms.Clipboard]::SetText('${escaped}')
-Start-Sleep -Milliseconds 50
-
-# Ctrl+V
-[WinInput]::keybd_event(0xA2, 0, 0, [IntPtr]::Zero)
-[WinInput]::keybd_event(0x56, 0, 0, [IntPtr]::Zero)
-[WinInput]::keybd_event(0x56, 0, [WinInput]::KEYEVENTF_KEYUP, [IntPtr]::Zero)
-[WinInput]::keybd_event(0xA2, 0, [WinInput]::KEYEVENTF_KEYUP, [IntPtr]::Zero)
-
-Start-Sleep -Milliseconds 50
-
-# Restore clipboard
-if ($saved -ne $null) {
-    [System.Windows.Forms.Clipboard]::SetText($saved)
-} else {
-    [System.Windows.Forms.Clipboard]::Clear()
-}
-
-Write-Output "typed text"
-`;
-      await runPowerShell(script);
+      await runPowerShell(script("screen-type.ps1"), {
+        env: { TEXT: text }
+      });
       return { success: true, action: "type", textLength: text.length };
     } catch (err) {
       return { success: false, error: err.message };
     }
   });
 
-  // Key press (single key or key combo with modifiers)
   ipcMain.handle("screen:key-press", async (_event, params) => {
     try {
       const { key, modifiers = [] } = params;
@@ -343,32 +194,25 @@ Write-Output "typed text"
         pressScript += `[WinInput]::keybd_event(${modVk}, 0, [WinInput]::KEYEVENTF_KEYUP, [IntPtr]::Zero)\n`;
       }
 
-      const script = `${WIN_INPUT_CS}
-${pressScript}
-Write-Output "pressed ${key}"
-`;
-      await runPowerShell(script);
+      await runPowerShell(script("screen-keypress.ps1"), {
+        env: { PRESS_SCRIPT: pressScript }
+      });
       return { success: true, action: "key_press", key, modifiers };
     } catch (err) {
       return { success: false, error: err.message };
     }
   });
 
-  // Scroll (up/down/left/right)
   ipcMain.handle("screen:scroll", async (_event, params) => {
     try {
       const { x, y, direction = "down", amount = 3 } = params;
-      // WHEEL_DELTA = 120 per notch
       const delta = direction === "up" ? 120 * amount : -120 * amount;
-      let moveCmd = "";
+      const env = { X: "", Y: "", DELTA: String(delta) };
       if (x !== undefined && y !== undefined) {
-        moveCmd = `[WinInput]::SetCursorPos(${Math.round(x)}, ${Math.round(y)})\nStart-Sleep -Milliseconds 10\n`;
+        env.X = String(Math.round(x));
+        env.Y = String(Math.round(y));
       }
-      const script = `${WIN_INPUT_CS}
-${moveCmd}[WinInput]::mouse_event([WinInput]::MOUSEEVENTF_WHEEL, 0, 0, ${delta}, [IntPtr]::Zero)
-Write-Output "scrolled ${direction} by ${amount}"
-`;
-      await runPowerShell(script);
+      await runPowerShell(script("screen-scroll.ps1"), { env });
       return { success: true, action: "scroll", direction, amount };
     } catch (err) {
       return { success: false, error: err.message };
@@ -377,34 +221,11 @@ Write-Output "scrolled ${direction} by ${amount}"
 }
 
 function setupWindowHandlers() {
-  // List visible windows with their handles, titles, positions, and states
   ipcMain.handle("window:list-windows", async () => {
     try {
-      const script = `${WIN_WINDOW_CS}
-$results = @()
-Get-Process | Where-Object { $_.MainWindowHandle -ne [IntPtr]::Zero } | ForEach-Object {
-    $hwnd = $_.MainWindowHandle
-    if ([WinWindow]::IsWindowVisible($hwnd)) {
-        $rect = New-Object WinWindow+RECT
-        [WinWindow]::GetWindowRect($hwnd, [ref]$rect) | Out-Null
-        $results += [PSCustomObject]@{
-            handle = $hwnd.ToInt64()
-            title = $_.MainWindowTitle
-            processName = $_.ProcessName
-            pid = $_.Id
-            x = $rect.Left
-            y = $rect.Top
-            width = $rect.Right - $rect.Left
-            height = $rect.Bottom - $rect.Top
-            isMinimized = [WinWindow]::IsIconic($hwnd)
-            isMaximized = [WinWindow]::IsZoomed($hwnd)
-        }
-    }
-}
-$results | ConvertTo-Json -Compress
-`;
-      const { stdout } = await runPowerShell(script, { timeout: 10000 });
-      // PowerShell returns a single object (not array) when there's only one result
+      const { stdout } = await runPowerShell(script("window-list.ps1"), {
+        timeout: 10000
+      });
       let windows = [];
       if (stdout) {
         const parsed = JSON.parse(stdout);
@@ -416,190 +237,74 @@ $results | ConvertTo-Json -Compress
     }
   });
 
-  // Focus/activate a window by handle or title substring
   ipcMain.handle("window:focus-window", async (_event, params) => {
     try {
       const { handle, title } = params;
-      let script = `${WIN_WINDOW_CS}\n`;
-      if (handle) {
-        script += `
-$hwnd = [IntPtr]${handle}
-[WinWindow]::ShowWindow($hwnd, [WinWindow]::SW_RESTORE) | Out-Null
-Start-Sleep -Milliseconds 50
-[WinWindow]::SetForegroundWindow($hwnd) | Out-Null
-Write-Output "focused handle ${handle}"
-`;
-      } else if (title) {
-        const escaped = title.replace(/'/g, "''");
-        script += `
-$proc = Get-Process | Where-Object { $_.MainWindowHandle -ne [IntPtr]::Zero -and $_.MainWindowTitle -like '*${escaped}*' } | Select-Object -First 1
-if ($proc) {
-    $hwnd = $proc.MainWindowHandle
-    [WinWindow]::ShowWindow($hwnd, [WinWindow]::SW_RESTORE) | Out-Null
-    Start-Sleep -Milliseconds 50
-    [WinWindow]::SetForegroundWindow($hwnd) | Out-Null
-    Write-Output "focused $($proc.MainWindowTitle)"
-} else {
-    Write-Output "ERROR:No window found matching '${escaped}'"
-}
-`;
-      } else {
+      if (!handle && !title)
         return { success: false, error: "Provide handle or title" };
-      }
-      const { stdout } = await runPowerShell(script);
-      if (stdout.startsWith("ERROR:")) {
-        return { success: false, error: stdout.slice(6) };
-      }
+      const env = {};
+      if (handle) env.HWND = String(handle);
+      if (title) env.TITLE = title;
+      const { stdout } = await runPowerShell(script("window-focus.ps1"), {
+        env
+      });
       return { success: true, message: stdout };
     } catch (err) {
-      return { success: false, error: err.message };
+      return { success: false, error: err.stderr?.trim() || err.message };
     }
   });
 
-  // Resize/move a window
   ipcMain.handle("window:resize-window", async (_event, params) => {
     try {
       const { handle, x, y, width, height } = params;
       if (!handle) return { success: false, error: "handle is required" };
-      const script = `${WIN_WINDOW_CS}
-$hwnd = [IntPtr]${handle}
-# Restore first if minimized/maximized
-[WinWindow]::ShowWindow($hwnd, [WinWindow]::SW_RESTORE) | Out-Null
-Start-Sleep -Milliseconds 50
-
-$rect = New-Object WinWindow+RECT
-[WinWindow]::GetWindowRect($hwnd, [ref]$rect) | Out-Null
-
-$newX = ${x !== undefined ? x : "$rect.Left"}
-$newY = ${y !== undefined ? y : "$rect.Top"}
-$newW = ${width !== undefined ? width : "($rect.Right - $rect.Left)"}
-$newH = ${height !== undefined ? height : "($rect.Bottom - $rect.Top)"}
-
-[WinWindow]::MoveWindow($hwnd, $newX, $newY, $newW, $newH, $true) | Out-Null
-Write-Output "moved to $newX,$newY size $newW x $newH"
-`;
-      const { stdout } = await runPowerShell(script);
+      const env = { HWND: String(handle) };
+      if (x !== undefined) env.X = String(x);
+      if (y !== undefined) env.Y = String(y);
+      if (width !== undefined) env.W = String(width);
+      if (height !== undefined) env.H = String(height);
+      const { stdout } = await runPowerShell(script("window-resize.ps1"), {
+        env
+      });
       return { success: true, message: stdout };
     } catch (err) {
       return { success: false, error: err.message };
     }
   });
 
-  // Minimize a window
-  ipcMain.handle("window:minimize-window", async (_event, params) => {
+  // Unified minimize/maximize/restore handler
+  const SW_MAP = { minimize: 6, maximize: 3, restore: 9 };
+  ipcMain.handle("window:set-state", async (_event, params) => {
     try {
-      const { handle } = params;
+      const { handle, state } = params;
       if (!handle) return { success: false, error: "handle is required" };
-      const script = `${WIN_WINDOW_CS}
-[WinWindow]::ShowWindow([IntPtr]${handle}, [WinWindow]::SW_MINIMIZE) | Out-Null
-Write-Output "minimized"
-`;
-      await runPowerShell(script);
-      return { success: true, message: "minimized" };
+      const swCmd = SW_MAP[state];
+      if (swCmd === undefined)
+        return { success: false, error: `Unknown state: ${state}` };
+      await runPowerShell(script("window-set-state.ps1"), {
+        env: { HWND: String(handle), SW_CMD: String(swCmd) }
+      });
+      return { success: true, message: state };
     } catch (err) {
       return { success: false, error: err.message };
     }
   });
 
-  // Maximize a window
-  ipcMain.handle("window:maximize-window", async (_event, params) => {
-    try {
-      const { handle } = params;
-      if (!handle) return { success: false, error: "handle is required" };
-      const script = `${WIN_WINDOW_CS}
-[WinWindow]::ShowWindow([IntPtr]${handle}, [WinWindow]::SW_MAXIMIZE) | Out-Null
-Write-Output "maximized"
-`;
-      await runPowerShell(script);
-      return { success: true, message: "maximized" };
-    } catch (err) {
-      return { success: false, error: err.message };
-    }
-  });
-
-  // Restore a window
-  ipcMain.handle("window:restore-window", async (_event, params) => {
-    try {
-      const { handle } = params;
-      if (!handle) return { success: false, error: "handle is required" };
-      const script = `${WIN_WINDOW_CS}
-[WinWindow]::ShowWindow([IntPtr]${handle}, [WinWindow]::SW_RESTORE) | Out-Null
-Write-Output "restored"
-`;
-      await runPowerShell(script);
-      return { success: true, message: "restored" };
-    } catch (err) {
-      return { success: false, error: err.message };
-    }
-  });
-
-  // Single-window screenshot using PrintWindow
   ipcMain.handle("window:screenshot", async (_event, params) => {
     try {
       const { handle } = params;
       if (!handle) return { success: false, error: "handle is required" };
-      const script = `${WIN_WINDOW_CS}
-Add-Type -AssemblyName System.Drawing
-
-$hwnd = [IntPtr]${handle}
-
-# Get window dimensions
-$rect = New-Object WinWindow+RECT
-[WinWindow]::GetWindowRect($hwnd, [ref]$rect) | Out-Null
-$w = $rect.Right - $rect.Left
-$h = $rect.Bottom - $rect.Top
-
-if ($w -le 0 -or $h -le 0) {
-    Write-Output "ERROR:Window has zero size (may be minimized)"
-    exit
-}
-
-# Create bitmap and capture window content via PrintWindow
-$bmp = New-Object System.Drawing.Bitmap($w, $h)
-$gfx = [System.Drawing.Graphics]::FromImage($bmp)
-$hdc = $gfx.GetHdc()
-[WinWindow]::PrintWindow($hwnd, $hdc, [WinWindow]::PW_RENDERFULLCONTENT) | Out-Null
-$gfx.ReleaseHdc($hdc)
-$gfx.Dispose()
-
-# Resize if wider than 1280px
-$maxW = 1280
-$outBmp = $bmp
-if ($bmp.Width -gt $maxW) {
-    $ratio = $maxW / $bmp.Width
-    $newH = [int]($bmp.Height * $ratio)
-    $outBmp = New-Object System.Drawing.Bitmap($maxW, $newH)
-    $g = [System.Drawing.Graphics]::FromImage($outBmp)
-    $g.InterpolationMode = [System.Drawing.Drawing2D.InterpolationMode]::HighQualityBicubic
-    $g.DrawImage($bmp, 0, 0, $maxW, $newH)
-    $g.Dispose()
-    $bmp.Dispose()
-}
-
-$ms = New-Object System.IO.MemoryStream
-$outBmp.Save($ms, [System.Drawing.Imaging.ImageFormat]::Png)
-$outBmp.Dispose()
-
-$bytes = $ms.ToArray()
-$ms.Dispose()
-
-Write-Output "$($w)x$($h)"
-Write-Output ([Convert]::ToBase64String($bytes))
-`;
-      const { stdout } = await runPowerShell(script, {
+      const { stdout } = await runPowerShell(script("window-screenshot.ps1"), {
         timeout: 15000,
-        maxBuffer: 20 * 1024 * 1024
+        maxBuffer: 20 * 1024 * 1024,
+        env: { HWND: String(handle) }
       });
-      if (stdout.startsWith("ERROR:")) {
-        return { success: false, error: stdout.slice(6) };
-      }
       const lines = stdout.split(/\r?\n/);
-      const dimensions = lines[0];
+      const [width, height] = lines[0].split("x").map(Number);
       const base64 = lines.slice(1).join("");
-      const [width, height] = dimensions.split("x").map(Number);
       return { success: true, width, height, base64 };
     } catch (err) {
-      return { success: false, error: err.message };
+      return { success: false, error: err.stderr?.trim() || err.message };
     }
   });
 }
@@ -629,9 +334,9 @@ function createWindow() {
   });
 
   // Capture renderer console.log and write to file
-  win.webContents.on("console-message", (_event, level, message) => {
+  win.webContents.on("console-message", (event) => {
     const levels = ["verbose", "info", "warning", "error"];
-    appendLog(levels[level] || "unknown", message);
+    appendLog(levels[event.level] || "unknown", event.message);
   });
 
   win.loadURL(APP_URL);

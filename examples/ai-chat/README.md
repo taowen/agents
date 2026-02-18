@@ -1,6 +1,6 @@
 # AI Chat Example
 
-A chat application built with `@cloudflare/ai-chat` featuring a sandboxed bash environment with persistent storage (D1 + R2) and read-write Git repository mounting.
+A chat application built with `@cloudflare/ai-chat` featuring a sandboxed bash environment with persistent storage (D1 + R2), read-write Git repository mounting, and an optional Electron shell for controlling Windows desktops.
 
 ## What it demonstrates
 
@@ -18,8 +18,9 @@ A chat application built with `@cloudflare/ai-chat` featuring a sandboxed bash e
 - Persistent memory system in `/home/user/.memory/`
 - `pruneMessages()` for managing LLM context in long conversations
 - `maxPersistedMessages` for storage management
+- `BridgeManager` Durable Object for relaying messages between ChatAgent and remote desktop agents
 
-**Client (`src/client.tsx`):**
+**Client (`src/client/`):**
 
 - `useAgentChat` for chat interaction
 - Structured bash tool output rendering (command, stdout, stderr, exit code badge)
@@ -27,6 +28,40 @@ A chat application built with `@cloudflare/ai-chat` featuring a sandboxed bash e
 - Interrupt: type and send during streaming to stop current response and start new one
 - Abort: stop button to cancel current response without sending
 - Kumo design system components
+- `useBridge` — connects Electron clients as remote desktop agents via WebSocket
+- `useBridgeViewer` — shows connected devices and activity logs in the sidebar
+- Capability-based Electron detection (`!!window.workWithWindows`) instead of URL path checks
+
+**Electron (`electron/`):**
+
+- `main.js` — IPC handlers for Win32 screen/window control (screenshot, click, type, key press, scroll, window management) via PowerShell
+- `preload.cjs` — `contextBridge` exposing `window.workWithWindows` to the renderer
+
+## Architecture
+
+```
+Browser (any device)                    Cloudflare Worker
+  App.tsx                               (ai.connect-screen.com)
+    │                                     │
+    ├─ useAgentChat ──── WebSocket ────> ChatAgent DO
+    │                                     │  ├─ bash tool (just-bash)
+    ├─ useBridgeViewer ─ WebSocket ────> BridgeManager DO
+    │  (device list, activity logs)       │  (relays messages)
+    │                                     │
+Electron (Windows)                        │
+  App.tsx                                 │
+    ├─ useAgentChat ──── WebSocket ────> ChatAgent DO
+    │                                     │  sends screen_control requests
+    ├─ useBridge ─────── WebSocket ────> BridgeManager DO
+    │  (registers as device,              │  (routes requests to device)
+    │   executes screen_control           │
+    │   via window.workWithWindows)       │
+    │                                     │
+  preload.cjs                             │
+    └─ window.workWithWindows ──────> main.js (IPC → PowerShell)
+```
+
+When `window.workWithWindows` is detected, the client automatically registers as a remote desktop device via `useBridge`. Any client can view connected devices and agent activity via `useBridgeViewer` in the sidebar.
 
 ## Storage architecture
 
@@ -52,6 +87,56 @@ Requires a `GOOGLE_AI_API_KEY` environment variable for Gemini 3 Flash.
 
 - **D1 database** — created automatically or via `wrangler d1 create ai-chat-db`
 - **R2 bucket** — requires R2 enabled on your Cloudflare account, then `wrangler r2 bucket create ai-chat-files`
+
+## Running with Electron (Windows Agent)
+
+### One-click build, deploy & launch (from WSL)
+
+`run-on-windows.sh` runs four steps in sequence:
+
+1. **Build just-bash** — ai-chat depends on its `dist/` output
+2. **Build workspace packages** — `agents`, `@cloudflare/ai-chat`, etc.
+3. **Deploy ai-chat** — `vite build && wrangler deploy` to Cloudflare
+4. **Launch Electron** — via PowerShell on the Windows side
+
+```bash
+bash examples/ai-chat/run-on-windows.sh
+```
+
+The Electron step copies `electron/` to a Windows temp directory (`%TEMP%\windows-agent-build`) with a minimal `package.json` to avoid UNC path and monorepo workspace issues.
+
+### Launch Electron only (skip deploy)
+
+If ai-chat is already deployed, just start Electron:
+
+```bash
+npm run electron:dev
+```
+
+### Local development (no deploy)
+
+Point Electron at a local ai-chat dev server:
+
+1. Start ai-chat locally: `npm run start` (runs on `http://localhost:5173`)
+2. Launch Electron with local URL:
+
+```bash
+AGENT_URL=http://localhost:5173 npm run electron:dev
+```
+
+### Debugging
+
+Electron renderer `console.log` output is captured to a file by `main.js`:
+
+```
+%TEMP%\windows-agent-build\electron\renderer.log
+```
+
+Read from WSL:
+
+```bash
+cat "/mnt/c/Users/$USER/AppData/Local/Temp/windows-agent-build/electron/renderer.log"
+```
 
 ## Try it
 
