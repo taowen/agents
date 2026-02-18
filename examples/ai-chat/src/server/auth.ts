@@ -298,7 +298,11 @@ export async function handleAuthRoutes(
     if (!raw) {
       return Response.json({ status: "expired" });
     }
-    const data = JSON.parse(raw) as { status: string; email?: string };
+    const data = JSON.parse(raw) as {
+      status: string;
+      email?: string;
+      reason?: string;
+    };
     return Response.json(data);
   }
 
@@ -344,9 +348,28 @@ export async function handleAuthRoutes(
   return null;
 }
 
+// ---- Email authentication helpers ----
+
+/** Extract bare email from a MIME From header like "Name <addr>" or "addr" */
+function extractEmail(headerValue: string): string {
+  const angleMatch = headerValue.match(/<([^>]+)>/);
+  return (angleMatch ? angleMatch[1] : headerValue).trim().toLowerCase();
+}
+
+/** Extract d= domain from a DKIM-Signature header */
+function extractDkimDomain(dkimHeader: string): string | null {
+  const match = dkimHeader.match(/\bd=([^;\s]+)/i);
+  return match ? match[1].toLowerCase() : null;
+}
+
 /**
  * Handle incoming email from Cloudflare Email Routing.
- * Extracts token from recipient address and sender email, updates KV.
+ *
+ * Security model:
+ * - Cloudflare Email Routing enforces SPF/DKIM at infrastructure level;
+ *   emails that fail both are rejected before reaching this Worker.
+ * - We additionally verify that the DKIM signature domain aligns with the
+ *   MIME From domain, preventing From-header spoofing.
  */
 export async function handleIncomingEmail(
   message: ForwardableEmailMessage,
@@ -358,7 +381,46 @@ export async function handleIncomingEmail(
   if (!match) return;
 
   const token = match[1];
-  const from = message.from;
+
+  // --- Validate sender authenticity ---
+
+  // 1. Require DKIM-Signature header with a valid d= domain
+  const dkimHeader = message.headers.get("DKIM-Signature");
+  if (!dkimHeader) {
+    await rejectToKV(env, token, "No DKIM signature found");
+    message.setReject("Missing DKIM signature");
+    return;
+  }
+  const dkimDomain = extractDkimDomain(dkimHeader);
+  if (!dkimDomain) {
+    await rejectToKV(env, token, "Invalid DKIM signature");
+    message.setReject("Invalid DKIM signature");
+    return;
+  }
+
+  // 2. Require MIME From header
+  const mimeFromRaw = message.headers.get("From");
+  if (!mimeFromRaw) {
+    await rejectToKV(env, token, "Missing From header");
+    message.setReject("Missing From header");
+    return;
+  }
+  const mimeFrom = extractEmail(mimeFromRaw);
+  const fromDomain = mimeFrom.split("@")[1];
+
+  // 3. Verify DKIM domain aligns with From domain
+  //    (Cloudflare already verified the DKIM signature itself is valid)
+  if (dkimDomain !== fromDomain) {
+    await rejectToKV(
+      env,
+      token,
+      `DKIM domain (${dkimDomain}) does not match From domain (${fromDomain})`
+    );
+    message.setReject("DKIM domain does not match sender");
+    return;
+  }
+
+  // --- Authentication passed ---
 
   const raw = await env.OTP_KV.get(`email-login:${token}`);
   if (!raw) return; // expired or invalid
@@ -368,7 +430,21 @@ export async function handleIncomingEmail(
 
   await env.OTP_KV.put(
     `email-login:${token}`,
-    JSON.stringify({ status: "received", email: from }),
+    JSON.stringify({ status: "received", email: mimeFrom }),
+    { expirationTtl: EMAIL_TOKEN_TTL }
+  );
+}
+
+async function rejectToKV(
+  env: Env,
+  token: string,
+  reason: string
+): Promise<void> {
+  const raw = await env.OTP_KV.get(`email-login:${token}`);
+  if (!raw) return;
+  await env.OTP_KV.put(
+    `email-login:${token}`,
+    JSON.stringify({ status: "rejected", reason }),
     { expirationTtl: EMAIL_TOKEN_TTL }
   );
 }

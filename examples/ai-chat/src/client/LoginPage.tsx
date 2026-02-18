@@ -7,7 +7,7 @@ import {
 } from "@phosphor-icons/react";
 import { useState, useEffect, useRef, useCallback } from "react";
 
-type EmailStep = "idle" | "waiting" | "confirm";
+type EmailStep = "idle" | "waiting" | "confirm" | "rejected";
 
 export function LoginPage() {
   const [emailStep, setEmailStep] = useState<EmailStep>("idle");
@@ -16,6 +16,7 @@ export function LoginPage() {
   const [senderEmail, setSenderEmail] = useState("");
   const [copied, setCopied] = useState(false);
   const [error, setError] = useState("");
+  const [rejectReason, setRejectReason] = useState("");
   const pollRef = useRef<ReturnType<typeof setInterval>>();
 
   const stopPolling = useCallback(() => {
@@ -45,11 +46,17 @@ export function LoginPage() {
           const checkData = (await checkRes.json()) as {
             status: string;
             email?: string;
+            reason?: string;
+            debug?: unknown;
           };
           if (checkData.status === "received" && checkData.email) {
             stopPolling();
             setSenderEmail(checkData.email);
             setEmailStep("confirm");
+          } else if (checkData.status === "rejected") {
+            stopPolling();
+            setRejectReason(checkData.reason || "");
+            setEmailStep("rejected");
           } else if (checkData.status === "expired") {
             stopPolling();
             setError("Token expired. Please try again.");
@@ -210,6 +217,25 @@ export function LoginPage() {
                 Cancel
               </button>
             </div>
+          </div>
+        )}
+
+        {emailStep === "rejected" && (
+          <div className="space-y-3">
+            <p className="text-sm text-kumo-default">
+              We received your email, but it failed authentication.
+            </p>
+            <p className="text-sm text-kumo-secondary">
+              {rejectReason || "The email could not be verified."} Please use
+              Google Sign-In or try with a different email provider (e.g. Gmail,
+              Outlook).
+            </p>
+            <button
+              onClick={cancelEmailLogin}
+              className="px-5 py-2 rounded-lg ring ring-kumo-line text-kumo-default text-sm font-medium hover:bg-kumo-elevated transition-colors"
+            >
+              Back
+            </button>
           </div>
         )}
 
