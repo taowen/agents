@@ -26,6 +26,7 @@ export { InMemoryFs } from "./fs/in-memory-fs/index.js";
 export type {
   BufferEncoding,
   CpOptions,
+  DirentEntry,
   DirectoryEntry,
   FileContent,
   FileEntry,
