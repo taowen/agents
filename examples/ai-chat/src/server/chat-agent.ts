@@ -17,8 +17,8 @@ import { z } from "zod";
 import {
   parseFstab,
   DEFAULT_FSTAB,
-  syncDirtyGitMounts,
   createMountCommands,
+  createGitCommands,
   mountEntry,
   D1FsAdapter,
   R2FsAdapter,
@@ -142,6 +142,7 @@ class ChatAgentBase extends AIChatAgent {
       fs,
       customCommands: [
         ...createMountCommands(fs, undefined, mountOptions),
+        ...createGitCommands(fs),
         createSessionsCommand(db, userId, this.env.ChatAgent)
       ],
       cwd: "/home/user",
@@ -770,22 +771,10 @@ class ChatAgentBase extends AIChatAgent {
             await Sentry.startSpan({ name: "ensureMounted", op: "mount" }, () =>
               this.ensureMounted()
             );
-            const result = await Sentry.startSpan(
+            return await Sentry.startSpan(
               { name: "bash.exec", op: "exec" },
               () => this.bash.exec(command)
             );
-            try {
-              await Sentry.startSpan({ name: "gitSync", op: "git" }, () =>
-                syncDirtyGitMounts(this.mountableFs, command)
-              );
-            } catch (e) {
-              result.stderr += `\ngit sync error: ${e instanceof Error ? e.message : e}`;
-            }
-            return {
-              stdout: result.stdout,
-              stderr: result.stderr,
-              exitCode: result.exitCode
-            };
           }
         );
       }

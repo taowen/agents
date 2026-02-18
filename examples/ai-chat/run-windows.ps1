@@ -32,15 +32,18 @@ $miniPkg = @'
   "type": "module",
   "version": "0.0.0",
   "scripts": {
-    "dev": "electron electron/main.js",
-    "start": "electron electron/main.js"
+    "dev": "electron electron/main.ts",
+    "start": "electron electron/main.ts"
   },
   "devDependencies": {
-    "electron": "^40.0.0"
+    "electron": "^40.0.0",
+    "tsx": "^4.19.0"
   }
 }
 '@
-Set-Content -Path (Join-Path $WorkDir "package.json") -Value $miniPkg -Encoding UTF8
+# Write without BOM (PowerShell 5.1 -Encoding UTF8 adds BOM which breaks tsx)
+$pkgPath = Join-Path $WorkDir "package.json"
+[System.IO.File]::WriteAllText($pkgPath, $miniPkg, [System.Text.UTF8Encoding]::new($false))
 $ElectronDest = Join-Path $WorkDir "electron"
 if (-not (Test-Path $ElectronDest)) {
     New-Item -ItemType Directory -Path $ElectronDest | Out-Null
@@ -54,6 +57,7 @@ try {
     if ($LASTEXITCODE -ne 0) { throw "npm install failed" }
 
     Write-Host "==> Starting Electron app ..." -ForegroundColor Green
+    $env:NODE_OPTIONS = "--import tsx"
     & npm run dev
 } finally {
     Pop-Location

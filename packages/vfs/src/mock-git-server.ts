@@ -150,6 +150,17 @@ function pktLineBytes(data: Uint8Array): Uint8Array {
 
 const FLUSH = "0000";
 
+function concatUint8Arrays(arrays: Uint8Array[]): Uint8Array {
+  const totalLen = arrays.reduce((s, a) => s + a.length, 0);
+  const result = new Uint8Array(totalLen);
+  let pos = 0;
+  for (const a of arrays) {
+    result.set(a, pos);
+    pos += a.length;
+  }
+  return result;
+}
+
 // ---- Create mock git server ----
 
 export async function createMockGitServer(
@@ -188,8 +199,8 @@ export async function createMockGitServer(
     author: { name: "Test", email: "test@test.com" }
   });
 
-  // Get HEAD oid and ref
-  const headOid = await git.resolveRef({ fs: memFs, dir, ref: "HEAD" });
+  // Get HEAD oid and ref (mutable — updated by receive-pack)
+  let headOid = await git.resolveRef({ fs: memFs, dir, ref: "HEAD" });
 
   // Build the mock HTTP handler
   const mockUrl = "http://localhost/__mock_git_repo__";
@@ -204,12 +215,36 @@ export async function createMockGitServer(
       const requestUrl = opts.url;
       const method = opts.method || "GET";
 
+      // GET /info/refs?service=git-receive-pack
+      if (
+        method === "GET" &&
+        requestUrl.includes("/info/refs") &&
+        requestUrl.includes("service=git-receive-pack")
+      ) {
+        const capabilities =
+          "report-status delete-refs ofs-delta agent=mock-git-server";
+        const serviceLine = pktLine("# service=git-receive-pack\n");
+        const firstRef = pktLine(
+          `${headOid} refs/heads/main\0${capabilities}\n`
+        );
+        const body = serviceLine + FLUSH + firstRef + FLUSH;
+
+        return {
+          url: requestUrl,
+          method,
+          statusCode: 200,
+          statusMessage: "OK",
+          headers: {
+            "content-type": "application/x-git-receive-pack-advertisement"
+          },
+          body: [textEncoder.encode(body)]
+        };
+      }
+
       // GET /info/refs?service=git-upload-pack
       if (method === "GET" && requestUrl.includes("/info/refs")) {
         const capabilities =
-          "multi_ack_detailed no-done side-band-64k thin-pack ofs-delta shallow agent=mock-git-server";
-        const refLine = `${headOid} refs/heads/main\n`;
-        const headRefLine = `${headOid} HEAD\n`;
+          "multi_ack_detailed no-done side-band-64k thin-pack ofs-delta shallow symref=HEAD:refs/heads/main agent=mock-git-server";
 
         // Smart HTTP: service announcement + ref advertisement
         const serviceLine = pktLine("# service=git-upload-pack\n");
@@ -311,6 +346,122 @@ export async function createMockGitServer(
           statusMessage: "OK",
           headers: {
             "content-type": "application/x-git-upload-pack-result"
+          },
+          body: [responseBody]
+        };
+      }
+
+      // POST /git-receive-pack
+      if (
+        method === "POST" &&
+        requestUrl.includes("git-receive-pack") &&
+        !requestUrl.includes("git-upload-pack")
+      ) {
+        const bodyChunks: Uint8Array[] = [];
+        if (opts.body) {
+          for await (const chunk of opts.body) {
+            bodyChunks.push(chunk);
+          }
+        }
+        const body = concatUint8Arrays(bodyChunks);
+
+        // Parse pkt-lines to find ref update commands and packfile
+        let offset = 0;
+        const commands: Array<{
+          oldOid: string;
+          newOid: string;
+          refName: string;
+        }> = [];
+
+        while (offset < body.length) {
+          const lenHex = textDecoder.decode(body.slice(offset, offset + 4));
+          if (lenHex === "0000") {
+            offset += 4;
+            break;
+          }
+          const len = parseInt(lenHex, 16);
+          if (len === 0) {
+            offset += 4;
+            break;
+          }
+          const lineBytes = body.slice(offset + 4, offset + len);
+          const line = textDecoder.decode(lineBytes);
+          offset += len;
+
+          // ref update line: "<old-oid> <new-oid> <refname>\n"
+          // first line may have \0capabilities
+          const cleanLine = line.split("\0")[0].trim();
+          const parts = cleanLine.split(" ");
+          if (parts.length >= 3 && parts[0].length === 40) {
+            commands.push({
+              oldOid: parts[0],
+              newOid: parts[1],
+              refName: parts[2]
+            });
+          }
+        }
+
+        // Remaining bytes are the packfile — write it to the memFs and index it
+        if (offset < body.length) {
+          const packData = body.slice(offset);
+          // Write the pack to the git objects
+          const packPath = `${gitdir}/objects/pack/incoming.pack`;
+          await memFs.writeFile(packPath, packData);
+          try {
+            await git.indexPack({
+              fs: memFs,
+              dir,
+              gitdir,
+              filepath: `objects/pack/incoming.pack`
+            });
+          } catch {
+            // indexPack may fail in some isomorphic-git versions;
+            // the objects are already unpacked by the push side
+          }
+        }
+
+        // Update refs
+        for (const cmd of commands) {
+          if (cmd.refName === "refs/heads/main") {
+            headOid = cmd.newOid;
+            // Update the actual ref in the memFs git repo
+            await memFs.writeFile(
+              `${gitdir}/refs/heads/main`,
+              cmd.newOid + "\n"
+            );
+            await memFs.writeFile(`${gitdir}/HEAD`, "ref: refs/heads/main\n");
+          }
+        }
+
+        // Build report-status response wrapped in sideband channel 1
+        // (isomorphic-git always demuxes push responses via GitSideBand.demux)
+        const statusParts: Uint8Array[] = [];
+        statusParts.push(pktLineBytes(textEncoder.encode("unpack ok\n")));
+        for (const cmd of commands) {
+          statusParts.push(
+            pktLineBytes(textEncoder.encode(`ok ${cmd.refName}\n`))
+          );
+        }
+        statusParts.push(textEncoder.encode(FLUSH));
+        const statusData = concatUint8Arrays(statusParts);
+
+        // Wrap in sideband channel 1
+        const sbPayload = new Uint8Array(1 + statusData.length);
+        sbPayload[0] = 1; // channel 1 = pack data / report-status
+        sbPayload.set(statusData, 1);
+
+        const responseParts: Uint8Array[] = [];
+        responseParts.push(pktLineBytes(sbPayload));
+        responseParts.push(textEncoder.encode(FLUSH));
+        const responseBody = concatUint8Arrays(responseParts);
+
+        return {
+          url: requestUrl,
+          method,
+          statusCode: 200,
+          statusMessage: "OK",
+          headers: {
+            "content-type": "application/x-git-receive-pack-result"
           },
           body: [responseBody]
         };

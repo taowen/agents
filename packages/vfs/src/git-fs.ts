@@ -52,6 +52,14 @@ interface CpOptions {
   recursive?: boolean;
 }
 
+// ---- Public types ----
+
+export interface GitStatus {
+  modified: string[];
+  added: string[];
+  deleted: string[];
+}
+
 // ---- Helpers ----
 
 const textEncoder = new TextEncoder();
@@ -304,6 +312,7 @@ export class GitFs {
   private memFs = createIsomorphicGitMemFs();
   private cache: object = {};
   private commitOid: string | null = null;
+  private remoteOid: string | null = null;
   private commitMtime: Date = new Date(0);
   private initPromise: Promise<void> | null = null;
   private treeCache = new Map<string, GitTreeEntry[]>();
@@ -340,6 +349,134 @@ export class GitFs {
   /** Expose the resolved ref (available after init). */
   getRef(): string | undefined {
     return this.ref;
+  }
+
+  /** Returns true if there are local commits not yet pushed. */
+  hasUnpushedCommits(): boolean {
+    return this.commitOid !== this.remoteOid;
+  }
+
+  /** Return overlay status: added, modified, and deleted files. */
+  async getStatus(): Promise<GitStatus> {
+    await this.ensureInitialized();
+    const modified: string[] = [];
+    const added: string[] = [];
+    const deleted: string[] = [];
+
+    for (const path of this.overlay.keys()) {
+      const gitPath = toGitPath(path);
+      try {
+        await git.readBlob({
+          fs: this.memFs,
+          gitdir: GitFs.GITDIR,
+          oid: this.commitOid!,
+          filepath: gitPath,
+          cache: this.cache
+        });
+        modified.push(path);
+      } catch {
+        added.push(path);
+      }
+    }
+
+    for (const path of this.deleted) {
+      deleted.push(path);
+    }
+
+    return { modified, added, deleted };
+  }
+
+  /**
+   * Commit overlay changes without pushing.
+   * Returns the new commit OID.
+   */
+  async commit(
+    message: string,
+    author: { name: string; email: string }
+  ): Promise<string> {
+    await this.ensureInitialized();
+
+    if (!this.isDirty()) {
+      throw new Error("nothing to commit, working tree clean");
+    }
+
+    const DIR = GitFs.DIR;
+
+    // 1. Checkout working directory from current commit
+    await git.checkout({
+      fs: this.memFs,
+      dir: DIR,
+      ref: this.ref,
+      cache: this.cache
+    });
+
+    // 2. Materialize overlay files into memFs working directory
+    for (const [path, content] of this.overlay) {
+      const fsPath = `${DIR}${path}`;
+      await this.memFs.writeFile(fsPath, content);
+    }
+
+    // 3. Stage added/modified files
+    for (const path of this.overlay.keys()) {
+      const gitPath = toGitPath(path);
+      await git.add({
+        fs: this.memFs,
+        dir: DIR,
+        filepath: gitPath,
+        cache: this.cache
+      });
+    }
+
+    // 4. Stage deletions
+    for (const path of this.deleted) {
+      const gitPath = toGitPath(path);
+      try {
+        await git.remove({
+          fs: this.memFs,
+          dir: DIR,
+          filepath: gitPath,
+          cache: this.cache
+        });
+      } catch {
+        // File may not exist in git tree — skip
+      }
+    }
+
+    // 5. Commit
+    this.commitOid = await git.commit({
+      fs: this.memFs,
+      dir: DIR,
+      message,
+      author,
+      cache: this.cache
+    });
+
+    // 6. Clear overlay and caches
+    this.treeCache.clear();
+    this.overlay.clear();
+    this.overlayDirs.clear();
+    this.deleted.clear();
+
+    return this.commitOid;
+  }
+
+  /**
+   * Push local commits to the remote.
+   */
+  async push(
+    onAuth?: () => { username: string; password?: string }
+  ): Promise<void> {
+    await this.ensureInitialized();
+
+    await git.push({
+      fs: this.memFs,
+      http: this.httpTransport,
+      dir: GitFs.DIR,
+      onAuth: onAuth ?? this.onAuth,
+      cache: this.cache
+    });
+
+    this.remoteOid = this.commitOid;
   }
 
   // ---- Init ----
@@ -409,6 +546,8 @@ export class GitFs {
     if (commit) {
       this.commitMtime = new Date(commit.commit.committer.timestamp * 1000);
     }
+
+    this.remoteOid = this.commitOid;
   }
 
   // ---- Internal tree/blob reading ----
@@ -926,72 +1065,7 @@ export class GitFs {
     author: { name: string; email: string },
     onAuth?: () => { username: string; password?: string }
   ): Promise<void> {
-    await this.ensureInitialized();
-
-    const DIR = GitFs.DIR;
-
-    // 1. Checkout working directory from current commit so git.add works
-    await git.checkout({
-      fs: this.memFs,
-      dir: DIR,
-      ref: this.ref,
-      cache: this.cache
-    });
-
-    // 2. Materialize overlay files into memFs working directory
-    for (const [path, content] of this.overlay) {
-      const fsPath = `${DIR}${path}`;
-      await this.memFs.writeFile(fsPath, content);
-    }
-
-    // 3. Stage added/modified files
-    for (const path of this.overlay.keys()) {
-      const gitPath = toGitPath(path);
-      await git.add({
-        fs: this.memFs,
-        dir: DIR,
-        filepath: gitPath,
-        cache: this.cache
-      });
-    }
-
-    // 4. Stage deletions
-    for (const path of this.deleted) {
-      const gitPath = toGitPath(path);
-      try {
-        await git.remove({
-          fs: this.memFs,
-          dir: DIR,
-          filepath: gitPath,
-          cache: this.cache
-        });
-      } catch {
-        // File may not exist in git tree — skip
-      }
-    }
-
-    // 5. Commit
-    this.commitOid = await git.commit({
-      fs: this.memFs,
-      dir: DIR,
-      message,
-      author,
-      cache: this.cache
-    });
-
-    // 6. Push
-    await git.push({
-      fs: this.memFs,
-      http: this.httpTransport,
-      dir: DIR,
-      onAuth: onAuth ?? this.onAuth,
-      cache: this.cache
-    });
-
-    // 7. Clear overlay and caches
-    this.treeCache.clear();
-    this.overlay.clear();
-    this.overlayDirs.clear();
-    this.deleted.clear();
+    await this.commit(message, author);
+    await this.push(onAuth);
   }
 }

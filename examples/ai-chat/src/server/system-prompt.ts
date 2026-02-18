@@ -21,8 +21,8 @@ export function buildSystemPrompt(): string {
       "uname, id, uptime, hostname, whoami, clear, pwd, bash, sh.\n" +
       "Network: curl (use this to fetch URLs).\n" +
       "HTML: html-to-markdown.\n" +
-      "Custom: mount, umount, sessions, help.\n" +
-      "NOT available: git, apt, npm, pip, python, node, tar, gzip, ssh, wget, docker, sudo, rclone, " +
+      "Custom: mount, umount, git, sessions, help.\n" +
+      "NOT available: apt, npm, pip, python, node, tar, gzip, ssh, wget, docker, sudo, rclone, " +
       "and any package managers, compilers, or tools not listed above.",
 
     // No virtual filesystems
@@ -44,7 +44,8 @@ export function buildSystemPrompt(): string {
       "Do NOT mount inside /home/user as it would conflict with persistent storage. " +
       "Options via -o: ref (branch/tag, default main), depth (clone depth, default 1), username, password. " +
       "For private repos: if a GitHub account is connected (via Settings), authentication is automatic. " +
-      "Git mounts are read-write — file changes are automatically committed and pushed after each command.",
+      "Git mounts are read-write. Changes are NOT auto-committed — use git status/commit/push explicitly. " +
+      "No staging area: all pending changes are included in the next commit.",
 
     // Google Drive mounts
     "mount -t gdrive none /mnt/gdrive mounts the user's Google Drive. " +

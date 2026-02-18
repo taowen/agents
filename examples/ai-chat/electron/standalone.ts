@@ -16,7 +16,9 @@ import path from "node:path";
 import os from "node:os";
 import { screenControl } from "./win-automation.ts";
 import { createAgentLoop } from "../src/shared/agent-loop.ts";
-import { Bash, InMemoryFs } from "just-bash";
+import { Bash, InMemoryFs, MountableFs } from "just-bash";
+import { NodeFsAdapter } from "./node-fs-adapter.ts";
+import { detectDrives } from "./detect-drives.ts";
 import { createOpenAICompatible } from "@ai-sdk/openai-compatible";
 import { createGoogleGenerativeAI } from "@ai-sdk/google";
 import type { LanguageModel } from "ai";
@@ -91,7 +93,11 @@ function saveScreenshot(step: number, action: string, base64: string) {
 
 // ---- Run agent ----
 
-const bash = new Bash({ fs: new InMemoryFs(), cwd: "/home" });
+const mountableFs = new MountableFs({ base: new InMemoryFs() });
+for (const drive of detectDrives()) {
+  mountableFs.mount(drive.mountPoint, new NodeFsAdapter(drive.root), "winfs");
+}
+const bash = new Bash({ fs: mountableFs, cwd: "/home" });
 
 const agent = createAgentLoop({
   getModel: () => model,
