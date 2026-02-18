@@ -4,7 +4,6 @@ import { handleAuthRoutes, requireAuth, handleIncomingEmail } from "./auth";
 import { handleApiRoutes } from "./api";
 import { handleLlmRoutes } from "./llm-proxy";
 import { handleGitHubOAuth } from "./github-oauth";
-import { handleGDriveOAuth } from "vfs";
 
 export { ChatAgent } from "./chat-agent";
 
@@ -36,19 +35,19 @@ const sentryHandler = Sentry.withSentry(
       const ghResponse = await handleGitHubOAuth(request, env, userId);
       if (ghResponse) return ghResponse;
 
-      // 4b. Google Drive OAuth
-      const gdriveResponse = await handleGDriveOAuth(request, env, userId);
-      if (gdriveResponse) return gdriveResponse;
-
       // 5. Route to ChatAgent DO with userId + sessionId headers injected
       const headers = new Headers(request.headers);
       headers.set("x-user-id", userId);
       const url = new URL(request.url);
-      const nameMatch = url.pathname.match(/\/agents\/[^/]+\/([^/?]+)/);
-      if (nameMatch) {
-        headers.set("x-session-id", decodeURIComponent(nameMatch[1]));
+      const agentMatch = url.pathname.match(/\/agents\/([^/]+)\/([^/?]+)/);
+      if (agentMatch) {
+        const sessionId = decodeURIComponent(agentMatch[2]);
+        headers.set("x-session-id", sessionId);
+        // Rewrite DO name to userId:sessionId for user isolation
+        const isolatedName = encodeURIComponent(`${userId}:${sessionId}`);
+        url.pathname = `/agents/${agentMatch[1]}/${isolatedName}`;
       }
-      const agentReq = new Request(request.url, {
+      const agentReq = new Request(url.toString(), {
         method: request.method,
         headers,
         body: request.body

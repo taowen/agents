@@ -26,4 +26,3 @@ export {
 } from "./github-oauth";
 export type { GitHubOAuthDeps } from "./github-oauth";
 export { GoogleDriveFsAdapter } from "./gdrive-fs-adapter";
-export { handleGDriveOAuth } from "./gdrive-oauth";

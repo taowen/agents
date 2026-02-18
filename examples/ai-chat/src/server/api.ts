@@ -81,7 +81,7 @@ export async function handleApiRoutes(
   );
   if (schedulesMatch && request.method === "GET") {
     const sessionId = schedulesMatch[1];
-    const id = env.ChatAgent.idFromName(sessionId);
+    const id = env.ChatAgent.idFromName(`${userId}:${sessionId}`);
     const stub = env.ChatAgent.get(id);
     return stub.fetch(new Request("http://agent/get-schedules"));
   }

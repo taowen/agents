@@ -67,7 +67,10 @@ export function createSessionsCommand(
 
       const lines = result.results.map((row) => {
         const date = row.created_at.slice(0, 10);
-        const doId = chatAgentNs.idFromName(row.id).toString().slice(0, 12);
+        const doId = chatAgentNs
+          .idFromName(`${userId}:${row.id}`)
+          .toString()
+          .slice(0, 12);
         const title = row.title || "Untitled";
         return `${date}  ${doId}  ${title}`;
       });
