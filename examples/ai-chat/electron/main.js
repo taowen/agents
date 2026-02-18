@@ -1,9 +1,10 @@
 import { app, BrowserWindow, ipcMain } from "electron";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
-import { execFile } from "node:child_process";
+import { execFile, execFileSync } from "node:child_process";
 import { promisify } from "node:util";
 import fs from "node:fs";
+import fsPromises from "node:fs/promises";
 
 const execFileAsync = promisify(execFile);
 
@@ -309,6 +310,174 @@ function setupWindowHandlers() {
   });
 }
 
+function setupFileSystemHandlers() {
+  // Detect available Windows drives and WSL distros
+  ipcMain.handle("fs:detect-drives", async () => {
+    const drives = [];
+
+    // Scan A:-Z: for existing drives
+    for (let code = 65; code <= 90; code++) {
+      const letter = String.fromCharCode(code);
+      const root = `${letter}:\\`;
+      try {
+        fs.statSync(root);
+        drives.push({
+          mountPoint: `/mnt/${letter.toLowerCase()}`,
+          root
+        });
+      } catch {
+        // Drive doesn't exist
+      }
+    }
+
+    // Detect WSL distros
+    try {
+      const output = execFileSync("wsl", ["--list", "--quiet"], {
+        encoding: "utf16le",
+        windowsHide: true,
+        timeout: 5000
+      });
+      const distros = output
+        .split(/\r?\n/)
+        .map((l) => l.trim())
+        .filter(Boolean);
+      if (distros.length > 0) {
+        drives.push({
+          mountPoint: "/mnt/wsl",
+          root: `\\\\wsl.localhost\\${distros[0]}\\`
+        });
+      }
+    } catch {
+      // WSL not available
+    }
+
+    return drives;
+  });
+
+  // Unified fs operations IPC channel
+  ipcMain.handle("fs:op", async (_event, params) => {
+    const { op } = params;
+    try {
+      switch (op) {
+        case "readFile": {
+          const content = await fsPromises.readFile(params.path, "utf8");
+          return { ok: true, result: content };
+        }
+        case "readFileBuffer": {
+          const buf = await fsPromises.readFile(params.path);
+          return { ok: true, result: new Uint8Array(buf) };
+        }
+        case "writeFile": {
+          await fsPromises.writeFile(params.path, params.content);
+          return { ok: true };
+        }
+        case "appendFile": {
+          await fsPromises.appendFile(params.path, params.content);
+          return { ok: true };
+        }
+        case "stat":
+        case "lstat": {
+          const s = await (op === "lstat"
+            ? fsPromises.lstat(params.path)
+            : fsPromises.stat(params.path));
+          return {
+            ok: true,
+            result: {
+              isFile: s.isFile(),
+              isDirectory: s.isDirectory(),
+              isSymbolicLink: s.isSymbolicLink(),
+              mode: s.mode,
+              size: s.size,
+              mtime: s.mtime.toISOString()
+            }
+          };
+        }
+        case "exists": {
+          try {
+            await fsPromises.stat(params.path);
+            return { ok: true, result: true };
+          } catch {
+            return { ok: true, result: false };
+          }
+        }
+        case "mkdir": {
+          await fsPromises.mkdir(params.path, {
+            recursive: !!params.recursive
+          });
+          return { ok: true };
+        }
+        case "readdir": {
+          const entries = await fsPromises.readdir(params.path);
+          return { ok: true, result: entries };
+        }
+        case "readdirWithFileTypes": {
+          const dirents = await fsPromises.readdir(params.path, {
+            withFileTypes: true
+          });
+          return {
+            ok: true,
+            result: dirents.map((d) => ({
+              name: d.name,
+              isFile: d.isFile(),
+              isDirectory: d.isDirectory(),
+              isSymbolicLink: d.isSymbolicLink()
+            }))
+          };
+        }
+        case "rm": {
+          await fsPromises.rm(params.path, {
+            recursive: !!params.recursive,
+            force: !!params.force
+          });
+          return { ok: true };
+        }
+        case "cp": {
+          await fsPromises.cp(params.src, params.dest, {
+            recursive: !!params.recursive
+          });
+          return { ok: true };
+        }
+        case "mv": {
+          await fsPromises.rename(params.src, params.dest);
+          return { ok: true };
+        }
+        case "chmod": {
+          await fsPromises.chmod(params.path, params.mode);
+          return { ok: true };
+        }
+        case "symlink": {
+          await fsPromises.symlink(params.target, params.linkPath);
+          return { ok: true };
+        }
+        case "link": {
+          await fsPromises.link(params.existingPath, params.newPath);
+          return { ok: true };
+        }
+        case "readlink": {
+          const target = await fsPromises.readlink(params.path);
+          return { ok: true, result: target };
+        }
+        case "realpath": {
+          const resolved = await fsPromises.realpath(params.path);
+          return { ok: true, result: resolved };
+        }
+        case "utimes": {
+          await fsPromises.utimes(
+            params.path,
+            new Date(params.atime),
+            new Date(params.mtime)
+          );
+          return { ok: true };
+        }
+        default:
+          return { ok: false, error: `Unknown fs op: ${op}`, code: "ENOSYS" };
+      }
+    } catch (err) {
+      return { ok: false, error: err.message, code: err.code };
+    }
+  });
+}
+
 // Log file for renderer console output (readable from WSL)
 const LOG_FILE = path.join(__dirname, "renderer.log");
 fs.writeFileSync(
@@ -345,6 +514,7 @@ function createWindow() {
 app.whenReady().then(() => {
   setupScreenHandlers();
   setupWindowHandlers();
+  setupFileSystemHandlers();
   createWindow();
 
   app.on("activate", () => {

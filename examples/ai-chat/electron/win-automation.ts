@@ -5,7 +5,6 @@
 import { execFile } from "node:child_process";
 import { promisify } from "node:util";
 import path from "node:path";
-import fs from "node:fs";
 import { fileURLToPath } from "node:url";
 
 const execFileAsync = promisify(execFile);
@@ -192,7 +191,16 @@ async function handleMouseClick(
         CLICK_COUNT: String(doubleClick ? 2 : 1)
       }
     });
-    return { success: true, action: "click", x, y, button, doubleClick };
+    return {
+      success: true,
+      action: "click",
+      x,
+      y,
+      button,
+      doubleClick,
+      desktopX: abs.x,
+      desktopY: abs.y
+    };
   } catch (err: any) {
     return { success: false, error: err.message };
   }
@@ -207,7 +215,14 @@ async function handleMouseMove(
     await runPowerShell(script("screen-move.ps1"), {
       env: { X: String(Math.round(abs.x)), Y: String(Math.round(abs.y)) }
     });
-    return { success: true, action: "mouse_move", x, y };
+    return {
+      success: true,
+      action: "mouse_move",
+      x,
+      y,
+      desktopX: abs.x,
+      desktopY: abs.y
+    };
   } catch (err: any) {
     return { success: false, error: err.message };
   }
@@ -263,13 +278,21 @@ async function handleScroll(
     const { x, y, direction = "down", amount = 3 } = params;
     const delta = direction === "up" ? 120 * amount : -120 * amount;
     const env: Record<string, string> = { X: "", Y: "", DELTA: String(delta) };
+    const result: ScreenControlResult = {
+      success: true,
+      action: "scroll",
+      direction,
+      amount
+    };
     if (x !== undefined && y !== undefined) {
       const abs = toDesktopCoords(x, y);
       env.X = String(Math.round(abs.x));
       env.Y = String(Math.round(abs.y));
+      result.desktopX = abs.x;
+      result.desktopY = abs.y;
     }
     await runPowerShell(script("screen-scroll.ps1"), { env });
-    return { success: true, action: "scroll", direction, amount };
+    return result;
   } catch (err: any) {
     return { success: false, error: err.message };
   }
@@ -370,29 +393,13 @@ async function handleWindowScreenshot(
     const width = Number(wStr);
     const height = Number(hStr);
     // Remember window position so subsequent click/move/scroll coords get offset
-    lastWindowOffset = { left: Number(leftStr), top: Number(topStr) };
+    const windowLeft = Number(leftStr);
+    const windowTop = Number(topStr);
+    lastWindowOffset = { left: windowLeft, top: windowTop };
     const base64 = lines.slice(1).join("");
-    return { success: true, width, height, base64 };
+    return { success: true, width, height, base64, windowLeft, windowTop };
   } catch (err: any) {
     return { success: false, error: err.stderr?.trim() || err.message };
-  }
-}
-
-// ---- Foreground window debug helper ----
-
-export async function getForegroundWindow(): Promise<{
-  handle: number;
-  title: string;
-}> {
-  try {
-    const { stdout } = await runPowerShell(script("debug-foreground.ps1"));
-    const [handleStr, ...titleParts] = stdout.split("|");
-    return {
-      handle: parseInt(handleStr, 10) || 0,
-      title: titleParts.join("|")
-    };
-  } catch {
-    return { handle: 0, title: "(unknown)" };
   }
 }
 
@@ -418,84 +425,37 @@ const actionAliases: Record<string, string> = {
   list: "list_windows"
 };
 
-export interface ScreenControlOptions {
-  debugDir?: string;
-  debugStep?: number;
-}
-
 export async function screenControl(
-  params: ScreenControlParams,
-  options?: ScreenControlOptions
+  params: ScreenControlParams
 ): Promise<ScreenControlResult> {
   const action = actionAliases[params.action] ?? params.action;
-  const { debugDir, debugStep } = options ?? {};
 
-  if (debugDir) {
-    const before = await getForegroundWindow();
-    const prefix = debugStep !== undefined ? `step${debugStep}` : "?";
-    fs.appendFileSync(
-      path.join(debugDir, "focus-log.txt"),
-      `[${prefix}] BEFORE ${action}: foreground = ${before.handle} "${before.title}"\n`
-    );
-  }
-
-  let result: ScreenControlResult;
   switch (action) {
     case "screenshot":
-      result = await handleScreenshot();
-      break;
+      return handleScreenshot();
     case "click":
-      result = await handleMouseClick(params);
-      break;
+      return handleMouseClick(params);
     case "mouse_move":
-      result = await handleMouseMove(params);
-      break;
+      return handleMouseMove(params);
     case "type":
-      result = await handleKeyboardType(params);
-      break;
+      return handleKeyboardType(params);
     case "key_press":
-      result = await handleKeyPress(params);
-      break;
+      return handleKeyPress(params);
     case "scroll":
-      result = await handleScroll(params);
-      break;
+      return handleScroll(params);
     case "list_windows":
-      result = await handleListWindows();
-      break;
+      return handleListWindows();
     case "focus_window":
-      result = await handleFocusWindow(params);
-      break;
+      return handleFocusWindow(params);
     case "resize_window":
-      result = await handleResizeWindow(params);
-      break;
+      return handleResizeWindow(params);
     case "minimize_window":
     case "maximize_window":
     case "restore_window":
-      result = await handleSetState({ ...params, state: stateMap[action] });
-      break;
+      return handleSetState({ ...params, state: stateMap[action] });
     case "window_screenshot":
-      result = await handleWindowScreenshot(params);
-      break;
+      return handleWindowScreenshot(params);
     default:
-      result = { success: false, error: `Unknown action: ${action}` };
+      return { success: false, error: `Unknown action: ${action}` };
   }
-
-  if (debugDir) {
-    const after = await getForegroundWindow();
-    const prefix = debugStep !== undefined ? `step${debugStep}` : "?";
-    fs.appendFileSync(
-      path.join(debugDir, "focus-log.txt"),
-      `[${prefix}] AFTER  ${action}: foreground = ${after.handle} "${after.title}"\n`
-    );
-
-    if (result.base64) {
-      const filename = `${prefix}-${action}.png`;
-      fs.writeFileSync(
-        path.join(debugDir, filename),
-        Buffer.from(result.base64, "base64")
-      );
-    }
-  }
-
-  return result;
 }

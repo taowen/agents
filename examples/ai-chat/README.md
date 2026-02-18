@@ -190,31 +190,16 @@ bash run-standalone-on-windows.sh "List all visible windows"
 bash run-standalone-on-windows.sh "Open notepad and type hello"
 ```
 
-### Debugging the standalone agent
+### Logs and screenshots
 
-Set `DEBUG_DIR` to capture focus-transition logs and screenshots from every step:
+Every run saves structured logs and screenshots to a fixed directory:
 
-```bash
-DEBUG_DIR=/tmp/agent-debug bash examples/ai-chat/run-standalone-on-windows.sh "找到微信窗口并截图"
-```
+- **Windows**: `%TEMP%\windows-agent-standalone\logs\`
+- **WSL**: `/mnt/c/Users/$USER/AppData/Local/Temp/windows-agent-standalone/logs/`
 
-This produces:
-
-| File | Contents |
-|------|----------|
-| `focus-log.txt` | BEFORE/AFTER foreground window handle + title for every tool call |
-| `stepN-action.png` | Screenshot saved whenever a screenshot/window_screenshot action returns an image |
-
-Example `focus-log.txt`:
-
-```
-[step0] BEFORE list_windows: foreground = 525760 "Visual Studio Code"
-[step0] AFTER  list_windows: foreground = 525760 "Visual Studio Code"
-[step1] BEFORE focus_window: foreground = 525760 "Visual Studio Code"
-[step1] AFTER  focus_window: foreground = 67336 "Weixin"
-[step2] BEFORE window_screenshot: foreground = 67336 "Weixin"
-[step2] AFTER  window_screenshot: foreground = 67336 "Weixin"
-```
+Contents:
+- `agent.log` — timestamped log of every step, tool call, and result (including coordinate translations)
+- `step-NN-<action>.png` — screenshots the agent captured during normal operation
 
 ### How it works
 

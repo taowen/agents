@@ -7,6 +7,12 @@ contextBridge.exposeInMainWorld("workWithWindows", {
   /** Platform info */
   platform: process.platform,
 
+  /** Filesystem operations via IPC to Node.js fs */
+  fileSystem: (params) => ipcRenderer.invoke("fs:op", params),
+
+  /** Detect available Windows drives and WSL mounts */
+  detectDrives: () => ipcRenderer.invoke("fs:detect-drives"),
+
   /** Screen control — maps action names to IPC channels */
   screenControl: (params) => {
     const channelMap = {

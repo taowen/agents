@@ -10,10 +10,10 @@
  *   LLM_BASE_URL  - API base URL (required for openai-compatible)
  *   LLM_API_KEY   - API key (required)
  *   LLM_MODEL     - Model name (required)
- *   DEBUG_DIR     - Directory for focus-transition logs and screenshot PNGs (optional)
  */
 import fs from "node:fs";
 import path from "node:path";
+import os from "node:os";
 import { screenControl } from "./win-automation.ts";
 import { createAgent } from "./agent-core.ts";
 import { createOpenAICompatible } from "@ai-sdk/openai-compatible";
@@ -67,48 +67,42 @@ if (provider === "google") {
   })(modelName);
 }
 
-// ---- Debug mode ----
+// ---- Always-on log directory ----
 
-const debugDir = process.env.DEBUG_DIR;
-if (debugDir) {
-  fs.mkdirSync(debugDir, { recursive: true });
+const logDir = path.join(os.tmpdir(), "windows-agent-standalone", "logs");
+fs.mkdirSync(logDir, { recursive: true });
+// Clean previous run
+for (const f of fs.readdirSync(logDir)) fs.unlinkSync(path.join(logDir, f));
+
+const logFile = path.join(logDir, "agent.log");
+
+function log(msg: string) {
+  const line = `[${new Date().toISOString()}] ${msg}`;
+  process.stderr.write(line + "\n");
+  fs.appendFileSync(logFile, line + "\n");
+}
+
+function saveScreenshot(step: number, action: string, base64: string) {
+  const filename = `step-${String(step).padStart(2, "0")}-${action}.png`;
+  fs.writeFileSync(path.join(logDir, filename), Buffer.from(base64, "base64"));
+  log(`screenshot saved: ${filename}`);
 }
 
 // ---- Run agent ----
 
-const agent = createAgent({ screenControlFn: screenControl, model, debugDir });
-
-function log(msg: string) {
-  process.stderr.write(msg + "\n");
-}
+const agent = createAgent({ screenControlFn: screenControl, model });
 
 log(`[standalone] Provider: ${provider}`);
 log(`[standalone] Model: ${modelName}`);
 log(`[standalone] Prompt: ${prompt}`);
-if (debugDir) log(`[standalone] Debug dir: ${debugDir}`);
+log(`[standalone] Log dir: ${logDir}`);
 log("");
 
 try {
-  const response = await agent.runAgent(prompt, log);
+  const response = await agent.runAgent(prompt, log, saveScreenshot);
   log("");
   log("[standalone] Done.");
   console.log(response);
-
-  if (debugDir) {
-    const focusLog = path.join(debugDir, "focus-log.txt");
-    if (fs.existsSync(focusLog)) {
-      log("");
-      log("[standalone] === Focus transition log ===");
-      log(fs.readFileSync(focusLog, "utf-8"));
-    }
-    const pngs = fs
-      .readdirSync(debugDir)
-      .filter((f: string) => f.endsWith(".png"));
-    if (pngs.length > 0) {
-      log(`[standalone] Saved ${pngs.length} screenshot(s) to ${debugDir}/`);
-      for (const png of pngs) log(`  - ${png}`);
-    }
-  }
 } catch (err) {
   const msg = err instanceof Error ? err.message : String(err);
   console.error(`[standalone] Fatal error: ${msg}`);

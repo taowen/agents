@@ -3,7 +3,8 @@ import { createOpenAICompatible } from "@ai-sdk/openai-compatible";
 import { createGoogleGenerativeAI } from "@ai-sdk/google";
 import type { LanguageModel, ModelMessage } from "ai";
 import { streamText, tool } from "ai";
-import { Bash, InMemoryFs } from "just-bash";
+import { Bash, InMemoryFs, MountableFs } from "just-bash";
+import { WindowsFsAdapter } from "./windows-fs-adapter";
 import { z } from "zod";
 import type { LlmConfig } from "../server/llm-proxy";
 
@@ -32,10 +33,24 @@ interface ScreenControlResult {
   [key: string]: unknown;
 }
 
+interface FsOpResult {
+  ok: boolean;
+  result?: unknown;
+  error?: string;
+  code?: string;
+}
+
+interface DriveInfo {
+  mountPoint: string;
+  root: string;
+}
+
 interface WorkWithWindows {
   ping: () => string;
   platform: string;
   screenControl: (params: ScreenControlParams) => Promise<ScreenControlResult>;
+  fileSystem?: (params: Record<string, unknown>) => Promise<FsOpResult>;
+  detectDrives?: () => Promise<DriveInfo[]>;
 }
 
 declare global {
@@ -46,8 +61,31 @@ declare global {
 
 // ---- Local agent logic (runs in-browser, triggered by bridge messages) ----
 
-const fs = new InMemoryFs();
-const bash = new Bash({ fs, cwd: "/home" });
+const mountableFs = new MountableFs({ base: new InMemoryFs() });
+const bash = new Bash({ fs: mountableFs, cwd: "/home" });
+
+let windowsMountsInitialized = false;
+let mountedDriveDescriptions: string[] = [];
+
+async function initWindowsMounts() {
+  if (windowsMountsInitialized) return;
+  if (!window.workWithWindows?.detectDrives) return;
+  windowsMountsInitialized = true;
+
+  try {
+    const drives = await window.workWithWindows.detectDrives();
+    const ipcFn = window.workWithWindows.fileSystem!;
+    for (const drive of drives) {
+      const adapter = new WindowsFsAdapter(drive.root, ipcFn);
+      mountableFs.mount(drive.mountPoint, adapter, "winfs");
+      mountedDriveDescriptions.push(
+        `${drive.mountPoint} (${drive.root.replace(/\\$/, "")})`
+      );
+    }
+  } catch (err) {
+    console.error("Failed to init Windows mounts:", err);
+  }
+}
 
 const bashToolDef = tool({
   description: "Execute a bash command in the browser-side virtual filesystem",
@@ -189,17 +227,26 @@ async function runLocalAgent(
   userMessage: string,
   onLog?: (msg: string) => void
 ): Promise<string> {
+  await initWindowsMounts();
   agentHistory.push({ role: "user", content: userMessage });
 
   const model = await getModel();
   const hasScreenControl = !!window.workWithWindows?.screenControl;
 
+  const fsDescription =
+    mountedDriveDescriptions.length > 0
+      ? "You have access to a bash shell with the host file system mounted: " +
+        mountedDriveDescriptions.join(", ") +
+        ". You can ls, cat, grep, find files on the Windows machine. " +
+        "File writes are real — they modify the host filesystem. Be cautious with rm and destructive operations. "
+      : "You have access to a bash shell (virtual in-memory filesystem). ";
+
   const systemPrompt =
     "You are a remote desktop agent running on a Windows machine. " +
     "You receive instructions from a central AI assistant and execute them on the local desktop. " +
-    "You have access to a bash shell (virtual in-memory filesystem) " +
+    fsDescription +
     (hasScreenControl
-      ? "and the Windows desktop screen. You can take screenshots, click, type, press keys, move the mouse, and scroll. " +
+      ? "You also have the Windows desktop screen. You can take screenshots, click, type, press keys, move the mouse, and scroll. " +
         "You also have a 'win' tool for window management: list visible windows, focus/activate, " +
         "move/resize, minimize/maximize/restore, and take a screenshot of a single window. " +
         "Use win({ action: 'list_windows' }) to discover windows and their handles. " +

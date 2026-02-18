@@ -1,7 +1,6 @@
 param(
     [string]$ProjectDir,
     [string]$JustBashTarball,
-    [string]$DebugDir,
     [Parameter(ValueFromRemainingArguments)]
     [string[]]$AgentArgs
 )
@@ -83,14 +82,6 @@ if ((Test-Path $envFile) -and -not $env:LLM_API_KEY) {
             [System.Environment]::SetEnvironmentVariable($Matches[1], $Matches[2], "Process")
         }
     }
-}
-
-if ($DebugDir) {
-    $env:DEBUG_DIR = $DebugDir
-    if (-not (Test-Path $DebugDir)) {
-        New-Item -ItemType Directory -Path $DebugDir -Force | Out-Null
-    }
-    Write-Host "==> Debug dir: $DebugDir" -ForegroundColor Yellow
 }
 
 Push-Location $WorkDir

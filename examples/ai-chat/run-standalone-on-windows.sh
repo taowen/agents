@@ -39,19 +39,13 @@ echo "==> [3/3] Launching standalone agent on Windows ..."
 WIN_DIR="$(wslpath -w "$SCRIPT_DIR")"
 WIN_PS1="$(wslpath -w "$SCRIPT_DIR/run-standalone.ps1")"
 
-# Convert DEBUG_DIR to Windows path if set
-DEBUG_ARGS=()
-if [ -n "$DEBUG_DIR" ]; then
-  mkdir -p "$DEBUG_DIR"
-  WIN_DEBUG_DIR="$(wslpath -w "$DEBUG_DIR")"
-  DEBUG_ARGS+=("-DebugDir" "$WIN_DEBUG_DIR")
-fi
-
 powershell.exe -ExecutionPolicy Bypass -File "$WIN_PS1" \
   -ProjectDir "$WIN_DIR" \
   -JustBashTarball "$WIN_TARBALL" \
-  "${DEBUG_ARGS[@]}" \
   "$@"
 
 # Clean up tarball
 rm -f "$TARBALL_PATH"
+
+echo ""
+echo "==> Logs (WSL path): /mnt/c/Users/$USER/AppData/Local/Temp/windows-agent-standalone/logs/"

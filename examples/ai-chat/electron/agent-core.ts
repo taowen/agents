@@ -9,10 +9,8 @@ import { z } from "zod";
 
 import type {
   ScreenControlParams,
-  ScreenControlResult,
-  ScreenControlOptions
+  ScreenControlResult
 } from "./win-automation.ts";
-import { getForegroundWindow } from "./win-automation.ts";
 
 // ---- Tool definitions ----
 
@@ -86,18 +84,16 @@ const windowToolDef = tool({
 
 export interface AgentDeps {
   screenControlFn: (
-    params: ScreenControlParams,
-    options?: ScreenControlOptions
+    params: ScreenControlParams
   ) => Promise<ScreenControlResult>;
   model: LanguageModel;
-  debugDir?: string;
 }
 
 export function createAgent(deps: AgentDeps) {
   const fs = new InMemoryFs();
   const bash = new Bash({ fs, cwd: "/home" });
   const history: ModelMessage[] = [];
-  let debugStepCounter = 0;
+  let stepCounter = 0;
 
   async function executeBash(command: string) {
     const result = await bash.exec(command);
@@ -111,30 +107,72 @@ export function createAgent(deps: AgentDeps) {
   async function executeScreen(
     input: ScreenControlParams
   ): Promise<ScreenControlResult> {
-    const step = debugStepCounter++;
-    const debugOpts: ScreenControlOptions | undefined = deps.debugDir
-      ? { debugDir: deps.debugDir, debugStep: step }
-      : undefined;
-    const result = await deps.screenControlFn(input, debugOpts);
+    const result = await deps.screenControlFn(input);
     return { ...result, action: input.action };
   }
 
   async function executeWindow(
     input: ScreenControlParams
   ): Promise<ScreenControlResult> {
-    const step = debugStepCounter++;
-    const debugOpts: ScreenControlOptions | undefined = deps.debugDir
-      ? { debugDir: deps.debugDir, debugStep: step }
-      : undefined;
-    const result = await deps.screenControlFn(input, debugOpts);
+    const result = await deps.screenControlFn(input);
     return { ...result, action: input.action };
+  }
+
+  function formatScreenLog(result: ScreenControlResult): string {
+    const action = result.action ?? "screenshot";
+    if (!result.success)
+      return `[agent] screen: ${action} → error: ${result.error}`;
+    if (action === "click" || action === "mouse_move") {
+      const coords = `(${result.x},${result.y})`;
+      const desktop =
+        result.desktopX !== undefined
+          ? `→desktop(${result.desktopX},${result.desktopY})`
+          : "";
+      return `[agent] screen: ${action} ${coords}${desktop} → success`;
+    }
+    if (action === "screenshot" && result.width) {
+      return `[agent] screen: screenshot → ${result.width}x${result.height}`;
+    }
+    if (action === "scroll") {
+      return `[agent] screen: scroll ${result.direction} ${result.amount}${result.desktopX !== undefined ? ` at desktop(${result.desktopX},${result.desktopY})` : ""} → success`;
+    }
+    return `[agent] screen: ${action} → success`;
+  }
+
+  function formatWinLog(
+    result: ScreenControlResult,
+    params: ScreenControlParams
+  ): string {
+    const action = result.action ?? params.action;
+    if (!result.success)
+      return `[agent] win: ${action} → error: ${result.error}`;
+    if (action === "list_windows") {
+      const count = result.windows?.length ?? 0;
+      return `[agent] win: list_windows → ${count} windows`;
+    }
+    if (action === "window_screenshot") {
+      const handle = params.handle ?? "?";
+      const size = result.width ? `${result.width}x${result.height}` : "?";
+      const pos =
+        result.windowLeft !== undefined
+          ? ` at (${result.windowLeft},${result.windowTop})`
+          : "";
+      return `[agent] win: window_screenshot handle=${handle} → ${size}${pos}`;
+    }
+    if (action === "focus_window") {
+      const handle = params.handle ?? params.title ?? "?";
+      return `[agent] win: focus_window handle=${handle} → success`;
+    }
+    return `[agent] win: ${action} → success`;
   }
 
   async function runAgent(
     userMessage: string,
-    onLog?: (msg: string) => void
+    onLog?: (msg: string) => void,
+    onScreenshot?: (step: number, action: string, base64: string) => void
   ): Promise<string> {
     history.push({ role: "user", content: userMessage });
+    stepCounter = 0;
 
     const systemPrompt =
       "You are a remote desktop agent running on a Windows machine. " +
@@ -200,29 +238,21 @@ export function createAgent(deps: AgentDeps) {
 
       for (const tc of toolCalls) {
         let toolResultContent: string;
-
-        if (deps.debugDir) {
-          const fg = await getForegroundWindow();
-          onLog?.(
-            `[debug] BEFORE ${tc.toolName}: foreground = ${fg.handle} "${fg.title}"`
-          );
-        }
+        const currentStep = stepCounter++;
 
         if (tc.toolName === "bash") {
           const bashResult = await executeBash(
             (tc.args as { command: string }).command
           );
           onLog?.(
-            `[agent] bash result: exit=${bashResult.exitCode} stdout=${bashResult.stdout.slice(0, 100)}`
+            `[agent] bash: exit=${bashResult.exitCode} stdout=${bashResult.stdout.slice(0, 100)}`
           );
           toolResultContent = JSON.stringify(bashResult);
         } else if (tc.toolName === "screen") {
           const screenResult = await executeScreen(
             tc.args as ScreenControlParams
           );
-          onLog?.(
-            `[agent] screen: ${screenResult.action} success=${screenResult.success}`
-          );
+          onLog?.(formatScreenLog(screenResult));
 
           const lines: string[] = [];
           lines.push(
@@ -234,6 +264,12 @@ export function createAgent(deps: AgentDeps) {
           toolResultContent = lines.join("\n");
 
           if (screenResult.base64) {
+            onScreenshot?.(
+              currentStep,
+              screenResult.action ?? "screenshot",
+              screenResult.base64
+            );
+
             history.push({
               role: "tool" as const,
               content: [
@@ -256,19 +292,11 @@ export function createAgent(deps: AgentDeps) {
                 }
               ]
             });
-            if (deps.debugDir) {
-              const fg = await getForegroundWindow();
-              onLog?.(
-                `[debug] AFTER  ${tc.toolName}: foreground = ${fg.handle} "${fg.title}"`
-              );
-            }
             continue;
           }
         } else if (tc.toolName === "win") {
           const winResult = await executeWindow(tc.args as ScreenControlParams);
-          onLog?.(
-            `[agent] win: ${winResult.action} success=${winResult.success}`
-          );
+          onLog?.(formatWinLog(winResult, tc.args as ScreenControlParams));
 
           if (winResult.action === "list_windows") {
             const windows = winResult.windows || [];
@@ -284,6 +312,8 @@ export function createAgent(deps: AgentDeps) {
             if (winResult.width && winResult.height)
               lines.push(`Window size: ${winResult.width}x${winResult.height}`);
             toolResultContent = lines.join("\n");
+
+            onScreenshot?.(currentStep, "window_screenshot", winResult.base64);
 
             history.push({
               role: "tool" as const,
@@ -307,12 +337,6 @@ export function createAgent(deps: AgentDeps) {
                 }
               ]
             });
-            if (deps.debugDir) {
-              const fg = await getForegroundWindow();
-              onLog?.(
-                `[debug] AFTER  ${tc.toolName}: foreground = ${fg.handle} "${fg.title}"`
-              );
-            }
             continue;
           } else {
             const lines: string[] = [];
@@ -325,13 +349,6 @@ export function createAgent(deps: AgentDeps) {
           }
         } else {
           toolResultContent = "Unknown tool";
-        }
-
-        if (deps.debugDir) {
-          const fg = await getForegroundWindow();
-          onLog?.(
-            `[debug] AFTER  ${tc.toolName}: foreground = ${fg.handle} "${fg.title}"`
-          );
         }
 
         history.push({

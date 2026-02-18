@@ -9,8 +9,8 @@
     "deploy": "vite build && wrangler deploy",
     "test": "vitest run",
     "types": "wrangler types env.d.ts --include-runtime false",
-    "electron:dev": "electron electron/main.js",
-    "electron:start": "electron electron/main.js"
+    "electron:dev": "bash run-on-windows.sh",
+    "electron:start": "bash run-on-windows.sh"
   },
   "dependencies": {
     "@cloudflare/agents-ui": "*",
