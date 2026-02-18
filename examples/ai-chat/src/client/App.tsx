@@ -4,8 +4,11 @@ import { SessionSidebar } from "./SessionSidebar";
 import { SettingsPage } from "./SettingsPage";
 import { MemoryPage } from "./MemoryPage";
 import { Chat } from "./Chat";
-import { WindowsAgent } from "./WindowsAgent";
+import { AgentActivityPanel } from "./AgentActivityPanel";
+import { useBridge } from "./use-bridge";
+import { useBridgeViewer } from "./use-bridge-viewer";
 import { useAuth, useSessions } from "./api";
+import "./windows-agent.css";
 
 export interface UserInfo {
   id: string;
@@ -14,13 +17,31 @@ export interface UserInfo {
   picture: string | null;
 }
 
-function AuthenticatedApp({ user }: { user: UserInfo }) {
+function AuthenticatedApp({
+  user,
+  enableBridge
+}: {
+  user: UserInfo;
+  enableBridge: boolean;
+}) {
   const { sessions, isLoading, createSession, deleteSession, renameSession } =
     useSessions();
   const [activeSessionId, setActiveSessionId] = useState<string | null>(null);
   const [view, setView] = useState<"chat" | "settings" | "memory">("chat");
   const [sidebarOpen, setSidebarOpen] = useState(false);
+  const [showActivityPanel, setShowActivityPanel] = useState(false);
   const autoCreatingRef = useRef(false);
+
+  // Viewer — ALL clients get device list + activity logs
+  const viewer = useBridgeViewer();
+
+  // Bridge — only active on Electron (device registration + local agent)
+  const deviceName = enableBridge
+    ? window.workWithWindows
+      ? `windows-${window.workWithWindows.platform}`
+      : "browser-agent"
+    : "";
+  const bridge = enableBridge ? useBridge(deviceName) : null;
 
   // Select first session when sessions load and nothing is active
   useEffect(() => {
@@ -136,7 +157,11 @@ function AuthenticatedApp({ user }: { user: UserInfo }) {
     onOpenMemory: () => {
       setView("memory");
       setSidebarOpen(false);
-    }
+    },
+    devices: viewer.devices,
+    showActivityPanel,
+    onToggleActivityPanel: () => setShowActivityPanel((v) => !v),
+    ...(bridge ? { onResetAgent: bridge.resetAgent } : {})
   };
 
   return (
@@ -159,28 +184,39 @@ function AuthenticatedApp({ user }: { user: UserInfo }) {
         </div>
       )}
 
-      <div className="flex-1 min-w-0">
-        {view === "settings" ? (
-          <SettingsPage
-            onBack={() => setView("chat")}
-            onOpenSidebar={() => setSidebarOpen(true)}
+      <div className="flex-1 min-w-0 flex flex-col">
+        <div className="flex-1 min-h-0">
+          {view === "settings" ? (
+            <SettingsPage
+              onBack={() => setView("chat")}
+              onOpenSidebar={() => setSidebarOpen(true)}
+            />
+          ) : view === "memory" ? (
+            <MemoryPage
+              onBack={() => setView("chat")}
+              onOpenSidebar={() => setSidebarOpen(true)}
+            />
+          ) : activeSessionId ? (
+            <Chat
+              key={activeSessionId}
+              sessionId={activeSessionId}
+              onFirstMessage={handleFirstMessage}
+              onOpenSidebar={() => setSidebarOpen(true)}
+            />
+          ) : (
+            <div className="flex items-center justify-center h-full text-kumo-inactive">
+              Loading...
+            </div>
+          )}
+        </div>
+
+        {/* Agent Activity Panel — available for all clients */}
+        {showActivityPanel && (
+          <AgentActivityPanel
+            logs={viewer.logs}
+            onClose={() => setShowActivityPanel(false)}
+            onClear={viewer.clearLogs}
           />
-        ) : view === "memory" ? (
-          <MemoryPage
-            onBack={() => setView("chat")}
-            onOpenSidebar={() => setSidebarOpen(true)}
-          />
-        ) : activeSessionId ? (
-          <Chat
-            key={activeSessionId}
-            sessionId={activeSessionId}
-            onFirstMessage={handleFirstMessage}
-            onOpenSidebar={() => setSidebarOpen(true)}
-          />
-        ) : (
-          <div className="flex items-center justify-center h-full text-kumo-inactive">
-            Loading...
-          </div>
         )}
       </div>
     </div>
@@ -189,7 +225,7 @@ function AuthenticatedApp({ user }: { user: UserInfo }) {
 
 export default function App() {
   const { user, authenticated, isLoading } = useAuth();
-  const isAgentPage = window.location.pathname === "/windows-agent";
+  const enableBridge = !!window.workWithWindows;
 
   if (isLoading) {
     return (
@@ -203,10 +239,6 @@ export default function App() {
     return <LoginPage />;
   }
 
-  if (isAgentPage) {
-    return <WindowsAgent />;
-  }
-
   return (
     <Suspense
       fallback={
@@ -215,7 +247,7 @@ export default function App() {
         </div>
       }
     >
-      <AuthenticatedApp user={user!} />
+      <AuthenticatedApp user={user!} enableBridge={enableBridge} />
     </Suspense>
   );
 }

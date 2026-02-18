@@ -5,7 +5,7 @@ param(
 $ErrorActionPreference = "Stop"
 
 if (-not $ProjectDir) {
-    $ProjectDir = & wsl.exe wslpath -w '~/cloudflare-agents/examples/windows-agent' 2>$null
+    $ProjectDir = & wsl.exe wslpath -w '~/cloudflare-agents/examples/ai-chat' 2>$null
     if (-not $ProjectDir) {
         Write-Error "Cannot determine project directory. Pass -ProjectDir <path>."
         exit 1
@@ -22,9 +22,25 @@ if (-not (Test-Path $WorkDir)) {
     New-Item -ItemType Directory -Path $WorkDir | Out-Null
 }
 
-# Copy project files (package.json + electron/) to Windows temp dir
+# Generate a minimal Electron-only package.json (the full ai-chat one has
+# monorepo file: references that cannot resolve outside the workspace).
 Write-Host "==> Syncing files to $WorkDir ..." -ForegroundColor Cyan
-Copy-Item (Join-Path $ProjectDir "package.json") -Destination $WorkDir -Force
+$miniPkg = @'
+{
+  "name": "windows-agent",
+  "private": true,
+  "type": "module",
+  "version": "0.0.0",
+  "scripts": {
+    "dev": "electron electron/main.js",
+    "start": "electron electron/main.js"
+  },
+  "devDependencies": {
+    "electron": "^40.0.0"
+  }
+}
+'@
+Set-Content -Path (Join-Path $WorkDir "package.json") -Value $miniPkg -Encoding UTF8
 $ElectronDest = Join-Path $WorkDir "electron"
 if (-not (Test-Path $ElectronDest)) {
     New-Item -ItemType Directory -Path $ElectronDest | Out-Null

@@ -6,6 +6,7 @@ import { handleLlmRoutes } from "./llm-proxy";
 import { handleGitHubOAuth } from "./github-oauth";
 
 export { ChatAgent } from "./chat-agent";
+export { BridgeManager } from "./bridge-manager";
 
 const sentryHandler = Sentry.withSentry(
   (env: Env) => ({
@@ -35,17 +36,23 @@ const sentryHandler = Sentry.withSentry(
       const ghResponse = await handleGitHubOAuth(request, env, userId);
       if (ghResponse) return ghResponse;
 
-      // 5. Route to ChatAgent DO with userId + sessionId headers injected
+      // 5. Route to Agent DOs with userId header injected
       const headers = new Headers(request.headers);
       headers.set("x-user-id", userId);
       const url = new URL(request.url);
       const agentMatch = url.pathname.match(/\/agents\/([^/]+)\/([^/?]+)/);
       if (agentMatch) {
-        const sessionId = decodeURIComponent(agentMatch[2]);
-        headers.set("x-session-id", sessionId);
-        // Rewrite DO name to userId:sessionId for user isolation
-        const isolatedName = encodeURIComponent(`${userId}:${sessionId}`);
-        url.pathname = `/agents/${agentMatch[1]}/${isolatedName}`;
+        const agentName = agentMatch[1];
+        if (agentName === "bridge-manager") {
+          // BridgeManager: DO name = userId only (shared across all sessions)
+          url.pathname = `/agents/${agentName}/${encodeURIComponent(userId)}`;
+        } else {
+          // ChatAgent: DO name = userId:sessionId for per-session isolation
+          const sessionId = decodeURIComponent(agentMatch[2]);
+          headers.set("x-session-id", sessionId);
+          const isolatedName = encodeURIComponent(`${userId}:${sessionId}`);
+          url.pathname = `/agents/${agentName}/${isolatedName}`;
+        }
       }
       const agentReq = new Request(url.toString(), {
         method: request.method,

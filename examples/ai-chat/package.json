@@ -8,7 +8,9 @@
     "start": "vite dev",
     "deploy": "vite build && wrangler deploy",
     "test": "vitest run",
-    "types": "wrangler types env.d.ts --include-runtime false"
+    "types": "wrangler types env.d.ts --include-runtime false",
+    "electron:dev": "electron electron/main.js",
+    "electron:start": "electron electron/main.js"
   },
   "dependencies": {
     "@cloudflare/agents-ui": "*",
@@ -28,6 +30,7 @@
   },
   "devDependencies": {
     "@tailwindcss/vite": "^4",
+    "electron": "^40.0.0",
     "tailwindcss": "^4.1.18"
   }
 }

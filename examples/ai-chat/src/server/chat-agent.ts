@@ -57,6 +57,12 @@ class ChatAgentBase extends AIChatAgent {
   } | null = null;
   private static SETTINGS_TTL = 60_000; // 60 seconds
 
+  private cachedBridgeDevices: {
+    data: { deviceName: string }[];
+    fetchedAt: number;
+  } | null = null;
+  private static BRIDGE_DEVICES_TTL = 30_000; // 30 seconds
+
   constructor(ctx: DurableObjectState, env: Env) {
     super(ctx, env);
     this.browserState = createBrowserState();
@@ -803,8 +809,65 @@ class ChatAgentBase extends AIChatAgent {
     return "";
   }
 
-  private createTools() {
-    return {
+  /**
+   * Fetch the list of connected remote desktop devices from BridgeManager DO.
+   * Cached for 30s to avoid hammering the DO on every message.
+   */
+  private async getAvailableBridgeDevices(): Promise<{ deviceName: string }[]> {
+    const now = Date.now();
+    if (
+      this.cachedBridgeDevices &&
+      now - this.cachedBridgeDevices.fetchedAt <
+        ChatAgentBase.BRIDGE_DEVICES_TTL
+    ) {
+      return this.cachedBridgeDevices.data;
+    }
+    try {
+      const id = this.env.BridgeManager.idFromName(this.userId!);
+      const stub = this.env.BridgeManager.get(id);
+      const resp = await stub.fetch(
+        new Request("http://bridge/devices", {
+          method: "GET",
+          headers: { "x-partykit-room": this.userId! }
+        })
+      );
+      const data = (await resp.json()) as { deviceName: string }[];
+      this.cachedBridgeDevices = { data, fetchedAt: now };
+      return data;
+    } catch (e) {
+      console.error("getAvailableBridgeDevices:", e);
+      return [];
+    }
+  }
+
+  /**
+   * Send a message to a remote desktop agent via BridgeManager and wait for the response.
+   */
+  private async sendToRemoteDesktop(
+    deviceName: string,
+    content: string
+  ): Promise<string> {
+    const id = this.env.BridgeManager.idFromName(this.userId!);
+    const stub = this.env.BridgeManager.get(id);
+    const resp = await stub.fetch(
+      new Request("http://bridge/message", {
+        method: "POST",
+        headers: {
+          "Content-Type": "application/json",
+          "x-partykit-room": this.userId!
+        },
+        body: JSON.stringify({ deviceName, content })
+      })
+    );
+    const data = (await resp.json()) as { response?: string; error?: string };
+    if (data.error) {
+      return `[Error] ${data.error}`;
+    }
+    return data.response || "[No response from remote desktop]";
+  }
+
+  private createTools(bridgeDevices?: { deviceName: string }[]) {
+    const tools: Record<string, ReturnType<typeof tool>> = {
       bash: this.createBashTool(),
       browser: createBrowserTool(this.browserState, this.env.MYBROWSER),
       schedule_task: tool({
@@ -934,6 +997,36 @@ class ChatAgentBase extends AIChatAgent {
         }
       })
     };
+
+    // Add remote_desktop tool when bridge devices are available
+    if (bridgeDevices && bridgeDevices.length > 0) {
+      tools.remote_desktop = tool({
+        description:
+          "Send a message to a connected remote desktop agent. " +
+          "The remote agent can see the screen, control mouse/keyboard, and execute commands. " +
+          "It maintains conversation context across calls — you can give follow-up instructions. " +
+          "Describe what you want done in natural language. Returns the agent's text response.",
+        inputSchema: z.object({
+          message: z
+            .string()
+            .describe("What to do on the remote desktop, in natural language"),
+          device: z
+            .string()
+            .optional()
+            .describe("Device name (omit if only one device)")
+        }),
+        execute: async ({ message, device }) => {
+          const targetDevice =
+            device ||
+            (bridgeDevices.length === 1
+              ? bridgeDevices[0].deviceName
+              : "default");
+          return this.sendToRemoteDesktop(targetDevice, message);
+        }
+      });
+    }
+
+    return tools;
   }
 
   async onChatMessage(
@@ -973,8 +1066,11 @@ class ChatAgentBase extends AIChatAgent {
         console.error("writeChatHistory:", e)
       );
 
-      const llmModel = await this.getLlmModel();
-      const memoryBlock = await this.readMemoryBlock();
+      const [llmModel, memoryBlock, bridgeDevices] = await Promise.all([
+        this.getLlmModel(),
+        this.readMemoryBlock(),
+        this.getAvailableBridgeDevices()
+      ]);
 
       const messages = await Sentry.startSpan(
         { name: "convertMessages", op: "serialize" },
@@ -987,19 +1083,26 @@ class ChatAgentBase extends AIChatAgent {
       );
 
       // Inject dynamic context as a system message so the static system prompt stays cacheable
-      const dynamicContext = [
+      const dynamicParts = [
         `Chat history directory: /home/user/.chat/${this.sessionDir}/`,
         memoryBlock
-      ]
-        .filter(Boolean)
-        .join("\n");
+      ];
+      if (bridgeDevices.length > 0) {
+        const names = bridgeDevices.map((d) => d.deviceName).join(", ");
+        dynamicParts.push(
+          `\nConnected remote desktop devices: ${names}. ` +
+            "Use the remote_desktop tool to send instructions to these devices. " +
+            "The remote agent can see the screen, control mouse/keyboard, and maintains conversation context."
+        );
+      }
+      const dynamicContext = dynamicParts.filter(Boolean).join("\n");
       messages.unshift({ role: "system", content: dynamicContext });
 
       const result = streamText({
         model: llmModel,
         system: buildSystemPrompt(),
         messages,
-        tools: this.createTools(),
+        tools: this.createTools(bridgeDevices),
         stopWhen: stepCountIs(10)
       });
 

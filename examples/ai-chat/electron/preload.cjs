@@ -15,7 +15,14 @@ contextBridge.exposeInMainWorld("workWithWindows", {
       mouse_move: "screen:mouse-move",
       type: "screen:keyboard-type",
       key_press: "screen:key-press",
-      scroll: "screen:scroll"
+      scroll: "screen:scroll",
+      list_windows: "window:list-windows",
+      focus_window: "window:focus-window",
+      resize_window: "window:resize-window",
+      minimize_window: "window:minimize-window",
+      maximize_window: "window:maximize-window",
+      restore_window: "window:restore-window",
+      window_screenshot: "window:screenshot"
     };
     const channel = channelMap[params.action];
     if (!channel) {

@@ -91,7 +91,14 @@ export function buildSystemPrompt(): string {
 
     // Image attachments
     "Users can share images with you by attaching them to their messages. " +
-      "When the user attaches an image, you will be able to see and analyze it directly."
+      "When the user attaches an image, you will be able to see and analyze it directly.",
+
+    // Remote desktop
+    "You may have a remote_desktop tool available when a user's Windows desktop agent is connected. " +
+      "The remote agent runs on the user's local machine, can see the screen, control mouse/keyboard, and execute commands. " +
+      "It maintains conversation context across calls — you can give follow-up instructions (e.g. 'open notepad' then 'type hello'). " +
+      "Describe what you want done in natural language. The remote agent processes screenshots locally and returns a text summary. " +
+      "Check the dynamic context at the start of the conversation to see which devices are connected."
   ];
 
   return sections.join(" ");

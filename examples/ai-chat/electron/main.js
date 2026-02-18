@@ -9,7 +9,7 @@ const execFileAsync = promisify(execFile);
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 
-const PROD_URL = "https://ai.connect-screen.com/windows-agent";
+const PROD_URL = "https://ai.connect-screen.com";
 const APP_URL = process.env.AGENT_URL || PROD_URL;
 
 // Shared Win32 P/Invoke C# code for input simulation
@@ -37,6 +37,50 @@ public class WinInput {
     public const uint MOUSEEVENTF_WHEEL = 0x0800;
 
     public const uint KEYEVENTF_KEYUP = 0x0002;
+}
+"@ -ErrorAction SilentlyContinue
+`;
+
+// Shared Win32 P/Invoke C# code for window management
+const WIN_WINDOW_CS = `
+Add-Type -TypeDefinition @"
+using System;
+using System.Runtime.InteropServices;
+
+public class WinWindow {
+    [StructLayout(LayoutKind.Sequential)]
+    public struct RECT {
+        public int Left, Top, Right, Bottom;
+    }
+
+    [DllImport("user32.dll")]
+    public static extern bool SetForegroundWindow(IntPtr hWnd);
+
+    [DllImport("user32.dll")]
+    public static extern bool ShowWindow(IntPtr hWnd, int nCmdShow);
+
+    [DllImport("user32.dll")]
+    public static extern bool MoveWindow(IntPtr hWnd, int X, int Y, int nWidth, int nHeight, bool bRepaint);
+
+    [DllImport("user32.dll")]
+    public static extern bool GetWindowRect(IntPtr hWnd, out RECT lpRect);
+
+    [DllImport("user32.dll")]
+    public static extern bool IsIconic(IntPtr hWnd);
+
+    [DllImport("user32.dll")]
+    public static extern bool IsZoomed(IntPtr hWnd);
+
+    [DllImport("user32.dll")]
+    public static extern bool IsWindowVisible(IntPtr hWnd);
+
+    [DllImport("user32.dll")]
+    public static extern bool PrintWindow(IntPtr hWnd, IntPtr hdcBlt, uint nFlags);
+
+    public const int SW_MINIMIZE = 6;
+    public const int SW_MAXIMIZE = 3;
+    public const int SW_RESTORE = 9;
+    public const uint PW_RENDERFULLCONTENT = 2;
 }
 "@ -ErrorAction SilentlyContinue
 `;
@@ -332,6 +376,234 @@ Write-Output "scrolled ${direction} by ${amount}"
   });
 }
 
+function setupWindowHandlers() {
+  // List visible windows with their handles, titles, positions, and states
+  ipcMain.handle("window:list-windows", async () => {
+    try {
+      const script = `${WIN_WINDOW_CS}
+$results = @()
+Get-Process | Where-Object { $_.MainWindowHandle -ne [IntPtr]::Zero } | ForEach-Object {
+    $hwnd = $_.MainWindowHandle
+    if ([WinWindow]::IsWindowVisible($hwnd)) {
+        $rect = New-Object WinWindow+RECT
+        [WinWindow]::GetWindowRect($hwnd, [ref]$rect) | Out-Null
+        $results += [PSCustomObject]@{
+            handle = $hwnd.ToInt64()
+            title = $_.MainWindowTitle
+            processName = $_.ProcessName
+            pid = $_.Id
+            x = $rect.Left
+            y = $rect.Top
+            width = $rect.Right - $rect.Left
+            height = $rect.Bottom - $rect.Top
+            isMinimized = [WinWindow]::IsIconic($hwnd)
+            isMaximized = [WinWindow]::IsZoomed($hwnd)
+        }
+    }
+}
+$results | ConvertTo-Json -Compress
+`;
+      const { stdout } = await runPowerShell(script, { timeout: 10000 });
+      // PowerShell returns a single object (not array) when there's only one result
+      let windows = [];
+      if (stdout) {
+        const parsed = JSON.parse(stdout);
+        windows = Array.isArray(parsed) ? parsed : [parsed];
+      }
+      return { success: true, windows };
+    } catch (err) {
+      return { success: false, error: err.message };
+    }
+  });
+
+  // Focus/activate a window by handle or title substring
+  ipcMain.handle("window:focus-window", async (_event, params) => {
+    try {
+      const { handle, title } = params;
+      let script = `${WIN_WINDOW_CS}\n`;
+      if (handle) {
+        script += `
+$hwnd = [IntPtr]${handle}
+[WinWindow]::ShowWindow($hwnd, [WinWindow]::SW_RESTORE) | Out-Null
+Start-Sleep -Milliseconds 50
+[WinWindow]::SetForegroundWindow($hwnd) | Out-Null
+Write-Output "focused handle ${handle}"
+`;
+      } else if (title) {
+        const escaped = title.replace(/'/g, "''");
+        script += `
+$proc = Get-Process | Where-Object { $_.MainWindowHandle -ne [IntPtr]::Zero -and $_.MainWindowTitle -like '*${escaped}*' } | Select-Object -First 1
+if ($proc) {
+    $hwnd = $proc.MainWindowHandle
+    [WinWindow]::ShowWindow($hwnd, [WinWindow]::SW_RESTORE) | Out-Null
+    Start-Sleep -Milliseconds 50
+    [WinWindow]::SetForegroundWindow($hwnd) | Out-Null
+    Write-Output "focused $($proc.MainWindowTitle)"
+} else {
+    Write-Output "ERROR:No window found matching '${escaped}'"
+}
+`;
+      } else {
+        return { success: false, error: "Provide handle or title" };
+      }
+      const { stdout } = await runPowerShell(script);
+      if (stdout.startsWith("ERROR:")) {
+        return { success: false, error: stdout.slice(6) };
+      }
+      return { success: true, message: stdout };
+    } catch (err) {
+      return { success: false, error: err.message };
+    }
+  });
+
+  // Resize/move a window
+  ipcMain.handle("window:resize-window", async (_event, params) => {
+    try {
+      const { handle, x, y, width, height } = params;
+      if (!handle) return { success: false, error: "handle is required" };
+      const script = `${WIN_WINDOW_CS}
+$hwnd = [IntPtr]${handle}
+# Restore first if minimized/maximized
+[WinWindow]::ShowWindow($hwnd, [WinWindow]::SW_RESTORE) | Out-Null
+Start-Sleep -Milliseconds 50
+
+$rect = New-Object WinWindow+RECT
+[WinWindow]::GetWindowRect($hwnd, [ref]$rect) | Out-Null
+
+$newX = ${x !== undefined ? x : "$rect.Left"}
+$newY = ${y !== undefined ? y : "$rect.Top"}
+$newW = ${width !== undefined ? width : "($rect.Right - $rect.Left)"}
+$newH = ${height !== undefined ? height : "($rect.Bottom - $rect.Top)"}
+
+[WinWindow]::MoveWindow($hwnd, $newX, $newY, $newW, $newH, $true) | Out-Null
+Write-Output "moved to $newX,$newY size $newW x $newH"
+`;
+      const { stdout } = await runPowerShell(script);
+      return { success: true, message: stdout };
+    } catch (err) {
+      return { success: false, error: err.message };
+    }
+  });
+
+  // Minimize a window
+  ipcMain.handle("window:minimize-window", async (_event, params) => {
+    try {
+      const { handle } = params;
+      if (!handle) return { success: false, error: "handle is required" };
+      const script = `${WIN_WINDOW_CS}
+[WinWindow]::ShowWindow([IntPtr]${handle}, [WinWindow]::SW_MINIMIZE) | Out-Null
+Write-Output "minimized"
+`;
+      await runPowerShell(script);
+      return { success: true, message: "minimized" };
+    } catch (err) {
+      return { success: false, error: err.message };
+    }
+  });
+
+  // Maximize a window
+  ipcMain.handle("window:maximize-window", async (_event, params) => {
+    try {
+      const { handle } = params;
+      if (!handle) return { success: false, error: "handle is required" };
+      const script = `${WIN_WINDOW_CS}
+[WinWindow]::ShowWindow([IntPtr]${handle}, [WinWindow]::SW_MAXIMIZE) | Out-Null
+Write-Output "maximized"
+`;
+      await runPowerShell(script);
+      return { success: true, message: "maximized" };
+    } catch (err) {
+      return { success: false, error: err.message };
+    }
+  });
+
+  // Restore a window
+  ipcMain.handle("window:restore-window", async (_event, params) => {
+    try {
+      const { handle } = params;
+      if (!handle) return { success: false, error: "handle is required" };
+      const script = `${WIN_WINDOW_CS}
+[WinWindow]::ShowWindow([IntPtr]${handle}, [WinWindow]::SW_RESTORE) | Out-Null
+Write-Output "restored"
+`;
+      await runPowerShell(script);
+      return { success: true, message: "restored" };
+    } catch (err) {
+      return { success: false, error: err.message };
+    }
+  });
+
+  // Single-window screenshot using PrintWindow
+  ipcMain.handle("window:screenshot", async (_event, params) => {
+    try {
+      const { handle } = params;
+      if (!handle) return { success: false, error: "handle is required" };
+      const script = `${WIN_WINDOW_CS}
+Add-Type -AssemblyName System.Drawing
+
+$hwnd = [IntPtr]${handle}
+
+# Get window dimensions
+$rect = New-Object WinWindow+RECT
+[WinWindow]::GetWindowRect($hwnd, [ref]$rect) | Out-Null
+$w = $rect.Right - $rect.Left
+$h = $rect.Bottom - $rect.Top
+
+if ($w -le 0 -or $h -le 0) {
+    Write-Output "ERROR:Window has zero size (may be minimized)"
+    exit
+}
+
+# Create bitmap and capture window content via PrintWindow
+$bmp = New-Object System.Drawing.Bitmap($w, $h)
+$gfx = [System.Drawing.Graphics]::FromImage($bmp)
+$hdc = $gfx.GetHdc()
+[WinWindow]::PrintWindow($hwnd, $hdc, [WinWindow]::PW_RENDERFULLCONTENT) | Out-Null
+$gfx.ReleaseHdc($hdc)
+$gfx.Dispose()
+
+# Resize if wider than 1280px
+$maxW = 1280
+$outBmp = $bmp
+if ($bmp.Width -gt $maxW) {
+    $ratio = $maxW / $bmp.Width
+    $newH = [int]($bmp.Height * $ratio)
+    $outBmp = New-Object System.Drawing.Bitmap($maxW, $newH)
+    $g = [System.Drawing.Graphics]::FromImage($outBmp)
+    $g.InterpolationMode = [System.Drawing.Drawing2D.InterpolationMode]::HighQualityBicubic
+    $g.DrawImage($bmp, 0, 0, $maxW, $newH)
+    $g.Dispose()
+    $bmp.Dispose()
+}
+
+$ms = New-Object System.IO.MemoryStream
+$outBmp.Save($ms, [System.Drawing.Imaging.ImageFormat]::Png)
+$outBmp.Dispose()
+
+$bytes = $ms.ToArray()
+$ms.Dispose()
+
+Write-Output "$($w)x$($h)"
+Write-Output ([Convert]::ToBase64String($bytes))
+`;
+      const { stdout } = await runPowerShell(script, {
+        timeout: 15000,
+        maxBuffer: 20 * 1024 * 1024
+      });
+      if (stdout.startsWith("ERROR:")) {
+        return { success: false, error: stdout.slice(6) };
+      }
+      const lines = stdout.split(/\r?\n/);
+      const dimensions = lines[0];
+      const base64 = lines.slice(1).join("");
+      const [width, height] = dimensions.split("x").map(Number);
+      return { success: true, width, height, base64 };
+    } catch (err) {
+      return { success: false, error: err.message };
+    }
+  });
+}
+
 // Log file for renderer console output (readable from WSL)
 const LOG_FILE = path.join(__dirname, "renderer.log");
 fs.writeFileSync(
@@ -367,6 +639,7 @@ function createWindow() {
 
 app.whenReady().then(() => {
   setupScreenHandlers();
+  setupWindowHandlers();
   createWindow();
 
   app.on("activate", () => {

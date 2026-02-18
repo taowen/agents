@@ -6,8 +6,12 @@ import {
   TrashIcon,
   ChatCircleIcon,
   SignOutIcon,
-  PencilSimpleIcon
+  PencilSimpleIcon,
+  MonitorIcon,
+  ArrowsClockwiseIcon,
+  TerminalWindowIcon
 } from "@phosphor-icons/react";
+import type { BridgeDevice } from "./use-bridge-viewer";
 import { Button, Text } from "@cloudflare/kumo";
 
 export interface SessionInfo {
@@ -24,6 +28,11 @@ interface UserInfo {
   picture: string | null;
 }
 
+const DEVICE_STATUS_COLORS: Record<string, string> = {
+  connected: "#22c55e",
+  running: "#3b82f6"
+};
+
 interface SessionSidebarProps {
   sessions: SessionInfo[];
   activeSessionId: string | null;
@@ -34,6 +43,10 @@ interface SessionSidebarProps {
   onRenameSession: (id: string, title: string) => void;
   onOpenSettings: () => void;
   onOpenMemory: () => void;
+  devices?: BridgeDevice[];
+  showActivityPanel?: boolean;
+  onToggleActivityPanel?: () => void;
+  onResetAgent?: () => void;
 }
 
 export function SessionSidebar({
@@ -45,7 +58,11 @@ export function SessionSidebar({
   onDeleteSession,
   onRenameSession,
   onOpenSettings,
-  onOpenMemory
+  onOpenMemory,
+  devices,
+  showActivityPanel,
+  onToggleActivityPanel,
+  onResetAgent
 }: SessionSidebarProps) {
   const [editingId, setEditingId] = useState<string | null>(null);
   const [editTitle, setEditTitle] = useState("");
@@ -152,6 +169,62 @@ export function SessionSidebar({
 
       {/* Bottom section */}
       <div className="border-t border-kumo-line p-3 space-y-2">
+        {/* Device list + activity toggle */}
+        {devices && devices.length > 0 && (
+          <div className="space-y-1">
+            <div className="flex items-center gap-2 px-3 py-1">
+              <MonitorIcon size={14} className="shrink-0 text-kumo-inactive" />
+              <span className="text-xs font-medium text-kumo-secondary">
+                Devices ({devices.length})
+              </span>
+            </div>
+            {devices.map((device) => (
+              <div
+                key={device.deviceName}
+                className="flex items-center gap-2 px-3 py-1"
+              >
+                <span
+                  style={{
+                    width: 8,
+                    height: 8,
+                    borderRadius: "50%",
+                    backgroundColor:
+                      DEVICE_STATUS_COLORS[device.status] ?? "#22c55e",
+                    display: "inline-block",
+                    flexShrink: 0
+                  }}
+                />
+                <span className="flex-1 text-xs text-kumo-secondary truncate">
+                  {device.deviceName}
+                </span>
+              </div>
+            ))}
+            <div className="flex gap-1 px-3">
+              <button
+                onClick={onToggleActivityPanel}
+                className={`flex items-center gap-1.5 flex-1 px-2 py-1.5 rounded text-xs transition-colors ${
+                  showActivityPanel
+                    ? "bg-kumo-brand/10 text-kumo-brand"
+                    : "text-kumo-secondary hover:bg-kumo-elevated hover:text-kumo-default"
+                }`}
+              >
+                <TerminalWindowIcon size={12} />
+                <span>Activity</span>
+              </button>
+              {onResetAgent && (
+                <button
+                  onClick={onResetAgent}
+                  className="flex items-center gap-1.5 px-2 py-1.5 rounded text-xs text-kumo-secondary hover:bg-kumo-elevated hover:text-kumo-default transition-colors"
+                  title="Reset local agent session"
+                >
+                  <ArrowsClockwiseIcon size={12} />
+                  <span>Reset</span>
+                </button>
+              )}
+            </div>
+          </div>
+        )}
+
         {/* Memory link */}
         <button
           onClick={onOpenMemory}

@@ -3,11 +3,14 @@
 declare namespace Cloudflare {
   interface GlobalProps {
     mainModule: typeof import("./src/server/index");
-    durableNamespaces: "ChatAgent";
+    durableNamespaces: "ChatAgent" | "BridgeManager";
   }
   interface Env {
     AI: Ai;
     ChatAgent: DurableObjectNamespace<import("./src/server/index").ChatAgent>;
+    BridgeManager: DurableObjectNamespace<
+      import("./src/server/index").BridgeManager
+    >;
     DB: D1Database;
     GOOGLE_AI_API_KEY: string;
     ARK_API_KEY: string;
