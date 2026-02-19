@@ -26,6 +26,17 @@ android {
     }
 }
 
+// Copy llm-config.json into assets so it's bundled in the APK
+task copyLlmConfig(type: Copy) {
+    from "${rootProject.projectDir}/llm-config.json"
+    into "${projectDir}/src/main/assets"
+    rename { 'llm-config.json' }
+}
+preBuild.dependsOn copyLlmConfig
+
 dependencies {
     implementation 'androidx.appcompat:appcompat:1.6.1'
+    implementation 'com.squareup.okhttp3:okhttp:4.12.0'
+    implementation 'org.json:json:20231013'
+    implementation 'org.mozilla:rhino:1.7.15'
 }

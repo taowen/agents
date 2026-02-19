@@ -19,6 +19,9 @@ export interface ScreenControlParams {
   title?: string;
   width?: number;
   height?: number;
+  normX?: number;
+  normY?: number;
+  mode?: "auto" | "accessibility" | "pixel";
 }
 
 export interface ScreenControlResult {
@@ -27,9 +30,11 @@ export interface ScreenControlResult {
   width?: number;
   height?: number;
   base64?: string;
+  accessibilityTree?: string;
   action?: string;
   windows?: Array<Record<string, unknown>>;
   message?: string;
+  a11yDiagnostics?: string;
   [key: string]: unknown;
 }
 

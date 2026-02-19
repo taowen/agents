@@ -89,6 +89,12 @@ function saveScreenshot(step: number, action: string, base64: string) {
   log(`screenshot saved: ${filename}`);
 }
 
+function saveText(step: number, label: string, text: string) {
+  const filename = `step-${String(step).padStart(2, "0")}-${label}.txt`;
+  fs.writeFileSync(path.join(logDir, filename), text, "utf-8");
+  log(`text saved: ${filename} (${text.length} chars)`);
+}
+
 // ---- Exit when parent dies (stdin pipe closes) ----
 process.stdin.resume();
 process.stdin.on("end", () => {
@@ -123,7 +129,8 @@ log("");
 try {
   const response = await agent.runAgent(prompt, {
     onLog: log,
-    onScreenshot: saveScreenshot
+    onScreenshot: saveScreenshot,
+    onText: saveText
   });
   log("");
   log("[standalone] Done.");

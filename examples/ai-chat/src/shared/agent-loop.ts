@@ -16,32 +16,43 @@ import { normalizeAction, isDoubleClickAlias } from "./action-aliases.ts";
 
 // ---- Tool definitions ----
 
-const screenToolDef = tool({
+const desktopToolDef = tool({
   description:
-    "Control the Windows desktop screen. Take screenshots, click, type, press keys, move mouse, and scroll. " +
+    "Control the Windows desktop: screenshots, click, type, press keys, move mouse, scroll, " +
+    "and window management (list, focus, resize, minimize, maximize, restore, window screenshot). " +
     "Each action automatically returns a follow-up screenshot showing the result. " +
     "Coordinates use a 0-999 grid: (0,0)=top-left corner, (999,999)=bottom-right corner, (500,500)=center. " +
-    "Use 'annotate' with x,y to draw a red crosshair on the last screenshot — verify your target before clicking.",
+    "Use list_windows to discover windows and their handles. " +
+    "Use window_screenshot to capture just one window (smaller image than full desktop screenshot).",
   inputSchema: z.object({
     action: z
       .enum([
-        "screenshot",
         "click",
         "mouse_move",
         "type",
         "key_press",
         "scroll",
-        "annotate"
+        "list_windows",
+        "focus_window",
+        "resize_window",
+        "minimize_window",
+        "maximize_window",
+        "restore_window",
+        "window_screenshot"
       ])
-      .describe("The screen action to perform"),
+      .describe("The desktop action to perform"),
     x: z
       .number()
       .optional()
-      .describe("X position in 0-999 range (0=left edge, 999=right edge)"),
+      .describe(
+        "X position in 0-999 range for screen actions, or pixel position for resize_window"
+      ),
     y: z
       .number()
       .optional()
-      .describe("Y position in 0-999 range (0=top edge, 999=bottom edge)"),
+      .describe(
+        "Y position in 0-999 range for screen actions, or pixel position for resize_window"
+      ),
     text: z.string().optional().describe("Text to type"),
     key: z.string().optional().describe("Key name to press"),
     modifiers: z.array(z.string()).optional().describe("Modifier keys"),
@@ -56,6 +67,19 @@ const screenToolDef = tool({
       .optional()
       .describe(
         "Scroll wheel notches (default 3, use 30-50 to scroll through long pages or chat history)"
+      ),
+    handle: z.number().optional().describe("Window handle from list_windows"),
+    title: z
+      .string()
+      .optional()
+      .describe("Window title substring (for focus_window)"),
+    width: z.number().optional().describe("Width for resize_window"),
+    height: z.number().optional().describe("Height for resize_window"),
+    mode: z
+      .enum(["auto", "accessibility", "pixel"])
+      .optional()
+      .describe(
+        "window_screenshot mode: 'auto' (default, prefers a11y tree), 'accessibility' (tree only), 'pixel' (image only). Only affects this call — auto-screenshots always use 'auto'."
       )
   })
 });
@@ -73,41 +97,13 @@ const powershellToolDef = tool({
   })
 });
 
-const windowToolDef = tool({
-  description:
-    "Manage windows on the Windows desktop. List visible windows, focus/activate, " +
-    "move/resize, minimize/maximize/restore, or take a screenshot of a single window. " +
-    "Use list_windows first to discover windows and their handles. " +
-    "Use window_screenshot to capture just one window (smaller image than full desktop screenshot).",
-  inputSchema: z.object({
-    action: z.enum([
-      "list_windows",
-      "focus_window",
-      "resize_window",
-      "minimize_window",
-      "maximize_window",
-      "restore_window",
-      "window_screenshot"
-    ]),
-    handle: z.number().optional().describe("Window handle from list_windows"),
-    title: z
-      .string()
-      .optional()
-      .describe("Window title substring (for focus_window)"),
-    x: z.number().optional().describe("X position for resize_window"),
-    y: z.number().optional().describe("Y position for resize_window"),
-    width: z.number().optional().describe("Width for resize_window"),
-    height: z.number().optional().describe("Height for resize_window")
-  })
-});
-
 // ---- System prompt ----
 
 const SYSTEM_PROMPT_BASE =
   "You are a remote desktop agent running on a Windows machine.\n" +
   "You have a `powershell` tool for running PowerShell commands on the Windows host.\n" +
-  "You have the Windows desktop screen. You can take screenshots, click, type, press keys, move the mouse, and scroll.\n" +
-  "You have a 'win' tool for window management: list_windows, focus/activate, move/resize, minimize/maximize/restore, window_screenshot.\n" +
+  "You have a `desktop` tool for all screen and window operations: screenshots, click, type, press keys, move mouse, scroll, " +
+  "and window management (list_windows, focus_window, resize_window, minimize/maximize/restore_window, window_screenshot).\n" +
   "\n" +
   "COORDINATE SYSTEM:\n" +
   "All coordinates use a 0-999 grid mapped to the screenshot image.\n" +
@@ -115,22 +111,34 @@ const SYSTEM_PROMPT_BASE =
   "Examples: top-right corner = (999,0), bottom-left corner = (0,999).\n" +
   "A button at roughly 70% from left and 85% from top → x=700, y=850.\n" +
   "\n" +
-  "SCREENSHOT STRATEGY:\n" +
-  "PREFER win({ action: 'window_screenshot', handle }) over screen({ action: 'screenshot' }).\n" +
-  "Full desktop screenshots are very large and waste tokens. Only use screen({ action: 'screenshot' }) when:\n" +
-  "- You don't know which window to target yet (first step)\n" +
-  "- You need to see the taskbar or desktop icons\n" +
-  "For all other cases, use win({ action: 'list_windows' }) to find the target window handle,\n" +
-  "then use win({ action: 'window_screenshot', handle }) to capture just that window.\n" +
-  "\n" +
   "WORKFLOW RULES:\n" +
   "1. Every action (click, type, key_press, scroll, mouse_move) automatically includes a follow-up screenshot — you see the result immediately without calling screenshot again.\n" +
-  "2. Only call screenshot/window_screenshot explicitly when you need to see the screen for the FIRST time or after switching windows.\n" +
-  "3. If wrong window is in front, use win({ action: 'focus_window' }) then the follow-up screenshot will show the new state.\n" +
+  "2. Start by calling desktop({ action: 'list_windows' }) to discover windows and their handles, then use desktop({ action: 'window_screenshot', handle }) to see a specific window. Only call window_screenshot explicitly when you need to see the screen for the FIRST time or after switching windows.\n" +
+  "3. If wrong window is in front, use desktop({ action: 'focus_window' }) then the follow-up screenshot will show the new state.\n" +
   "4. Use coordinates from the MOST RECENT screenshot only.\n" +
-  "5. Before clicking, use screen({ action: 'annotate', x, y }) to verify target coords.\n" +
+  "5. Use coordinates from the MOST RECENT screenshot or accessibility tree only.\n" +
   "6. Do NOT include base64 image data in your text response.\n" +
-  "7. When scrolling, ALWAYS provide x,y coordinates pointing to the CENTER of the area you want to scroll (e.g. the chat message area, not the sidebar). Use a small amount (3-5) so you don't skip content.";
+  "7. When scrolling, ALWAYS provide x,y coordinates pointing to the CENTER of the area you want to scroll (e.g. the chat message area, not the sidebar). Use a small amount (3-5) so you don't skip content.\n" +
+  "\n" +
+  "ACCESSIBILITY TREE MODE:\n" +
+  "window_screenshot returns a text accessibility tree by default.\n" +
+  "The tree uses indentation for parent-child hierarchy. Each element line:\n" +
+  '  [ControlType] Name="..." Value="..." bounds=[left,top][right,bottom] <patterns>\n' +
+  "The first line is 'Window: WxH' — use W,H in the coordinate formula below.\n" +
+  "Patterns indicate available interactions: Invoke (clickable), Toggle (checkbox/switch), " +
+  "Scroll (scrollable area), ExpandCollapse (dropdown/tree node), SelectionItem.\n" +
+  "\n" +
+  "To click an element, convert its bounds to 0-999 coords:\n" +
+  "  normX = round((left+right)/2 * 999 / W), normY = round((top+bottom)/2 * 999 / H)\n" +
+  "Then desktop({ action: 'click', x: normX, y: normY }).\n" +
+  "\n" +
+  "MODE SELECTION (a11y vs pixel):\n" +
+  "- a11y: faster (no image transfer), saves tokens, gives exact element bounds. Best for standard UI.\n" +
+  "- pixel: needed for visual content (images, colors, layout verification), canvas/games, or elements without names.\n" +
+  "Use window_screenshot with mode='pixel' or mode='accessibility' to force a specific mode for that call.\n" +
+  "Follow-up auto-screenshots always use 'auto' mode — the backend picks the best format based on content.\n" +
+  "In a11y mode, coordinates from element bounds are exact — click directly.\n" +
+  "In pixel mode, visually estimate coordinates from the screenshot.";
 
 const CLOUD_DRIVE_PROMPT =
   "\n\nCLOUD FILE STORAGE:\n" +
@@ -153,14 +161,15 @@ const CLOUD_DRIVE_PROMPT =
 
 // ---- Logging helpers ----
 
-function formatScreenLog(
+function formatDesktopLog(
   result: ScreenControlResult,
+  params: ScreenControlParams,
   normX?: number,
   normY?: number
 ): string {
-  const action = result.action ?? "screenshot";
+  const action = result.action ?? params.action;
   if (!result.success)
-    return `[agent] screen: ${action} → error: ${result.error}`;
+    return `[agent] desktop: ${action} → error: ${result.error}`;
   if (action === "click" || action === "mouse_move") {
     const norm = normX !== undefined ? `norm(${normX},${normY})→` : "";
     const pixel = `pixel(${result.x},${result.y})`;
@@ -168,32 +177,15 @@ function formatScreenLog(
       result.desktopX !== undefined
         ? `→desktop(${result.desktopX},${result.desktopY})`
         : "";
-    return `[agent] screen: ${action} ${norm}${pixel}${desktop} → success`;
-  }
-  if (action === "screenshot" && result.width) {
-    return `[agent] screen: screenshot → ${result.width}x${result.height}`;
-  }
-  if (action === "annotate" && result.width) {
-    const norm = normX !== undefined ? `norm(${normX},${normY})→` : "";
-    const pixel = `pixel(${result.x ?? "?"},${result.y ?? "?"})`;
-    return `[agent] screen: annotate ${norm}${pixel} → ${result.width}x${result.height}`;
+    return `[agent] desktop: ${action} ${norm}${pixel}${desktop} → success`;
   }
   if (action === "scroll") {
     const norm = normX !== undefined ? `norm(${normX},${normY})→` : "";
-    return `[agent] screen: scroll ${result.direction} ${result.amount}${norm ? ` at ${norm}` : ""}${result.desktopX !== undefined ? `desktop(${result.desktopX},${result.desktopY})` : ""} → success`;
+    return `[agent] desktop: scroll ${result.direction} ${result.amount}${norm ? ` at ${norm}` : ""}${result.desktopX !== undefined ? `desktop(${result.desktopX},${result.desktopY})` : ""} → success`;
   }
-  return `[agent] screen: ${action} → success`;
-}
-
-function formatWinLog(
-  result: ScreenControlResult,
-  params: ScreenControlParams
-): string {
-  const action = result.action ?? params.action;
-  if (!result.success) return `[agent] win: ${action} → error: ${result.error}`;
   if (action === "list_windows") {
     const count = result.windows?.length ?? 0;
-    return `[agent] win: list_windows → ${count} windows`;
+    return `[agent] desktop: list_windows → ${count} windows`;
   }
   if (action === "window_screenshot") {
     const handle = params.handle ?? "?";
@@ -202,13 +194,14 @@ function formatWinLog(
       result.windowLeft !== undefined
         ? ` at (${result.windowLeft},${result.windowTop})`
         : "";
-    return `[agent] win: window_screenshot handle=${handle} → ${size}${pos}`;
+    const tag = result.accessibilityTree !== undefined ? "[a11y]" : "[pixel]";
+    return `[agent] desktop: window_screenshot ${tag} handle=${handle} → ${size}${pos}`;
   }
   if (action === "focus_window") {
     const handle = params.handle ?? params.title ?? "?";
-    return `[agent] win: focus_window handle=${handle} → success`;
+    return `[agent] desktop: focus_window handle=${handle} → success`;
   }
-  return `[agent] win: ${action} → success`;
+  return `[agent] desktop: ${action} → success`;
 }
 
 // ---- Agent factory ----
@@ -226,6 +219,7 @@ export interface AgentLoopConfig {
 export interface AgentLoopCallbacks {
   onLog?: (msg: string) => void;
   onScreenshot?: (step: number, action: string, base64: string) => void;
+  onText?: (step: number, label: string, text: string) => void;
   abortSignal?: AbortSignal;
 }
 
@@ -263,30 +257,30 @@ export function createAgentLoop(config: AgentLoopConfig): AgentLoop {
       if (lastScreenshotIsWindow && lastWindowHandle) {
         const result = await executeScreenControl({
           action: "window_screenshot",
-          handle: lastWindowHandle
+          handle: lastWindowHandle,
+          mode: "auto"
         });
+        const tag = result.accessibilityTree ? "[a11y]" : "[pixel]";
         onLog?.(
-          `[agent] autoScreenshot: window_screenshot handle=${lastWindowHandle} → ${result.success ? `${result.width}x${result.height}` : result.error}`
+          `[agent] autoScreenshot: window_screenshot ${tag} handle=${lastWindowHandle} → ${result.success ? `${result.width}x${result.height}` : result.error}`
         );
         return result;
       }
-      const result = await executeScreenControl({ action: "screenshot" });
-      onLog?.(
-        `[agent] autoScreenshot: screenshot → ${result.success ? `${result.width}x${result.height}` : result.error}`
-      );
-      return result;
+      onLog?.(`[agent] autoScreenshot: no window handle, skipping`);
+      return null;
     } catch (e) {
       onLog?.(`[agent] autoScreenshot: error → ${e}`);
       return null;
     }
   }
 
-  /** Remove old screenshot images from history to prevent token bloat. */
-  function stripOldImages(): void {
+  /** Remove old screenshot images and accessibility trees from history to prevent token bloat. */
+  function stripOldScreenshots(): void {
     for (const msg of history) {
       if (msg.role !== "user" || typeof msg.content === "string") continue;
       const parts = msg.content as unknown as Array<{
         type: string;
+        text?: string;
         [k: string]: unknown;
       }>;
       for (let i = parts.length - 1; i >= 0; i--) {
@@ -294,6 +288,19 @@ export function createAgentLoop(config: AgentLoopConfig): AgentLoop {
           parts[i] = {
             type: "text",
             text: "[Previous screenshot removed]"
+          } as any;
+        } else if (
+          parts[i].type === "text" &&
+          (parts[i].text?.startsWith(
+            "Here is the window accessibility tree:"
+          ) ||
+            parts[i].text?.startsWith(
+              "Here is the updated accessibility tree after the action:"
+            ))
+        ) {
+          parts[i] = {
+            type: "text",
+            text: "[Previous accessibility tree removed]"
           } as any;
         }
       }
@@ -314,6 +321,7 @@ export function createAgentLoop(config: AgentLoopConfig): AgentLoop {
   ): Promise<string> {
     const onLog = callbacks?.onLog;
     const onScreenshot = callbacks?.onScreenshot;
+    const onText = callbacks?.onText;
     const abortSignal = callbacks?.abortSignal;
 
     history.push({ role: "user", content: userMessage });
@@ -322,8 +330,7 @@ export function createAgentLoop(config: AgentLoopConfig): AgentLoop {
     const model = await getModel();
     const tools: Record<string, ReturnType<typeof tool>> = {
       powershell: powershellToolDef,
-      screen: screenToolDef,
-      win: windowToolDef
+      desktop: desktopToolDef
     };
 
     const systemPrompt = hasCloudDrive
@@ -374,6 +381,9 @@ export function createAgentLoop(config: AgentLoopConfig): AgentLoop {
       onLog?.(
         `[agent] step ${step + 1} LLM: ${llmMs}ms, tools: ${toolCalls.length}, text: ${stepText.length} chars`
       );
+      if (stepText) {
+        onLog?.(`[agent] LLM text: ${stepText}`);
+      }
 
       const response = await result.response;
       history.push(...response.messages);
@@ -397,29 +407,29 @@ export function createAgentLoop(config: AgentLoopConfig): AgentLoop {
             `[agent] powershell: exit=${psResult.exitCode} stdout=${psResult.stdout.slice(0, 100)}`
           );
           toolResultContent = JSON.stringify(psResult);
-        } else if (tc.toolName === "screen") {
-          const screenArgs = tc.args as unknown as ScreenControlParams;
+        } else if (tc.toolName === "desktop") {
+          const args = tc.args as unknown as ScreenControlParams;
 
           // Normalize action aliases
-          const originalAction = screenArgs.action;
-          screenArgs.action = normalizeAction(screenArgs.action);
+          const originalAction = args.action;
+          args.action = normalizeAction(args.action);
           if (isDoubleClickAlias(originalAction)) {
-            screenArgs.doubleClick = true;
+            args.doubleClick = true;
           }
 
-          // Coordinate conversion: 0-999 normalized → pixel
+          // Coordinate conversion: 0-999 normalized → pixel for coordinate-based actions
           let savedNormX: number | undefined;
           let savedNormY: number | undefined;
-          const coordActions = ["click", "mouse_move", "scroll", "annotate"];
+          const COORD_ACTIONS = new Set(["click", "mouse_move", "scroll"]);
           if (
-            coordActions.includes(screenArgs.action) &&
-            screenArgs.x !== undefined &&
-            screenArgs.y !== undefined &&
+            COORD_ACTIONS.has(args.action) &&
+            args.x !== undefined &&
+            args.y !== undefined &&
             lastScreenshotWidth > 0 &&
             lastScreenshotHeight > 0
           ) {
-            savedNormX = screenArgs.x;
-            savedNormY = screenArgs.y;
+            savedNormX = args.x;
+            savedNormY = args.y;
 
             // Range check: normalized coordinates must be 0-999
             if (
@@ -430,7 +440,7 @@ export function createAgentLoop(config: AgentLoopConfig): AgentLoop {
             ) {
               const errMsg = `Error: coordinates out of range. x=${savedNormX}, y=${savedNormY}. Use values 0-999.`;
               onLog?.(
-                `[agent] screen: ${screenArgs.action} → REJECTED out-of-range`
+                `[agent] desktop: ${args.action} → REJECTED out-of-range`
               );
               history.push({
                 role: "tool" as const,
@@ -448,54 +458,140 @@ export function createAgentLoop(config: AgentLoopConfig): AgentLoop {
 
             // Convert to pixel coordinates
             const pixel = normToPixel(savedNormX, savedNormY);
-            screenArgs.x = pixel.x;
-            screenArgs.y = pixel.y;
+            args.x = pixel.x;
+            args.y = pixel.y;
+            args.normX = savedNormX;
+            args.normY = savedNormY;
           }
 
-          // Inject stored screenshot for annotate action
-          if (screenArgs.action === "annotate" && lastScreenshotBase64) {
-            screenArgs.base64 = lastScreenshotBase64;
+          // Auto-annotate for logging (not sent to LLM)
+          if (savedNormX !== undefined && savedNormY !== undefined) {
+            let screenshotForAnnotation = lastScreenshotBase64;
+            // In a11y mode lastScreenshotBase64 is null — take a temporary pixel screenshot for annotation only
+            if (
+              !screenshotForAnnotation &&
+              lastScreenshotIsWindow &&
+              lastWindowHandle
+            ) {
+              try {
+                const pixelShot = await executeScreenControl({
+                  action: "window_screenshot",
+                  handle: lastWindowHandle,
+                  mode: "pixel"
+                });
+                if (pixelShot.success && pixelShot.base64) {
+                  screenshotForAnnotation = pixelShot.base64;
+                }
+              } catch {}
+            }
+            if (screenshotForAnnotation) {
+              try {
+                const annotateResult = await executeScreenControl({
+                  action: "annotate",
+                  x: args.x,
+                  y: args.y,
+                  normX: savedNormX,
+                  normY: savedNormY,
+                  base64: screenshotForAnnotation
+                });
+                if (annotateResult.success && annotateResult.base64) {
+                  onScreenshot?.(
+                    currentStep,
+                    args.action + "+annotate",
+                    annotateResult.base64
+                  );
+                }
+              } catch {}
+            }
           }
 
-          const screenResult = await executeScreenControl(screenArgs);
-          const resultWithAction = {
-            ...screenResult,
-            action: screenArgs.action
-          };
-          onLog?.(formatScreenLog(resultWithAction, savedNormX, savedNormY));
-
-          const lines: string[] = [];
-          lines.push(
-            `Action: ${resultWithAction.action ?? "screenshot"} | Success: ${resultWithAction.success}`
+          const result = await executeScreenControl(args);
+          const resultWithAction = { ...result, action: args.action };
+          onLog?.(
+            formatDesktopLog(resultWithAction, args, savedNormX, savedNormY)
           );
-          if (resultWithAction.error)
-            lines.push(`Error: ${resultWithAction.error}`);
-          if (
-            resultWithAction.action === "annotate" &&
-            savedNormX !== undefined
-          ) {
-            lines.push(`Annotated at (${savedNormX}, ${savedNormY}).`);
-            lines.push(
-              `If the crosshair is on the correct target, click with x=${savedNormX}, y=${savedNormY} (use these EXACT numbers).`
-            );
+          if (resultWithAction.a11yDiagnostics) {
+            onLog?.(`[agent] a11y: ${resultWithAction.a11yDiagnostics}`);
           }
-          toolResultContent = lines.join("\n");
+
+          // Build toolResultContent based on action type
+          if (resultWithAction.action === "list_windows") {
+            const windows = resultWithAction.windows || [];
+            toolResultContent = JSON.stringify(windows, null, 2);
+          } else {
+            const lines: string[] = [];
+            lines.push(
+              `Action: ${resultWithAction.action} | Success: ${resultWithAction.success}`
+            );
+            if (resultWithAction.error)
+              lines.push(`Error: ${resultWithAction.error}`);
+            if (resultWithAction.message) lines.push(resultWithAction.message);
+            toolResultContent = lines.join("\n");
+          }
 
           // Auto-screenshot after interactive actions
-          const autoScreenshotActions = [
+          const AUTO_SCREENSHOT_ACTIONS = new Set([
             "click",
             "scroll",
             "type",
             "key_press",
-            "mouse_move"
-          ];
+            "mouse_move",
+            "focus_window",
+            "resize_window",
+            "maximize_window",
+            "restore_window"
+          ]);
           if (
-            autoScreenshotActions.includes(resultWithAction.action) &&
+            AUTO_SCREENSHOT_ACTIONS.has(resultWithAction.action) &&
             resultWithAction.success
           ) {
+            // If focus_window was called with a handle, use it for window_screenshot
+            if (resultWithAction.action === "focus_window" && args.handle) {
+              lastWindowHandle = args.handle as number;
+              lastScreenshotIsWindow = true;
+            }
             const autoResult = await autoScreenshot(onLog);
-            if (autoResult?.success && autoResult.base64) {
-              // Update stored screenshot state
+            if (autoResult?.a11yDiagnostics) {
+              onLog?.(`[agent] a11y: ${autoResult.a11yDiagnostics}`);
+            }
+            if (autoResult?.success && autoResult.accessibilityTree) {
+              // Auto-screenshot returned accessibility tree
+              lastScreenshotBase64 = null;
+              if (autoResult.width && autoResult.height) {
+                lastScreenshotWidth = autoResult.width;
+                lastScreenshotHeight = autoResult.height;
+              }
+              onText?.(
+                currentStep,
+                resultWithAction.action + "+auto_a11y",
+                autoResult.accessibilityTree
+              );
+
+              history.push({
+                role: "tool" as const,
+                content: [
+                  {
+                    type: "tool-result" as const,
+                    toolCallId: tc.toolCallId,
+                    toolName: tc.toolName,
+                    output: { type: "text", value: toolResultContent }
+                  }
+                ]
+              });
+              stripOldScreenshots();
+              history.push({
+                role: "user",
+                content: [
+                  {
+                    type: "text",
+                    text:
+                      "Here is the updated accessibility tree after the action:\n" +
+                      autoResult.accessibilityTree
+                  }
+                ]
+              });
+              continue;
+            } else if (autoResult?.success && autoResult.base64) {
               lastScreenshotBase64 = autoResult.base64;
               if (autoResult.width && autoResult.height) {
                 lastScreenshotWidth = autoResult.width;
@@ -519,7 +615,7 @@ export function createAgentLoop(config: AgentLoopConfig): AgentLoop {
                   }
                 ]
               });
-              stripOldImages();
+              stripOldScreenshots();
               history.push({
                 role: "user",
                 content: [
@@ -538,22 +634,19 @@ export function createAgentLoop(config: AgentLoopConfig): AgentLoop {
             }
           }
 
-          if (resultWithAction.base64) {
-            // Store for future annotate/coord conversion (but not from annotate itself)
-            if (resultWithAction.action !== "annotate") {
-              lastScreenshotBase64 = resultWithAction.base64;
-              lastScreenshotIsWindow = false;
-              lastWindowHandle = null;
-              if (resultWithAction.width && resultWithAction.height) {
-                lastScreenshotWidth = resultWithAction.width;
-                lastScreenshotHeight = resultWithAction.height;
-              }
+          // Handle accessibility tree results from window_screenshot
+          if (resultWithAction.accessibilityTree !== undefined) {
+            lastScreenshotBase64 = null;
+            lastScreenshotIsWindow = true;
+            lastWindowHandle = (args.handle as number) ?? null;
+            if (resultWithAction.width && resultWithAction.height) {
+              lastScreenshotWidth = resultWithAction.width;
+              lastScreenshotHeight = resultWithAction.height;
             }
-
-            onScreenshot?.(
+            onText?.(
               currentStep,
-              resultWithAction.action ?? "screenshot",
-              resultWithAction.base64
+              "window_screenshot+a11y",
+              resultWithAction.accessibilityTree
             );
 
             history.push({
@@ -567,53 +660,29 @@ export function createAgentLoop(config: AgentLoopConfig): AgentLoop {
                 }
               ]
             });
-            stripOldImages();
+            stripOldScreenshots();
             history.push({
               role: "user",
               content: [
                 {
                   type: "text",
                   text:
-                    resultWithAction.action === "annotate"
-                      ? "Here is the annotated screenshot with crosshair:"
-                      : "Here is the screenshot:"
-                },
-                {
-                  type: "image",
-                  image: resultWithAction.base64,
-                  mediaType: "image/png"
+                    "Here is the window accessibility tree:\n" +
+                    resultWithAction.accessibilityTree
                 }
               ]
             });
             continue;
           }
-        } else if (tc.toolName === "win") {
-          const winArgs = tc.args as unknown as ScreenControlParams;
 
-          // Normalize action aliases for win tool too
-          const originalAction = winArgs.action;
-          winArgs.action = normalizeAction(winArgs.action);
-          if (isDoubleClickAlias(originalAction)) {
-            winArgs.doubleClick = true;
-          }
-
-          const winResult = await executeScreenControl(winArgs);
-          const resultWithAction = { ...winResult, action: winArgs.action };
-          onLog?.(formatWinLog(resultWithAction, winArgs));
-
-          if (resultWithAction.action === "list_windows") {
-            const windows = resultWithAction.windows || [];
-            toolResultContent = JSON.stringify(windows, null, 2);
-          } else if (
-            resultWithAction.action === "window_screenshot" &&
-            resultWithAction.base64
-          ) {
-            toolResultContent = `Action: window_screenshot | Success: ${resultWithAction.success}`;
-
-            // Store for future annotate/coord conversion
-            lastScreenshotBase64 = resultWithAction.base64;
-            lastScreenshotIsWindow = true;
-            lastWindowHandle = (winArgs.handle as number) ?? null;
+          // Handle direct screenshot results (screenshot, window_screenshot, annotate)
+          if (resultWithAction.base64) {
+            if (resultWithAction.action === "window_screenshot") {
+              lastScreenshotBase64 = resultWithAction.base64;
+              lastScreenshotIsWindow = true;
+              lastWindowHandle = (args.handle as number) ?? null;
+            }
+            // Update dimensions (for all screenshot types including annotate)
             if (resultWithAction.width && resultWithAction.height) {
               lastScreenshotWidth = resultWithAction.width;
               lastScreenshotHeight = resultWithAction.height;
@@ -621,9 +690,11 @@ export function createAgentLoop(config: AgentLoopConfig): AgentLoop {
 
             onScreenshot?.(
               currentStep,
-              "window_screenshot",
+              resultWithAction.action,
               resultWithAction.base64
             );
+
+            const imageLabel = "Here is the window screenshot:";
 
             history.push({
               role: "tool" as const,
@@ -636,11 +707,11 @@ export function createAgentLoop(config: AgentLoopConfig): AgentLoop {
                 }
               ]
             });
-            stripOldImages();
+            stripOldScreenshots();
             history.push({
               role: "user",
               content: [
-                { type: "text", text: "Here is the window screenshot:" },
+                { type: "text", text: imageLabel },
                 {
                   type: "image",
                   image: resultWithAction.base64,
@@ -649,78 +720,6 @@ export function createAgentLoop(config: AgentLoopConfig): AgentLoop {
               ]
             });
             continue;
-          } else {
-            const lines: string[] = [];
-            lines.push(
-              `Action: ${resultWithAction.action} | Success: ${resultWithAction.success}`
-            );
-            if (resultWithAction.error)
-              lines.push(`Error: ${resultWithAction.error}`);
-            if (resultWithAction.message) lines.push(resultWithAction.message);
-            toolResultContent = lines.join("\n");
-
-            // Auto-screenshot after window management actions
-            const winAutoActions = [
-              "focus_window",
-              "resize_window",
-              "maximize_window",
-              "restore_window"
-            ];
-            if (
-              winAutoActions.includes(resultWithAction.action) &&
-              resultWithAction.success
-            ) {
-              // If focus_window was called with a handle, use it for window_screenshot
-              if (
-                resultWithAction.action === "focus_window" &&
-                winArgs.handle
-              ) {
-                lastWindowHandle = winArgs.handle as number;
-                lastScreenshotIsWindow = true;
-              }
-              const autoResult = await autoScreenshot(onLog);
-              if (autoResult?.success && autoResult.base64) {
-                lastScreenshotBase64 = autoResult.base64;
-                if (autoResult.width && autoResult.height) {
-                  lastScreenshotWidth = autoResult.width;
-                  lastScreenshotHeight = autoResult.height;
-                }
-
-                onScreenshot?.(
-                  currentStep,
-                  resultWithAction.action + "+auto_screenshot",
-                  autoResult.base64
-                );
-
-                history.push({
-                  role: "tool" as const,
-                  content: [
-                    {
-                      type: "tool-result" as const,
-                      toolCallId: tc.toolCallId,
-                      toolName: tc.toolName,
-                      output: { type: "text", value: toolResultContent }
-                    }
-                  ]
-                });
-                stripOldImages();
-                history.push({
-                  role: "user",
-                  content: [
-                    {
-                      type: "text",
-                      text: "Here is the screenshot after the action:"
-                    },
-                    {
-                      type: "image",
-                      image: autoResult.base64,
-                      mediaType: "image/png"
-                    }
-                  ]
-                });
-                continue;
-              }
-            }
           }
         } else {
           toolResultContent = "Unknown tool";

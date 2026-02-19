@@ -1,7 +1,8 @@
-import { app, BrowserWindow, ipcMain, session } from "electron";
+import { app, BrowserWindow, dialog, ipcMain, session } from "electron";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
 import fs from "node:fs";
+import os from "node:os";
 import http from "node:http";
 import { NodeFsAdapter } from "./node-fs-adapter.ts";
 import { detectDrives } from "./detect-drives.ts";
@@ -11,6 +12,25 @@ import {
   cleanupCloudDrive
 } from "./win-automation.ts";
 import type { FsStat } from "just-bash";
+
+// --- Crash log: as early as possible ---
+const CRASH_LOG = path.join(os.tmpdir(), "windows-agent-crash.log");
+
+process.on("uncaughtException", (err) => {
+  const msg = `[${new Date().toISOString()}] ${err.stack || err.message}\n`;
+  try {
+    fs.appendFileSync(CRASH_LOG, msg);
+  } catch {}
+  dialog.showErrorBox("Windows Agent Crash", err.stack || err.message);
+  app.exit(1);
+});
+
+process.on("unhandledRejection", (reason) => {
+  const msg = `[${new Date().toISOString()}] Unhandled rejection: ${reason}\n`;
+  try {
+    fs.appendFileSync(CRASH_LOG, msg);
+  } catch {}
+});
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 
@@ -150,17 +170,21 @@ function setupFileSystemHandlers(): void {
 }
 
 // Log file for renderer console output (readable from WSL in dev, userData in production)
-const LOG_FILE = app.isPackaged
-  ? path.join(app.getPath("userData"), "renderer.log")
-  : path.join(__dirname, "renderer.log");
-fs.writeFileSync(
-  LOG_FILE,
-  `--- Electron started ${new Date().toISOString()} ---\n`
-);
+const LOG_DIR = app.isPackaged ? app.getPath("userData") : __dirname;
+const LOG_FILE = path.join(LOG_DIR, "renderer.log");
+try {
+  fs.mkdirSync(LOG_DIR, { recursive: true });
+  fs.writeFileSync(
+    LOG_FILE,
+    `--- Electron started ${new Date().toISOString()} ---\n`
+  );
+} catch {}
 
 function appendLog(level: string, msg: string): void {
-  const line = `[${new Date().toISOString()}] [${level}] ${msg}\n`;
-  fs.appendFileSync(LOG_FILE, line);
+  try {
+    const line = `[${new Date().toISOString()}] [${level}] ${msg}\n`;
+    fs.appendFileSync(LOG_FILE, line);
+  } catch {}
 }
 
 // --- Debug HTTP Server ---
@@ -269,6 +293,10 @@ function setupDebugHttpServer(): void {
     // --- 404 ---
     res.writeHead(404, { "Content-Type": "application/json" });
     res.end(JSON.stringify({ error: "not found" }));
+  });
+
+  server.on("error", (err: NodeJS.ErrnoException) => {
+    appendLog("warning", `Debug HTTP server failed to start: ${err.message}`);
   });
 
   server.listen(9960, "127.0.0.1", () => {

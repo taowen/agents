@@ -196,7 +196,6 @@ export function cleanupCloudDrive(): void {
 // After window_screenshot, we remember the window's screen position so
 // click/move/scroll coordinates (which are window-relative from the LLM's
 // perspective) get translated to desktop-absolute coordinates automatically.
-// A full-desktop screenshot clears the offset (coordinates become absolute).
 let lastWindowOffset: { left: number; top: number } | null = null;
 
 /** Convert window-relative coords to desktop-absolute when offset is known */
@@ -208,23 +207,6 @@ function toDesktopCoords(x: number, y: number): { x: number; y: number } {
 }
 
 // ---- Screen handlers ----
-
-async function handleScreenshot(): Promise<ScreenControlResult> {
-  try {
-    // Full desktop screenshot — coordinates are absolute, clear any window offset
-    lastWindowOffset = null;
-    const { stdout } = await runPowerShell(script("screen-screenshot.ps1"), {
-      timeout: 15000,
-      maxBuffer: 20 * 1024 * 1024
-    });
-    const lines = stdout.split(/\r?\n/);
-    const [width, height] = lines[0].split("x").map(Number);
-    const base64 = lines.slice(1).join("");
-    return { success: true, width, height, base64 };
-  } catch (err: any) {
-    return { success: false, error: err.message };
-  }
-}
 
 async function handleMouseClick(
   params: ScreenControlParams
@@ -429,12 +411,136 @@ async function handleSetState(
   }
 }
 
+async function handleWindowAccessibility(
+  handle: number
+): Promise<{
+  tree: string;
+  left: number;
+  top: number;
+  w: number;
+  h: number;
+} | null> {
+  try {
+    const { stdout, stderr } = await runPowerShell(
+      script("window-accessibility.ps1"),
+      {
+        timeout: 10000,
+        maxBuffer: 1024 * 1024,
+        env: { HWND: String(handle) }
+      }
+    );
+    if (!stdout) return null;
+    const lines = stdout.split(/\r?\n/);
+    const headerMatch = lines[0]?.match(/^(-?\d+),(-?\d+),(\d+)x(\d+)$/);
+    if (!headerMatch) return null;
+    const [, leftStr, topStr, wStr, hStr] = headerMatch;
+    const tree = lines.slice(1).join("\n");
+    return {
+      tree,
+      left: Number(leftStr),
+      top: Number(topStr),
+      w: Number(wStr),
+      h: Number(hStr)
+    };
+  } catch {
+    return null;
+  }
+}
+
+function isTreeUseful(tree: string): { useful: boolean; reason: string } {
+  const lines = tree.split("\n");
+  // Count element lines (lines containing "[SomeType]")
+  const elementLines = lines.filter((l) => /\[[\w]+\]/.test(l.trim()));
+  if (elementLines.length < 3)
+    return { useful: false, reason: `only ${elementLines.length} elements` };
+
+  // Check interactive elements specifically — if many exist but none has Name,
+  // the tree is useless for interaction (e.g. Calculator with 28 anonymous Buttons)
+  const interactiveTypes =
+    /\[(Button|MenuItem|CheckBox|RadioButton|TabItem|ListItem|TreeItem|ComboBox)\]/;
+  const interactiveLines = elementLines.filter((l) => interactiveTypes.test(l));
+  if (interactiveLines.length >= 3) {
+    const namedInteractive = interactiveLines.filter((l) =>
+      /Name="[^"]+"/.test(l)
+    );
+    if (namedInteractive.length === 0) {
+      return {
+        useful: false,
+        reason: `${interactiveLines.length} interactive elements but none has Name`
+      };
+    }
+  }
+
+  // Check if at least one element has a non-empty Name
+  const hasName = elementLines.some((l) => /Name="[^"]+"/.test(l));
+  if (!hasName)
+    return {
+      useful: false,
+      reason: `${elementLines.length} elements but none has Name`
+    };
+  return {
+    useful: true,
+    reason: `${elementLines.length} elements (${interactiveLines.length} interactive) with names`
+  };
+}
+
 async function handleWindowScreenshot(
   params: ScreenControlParams
 ): Promise<ScreenControlResult> {
   try {
     const { handle } = params;
     if (!handle) return { success: false, error: "handle is required" };
+
+    const mode = params.mode ?? "auto";
+    let a11yFallbackReason: string | undefined;
+
+    // Try accessibility tree for auto and accessibility modes
+    if (mode === "auto" || mode === "accessibility") {
+      const a11y = await handleWindowAccessibility(handle);
+      if (a11y) {
+        lastWindowOffset = { left: a11y.left, top: a11y.top };
+        if (mode === "accessibility") {
+          return {
+            success: true,
+            width: a11y.w,
+            height: a11y.h,
+            accessibilityTree: a11y.tree,
+            windowLeft: a11y.left,
+            windowTop: a11y.top,
+            a11yDiagnostics: `accessibility: tree returned (${a11y.tree.split("\n").filter((l) => /\[[\w]+\]/.test(l.trim())).length} elements)`
+          };
+        }
+        // auto mode: use tree only if useful
+        const treeCheck = isTreeUseful(a11y.tree);
+        if (treeCheck.useful) {
+          return {
+            success: true,
+            width: a11y.w,
+            height: a11y.h,
+            accessibilityTree: a11y.tree,
+            windowLeft: a11y.left,
+            windowTop: a11y.top,
+            a11yDiagnostics: `auto: tree accepted (${treeCheck.reason})`
+          };
+        }
+        // Fall through to pixel mode — remember why tree was rejected
+        a11yFallbackReason = `auto: tree rejected (${treeCheck.reason}), fell back to pixel`;
+      } else if (mode === "accessibility") {
+        // Accessibility explicitly requested but failed
+        return {
+          success: true,
+          width: 0,
+          height: 0,
+          accessibilityTree: "",
+          windowLeft: 0,
+          windowTop: 0,
+          a11yDiagnostics: "accessibility: tree fetch failed"
+        };
+      }
+      // Fall through to pixel mode
+    }
+
+    // Pixel mode (or auto fallback)
     const { stdout } = await runPowerShell(script("window-screenshot.ps1"), {
       timeout: 15000,
       maxBuffer: 20 * 1024 * 1024,
@@ -453,7 +559,15 @@ async function handleWindowScreenshot(
     const windowTop = Number(topStr);
     lastWindowOffset = { left: windowLeft, top: windowTop };
     const base64 = lines.slice(1).join("");
-    return { success: true, width, height, base64, windowLeft, windowTop };
+    return {
+      success: true,
+      width,
+      height,
+      base64,
+      windowLeft,
+      windowTop,
+      a11yDiagnostics: a11yFallbackReason
+    };
   } catch (err: any) {
     return { success: false, error: err.stderr?.trim() || err.message };
   }
@@ -480,6 +594,8 @@ async function handleAnnotate(
         X: String(Math.round(x)),
         Y: String(Math.round(y))
       };
+      if (params.normX !== undefined) env.NORM_X = String(params.normX);
+      if (params.normY !== undefined) env.NORM_Y = String(params.normY);
       const { stdout } = await runPowerShell(script("annotate-image.ps1"), {
         timeout: 15000,
         maxBuffer: 20 * 1024 * 1024,
@@ -517,8 +633,6 @@ export async function screenControl(
   }
 
   switch (action) {
-    case "screenshot":
-      return handleScreenshot();
     case "click":
       return handleMouseClick(params);
     case "annotate":

@@ -9,7 +9,6 @@ files:
 asarUnpack:
   - "scripts/**"
 win:
-  target: nsis
-nsis:
-  oneClick: false
-  allowToChangeInstallationDirectory: true
+  target:
+    - target: dir
+    - target: nsis
