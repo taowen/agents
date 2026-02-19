@@ -14,7 +14,7 @@
 import fs from "node:fs";
 import path from "node:path";
 import os from "node:os";
-import { screenControl } from "./win-automation.ts";
+import { screenControl, runPowerShellCommand } from "./win-automation.ts";
 import { createAgentLoop } from "../src/shared/agent-loop.ts";
 import { Bash, InMemoryFs, MountableFs } from "just-bash";
 import { NodeFsAdapter } from "./node-fs-adapter.ts";
@@ -110,6 +110,7 @@ const agent = createAgentLoop({
   getModel: () => model,
   executeBash: (cmd) => bash.exec(cmd),
   executeScreenControl: screenControl,
+  executePowerShell: runPowerShellCommand,
   maxSteps: 20
 });
 

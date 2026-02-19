@@ -49,10 +49,12 @@ export async function handleLlmRoutes(
     if (!fileConfig) {
       // Builtin
       config = {
-        provider: "openai-compatible",
-        baseURL: "https://ark.cn-beijing.volces.com/api/v3",
-        apiKey: env.ARK_API_KEY,
-        model: "doubao-seed-2-0-pro-260215"
+        provider: (env.BUILTIN_LLM_PROVIDER || "google") as
+          | "openai-compatible"
+          | "google",
+        baseURL: env.BUILTIN_LLM_BASE_URL,
+        apiKey: env.BUILTIN_LLM_API_KEY,
+        model: env.BUILTIN_LLM_MODEL
       };
     } else if (fileConfig.provider === "openai-compatible") {
       config = {
@@ -65,11 +67,9 @@ export async function handleLlmRoutes(
       // google
       config = {
         provider: "google",
-        baseURL:
-          fileConfig.base_url ||
-          "https://generativelanguage.googleapis.com/v1beta",
-        apiKey: fileConfig.api_key || env.GOOGLE_AI_API_KEY,
-        model: fileConfig.model || "gemini-2.0-flash"
+        baseURL: fileConfig.base_url || "",
+        apiKey: fileConfig.api_key || "",
+        model: fileConfig.model || ""
       };
     }
 

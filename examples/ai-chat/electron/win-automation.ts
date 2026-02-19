@@ -118,6 +118,41 @@ async function runPowerShell(
   return { stdout: stdout.trim(), stderr: stderr.trim() };
 }
 
+// ---- Run arbitrary PowerShell command ----
+
+export async function runPowerShellCommand(
+  command: string
+): Promise<{ stdout: string; stderr: string; exitCode: number }> {
+  try {
+    const { stdout, stderr } = await execFileAsync(
+      "powershell.exe",
+      [
+        "-NoProfile",
+        "-NonInteractive",
+        "-ExecutionPolicy",
+        "Bypass",
+        "-Command",
+        command
+      ],
+      {
+        timeout: 30000,
+        maxBuffer: 5 * 1024 * 1024,
+        windowsHide: true,
+        env: process.env
+      }
+    );
+    return { stdout: stdout.trimEnd(), stderr: stderr.trimEnd(), exitCode: 0 };
+  } catch (err: any) {
+    // execFile rejects on non-zero exit or timeout
+    return {
+      stdout: (err.stdout ?? "").trimEnd(),
+      stderr: (err.stderr ?? err.message ?? "").trimEnd(),
+      exitCode:
+        err.code === "ERR_CHILD_PROCESS_STDIO_MAXBUFFER" ? 1 : (err.status ?? 1)
+    };
+  }
+}
+
 // ---- Coordinate offset state ----
 // After window_screenshot, we remember the window's screen position so
 // click/move/scroll coordinates (which are window-relative from the LLM's

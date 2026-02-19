@@ -12,7 +12,10 @@ declare namespace Cloudflare {
       import("./src/server/index").BridgeManager
     >;
     DB: D1Database;
-    GOOGLE_AI_API_KEY: string;
+    BUILTIN_LLM_PROVIDER: string;
+    BUILTIN_LLM_BASE_URL: string;
+    BUILTIN_LLM_API_KEY: string;
+    BUILTIN_LLM_MODEL: string;
     ARK_API_KEY: string;
     MYBROWSER: Fetcher;
     AUTH_SECRET: string;

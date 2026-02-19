@@ -35,15 +35,18 @@ export async function getCachedLlmConfig(
 export function getLlmModel(env: Env, config: LlmFileConfig | null) {
   if (!config) {
     // Builtin: no /etc/llm.json means use built-in provider
-    const apiKey = env.ARK_API_KEY;
-    const baseURL = "https://ark.cn-beijing.volces.com/api/v3";
-    const model = "doubao-seed-2-0-pro-260215";
-    return createOpenAICompatible({
-      name: "llm",
-      baseURL,
-      apiKey,
-      includeUsage: true
-    })(model);
+    const apiKey = env.BUILTIN_LLM_API_KEY;
+    const baseURL = env.BUILTIN_LLM_BASE_URL;
+    const model = env.BUILTIN_LLM_MODEL;
+    const provider = env.BUILTIN_LLM_PROVIDER;
+    return provider === "openai-compatible"
+      ? createOpenAICompatible({
+          name: "llm",
+          baseURL,
+          apiKey,
+          includeUsage: true
+        })(model)
+      : createGoogleGenerativeAI({ baseURL, apiKey })(model);
   }
 
   const { provider, api_key: apiKey, base_url: baseURL, model } = config;

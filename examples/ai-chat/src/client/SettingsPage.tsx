@@ -180,7 +180,7 @@ export function SettingsPage({ onBack, onOpenSidebar }: SettingsPageProps) {
                   onChange={(e) => setField("provider", e.target.value)}
                   className={inputClass}
                 >
-                  <option value="builtin">Built-in (Doubao)</option>
+                  <option value="builtin">Built-in</option>
                   <option value="google">Google Gemini</option>
                   <option value="openai-compatible">OpenAI Compatible</option>
                 </select>
@@ -188,7 +188,7 @@ export function SettingsPage({ onBack, onOpenSidebar }: SettingsPageProps) {
 
               {llmProvider === "builtin" ? (
                 <div className="px-3 py-2 rounded-lg bg-kumo-elevated text-sm text-kumo-secondary">
-                  Using built-in Doubao model. No API key needed.
+                  Using built-in model. No API key needed.
                 </div>
               ) : (
                 <>

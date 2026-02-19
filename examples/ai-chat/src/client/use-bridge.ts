@@ -8,7 +8,8 @@ import { HttpFsAdapter } from "./http-fs-adapter";
 import type { LlmConfig } from "../server/llm-proxy";
 import type {
   ScreenControlParams,
-  ScreenControlResult
+  ScreenControlResult,
+  BashResult
 } from "../shared/screen-control-types";
 import { createAgentLoop } from "../shared/agent-loop";
 import type { AgentLoop } from "../shared/agent-loop";
@@ -31,6 +32,7 @@ interface WorkWithWindows {
   ping: () => string;
   platform: string;
   screenControl: (params: ScreenControlParams) => Promise<ScreenControlResult>;
+  executePowerShell?: (params: { command: string }) => Promise<BashResult>;
   fileSystem?: (params: Record<string, unknown>) => Promise<FsOpResult>;
   detectDrives?: () => Promise<DriveInfo[]>;
 }
@@ -142,16 +144,31 @@ async function executeScreenControl(
   return window.workWithWindows.screenControl(params);
 }
 
+// ---- PowerShell bridge ----
+
+async function executePowerShell(command: string): Promise<BashResult> {
+  if (!window.workWithWindows?.executePowerShell) {
+    return {
+      stdout: "",
+      stderr: "PowerShell is only available in the Electron desktop app",
+      exitCode: 1
+    };
+  }
+  return window.workWithWindows.executePowerShell({ command });
+}
+
 // ---- Agent instance ----
 
 let agentInstance: AgentLoop | null = null;
 
 function getOrCreateAgent(): AgentLoop {
   if (agentInstance) return agentInstance;
+  const hasPowerShell = !!window.workWithWindows?.executePowerShell;
   agentInstance = createAgentLoop({
     getModel,
     executeBash: (cmd) => bash.exec(cmd),
     executeScreenControl,
+    ...(hasPowerShell ? { executePowerShell } : {}),
     maxSteps: 10
   });
   return agentInstance;

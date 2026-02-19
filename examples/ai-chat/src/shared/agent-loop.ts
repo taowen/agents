@@ -67,6 +67,19 @@ const screenToolDef = tool({
   })
 });
 
+const powershellToolDef = tool({
+  description:
+    "Run an arbitrary PowerShell command on the Windows host. " +
+    "Use for system administration, registry access, process management, file operations, " +
+    "installing software, or any task that requires native Windows capabilities. " +
+    "Returns stdout, stderr, and exitCode.",
+  inputSchema: z.object({
+    command: z
+      .string()
+      .describe("The PowerShell command or script block to execute")
+  })
+});
+
 const windowToolDef = tool({
   description:
     "Manage windows on the Windows desktop. List visible windows, focus/activate, " +
@@ -194,6 +207,7 @@ export interface AgentLoopConfig {
   executeScreenControl: (
     params: ScreenControlParams
   ) => Promise<ScreenControlResult>;
+  executePowerShell?: (command: string) => Promise<BashResult>;
   maxSteps?: number;
 }
 
@@ -212,7 +226,13 @@ export interface AgentLoop {
 }
 
 export function createAgentLoop(config: AgentLoopConfig): AgentLoop {
-  const { getModel, executeBash, executeScreenControl, maxSteps = 20 } = config;
+  const {
+    getModel,
+    executeBash,
+    executeScreenControl,
+    executePowerShell,
+    maxSteps = 20
+  } = config;
 
   const history: ModelMessage[] = [];
   let stepCounter = 0;
@@ -288,11 +308,21 @@ export function createAgentLoop(config: AgentLoopConfig): AgentLoop {
     stepCounter = 0;
 
     const model = await getModel();
-    const tools = {
+    const tools: Record<string, ReturnType<typeof tool>> = {
       bash: bashToolDef,
       screen: screenToolDef,
       win: windowToolDef
     };
+    if (executePowerShell) {
+      tools.powershell = powershellToolDef;
+    }
+
+    const systemPrompt = executePowerShell
+      ? SYSTEM_PROMPT +
+        "\n\nYou also have a 'powershell' tool for running arbitrary PowerShell commands on the Windows host. " +
+        "Use it for system administration, registry queries, process management, software installation, " +
+        "or any native Windows task that the bash shell cannot handle."
+      : SYSTEM_PROMPT;
     let finalText = "";
 
     for (let step = 0; step < maxSteps; step++) {
@@ -304,7 +334,7 @@ export function createAgentLoop(config: AgentLoopConfig): AgentLoop {
 
       const result = streamText({
         model,
-        system: SYSTEM_PROMPT,
+        system: systemPrompt,
         messages: history,
         tools,
         abortSignal
@@ -355,6 +385,14 @@ export function createAgentLoop(config: AgentLoopConfig): AgentLoop {
             `[agent] bash: exit=${bashResult.exitCode} stdout=${bashResult.stdout.slice(0, 100)}`
           );
           toolResultContent = JSON.stringify(bashResult);
+        } else if (tc.toolName === "powershell" && executePowerShell) {
+          const psResult = await executePowerShell(
+            (tc.args as { command: string }).command
+          );
+          onLog?.(
+            `[agent] powershell: exit=${psResult.exitCode} stdout=${psResult.stdout.slice(0, 100)}`
+          );
+          toolResultContent = JSON.stringify(psResult);
         } else if (tc.toolName === "screen") {
           const screenArgs = tc.args as unknown as ScreenControlParams;
 
@@ -708,7 +746,7 @@ export function createAgentLoop(config: AgentLoopConfig): AgentLoop {
     });
     const summary = streamText({
       model,
-      system: SYSTEM_PROMPT,
+      system: systemPrompt,
       messages: history,
       abortSignal
     });

@@ -100,7 +100,7 @@ npm install
 npm run dev
 ```
 
-Requires a `GOOGLE_AI_API_KEY` environment variable for Gemini 3 Flash.
+Requires `BUILTIN_LLM_*` secrets for the built-in model (`BUILTIN_LLM_PROVIDER`, `BUILTIN_LLM_BASE_URL`, `BUILTIN_LLM_API_KEY`, `BUILTIN_LLM_MODEL`). Users can override this by configuring `/etc/llm.json` in the Settings UI.
 
 ### Cloudflare resources
 
