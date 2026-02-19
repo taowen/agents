@@ -10,7 +10,8 @@
     "test": "vitest run",
     "types": "wrangler types env.d.ts --include-runtime false",
     "electron:dev": "bash run-on-windows.sh",
-    "electron:start": "bash run-on-windows.sh"
+    "electron:start": "bash run-on-windows.sh",
+    "electron:build": "node scripts/build-electron.mjs && electron-builder --win"
   },
   "dependencies": {
     "@cloudflare/agents-ui": "*",
@@ -30,6 +31,7 @@
   "devDependencies": {
     "@tailwindcss/vite": "^4",
     "electron": "^40.0.0",
+    "electron-builder": "^26.8.1",
     "tailwindcss": "^4.1.18"
   }
 }

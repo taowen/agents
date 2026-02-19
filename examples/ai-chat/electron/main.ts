@@ -149,8 +149,10 @@ function setupFileSystemHandlers(): void {
   });
 }
 
-// Log file for renderer console output (readable from WSL)
-const LOG_FILE = path.join(__dirname, "renderer.log");
+// Log file for renderer console output (readable from WSL in dev, userData in production)
+const LOG_FILE = app.isPackaged
+  ? path.join(app.getPath("userData"), "renderer.log")
+  : path.join(__dirname, "renderer.log");
 fs.writeFileSync(
   LOG_FILE,
   `--- Electron started ${new Date().toISOString()} ---\n`
