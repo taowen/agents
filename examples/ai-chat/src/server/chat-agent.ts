@@ -144,7 +144,7 @@ class ChatAgentBase extends AIChatAgent {
       fs,
       customCommands: [
         ...createMountCommands(fs, undefined, mountOptions),
-        ...createGitCommands(fs),
+        ...createGitCommands(fs, mountOptions),
         createSessionsCommand(db, userId, this.env.ChatAgent)
       ],
       cwd: "/home/user",

@@ -39,10 +39,32 @@ echo "==> [3/3] Launching standalone agent on Windows ..."
 WIN_DIR="$(wslpath -w "$SCRIPT_DIR")"
 WIN_PS1="$(wslpath -w "$SCRIPT_DIR/run-standalone.ps1")"
 
+# Resolve Windows %TEMP% as a WSL path for PID file cleanup
+WIN_TEMP="$(cmd.exe /c "echo %TEMP%" 2>/dev/null | tr -d '\r')"
+WIN_PID_FILE="$(wslpath "$WIN_TEMP")/windows-agent-standalone.pid"
+
 powershell.exe -ExecutionPolicy Bypass -File "$WIN_PS1" \
   -ProjectDir "$WIN_DIR" \
   -JustBashTarball "$WIN_TARBALL" \
-  "$@"
+  "$@" &
+PS_PID=$!
+
+cleanup() {
+    echo ""
+    echo "Stopping standalone agent..."
+    # Kill the Windows process tree via taskkill (WSL kill alone won't reach children)
+    if [ -f "$WIN_PID_FILE" ]; then
+        WIN_PID=$(cat "$WIN_PID_FILE")
+        taskkill.exe /PID "$WIN_PID" /T /F 2>/dev/null
+        rm -f "$WIN_PID_FILE"
+    fi
+    kill $PS_PID 2>/dev/null
+    wait $PS_PID 2>/dev/null
+    rm -f "$TARBALL_PATH"
+}
+trap cleanup EXIT INT TERM
+
+wait $PS_PID
 
 # Clean up tarball
 rm -f "$TARBALL_PATH"

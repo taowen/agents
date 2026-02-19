@@ -27,8 +27,10 @@ const screenToolDef = tool({
   description:
     "Control the Windows desktop screen. Take screenshots, click, type, press keys, move mouse, and scroll. " +
     "Use 'screenshot' first to see what's on screen, then interact with elements using normalized 0-1000 coordinates. " +
-    "Coordinates use a normalized 0-1000 range: the image is divided into a 1000x1000 grid, top-left is (0,0), bottom-right is (999,999). " +
-    "The system automatically converts these to actual pixel positions. " +
+    "IMPORTANT: Coordinates are RELATIVE POSITIONS, not pixel sizes. " +
+    "x=0 means the left edge, x=999 means the right edge, y=0 means the top edge, y=999 means the bottom edge. " +
+    "For example, the center of the image is always (500, 500) regardless of the image's actual pixel dimensions. " +
+    "The system automatically converts these relative positions to actual pixel positions. " +
     "Use 'annotate' with x,y to draw a red crosshair on the last screenshot — verify your target before clicking.",
   inputSchema: z.object({
     action: z
@@ -100,7 +102,18 @@ const SYSTEM_PROMPT =
   "You have a 'win' tool for window management: list_windows, focus/activate, move/resize, minimize/maximize/restore, window_screenshot.\n" +
   "\n" +
   "COORDINATE SYSTEM:\n" +
-  "All coordinates use a normalized 0-1000 range. Top-left is (0,0), bottom-right is (999,999).\n" +
+  "Coordinates are RELATIVE POSITIONS in range 0-999, NOT pixel values.\n" +
+  "x=0 is the left edge, x=999 is the right edge. y=0 is the top edge, y=999 is the bottom edge.\n" +
+  "The image center is always (500,500) no matter the actual image size.\n" +
+  "Example: a button at 70% from left and 85% from top → x=700, y=850.\n" +
+  "\n" +
+  "SCREENSHOT STRATEGY:\n" +
+  "PREFER win({ action: 'window_screenshot', handle }) over screen({ action: 'screenshot' }).\n" +
+  "Full desktop screenshots are very large and waste tokens. Only use screen({ action: 'screenshot' }) when:\n" +
+  "- You don't know which window to target yet (first step)\n" +
+  "- You need to see the taskbar or desktop icons\n" +
+  "For all other cases, use win({ action: 'list_windows' }) to find the target window handle,\n" +
+  "then use win({ action: 'window_screenshot', handle }) to capture just that window.\n" +
   "\n" +
   "WORKFLOW RULES:\n" +
   "1. Take a screenshot before every action. Never assume previous action succeeded.\n" +
@@ -183,6 +196,7 @@ export interface AgentLoopConfig {
 export interface AgentLoopCallbacks {
   onLog?: (msg: string) => void;
   onScreenshot?: (step: number, action: string, base64: string) => void;
+  abortSignal?: AbortSignal;
 }
 
 export interface AgentLoop {
@@ -201,6 +215,7 @@ export function createAgentLoop(config: AgentLoopConfig): AgentLoop {
   let lastScreenshotBase64: string | null = null;
   let lastScreenshotWidth = 0;
   let lastScreenshotHeight = 0;
+  let lastScreenshotIsWindow = false;
 
   function normToPixel(normX: number, normY: number): { x: number; y: number } {
     return {
@@ -215,6 +230,7 @@ export function createAgentLoop(config: AgentLoopConfig): AgentLoop {
   ): Promise<string> {
     const onLog = callbacks?.onLog;
     const onScreenshot = callbacks?.onScreenshot;
+    const abortSignal = callbacks?.abortSignal;
 
     history.push({ role: "user", content: userMessage });
     stepCounter = 0;
@@ -228,13 +244,18 @@ export function createAgentLoop(config: AgentLoopConfig): AgentLoop {
     let finalText = "";
 
     for (let step = 0; step < maxSteps; step++) {
+      if (abortSignal?.aborted) {
+        onLog?.("[agent] aborted before step " + (step + 1));
+        return finalText || "[Agent aborted]";
+      }
       onLog?.(`[agent] step ${step + 1}...`);
 
       const result = streamText({
         model,
         system: SYSTEM_PROMPT,
         messages: history,
-        tools
+        tools,
+        abortSignal
       });
 
       const toolCalls: Array<{
@@ -267,6 +288,10 @@ export function createAgentLoop(config: AgentLoopConfig): AgentLoop {
       if (toolCalls.length === 0) break;
 
       for (const tc of toolCalls) {
+        if (abortSignal?.aborted) {
+          onLog?.("[agent] aborted before tool execution");
+          return finalText || "[Agent aborted]";
+        }
         let toolResultContent: string;
         const currentStep = stepCounter++;
 
@@ -302,6 +327,38 @@ export function createAgentLoop(config: AgentLoopConfig): AgentLoop {
             logNormX = screenArgs.x;
             logNormY = screenArgs.y;
             const pixel = normToPixel(screenArgs.x, screenArgs.y);
+
+            // Bounds check: reject clicks outside window when in window-screenshot mode
+            if (
+              lastScreenshotIsWindow &&
+              screenArgs.action !== "annotate" &&
+              (pixel.x < 0 ||
+                pixel.x >= lastScreenshotWidth ||
+                pixel.y < 0 ||
+                pixel.y >= lastScreenshotHeight)
+            ) {
+              const errMsg =
+                `Error: coordinates out of bounds. ` +
+                `Normalized (${logNormX}, ${logNormY}) → pixel (${pixel.x}, ${pixel.y}) ` +
+                `is outside window (${lastScreenshotWidth}x${lastScreenshotHeight}). ` +
+                `Your coordinates are wrong — use values within 0-999 that correspond to positions inside the window screenshot.`;
+              onLog?.(
+                `[agent] screen: ${screenArgs.action} → REJECTED out-of-bounds`
+              );
+              history.push({
+                role: "tool" as const,
+                content: [
+                  {
+                    type: "tool-result" as const,
+                    toolCallId: tc.toolCallId,
+                    toolName: tc.toolName,
+                    output: { type: "text", value: errMsg }
+                  }
+                ]
+              });
+              continue;
+            }
+
             screenArgs.x = pixel.x;
             screenArgs.y = pixel.y;
           }
@@ -338,6 +395,7 @@ export function createAgentLoop(config: AgentLoopConfig): AgentLoop {
             // Store for future annotate/coord conversion (but not from annotate itself)
             if (resultWithAction.action !== "annotate") {
               lastScreenshotBase64 = resultWithAction.base64;
+              lastScreenshotIsWindow = false;
               if (resultWithAction.width && resultWithAction.height) {
                 lastScreenshotWidth = resultWithAction.width;
                 lastScreenshotHeight = resultWithAction.height;
@@ -413,6 +471,7 @@ export function createAgentLoop(config: AgentLoopConfig): AgentLoop {
 
             // Store for future annotate/coord conversion
             lastScreenshotBase64 = resultWithAction.base64;
+            lastScreenshotIsWindow = true;
             if (resultWithAction.width && resultWithAction.height) {
               lastScreenshotWidth = resultWithAction.width;
               lastScreenshotHeight = resultWithAction.height;
@@ -476,6 +535,9 @@ export function createAgentLoop(config: AgentLoopConfig): AgentLoop {
     }
 
     // Final summary step without tools
+    if (abortSignal?.aborted) {
+      return finalText || "[Agent aborted]";
+    }
     history.push({
       role: "user",
       content: "Summarize what you did and the result."
@@ -483,7 +545,8 @@ export function createAgentLoop(config: AgentLoopConfig): AgentLoop {
     const summary = streamText({
       model,
       system: SYSTEM_PROMPT,
-      messages: history
+      messages: history,
+      abortSignal
     });
     finalText = "";
     for await (const event of summary.fullStream) {
@@ -502,6 +565,7 @@ export function createAgentLoop(config: AgentLoopConfig): AgentLoop {
     lastScreenshotBase64 = null;
     lastScreenshotWidth = 0;
     lastScreenshotHeight = 0;
+    lastScreenshotIsWindow = false;
   }
 
   return { runAgent, reset };

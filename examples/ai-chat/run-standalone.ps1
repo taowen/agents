@@ -81,6 +81,10 @@ if ((Test-Path $envFile) -and -not $env:LLM_API_KEY) {
     }
 }
 
+# Write PID so the WSL wrapper script can taskkill the whole process tree
+$pidFile = Join-Path $env:TEMP "windows-agent-standalone.pid"
+[System.IO.File]::WriteAllText($pidFile, "$PID")
+
 Push-Location $WorkDir
 try {
     Write-Host "==> npm install (in $WorkDir) ..." -ForegroundColor Cyan
@@ -91,4 +95,5 @@ try {
     & npx tsx electron/standalone.ts @AgentArgs
 } finally {
     Pop-Location
+    Remove-Item $pidFile -ErrorAction SilentlyContinue
 }

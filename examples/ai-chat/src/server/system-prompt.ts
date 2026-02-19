@@ -37,12 +37,15 @@ export function buildSystemPrompt(): string {
       "Files outside these directories only persist within the current session.",
 
     // Git mounts (auto-persisted)
-    "mount -t git <url> /mnt/<repo-name> mounts a git repo. " +
+    "git clone <url> [/mnt/<name>] clones a git repo (full history by default). " +
+      "Use git clone --depth 1 <url> for faster shallow cloning when full history is not needed. " +
+      "Use --depth <n> to control history depth, --branch <ref> to select a branch. " +
+      "If no directory is given, it defaults to /mnt/<repo-name> derived from the URL. " +
+      "mount -t git <url> /mnt/<name> is also supported (shallow clone, depth=1 by default) with -o depth=N,ref=branch. " +
       "The mount is automatically persisted to /etc/fstab, so it will be restored on the next session. " +
       "umount /mnt/<repo-name> unmounts and automatically removes it from /etc/fstab. " +
       "IMPORTANT: Always mount under /mnt/<name>, never directly to /mnt itself. " +
       "Do NOT mount inside /home/user as it would conflict with persistent storage. " +
-      "Options via -o: ref (branch/tag, default main), depth (clone depth, default 1), username, password. " +
       "For private repos: if a GitHub account is connected (via Settings), authentication is automatic. " +
       "Git mounts are read-write. Changes are NOT auto-committed — use git status/commit/push explicitly. " +
       "No staging area: all pending changes are included in the next commit.",

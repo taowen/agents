@@ -159,12 +159,13 @@ function getOrCreateAgent(): AgentLoop {
 
 async function runLocalAgent(
   userMessage: string,
-  onLog?: (msg: string) => void
+  onLog?: (msg: string) => void,
+  abortSignal?: AbortSignal
 ): Promise<string> {
   await initWindowsMounts();
   initCloudMount();
   const agent = getOrCreateAgent();
-  return agent.runAgent(userMessage, { onLog });
+  return agent.runAgent(userMessage, { onLog, abortSignal });
 }
 
 function resetLocalAgent() {
@@ -193,6 +194,7 @@ export function useBridge(deviceName: string) {
   const [logs, setLogs] = useState<BridgeLog[]>([]);
   const wsRef = useRef<WebSocket | null>(null);
   const reconnectTimer = useRef<ReturnType<typeof setTimeout>>();
+  const agentAbortRef = useRef<AbortController | null>(null);
 
   const addLog = useCallback((message: string) => {
     const time = new Date().toLocaleTimeString();
@@ -242,26 +244,38 @@ export function useBridge(deviceName: string) {
       if (data.type === "cf_agent_bridge_message") {
         setStatus("running");
         addLog(`Received task: ${data.content.slice(0, 100)}`);
+        const abortController = new AbortController();
+        agentAbortRef.current = abortController;
         try {
-          const response = await runLocalAgent(data.content, addLog);
-          addLog(`Task complete. Response: ${response.slice(0, 100)}`);
-          ws.send(
-            JSON.stringify({
-              type: "cf_agent_bridge_response",
-              messageId: data.messageId,
-              content: response
-            })
+          const response = await runLocalAgent(
+            data.content,
+            addLog,
+            abortController.signal
           );
+          addLog(`Task complete. Response: ${response.slice(0, 100)}`);
+          if (ws.readyState === WebSocket.OPEN) {
+            ws.send(
+              JSON.stringify({
+                type: "cf_agent_bridge_response",
+                messageId: data.messageId,
+                content: response
+              })
+            );
+          }
         } catch (err) {
           const errMsg = err instanceof Error ? err.message : String(err);
           addLog(`Error: ${errMsg}`);
-          ws.send(
-            JSON.stringify({
-              type: "cf_agent_bridge_response",
-              messageId: data.messageId,
-              content: `[Error] Local agent failed: ${errMsg}`
-            })
-          );
+          if (ws.readyState === WebSocket.OPEN) {
+            ws.send(
+              JSON.stringify({
+                type: "cf_agent_bridge_response",
+                messageId: data.messageId,
+                content: `[Error] Local agent failed: ${errMsg}`
+              })
+            );
+          }
+        } finally {
+          agentAbortRef.current = null;
         }
         setStatus("connected");
         return;
@@ -269,6 +283,12 @@ export function useBridge(deviceName: string) {
     };
 
     ws.onclose = () => {
+      // Abort any running agent when the connection drops
+      if (agentAbortRef.current) {
+        agentAbortRef.current.abort();
+        agentAbortRef.current = null;
+        addLog("Agent aborted (connection closed)");
+      }
       setStatus("disconnected");
       addLog("Disconnected. Reconnecting in 3s...");
       reconnectTimer.current = setTimeout(connect, 3000);

@@ -43,8 +43,10 @@ function concatUint8Arrays(arrays: Uint8Array[]): Uint8Array {
 
 // ---- Create mock git server ----
 
+export type MockCommit = { files: Record<string, string>; message: string };
+
 export async function createMockGitServer(
-  files: Record<string, string>
+  filesOrCommits: Record<string, string> | MockCommit[]
 ): Promise<{
   url: string;
   http: { request: (opts: any) => Promise<any> };
@@ -53,31 +55,38 @@ export async function createMockGitServer(
   const dir = "/repo";
   const gitdir = "/repo/.git";
 
-  // Init repo and commit files
+  // Normalize input: single object → one-commit array
+  const commits: MockCommit[] = Array.isArray(filesOrCommits)
+    ? filesOrCommits
+    : [{ files: filesOrCommits, message: "Initial commit" }];
+
+  // Init repo and create commits
   await git.init({ fs: memFs, dir, defaultBranch: "main" });
 
-  for (const [path, content] of Object.entries(files)) {
-    const fullPath = `${dir}/${path}`;
-    // Ensure parent directories exist
-    const parts = path.split("/");
-    for (let i = 1; i < parts.length; i++) {
-      const parentDir = `${dir}/${parts.slice(0, i).join("/")}`;
-      try {
-        await memFs.mkdir(parentDir);
-      } catch {
-        /* exists */
+  for (const commitDef of commits) {
+    for (const [path, content] of Object.entries(commitDef.files)) {
+      const fullPath = `${dir}/${path}`;
+      // Ensure parent directories exist
+      const parts = path.split("/");
+      for (let i = 1; i < parts.length; i++) {
+        const parentDir = `${dir}/${parts.slice(0, i).join("/")}`;
+        try {
+          await memFs.mkdir(parentDir);
+        } catch {
+          /* exists */
+        }
       }
+      await memFs.writeFile(fullPath, textEncoder.encode(content));
+      await git.add({ fs: memFs, dir, filepath: path });
     }
-    await memFs.writeFile(fullPath, textEncoder.encode(content));
-    await git.add({ fs: memFs, dir, filepath: path });
-  }
 
-  await git.commit({
-    fs: memFs,
-    dir,
-    message: "Initial commit",
-    author: { name: "Test", email: "test@test.com" }
-  });
+    await git.commit({
+      fs: memFs,
+      dir,
+      message: commitDef.message,
+      author: { name: "Test", email: "test@test.com" }
+    });
+  }
 
   // Get HEAD oid and ref (mutable — updated by receive-pack)
   let headOid = await git.resolveRef({ fs: memFs, dir, ref: "HEAD" });
@@ -155,27 +164,39 @@ export async function createMockGitServer(
           }
         }
 
-        // Collect all reachable objects (commit + trees + blobs)
-        const oids: string[] = [headOid];
-        const commitResult = await git.readCommit({
-          fs: memFs,
-          gitdir,
-          oid: headOid
-        });
-        const treeOid = commitResult.commit.tree;
+        // Collect all reachable objects (walk full commit chain)
+        const oids: string[] = [];
+        const visited = new Set<string>();
 
         async function walkTree(oid: string) {
+          if (visited.has(oid)) return;
+          visited.add(oid);
           oids.push(oid);
           const { tree } = await git.readTree({ fs: memFs, gitdir, oid });
           for (const entry of tree) {
             if (entry.type === "tree") {
               await walkTree(entry.oid);
-            } else {
+            } else if (!visited.has(entry.oid)) {
+              visited.add(entry.oid);
               oids.push(entry.oid);
             }
           }
         }
-        await walkTree(treeOid);
+
+        // Walk commit chain: HEAD → parent → parent → ...
+        let currentOid: string | null = headOid;
+        while (currentOid) {
+          if (visited.has(currentOid)) break;
+          visited.add(currentOid);
+          oids.push(currentOid);
+          const commitResult = await git.readCommit({
+            fs: memFs,
+            gitdir,
+            oid: currentOid
+          });
+          await walkTree(commitResult.commit.tree);
+          currentOid = commitResult.commit.parent[0] ?? null;
+        }
 
         // Generate packfile using git.packObjects
         const packResult = await git.packObjects({

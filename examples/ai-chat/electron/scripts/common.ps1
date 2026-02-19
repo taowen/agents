@@ -60,12 +60,17 @@ public class WinWindow {
     [DllImport("user32.dll")]
     public static extern bool PrintWindow(IntPtr hWnd, IntPtr hdcBlt, uint nFlags);
 
+    [DllImport("user32.dll")]
+    public static extern bool SetProcessDPIAware();
+
     public const int SW_MINIMIZE = 6;
     public const int SW_MAXIMIZE = 3;
     public const int SW_RESTORE = 9;
     public const uint PW_RENDERFULLCONTENT = 2;
 }
 "@ -ErrorAction SilentlyContinue
+
+[WinWindow]::SetProcessDPIAware() | Out-Null
 
 function Encode-Bitmap($bmp) {
     $ms = New-Object System.IO.MemoryStream
