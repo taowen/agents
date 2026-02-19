@@ -20,7 +20,7 @@ describe("git pull", () => {
       r2Bucket,
       userId: "test-user"
     };
-    const mountCmds = createMountCommands(mountableFs, undefined, mountOptions);
+    const mountCmds = createMountCommands(mountableFs, mountOptions);
     const gitCmds = createGitCommands(mountableFs, mountOptions);
 
     const bash = new Bash({
@@ -79,7 +79,7 @@ describe("git pull", () => {
       r2Bucket,
       userId: "test-user"
     };
-    const mountCmds = createMountCommands(mountableFs, undefined, mountOptions);
+    const mountCmds = createMountCommands(mountableFs, mountOptions);
     const gitCmds = createGitCommands(mountableFs, mountOptions);
 
     const bash = new Bash({

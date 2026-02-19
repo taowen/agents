@@ -20,7 +20,6 @@
     "@phosphor-icons/react": "^2.1.10",
     "@sentry/cloudflare": "^10.39.0",
     "@tailwindcss/typography": "^0.5.19",
-    "agentfs-sdk": "^0.6.0",
     "agents": "*",
     "just-bash": "file:../../packages/just-bash",
     "react-markdown": "^10.1.0",

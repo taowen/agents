@@ -20,7 +20,7 @@ describe("git clone", () => {
       r2Bucket,
       userId: "test-user"
     };
-    const mountCmds = createMountCommands(mountableFs, undefined, mountOptions);
+    const mountCmds = createMountCommands(mountableFs, mountOptions);
     const gitCmds = createGitCommands(mountableFs, mountOptions);
     const bash = new Bash({
       fs: mountableFs,
@@ -53,7 +53,7 @@ describe("git clone", () => {
       r2Bucket,
       userId: "test-user"
     };
-    const mountCmds = createMountCommands(mountableFs, undefined, mountOptions);
+    const mountCmds = createMountCommands(mountableFs, mountOptions);
     const gitCmds = createGitCommands(mountableFs, mountOptions);
     const bash = new Bash({
       fs: mountableFs,
@@ -84,7 +84,7 @@ describe("git clone", () => {
       r2Bucket,
       userId: "test-user"
     };
-    const mountCmds = createMountCommands(mountableFs, undefined, mountOptions);
+    const mountCmds = createMountCommands(mountableFs, mountOptions);
     const gitCmds = createGitCommands(mountableFs, mountOptions);
     const bash = new Bash({
       fs: mountableFs,
@@ -130,7 +130,7 @@ describe("git clone", () => {
       r2Bucket,
       userId: "test-user"
     };
-    const mountCmds = createMountCommands(mountableFs, undefined, mountOptions);
+    const mountCmds = createMountCommands(mountableFs, mountOptions);
     const gitCmds = createGitCommands(mountableFs, mountOptions);
     const bash = new Bash({
       fs: mountableFs,

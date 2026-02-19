@@ -2,11 +2,7 @@
  * GitHub OAuth flow for git mounts.
  *
  * Worker-side: createGitHubOAuthRoutes() — handles /oauth/github/* routes
- * DO-side: handleGitHubOAuthDORequest() — handles /github-oauth-config and /store-github-token
  */
-
-import type { AgentFS } from "agentfs-sdk/cloudflare";
-import { upsertCredential } from "./git-credentials";
 
 // ---- Deps interface ----
 
@@ -244,80 +240,4 @@ export function createGitHubOAuthRoutes(
 
     return null;
   };
-}
-
-// ---- DO-side: OAuth request handler ----
-
-async function readAgentFsJson(
-  agentFs: AgentFS,
-  path: string
-): Promise<Record<string, string>> {
-  try {
-    const data = await agentFs.readFile(path);
-    const text =
-      typeof data === "string" ? data : new TextDecoder().decode(data);
-    return JSON.parse(text);
-  } catch (err) {
-    // ENOENT is expected for first-time reads; log anything else
-    if (err instanceof Error && !err.message.includes("ENOENT")) {
-      console.error(`readAgentFsJson(${path}): unexpected error:`, err);
-    }
-    return {};
-  }
-}
-
-export async function handleGitHubOAuthDORequest(
-  request: Request,
-  agentFs: AgentFS
-): Promise<Response | null> {
-  const url = new URL(request.url);
-
-  // Read GitHub OAuth config (internal, used by worker)
-  if (url.pathname === "/github-oauth-config" && request.method === "GET") {
-    const config = await readAgentFsJson(agentFs, "/etc/github-oauth.json");
-    return Response.json(config);
-  }
-
-  // Save GitHub OAuth config
-  if (url.pathname === "/github-oauth-config" && request.method === "POST") {
-    const body = (await request.json()) as {
-      clientId?: string;
-      clientSecret?: string;
-    };
-    const existing = await readAgentFsJson(agentFs, "/etc/github-oauth.json");
-    if (body.clientId) existing.clientId = body.clientId;
-    if (body.clientSecret) existing.clientSecret = body.clientSecret;
-    await agentFs.writeFile("/etc/github-oauth.json", JSON.stringify(existing));
-    return Response.json({ ok: true });
-  }
-
-  // Store GitHub OAuth token as git credential
-  if (url.pathname === "/store-github-token" && request.method === "POST") {
-    const { token } = (await request.json()) as { token: string };
-
-    // Read existing /etc/git-credentials or start fresh
-    let existing = "";
-    try {
-      const data = await agentFs.readFile("/etc/git-credentials");
-      existing =
-        typeof data === "string" ? data : new TextDecoder().decode(data);
-    } catch (err) {
-      console.warn(
-        "store-github-token: git-credentials not found, creating new:",
-        err
-      );
-    }
-
-    const updated = upsertCredential(existing, {
-      protocol: "https",
-      host: "github.com",
-      username: "oauth2",
-      password: token
-    });
-
-    await agentFs.writeFile("/etc/git-credentials", updated);
-    return new Response("OK", { status: 200 });
-  }
-
-  return null;
 }

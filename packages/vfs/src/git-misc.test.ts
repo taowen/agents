@@ -122,7 +122,7 @@ describe("git -C", () => {
 
     const { url, http } = await createMockGitServer({ "README.md": "Hello" });
     const r2Bucket = new MockR2Bucket() as unknown as R2Bucket;
-    const mountCmds = createMountCommands(mountableFs, undefined, {
+    const mountCmds = createMountCommands(mountableFs, {
       gitHttp: http,
       r2Bucket,
       userId: "test-user"
@@ -150,7 +150,7 @@ describe("git -C", () => {
     inMemoryFs.mkdirSync("/home");
     inMemoryFs.mkdirSync("/home/user");
     const mountableFs = new MountableFs({ base: inMemoryFs });
-    const mountCmds = createMountCommands(mountableFs, undefined, {
+    const mountCmds = createMountCommands(mountableFs, {
       gitHttp: http,
       r2Bucket,
       userId: "test-user"

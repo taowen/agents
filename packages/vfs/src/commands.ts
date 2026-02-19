@@ -4,15 +4,12 @@
  * Usage:
  *   mount                              — list mounts
  *   mount -t git [-o ...] <url> <mp>   — mount a git repo
- *   mount -t agentfs [-o ...] <dev> <mp> — mount an agentfs path
  *   mount -t <type> <dev> <mp>         — mount via FsTypeRegistry
  *   umount <mountpoint>
  */
 
 import { defineCommand } from "just-bash";
 import type { CustomCommand, MountableFs } from "just-bash";
-import type { AgentFS } from "agentfs-sdk/cloudflare";
-import { AgentFsAdapter } from "./agentfs-adapter";
 import { GitFs } from "./git-fs";
 import { parseGitCredentials, findCredential } from "./git-credentials";
 import { parseFstab } from "./fstab";
@@ -36,7 +33,6 @@ function parseOpts(raw: string): Record<string, string> {
 
 export function createMountCommands(
   mountableFs: MountableFs,
-  agentFs?: AgentFS,
   options?: MountOptions
 ): CustomCommand[] {
   const mountCmd = defineCommand("mount", async (args, ctx) => {
@@ -80,8 +76,6 @@ export function createMountCommands(
 
     if (type === "git") {
       return mountGit(mountableFs, positional, optsRaw, ctx, options);
-    } else if (type === "agentfs") {
-      return mountAgentFs(mountableFs, agentFs, positional);
     } else if (options?.fsTypeRegistry?.[type]) {
       return mountViaRegistry(mountableFs, type, positional, optsRaw, options);
     } else {
@@ -296,43 +290,6 @@ async function mountGit(
       };
     }
   );
-}
-
-// ---- mount -t agentfs ----
-
-function mountAgentFs(
-  mountableFs: MountableFs,
-  agentFs: AgentFS | undefined,
-  positional: string[]
-) {
-  if (!agentFs) {
-    return {
-      stdout: "",
-      stderr: "mount: agentfs not available (no AgentFS provided)\n",
-      exitCode: 1
-    };
-  }
-
-  if (positional.length < 2) {
-    return {
-      stdout: "",
-      stderr:
-        "mount: usage: mount -t agentfs [-o options] <device> <mountpoint>\n",
-      exitCode: 1
-    };
-  }
-
-  const mountpoint = positional[1];
-  const adapter = new AgentFsAdapter(agentFs, mountpoint);
-
-  try {
-    mountableFs.mount(mountpoint, adapter, "agentfs");
-  } catch (err) {
-    const msg = err instanceof Error ? err.message : String(err);
-    return { stdout: "", stderr: `mount: ${msg}\n`, exitCode: 1 };
-  }
-
-  return { stdout: "", stderr: "", exitCode: 0 };
 }
 
 // ---- mount -t <registry-type> ----

@@ -1,5 +1,6 @@
 import { tool } from "ai";
 import { z } from "zod";
+import * as Sentry from "@sentry/cloudflare";
 import puppeteer from "@cloudflare/puppeteer";
 import type { Browser, Page } from "@cloudflare/puppeteer";
 
@@ -53,11 +54,13 @@ export async function closeBrowser(state: BrowserState): Promise<void> {
     if (state.page && !state.page.isClosed()) await state.page.close();
   } catch (err) {
     console.error("Browser: error closing page:", err);
+    Sentry.captureException(err);
   }
   try {
     if (state.browser?.isConnected()) await state.browser.close();
   } catch (err) {
     console.error("Browser: error closing browser:", err);
+    Sentry.captureException(err);
   }
   state.page = null;
   state.browser = null;

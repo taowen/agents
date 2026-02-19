@@ -4,22 +4,17 @@
   "private": true,
   "type": "module",
   "main": "src/index.ts",
+  "scripts": {
+    "test": "vitest run"
+  },
   "dependencies": {
     "diff": "^8.0.2",
     "isomorphic-git": "^1.27.2",
     "just-bash": "file:../just-bash"
   },
-  "peerDependencies": {
-    "agentfs-sdk": ">=0.6.0"
-  },
-  "peerDependenciesMeta": {
-    "agentfs-sdk": {
-      "optional": true
-    }
-  },
   "devDependencies": {
     "@cloudflare/workers-types": "^4.20250214.0",
-    "agentfs-sdk": "^0.6.0",
-    "vitest": "^4.0.16"
+    "@types/better-sqlite3": "^7.6.13",
+    "better-sqlite3": "^12.6.2"
   }
 }

@@ -1,28 +1,20 @@
 import { describe, it, expect, beforeEach } from "vitest";
-import { AgentFS } from "agentfs-sdk";
 import { Bash, InMemoryFs, MountableFs } from "just-bash";
-import { AgentFsAdapter } from "./agentfs-adapter";
 import { createMountCommands } from "./commands";
 import { createMockGitServer } from "./mock-git-server";
 import { MockR2Bucket } from "./mock-r2-bucket";
 
-/** Helper: create a fresh AgentFS + MountableFs + Bash for each test. */
-async function createTestEnv(opts?: { withAgentFs?: boolean }) {
-  const agent = await AgentFS.open({ path: ":memory:" });
-  const agentFs = agent.fs as any;
-
+/** Helper: create a fresh InMemoryFs + MountableFs + Bash for each test. */
+function createTestEnv() {
   const inMemoryFs = new InMemoryFs();
   inMemoryFs.mkdirSync("/mnt");
   const mountableFs = new MountableFs({ base: inMemoryFs });
 
-  // /etc is always hardcoded-mounted (same as server.ts)
-  const etcFs = new AgentFsAdapter(agentFs, "/etc");
-  mountableFs.mount("/etc", etcFs, "agentfs");
+  const etcFs = new InMemoryFs();
+  mountableFs.mount("/etc", etcFs, "d1");
 
-  const cmds = createMountCommands(
-    mountableFs,
-    opts?.withAgentFs !== false ? agentFs : undefined
-  );
+  const fsTypeRegistry = { d1: () => new InMemoryFs() };
+  const cmds = createMountCommands(mountableFs, { fsTypeRegistry });
 
   const bash = new Bash({
     fs: mountableFs,
@@ -30,47 +22,20 @@ async function createTestEnv(opts?: { withAgentFs?: boolean }) {
     cwd: "/home/user"
   });
 
-  return { agentFs, mountableFs, bash };
+  return { mountableFs, bash };
 }
 
 describe("mount command — list mounts", () => {
   let bash: Bash;
 
-  beforeEach(async () => {
-    ({ bash } = await createTestEnv());
+  beforeEach(() => {
+    ({ bash } = createTestEnv());
   });
 
   it("mount (no args) lists existing mounts with type", async () => {
     const result = await bash.exec("mount");
     expect(result.exitCode).toBe(0);
-    expect(result.stdout).toContain("agentfs on /etc");
-  });
-});
-
-describe("mount -t agentfs", () => {
-  let agentFs: any;
-  let bash: Bash;
-
-  beforeEach(async () => {
-    ({ agentFs, bash } = await createTestEnv());
-  });
-
-  it("mounts agentfs and files are readable/writable", async () => {
-    const mount = await bash.exec("mount -t agentfs none /mnt/data");
-    expect(mount.exitCode).toBe(0);
-
-    const write = await bash.exec(
-      "echo hello > /mnt/data/test.txt && cat /mnt/data/test.txt"
-    );
-    expect(write.exitCode).toBe(0);
-    expect(write.stdout.trim()).toBe("hello");
-  });
-
-  it("errors when agentFs not provided", async () => {
-    const { bash: noAgentBash } = await createTestEnv({ withAgentFs: false });
-    const result = await noAgentBash.exec("mount -t agentfs none /mnt/data");
-    expect(result.exitCode).toBe(1);
-    expect(result.stderr).toContain("agentfs not available");
+    expect(result.stdout).toContain("d1 on /etc");
   });
 });
 
@@ -78,8 +43,8 @@ describe("mount -t git", () => {
   let bash: Bash;
   let mountableFs: MountableFs;
 
-  beforeEach(async () => {
-    ({ bash, mountableFs } = await createTestEnv());
+  beforeEach(() => {
+    ({ bash, mountableFs } = createTestEnv());
   });
 
   it("mounts git repo with mock server, files readable", async () => {
@@ -89,7 +54,7 @@ describe("mount -t git", () => {
     });
 
     const r2Bucket = new MockR2Bucket() as unknown as R2Bucket;
-    const cmds = createMountCommands(mountableFs, undefined, {
+    const cmds = createMountCommands(mountableFs, {
       gitHttp: http,
       r2Bucket,
       userId: "test-user"
@@ -112,18 +77,18 @@ describe("mount -t git", () => {
 describe("umount", () => {
   let bash: Bash;
 
-  beforeEach(async () => {
-    ({ bash } = await createTestEnv());
+  beforeEach(() => {
+    ({ bash } = createTestEnv());
   });
 
   it("unmounts a previously mounted path", async () => {
-    // Mount first
-    const mount = await bash.exec("mount -t agentfs none /mnt/data");
+    // Mount first via registry
+    const mount = await bash.exec("mount -t d1 none /mnt/data");
     expect(mount.exitCode).toBe(0);
 
     // Verify it shows in mount list
     const list1 = await bash.exec("mount");
-    expect(list1.stdout).toContain("agentfs on /mnt/data");
+    expect(list1.stdout).toContain("d1 on /mnt/data");
 
     // Unmount
     const umount = await bash.exec("umount /mnt/data");

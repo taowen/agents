@@ -283,6 +283,51 @@ explorer.exe "C:\Users\%USERNAME%\AppData\Local\Temp\windows-agent-standalone\lo
 - `run-standalone.ps1` — Windows-side launcher (copies files to temp dir, npm install, runs tsx)
 - `run-standalone-on-windows.sh` — WSL-side launcher (builds just-bash, packs tarball, calls PS1)
 
+## Sentry error monitoring
+
+The project integrates `@sentry/cloudflare` for error tracking and performance tracing. Set the `SENTRY_DSN` secret via `wrangler secret put SENTRY_DSN` to enable it.
+
+### Querying logs via Sentry API
+
+Create an auth token at **Sentry Settings > Auth Tokens**, then save it locally:
+
+```bash
+# examples/ai-chat/.env.sentry (git-ignored)
+SENTRY_AUTH_TOKEN=sntryu_xxx
+SENTRY_ORG=txom
+SENTRY_PROJECT=cloudflare-worker
+SENTRY_BASE_URL=https://us.sentry.io
+```
+
+Common API queries (all use the regional base URL `https://us.sentry.io`):
+
+```bash
+TOKEN="$(grep SENTRY_AUTH_TOKEN examples/ai-chat/.env.sentry | cut -d= -f2)"
+
+# List unresolved issues (most recent first)
+curl -s -H "Authorization: Bearer $TOKEN" \
+  'https://us.sentry.io/api/0/projects/txom/cloudflare-worker/issues/?query=is:unresolved&sort=date&limit=10'
+
+# Get the latest event (full stack trace + breadcrumbs) for a specific issue
+curl -s -H "Authorization: Bearer $TOKEN" \
+  'https://us.sentry.io/api/0/issues/{issue_id}/events/latest/'
+
+# List recent events for the project
+curl -s -H "Authorization: Bearer $TOKEN" \
+  'https://us.sentry.io/api/0/projects/txom/cloudflare-worker/events/?limit=10'
+```
+
+Pipe through `python3 -m json.tool` for pretty-printed output, or use `jq`.
+
+### Key fields in the event response
+
+| Field | What it tells you |
+|-------|-------------------|
+| `entries[type=exception].data.values` | Exception chain with stack traces |
+| `entries[type=breadcrumbs].data.values` | Chronological log of console, fetch, and schedule events leading up to the error |
+| `contexts.trace` | Distributed trace ID for correlating spans |
+| `tags` | Environment, handler status, runtime info |
+
 ## Try it
 
 - "List files in /home/user" -- bash command execution

@@ -27,7 +27,7 @@ export async function createGitTestEnv(
     r2Bucket,
     userId: "test-user"
   };
-  const mountCmds = createMountCommands(mountableFs, undefined, mountOptions);
+  const mountCmds = createMountCommands(mountableFs, mountOptions);
   const gitCmds = createGitCommands(mountableFs, mountOptions);
 
   const bash = new Bash({
@@ -61,7 +61,7 @@ export async function createCloneTestEnv(
     r2Bucket,
     userId: "test-user"
   };
-  const mountCmds = createMountCommands(mountableFs, undefined, mountOptions);
+  const mountCmds = createMountCommands(mountableFs, mountOptions);
   const gitCmds = createGitCommands(mountableFs, mountOptions);
 
   const bash = new Bash({

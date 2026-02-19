@@ -1,14 +1,10 @@
 /**
  * mount — fstab-driven filesystem mounting.
  *
- * Reads /etc/fstab from AgentFS, parses entries, and mounts them
- * onto a MountableFs. Extracted from server.ts for testability.
+ * Parses fstab entries and mounts them onto a MountableFs.
  */
 
-import type { AgentFS } from "agentfs-sdk/cloudflare";
-import { AgentFsAdapter } from "./agentfs-adapter";
 import { GitFs } from "./git-fs";
-import { parseFstab, DEFAULT_FSTAB } from "./fstab";
 import { parseGitCredentials, findCredential } from "./git-credentials";
 import type { FstabEntry } from "./fstab";
 import type { IFileSystem, MountableFs } from "just-bash";
@@ -18,24 +14,6 @@ export type FsFactory = (entry: FstabEntry) => IFileSystem | null;
 
 /** Registry mapping fstab type names to filesystem factories. */
 export type FsTypeRegistry = Record<string, FsFactory>;
-
-/** Recursively ensure a directory path exists in AgentFS. */
-async function ensureDirRecursive(
-  agentFs: AgentFS,
-  dirPath: string
-): Promise<void> {
-  const parts = dirPath.split("/").filter(Boolean);
-  let current = "";
-  for (const part of parts) {
-    current += `/${part}`;
-    try {
-      await agentFs.mkdir(current);
-    } catch (e) {
-      const msg = e instanceof Error ? e.message : String(e);
-      if (!msg.includes("EEXIST") && !msg.includes("already exists")) throw e;
-    }
-  }
-}
 
 export interface MountOptions {
   gitHttp?: any; // optional: inject mock HTTP transport for testing
@@ -50,71 +28,14 @@ export interface MountOptions {
 }
 
 /**
- * Mount all entries declared in /etc/fstab.
- * If /etc/fstab doesn't exist, writes the default one first.
- */
-export async function mountFstabEntries(
-  agentFs: AgentFS | null,
-  mountableFs: MountableFs,
-  options?: MountOptions
-): Promise<void> {
-  if (agentFs) {
-    // Ensure /etc directory exists in AgentFS
-    await ensureDirRecursive(agentFs, "/etc");
-  }
-
-  // Read /etc/fstab — if missing, write default
-  let fstabContent: string;
-  try {
-    const data = await mountableFs.readFile("/etc/fstab", { encoding: "utf8" });
-    fstabContent = typeof data === "string" ? data : String(data);
-  } catch (e) {
-    const msg = e instanceof Error ? e.message : String(e);
-    if (msg.includes("ENOENT") || msg.includes("not found")) {
-      fstabContent = DEFAULT_FSTAB;
-      try {
-        await mountableFs.writeFile("/etc/fstab", fstabContent);
-      } catch {
-        // /etc may not be mounted yet during bootstrap
-      }
-    } else {
-      throw e;
-    }
-  }
-
-  // Parse and mount entries
-  const entries = parseFstab(fstabContent);
-  for (const entry of entries) {
-    await mountEntry(entry, agentFs, mountableFs, options);
-  }
-}
-
-/**
  * Mount a single fstab entry.
  */
 export async function mountEntry(
   entry: FstabEntry,
-  agentFs: AgentFS | null,
   mountableFs: MountableFs,
   options?: MountOptions
 ): Promise<void> {
-  if (entry.type === "agentfs") {
-    if (!agentFs) {
-      console.error(`fstab: agentfs not available for ${entry.mountPoint}`);
-      return;
-    }
-    const adapter = new AgentFsAdapter(agentFs, entry.mountPoint);
-    try {
-      mountableFs.mount(entry.mountPoint, adapter, "agentfs");
-    } catch (e) {
-      const msg = e instanceof Error ? e.message : String(e);
-      // Already mounted (e.g. /etc) — skip
-      if (msg.includes("already mounted")) return;
-      throw e;
-    }
-    // Ensure the directory (and parents) exist in AgentFS
-    await ensureDirRecursive(agentFs, entry.mountPoint);
-  } else if (entry.type === "git") {
+  if (entry.type === "git") {
     const ref = entry.options.ref || "main";
     const depth = entry.options.depth ? parseInt(entry.options.depth, 10) : 1;
 
@@ -192,6 +113,11 @@ export async function mountEntry(
       const msg = e instanceof Error ? e.message : String(e);
       if (msg.includes("already mounted")) return;
       console.error(`fstab: failed to mount ${entry.mountPoint}: ${msg}`);
+      return;
     }
+    // Ensure root dir exists in backing store (D1 needs this, R2 is a no-op)
+    try {
+      await filesystem.mkdir("/", { recursive: true });
+    } catch {}
   }
 }

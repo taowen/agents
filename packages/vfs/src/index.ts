@@ -1,4 +1,3 @@
-export { AgentFsAdapter } from "./agentfs-adapter";
 export { D1FsAdapter } from "./d1-fs-adapter";
 export { R2FsAdapter } from "./r2-fs-adapter";
 export { normalizePath, parentPath, baseName } from "./fs-helpers";
@@ -9,8 +8,10 @@ export type { GitRepoOptions, GitTreeEntry, LogEntry } from "./git-repo";
 export { createGitCommands } from "./git-commands/index";
 export { parseFstab, parseOptions, DEFAULT_FSTAB } from "./fstab";
 export type { FstabEntry } from "./fstab";
-export { mountFstabEntries, mountEntry } from "./mount";
+export { mountEntry } from "./mount";
 export type { MountOptions, FsFactory, FsTypeRegistry } from "./mount";
+export { bootFilesystem } from "./boot";
+export type { BootOptions } from "./boot";
 export { createMountCommands } from "./commands";
 export { createMockGitServer } from "./mock-git-server";
 export {
@@ -22,7 +23,6 @@ export {
 export type { GitCredential } from "./git-credentials";
 export {
   createGitHubOAuthRoutes,
-  handleGitHubOAuthDORequest,
   generateOAuthState,
   verifyOAuthState
 } from "./github-oauth";
