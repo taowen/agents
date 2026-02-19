@@ -164,7 +164,7 @@ export class MockR2Bucket {
         ),
       text: async () => new TextDecoder().decode(bodyData),
       json: async () => JSON.parse(new TextDecoder().decode(bodyData)),
-      blob: async () => new Blob([bodyData])
+      blob: async () => new Blob([bodyData as BlobPart])
     } as unknown as R2ObjectBody;
   }
 }

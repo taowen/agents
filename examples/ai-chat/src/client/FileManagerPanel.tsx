@@ -1,4 +1,5 @@
-import { useState, useEffect, useCallback, useRef } from "react";
+import { useState, useEffect, useRef } from "react";
+import useSWR from "swr";
 import { Button } from "@cloudflare/kumo";
 import {
   XIcon,
@@ -19,6 +20,7 @@ import {
   getExtension,
   joinPath
 } from "../shared/file-utils";
+import { Skeleton } from "./Skeleton";
 
 interface FileEntry {
   name: string;
@@ -28,11 +30,20 @@ interface FileEntry {
 }
 
 function formatSize(bytes: number): string {
-  if (bytes === 0) return "—";
+  if (bytes === 0) return "\u2014";
   if (bytes < 1024) return `${bytes} B`;
   if (bytes < 1024 * 1024) return `${(bytes / 1024).toFixed(1)} KB`;
   return `${(bytes / (1024 * 1024)).toFixed(1)} MB`;
 }
+
+const fileFetcher = async <T = any>(url: string): Promise<T> => {
+  const res = await fetch(url);
+  if (!res.ok) {
+    const data = (await res.json()) as { error?: string };
+    throw new Error(data.error || `HTTP ${res.status}`);
+  }
+  return res.json() as Promise<T>;
+};
 
 export function FileManagerPanel({
   open,
@@ -44,9 +55,6 @@ export function FileManagerPanel({
   onInsertFile?: (path: string) => void;
 }) {
   const [currentPath, setCurrentPath] = useState("/");
-  const [entries, setEntries] = useState<FileEntry[]>([]);
-  const [loading, setLoading] = useState(false);
-  const [error, setError] = useState<string | null>(null);
   const [preview, setPreview] = useState<{
     name: string;
     path: string;
@@ -55,33 +63,19 @@ export function FileManagerPanel({
   } | null>(null);
   const fileInputRef = useRef<HTMLInputElement>(null);
 
-  const fetchEntries = useCallback(async (path: string) => {
-    setLoading(true);
-    setError(null);
-    try {
-      const res = await fetch(
-        `/api/files/list?path=${encodeURIComponent(path)}`
-      );
-      if (!res.ok) {
-        const data = await res.json();
-        throw new Error(data.error || `HTTP ${res.status}`);
-      }
-      const data = await res.json();
-      setEntries(data.entries);
-    } catch (e: unknown) {
-      setError(e instanceof Error ? e.message : String(e));
-      setEntries([]);
-    } finally {
-      setLoading(false);
-    }
-  }, []);
+  const { data, error, isValidating, mutate } = useSWR<{
+    entries: FileEntry[];
+  }>(
+    open ? `/api/files/list?path=${encodeURIComponent(currentPath)}` : null,
+    fileFetcher,
+    { keepPreviousData: true }
+  );
+  const entries: FileEntry[] = data?.entries ?? [];
 
+  // Clear preview when path changes
   useEffect(() => {
-    if (open) {
-      fetchEntries(currentPath);
-      setPreview(null);
-    }
-  }, [open, currentPath, fetchEntries]);
+    setPreview(null);
+  }, [currentPath]);
 
   const navigate = (name: string) => {
     setPreview(null);
@@ -134,7 +128,7 @@ export function FileManagerPanel({
         body: buffer
       });
     }
-    fetchEntries(currentPath);
+    mutate();
   };
 
   const handleDelete = async (entry: FileEntry) => {
@@ -148,7 +142,7 @@ export function FileManagerPanel({
       { method: "DELETE" }
     );
     if (preview?.path === filePath) setPreview(null);
-    fetchEntries(currentPath);
+    mutate();
   };
 
   const handleNewFolder = async () => {
@@ -160,7 +154,7 @@ export function FileManagerPanel({
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify({ path: folderPath })
     });
-    fetchEntries(currentPath);
+    mutate();
   };
 
   // Breadcrumb segments
@@ -180,7 +174,12 @@ export function FileManagerPanel({
       <div className="relative ml-auto flex h-full w-full max-w-md flex-col bg-kumo-base border-l border-kumo-line shadow-xl">
         {/* Header */}
         <div className="flex items-center justify-between px-4 py-3 border-b border-kumo-line">
-          <h2 className="text-base font-semibold text-kumo-default">Files</h2>
+          <div className="flex items-center gap-2">
+            <h2 className="text-base font-semibold text-kumo-default">Files</h2>
+            {isValidating && (
+              <div className="w-3 h-3 rounded-full border-2 border-kumo-secondary border-t-transparent animate-spin" />
+            )}
+          </div>
           <button
             onClick={onClose}
             className="p-1.5 rounded-lg hover:bg-kumo-elevated text-kumo-secondary hover:text-kumo-default transition-colors"
@@ -267,96 +266,101 @@ export function FileManagerPanel({
 
         {/* File listing */}
         <div className="flex-1 overflow-y-auto">
-          {loading && (
-            <div className="p-4 text-sm text-kumo-secondary">Loading...</div>
+          {error && (
+            <div className="p-4 text-sm text-red-500">{error.message}</div>
           )}
-          {error && <div className="p-4 text-sm text-red-500">{error}</div>}
-          {!loading && !error && entries.length === 0 && (
+          {!error && !data && isValidating && (
+            <div className="p-4 space-y-2">
+              {Array.from({ length: 5 }, (_, i) => (
+                <Skeleton key={i} className="h-10 w-full" />
+              ))}
+            </div>
+          )}
+          {!error && entries.length === 0 && data && (
             <div className="p-4 text-sm text-kumo-secondary">
               Empty directory
             </div>
           )}
-          {!loading &&
-            entries.map((entry) => {
-              const ext = getExtension(entry.name);
-              const isImage = IMAGE_EXTENSIONS.has(ext);
-              const isText = TEXT_EXTENSIONS.has(ext);
-              const filePath = joinPath(currentPath, entry.name);
+          {entries.map((entry) => {
+            const ext = getExtension(entry.name);
+            const isImage = IMAGE_EXTENSIONS.has(ext);
+            const isText = TEXT_EXTENSIONS.has(ext);
+            const filePath = joinPath(currentPath, entry.name);
 
-              return (
-                <div
-                  key={entry.name}
-                  className="group flex items-center gap-3 px-4 py-2 hover:bg-kumo-elevated cursor-pointer border-b border-kumo-line/50"
-                  onClick={() => handleFileClick(entry)}
-                >
-                  {/* Icon */}
-                  <div className="shrink-0 text-kumo-secondary">
-                    {entry.isDirectory ? (
-                      <FolderIcon
-                        size={18}
-                        weight="fill"
-                        className="text-amber-500"
-                      />
-                    ) : isImage ? (
-                      <ImageIcon size={18} className="text-emerald-500" />
-                    ) : isText ? (
-                      <FileTextIcon size={18} className="text-blue-500" />
-                    ) : (
-                      <FileIcon size={18} />
-                    )}
-                  </div>
-                  {/* Name + size */}
-                  <div className="flex-1 min-w-0">
-                    <div className="text-sm text-kumo-default truncate">
-                      {entry.name}
-                    </div>
-                    {!entry.isDirectory && (
-                      <div className="text-xs text-kumo-secondary">
-                        {formatSize(entry.size)}
-                      </div>
-                    )}
-                  </div>
-                  {/* Actions — visible on hover */}
-                  <div className="shrink-0 flex items-center gap-1 opacity-0 group-hover:opacity-100 transition-opacity">
-                    {!entry.isDirectory && isImage && onInsertFile && (
-                      <button
-                        onClick={(e) => {
-                          e.stopPropagation();
-                          onInsertFile(filePath);
-                        }}
-                        className="p-1 rounded hover:bg-kumo-base text-kumo-secondary hover:text-emerald-500 transition-colors"
-                        title="Insert into chat"
-                      >
-                        <ChatCircleIcon size={14} />
-                      </button>
-                    )}
-                    {!entry.isDirectory && (
-                      <a
-                        href={`/api/files/content?path=${encodeURIComponent(filePath)}`}
-                        download={entry.name}
-                        onClick={(e) => e.stopPropagation()}
-                        className="p-1 rounded hover:bg-kumo-base text-kumo-secondary hover:text-kumo-default transition-colors"
-                        title="Download"
-                      >
-                        <DownloadIcon size={14} />
-                      </a>
-                    )}
-                    {currentPath !== "/" && currentPath !== "/home" && (
-                      <button
-                        onClick={(e) => {
-                          e.stopPropagation();
-                          handleDelete(entry);
-                        }}
-                        className="p-1 rounded hover:bg-kumo-base text-kumo-secondary hover:text-red-500 transition-colors"
-                        title="Delete"
-                      >
-                        <TrashIcon size={14} />
-                      </button>
-                    )}
-                  </div>
+            return (
+              <div
+                key={entry.name}
+                className="group flex items-center gap-3 px-4 py-2 hover:bg-kumo-elevated cursor-pointer border-b border-kumo-line/50"
+                onClick={() => handleFileClick(entry)}
+              >
+                {/* Icon */}
+                <div className="shrink-0 text-kumo-secondary">
+                  {entry.isDirectory ? (
+                    <FolderIcon
+                      size={18}
+                      weight="fill"
+                      className="text-amber-500"
+                    />
+                  ) : isImage ? (
+                    <ImageIcon size={18} className="text-emerald-500" />
+                  ) : isText ? (
+                    <FileTextIcon size={18} className="text-blue-500" />
+                  ) : (
+                    <FileIcon size={18} />
+                  )}
                 </div>
-              );
-            })}
+                {/* Name + size */}
+                <div className="flex-1 min-w-0">
+                  <div className="text-sm text-kumo-default truncate">
+                    {entry.name}
+                  </div>
+                  {!entry.isDirectory && (
+                    <div className="text-xs text-kumo-secondary">
+                      {formatSize(entry.size)}
+                    </div>
+                  )}
+                </div>
+                {/* Actions — visible on hover */}
+                <div className="shrink-0 flex items-center gap-1 opacity-0 group-hover:opacity-100 transition-opacity">
+                  {!entry.isDirectory && isImage && onInsertFile && (
+                    <button
+                      onClick={(e) => {
+                        e.stopPropagation();
+                        onInsertFile(filePath);
+                      }}
+                      className="p-1 rounded hover:bg-kumo-base text-kumo-secondary hover:text-emerald-500 transition-colors"
+                      title="Insert into chat"
+                    >
+                      <ChatCircleIcon size={14} />
+                    </button>
+                  )}
+                  {!entry.isDirectory && (
+                    <a
+                      href={`/api/files/content?path=${encodeURIComponent(filePath)}`}
+                      download={entry.name}
+                      onClick={(e) => e.stopPropagation()}
+                      className="p-1 rounded hover:bg-kumo-base text-kumo-secondary hover:text-kumo-default transition-colors"
+                      title="Download"
+                    >
+                      <DownloadIcon size={14} />
+                    </a>
+                  )}
+                  {currentPath !== "/" && currentPath !== "/home" && (
+                    <button
+                      onClick={(e) => {
+                        e.stopPropagation();
+                        handleDelete(entry);
+                      }}
+                      className="p-1 rounded hover:bg-kumo-base text-kumo-secondary hover:text-red-500 transition-colors"
+                      title="Delete"
+                    >
+                      <TrashIcon size={14} />
+                    </button>
+                  )}
+                </div>
+              </div>
+            );
+          })}
         </div>
 
         {/* Preview area */}

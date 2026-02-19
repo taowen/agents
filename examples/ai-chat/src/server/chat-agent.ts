@@ -11,7 +11,8 @@ import {
   convertToModelMessages,
   pruneMessages,
   tool,
-  stepCountIs
+  stepCountIs,
+  type ToolSet
 } from "ai";
 import { z } from "zod";
 import {
@@ -26,7 +27,7 @@ import {
 } from "vfs";
 import type { FsTypeRegistry, FstabEntry } from "vfs";
 import { Bash, InMemoryFs, MountableFs } from "just-bash";
-import { getSettings, type UserSettings } from "./db";
+import type { LlmFileConfig } from "../client/api";
 import {
   createBrowserState,
   createBrowserTool,
@@ -51,8 +52,8 @@ class ChatAgentBase extends AIChatAgent {
   private browserState: BrowserState;
   private userId: string | null = null;
   private sessionUuid: string | null = null;
-  private cachedSettings: {
-    data: UserSettings | null;
+  private cachedLlmConfig: {
+    data: LlmFileConfig | null;
     fetchedAt: number;
   } | null = null;
   private static SETTINGS_TTL = 60_000; // 60 seconds
@@ -62,28 +63,38 @@ class ChatAgentBase extends AIChatAgent {
     fetchedAt: number;
   } | null = null;
   private static BRIDGE_DEVICES_TTL = 30_000; // 30 seconds
+  private mcpServersLoaded = false;
+
+  // System prompt cache — computed once per session, invalidated on clear history
+  private cachedSystemPrompt: string | null = null;
+  private cachedDynamicContext: string | null = null;
+  private cachedLlmModel: Awaited<
+    ReturnType<ChatAgentBase["getLlmModel"]>
+  > | null = null;
+  private cachedTools: ToolSet | null = null;
 
   constructor(ctx: DurableObjectState, env: Env) {
     super(ctx, env);
     this.browserState = createBrowserState();
   }
 
-  private async getCachedSettings(): Promise<UserSettings | null> {
+  private async getCachedLlmConfig(): Promise<LlmFileConfig | null> {
     const now = Date.now();
     if (
-      this.cachedSettings &&
-      now - this.cachedSettings.fetchedAt < ChatAgentBase.SETTINGS_TTL
+      this.cachedLlmConfig &&
+      now - this.cachedLlmConfig.fetchedAt < ChatAgentBase.SETTINGS_TTL
     ) {
-      return this.cachedSettings.data;
+      return this.cachedLlmConfig.data;
     }
-    return Sentry.startSpan(
-      { name: "getCachedSettings", op: "db.query" },
-      async () => {
-        const data = await getSettings(this.env.DB, this.userId!);
-        this.cachedSettings = { data, fetchedAt: now };
-        return data;
-      }
-    );
+    try {
+      const buf = await this.mountableFs.readFileBuffer("/etc/llm.json");
+      const data = JSON.parse(new TextDecoder().decode(buf)) as LlmFileConfig;
+      this.cachedLlmConfig = { data, fetchedAt: now };
+      return data;
+    } catch {
+      this.cachedLlmConfig = { data: null, fetchedAt: now };
+      return null;
+    }
   }
 
   /**
@@ -336,17 +347,76 @@ class ChatAgentBase extends AIChatAgent {
   }
 
   /**
+   * Read MCP server config from /etc/mcp-servers.json.
+   */
+  private async readMcpConfig(): Promise<
+    { name: string; url: string; headers?: Record<string, string> }[]
+  > {
+    try {
+      const buf = await this.mountableFs.readFileBuffer(
+        "/etc/mcp-servers.json"
+      );
+      const text = new TextDecoder().decode(buf);
+      return JSON.parse(text);
+    } catch {
+      return [];
+    }
+  }
+
+  /**
+   * Write MCP server config to /etc/mcp-servers.json.
+   */
+  private async writeMcpConfig(
+    entries: { name: string; url: string; headers?: Record<string, string> }[]
+  ): Promise<void> {
+    const text = JSON.stringify(entries, null, 2);
+    await this.mountableFs.writeFile("/etc/mcp-servers.json", text);
+  }
+
+  /**
+   * Auto-connect MCP servers from /etc/mcp-servers.json on session start.
+   */
+  private async ensureMcpServers(): Promise<void> {
+    if (this.mcpServersLoaded) return;
+    this.mcpServersLoaded = true;
+
+    const config = await this.readMcpConfig();
+    if (config.length === 0) return;
+
+    const existing = this.getMcpServers();
+    const connectedNames = new Set(
+      Object.values(existing.servers).map((s) => s.name)
+    );
+
+    const callbackHost =
+      (await this.ctx.storage.get<string>("callbackOrigin")) ?? "";
+    const callbackPath = `mcp-callback/${this.ctx.id.toString()}`;
+
+    for (const entry of config) {
+      if (connectedNames.has(entry.name)) continue;
+      try {
+        await this.addMcpServer(entry.name, entry.url, {
+          callbackHost,
+          callbackPath,
+          transport: entry.headers ? { headers: entry.headers } : undefined
+        });
+      } catch (e) {
+        console.error(
+          `ensureMcpServers: failed to connect "${entry.name}":`,
+          e
+        );
+      }
+    }
+  }
+
+  /**
    * Build the LLM model instance based on user settings.
    */
   private async getLlmModel() {
-    let provider: string = "builtin";
+    const config = this.userId ? await this.getCachedLlmConfig() : null;
 
-    if (this.userId) {
-      const settings = await this.getCachedSettings();
-      if (settings?.llm_provider) provider = settings.llm_provider;
-    }
-
-    if (provider === "builtin") {
+    if (!config) {
+      // Builtin: no /etc/llm.json means use built-in provider
       const apiKey = this.env.ARK_API_KEY;
       const baseURL = "https://ark.cn-beijing.volces.com/api/v3";
       const model = "doubao-seed-2-0-pro-260215";
@@ -358,16 +428,7 @@ class ChatAgentBase extends AIChatAgent {
       })(model);
     }
 
-    let apiKey = this.env.GOOGLE_AI_API_KEY;
-    let baseURL = "https://generativelanguage.googleapis.com/v1beta";
-    let model = "gemini-2.0-flash";
-
-    if (this.userId) {
-      const settings = await this.getCachedSettings();
-      if (settings?.llm_api_key) apiKey = settings.llm_api_key;
-      if (settings?.llm_base_url) baseURL = settings.llm_base_url;
-      if (settings?.llm_model) model = settings.llm_model;
-    }
+    const { provider, api_key: apiKey, base_url: baseURL, model } = config;
 
     return provider === "openai-compatible"
       ? createOpenAICompatible({
@@ -418,7 +479,7 @@ class ChatAgentBase extends AIChatAgent {
         bash: this.createBashTool(),
         browser: createBrowserTool(this.browserState, this.env.MYBROWSER)
       },
-      maxSteps: 10
+      stopWhen: stepCountIs(10)
     });
 
     // Inject result into chat history
@@ -479,12 +540,16 @@ class ChatAgentBase extends AIChatAgent {
     return null;
   }
 
-  onError(connection: Connection, error: unknown): void {
-    console.error("ChatAgent error:", error);
-    if (error instanceof Error) {
-      Sentry.captureException(error);
+  onError(connectionOrError: Connection | unknown, error?: unknown): void {
+    if (error !== undefined) {
+      console.error("ChatAgent error:", error);
+      if (error instanceof Error) Sentry.captureException(error);
+      super.onError(connectionOrError as Connection, error);
+    } else {
+      console.error("ChatAgent error:", connectionOrError);
+      if (connectionOrError instanceof Error)
+        Sentry.captureException(connectionOrError);
     }
-    super.onError(connection, error);
   }
 
   async onRequest(request: Request): Promise<Response> {
@@ -561,7 +626,7 @@ class ChatAgentBase extends AIChatAgent {
         const buffer = await fs.readFileBuffer(path);
         const ext = getExtension(rawPath);
         const contentType = MIME_TYPES[ext] || "application/octet-stream";
-        return new Response(buffer, {
+        return new Response(buffer as BodyInit, {
           headers: { "Content-Type": contentType }
         });
       }
@@ -617,6 +682,9 @@ class ChatAgentBase extends AIChatAgent {
     const uid = await this.getUserId(ctx.request);
     await this.getSessionUuid(ctx.request);
     this.initBash(uid);
+    // Persist origin for MCP OAuth callback URL construction
+    const origin = new URL(ctx.request.url).origin;
+    await this.ctx.storage.put("callbackOrigin", origin);
     return super.onConnect(connection, ctx);
   }
 
@@ -874,8 +942,8 @@ class ChatAgentBase extends AIChatAgent {
     return data.response || "[No response from remote desktop]";
   }
 
-  private createTools(bridgeDevices?: { deviceName: string }[]) {
-    const tools: Record<string, ReturnType<typeof tool>> = {
+  private createTools(bridgeDevices?: { deviceName: string }[]): ToolSet {
+    const tools: ToolSet = {
       bash: this.createBashTool(),
       browser: createBrowserTool(this.browserState, this.env.MYBROWSER),
       schedule_task: tool({
@@ -1074,11 +1142,77 @@ class ChatAgentBase extends AIChatAgent {
         console.error("writeChatHistory:", e)
       );
 
-      const [llmModel, memoryBlock, bridgeDevices] = await Promise.all([
-        this.getLlmModel(),
-        this.readMemoryBlock(),
-        this.getAvailableBridgeDevices()
-      ]);
+      // Auto-connect MCP servers from /etc/mcp-servers.json
+      try {
+        await this.ensureMcpServers();
+      } catch (e) {
+        console.error("ensureMcpServers failed:", e);
+      }
+
+      // Compute system prompt, dynamic context, LLM model, and tools once per session.
+      // Invalidate when this is the first message or after clear history (messages.length <= 1).
+      const shouldRecompute =
+        !this.cachedSystemPrompt || this.messages.length <= 1;
+
+      if (shouldRecompute) {
+        // Ensure jsonSchema is initialized for getAITools() — needed after DO hibernation
+        try {
+          await this.mcp.ensureJsonSchema();
+        } catch (e) {
+          console.error("mcp.ensureJsonSchema failed:", e);
+        }
+
+        const [llmModel, memoryBlock, bridgeDevices] = await Promise.all([
+          this.getLlmModel(),
+          this.readMemoryBlock(),
+          this.getAvailableBridgeDevices()
+        ]);
+
+        this.cachedLlmModel = llmModel;
+        this.cachedSystemPrompt = buildSystemPrompt();
+
+        // Build dynamic context
+        const dynamicParts = [
+          `Chat history directory: /home/user/.chat/${this.sessionDir}/`,
+          memoryBlock
+        ];
+        if (bridgeDevices.length > 0) {
+          const names = bridgeDevices.map((d) => d.deviceName).join(", ");
+          dynamicParts.push(
+            `\nConnected remote desktop devices: ${names}. ` +
+              "Use the remote_desktop tool to send instructions to these devices. " +
+              "The remote agent can see the screen, control mouse/keyboard, and maintains conversation context."
+          );
+        }
+        // Inject connected MCP server info
+        const mcpState = this.getMcpServers();
+        const mcpEntries = Object.entries(mcpState.servers);
+        if (mcpEntries.length > 0) {
+          const mcpToolsList = mcpState.tools || [];
+          const mcpLines = mcpEntries.map(([id, s]) => {
+            const toolNames =
+              mcpToolsList
+                .filter((t) => t.serverId === id)
+                .map((t) => t.name)
+                .join(", ") || "none";
+            return `- ${s.name} (${s.state}, id: ${id}): tools=[${toolNames}]`;
+          });
+          dynamicParts.push(`\nConnected MCP servers:\n${mcpLines.join("\n")}`);
+        }
+        this.cachedDynamicContext = dynamicParts.filter(Boolean).join("\n");
+
+        // Cache tools (including MCP tools)
+        let mcpTools: ToolSet = {};
+        try {
+          mcpTools = this.mcp.getAITools();
+        } catch (e) {
+          console.error("mcp.getAITools() failed:", e);
+        }
+        this.cachedTools = {
+          ...this.createTools(bridgeDevices),
+          ...mcpTools
+        } as ToolSet;
+      }
 
       const messages = await Sentry.startSpan(
         { name: "convertMessages", op: "serialize" },
@@ -1090,27 +1224,13 @@ class ChatAgentBase extends AIChatAgent {
           })
       );
 
-      // Inject dynamic context as a system message so the static system prompt stays cacheable
-      const dynamicParts = [
-        `Chat history directory: /home/user/.chat/${this.sessionDir}/`,
-        memoryBlock
-      ];
-      if (bridgeDevices.length > 0) {
-        const names = bridgeDevices.map((d) => d.deviceName).join(", ");
-        dynamicParts.push(
-          `\nConnected remote desktop devices: ${names}. ` +
-            "Use the remote_desktop tool to send instructions to these devices. " +
-            "The remote agent can see the screen, control mouse/keyboard, and maintains conversation context."
-        );
-      }
-      const dynamicContext = dynamicParts.filter(Boolean).join("\n");
-      messages.unshift({ role: "system", content: dynamicContext });
+      messages.unshift({ role: "system", content: this.cachedDynamicContext! });
 
       const result = streamText({
-        model: llmModel,
-        system: buildSystemPrompt(),
+        model: this.cachedLlmModel!,
+        system: this.cachedSystemPrompt!,
         messages,
-        tools: this.createTools(bridgeDevices),
+        tools: this.cachedTools!,
         stopWhen: stepCountIs(10)
       });
 

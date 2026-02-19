@@ -36,10 +36,22 @@ const sentryHandler = Sentry.withSentry(
       const ghResponse = await handleGitHubOAuth(request, env, userId);
       if (ghResponse) return ghResponse;
 
-      // 5. Route to Agent DOs with userId header injected
+      // 5. MCP OAuth callback — route directly to the DO by hex ID
+      //    The request URL is forwarded as-is so origin+pathname match the stored callback_url.
+      const url = new URL(request.url);
+      if (url.pathname.startsWith("/mcp-callback/")) {
+        const doId = url.pathname.split("/")[2];
+        if (doId) {
+          const id = env.ChatAgent.idFromString(doId);
+          const stub = env.ChatAgent.get(id);
+          return stub.fetch(request);
+        }
+      }
+
+      // 6. Route to Agent DOs with userId header injected
       const headers = new Headers(request.headers);
       headers.set("x-user-id", userId);
-      const url = new URL(request.url);
+
       const agentMatch = url.pathname.match(
         /\/agents\/([^/]+)\/([^/?]+)(\/.*)?/
       );

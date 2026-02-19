@@ -91,6 +91,13 @@ function saveScreenshot(step: number, action: string, base64: string) {
   log(`screenshot saved: ${filename}`);
 }
 
+// ---- Exit when parent dies (stdin pipe closes) ----
+process.stdin.resume();
+process.stdin.on("end", () => {
+  log("[standalone] stdin closed, parent died — exiting");
+  process.exit(0);
+});
+
 // ---- Run agent ----
 
 const mountableFs = new MountableFs({ base: new InMemoryFs() });

@@ -13,6 +13,7 @@ import {
 } from "@phosphor-icons/react";
 import type { BridgeDevice } from "./use-bridge-viewer";
 import { Button, Text } from "@cloudflare/kumo";
+import { SessionListSkeleton } from "./Skeleton";
 
 export interface SessionInfo {
   id: string;
@@ -37,6 +38,7 @@ interface SessionSidebarProps {
   sessions: SessionInfo[];
   activeSessionId: string | null;
   user: UserInfo | null;
+  isLoading?: boolean;
   onNewSession: () => void;
   onSelectSession: (id: string) => void;
   onDeleteSession: (id: string) => void;
@@ -53,6 +55,7 @@ export function SessionSidebar({
   sessions,
   activeSessionId,
   user,
+  isLoading,
   onNewSession,
   onSelectSession,
   onDeleteSession,
@@ -158,13 +161,15 @@ export function SessionSidebar({
             </div>
           );
         })}
-        {sessions.length === 0 && (
+        {isLoading && sessions.length === 0 ? (
+          <SessionListSkeleton />
+        ) : sessions.length === 0 ? (
           <div className="px-3 py-4 text-center">
             <Text size="xs" variant="secondary">
               No sessions yet
             </Text>
           </div>
-        )}
+        ) : null}
       </div>
 
       {/* Bottom section */}

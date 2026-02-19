@@ -50,6 +50,11 @@ export async function createMockGitServer(
 ): Promise<{
   url: string;
   http: { request: (opts: any) => Promise<any> };
+  /** Add a commit server-side (for testing pull). */
+  addCommit: (
+    files: Record<string, string>,
+    message: string
+  ) => Promise<string>;
 }> {
   const memFs = createIsomorphicGitMemFs();
   const dir = "/repo";
@@ -379,5 +384,38 @@ export async function createMockGitServer(
     }
   };
 
-  return { url: mockUrl, http: mockHttp };
+  const addCommit = async (
+    files: Record<string, string>,
+    message: string
+  ): Promise<string> => {
+    // Checkout current state
+    await git.checkout({ fs: memFs, dir, ref: "main" });
+
+    for (const [path, content] of Object.entries(files)) {
+      const fullPath = `${dir}/${path}`;
+      const parts = path.split("/");
+      for (let i = 1; i < parts.length; i++) {
+        const parentDir = `${dir}/${parts.slice(0, i).join("/")}`;
+        try {
+          await memFs.mkdir(parentDir);
+        } catch {
+          /* exists */
+        }
+      }
+      await memFs.writeFile(fullPath, textEncoder.encode(content));
+      await git.add({ fs: memFs, dir, filepath: path });
+    }
+
+    const oid = await git.commit({
+      fs: memFs,
+      dir,
+      message,
+      author: { name: "Remote", email: "remote@test.com" }
+    });
+
+    headOid = oid;
+    return oid;
+  };
+
+  return { url: mockUrl, http: mockHttp, addCommit };
 }

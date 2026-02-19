@@ -22,6 +22,7 @@ import { gitBranch } from "./branch";
 import { gitRemote } from "./remote";
 import { gitShow } from "./show";
 import { gitRevParse } from "./rev-parse";
+import { gitPull } from "./pull";
 
 /**
  * Find the GitFs mount whose mountPoint is a prefix of `cwd` (longest prefix wins).
@@ -106,16 +107,18 @@ export function createGitCommands(
         return gitCommit(match, subArgs, ctx);
       case "push":
         return gitPush(match, mountableFs);
+      case "pull":
+        return gitPull(match, mountableFs);
       case "log":
         return gitLog(match, subArgs);
       case "diff":
-        return gitDiff(match, subArgs);
+        return gitDiff(match, subArgs, mountableFs);
       case "branch":
         return gitBranch(match);
       case "remote":
         return gitRemote(match, subArgs);
       case "show":
-        return gitShow(match, subArgs);
+        return gitShow(match, subArgs, mountableFs);
       case "rev-parse":
         return gitRevParse(match, subArgs);
       default:

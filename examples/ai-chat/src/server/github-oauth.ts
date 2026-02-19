@@ -4,7 +4,24 @@ import {
   upsertCredential,
   D1FsAdapter
 } from "vfs";
-import { getSettings, upsertSettings as upsertSettingsDb } from "./db";
+
+async function readGithubConfig(
+  db: D1Database,
+  userId: string
+): Promise<{ client_id: string; client_secret: string } | null> {
+  const row = await db
+    .prepare(
+      "SELECT CAST(content AS TEXT) as content FROM files WHERE user_id=? AND path=?"
+    )
+    .bind(userId, "/etc/github.json")
+    .first<{ content: string | null }>();
+  if (!row?.content) return null;
+  try {
+    return JSON.parse(row.content);
+  } catch {
+    return null;
+  }
+}
 
 export async function handleGitHubOAuth(
   request: Request,
@@ -13,50 +30,20 @@ export async function handleGitHubOAuth(
 ): Promise<Response | null> {
   const url = new URL(request.url);
 
-  // GET /oauth/github/config — read config (never expose secret)
-  if (url.pathname === "/oauth/github/config" && request.method === "GET") {
-    const settings = await getSettings(env.DB, userId);
-    return Response.json({
-      clientId: settings?.github_client_id || "",
-      configured: !!(
-        settings?.github_client_id && settings?.github_client_secret
-      )
-    });
-  }
-
-  // POST /oauth/github/config — save config
-  if (url.pathname === "/oauth/github/config" && request.method === "POST") {
-    const body = (await request.json()) as {
-      clientId?: string;
-      clientSecret?: string;
-    };
-    const partial: Record<string, string | null> = {};
-    if (body.clientId !== undefined)
-      partial.github_client_id = body.clientId || null;
-    if (body.clientSecret !== undefined)
-      partial.github_client_secret = body.clientSecret || null;
-    await upsertSettingsDb(env.DB, userId, partial);
-    return Response.json({ ok: true });
-  }
-
   // GET /oauth/github — initiate OAuth flow
   if (url.pathname === "/oauth/github" && request.method === "GET") {
-    const settings = await getSettings(env.DB, userId);
-    const clientId = settings?.github_client_id;
-    const clientSecret = settings?.github_client_secret;
+    const config = await readGithubConfig(env.DB, userId);
+    const clientId = config?.client_id || env.GITHUB_CLIENT_ID;
+    const clientSecret = config?.client_secret || env.GITHUB_CLIENT_SECRET;
 
     if (!clientId || !clientSecret) {
-      // Fall back to env vars
-      if (!env.GITHUB_CLIENT_ID || !env.GITHUB_CLIENT_SECRET) {
-        return new Response("GitHub OAuth not configured", { status: 400 });
-      }
+      return new Response("GitHub OAuth not configured", { status: 400 });
     }
 
-    const secret = clientSecret || env.GITHUB_CLIENT_SECRET!;
-    const state = await generateOAuthState(userId, secret);
+    const state = await generateOAuthState(userId, clientSecret);
     const redirectUri = `${url.origin}/oauth/github/callback`;
     const ghUrl = new URL("https://github.com/login/oauth/authorize");
-    ghUrl.searchParams.set("client_id", clientId || env.GITHUB_CLIENT_ID!);
+    ghUrl.searchParams.set("client_id", clientId);
     ghUrl.searchParams.set("redirect_uri", redirectUri);
     ghUrl.searchParams.set("scope", "repo");
     ghUrl.searchParams.set("state", state);
@@ -71,10 +58,9 @@ export async function handleGitHubOAuth(
       return new Response("Missing code or state", { status: 400 });
     }
 
-    const settings = await getSettings(env.DB, userId);
-    const clientId = settings?.github_client_id || env.GITHUB_CLIENT_ID;
-    const clientSecret =
-      settings?.github_client_secret || env.GITHUB_CLIENT_SECRET;
+    const config = await readGithubConfig(env.DB, userId);
+    const clientId = config?.client_id || env.GITHUB_CLIENT_ID;
+    const clientSecret = config?.client_secret || env.GITHUB_CLIENT_SECRET;
 
     if (!clientId || !clientSecret) {
       return new Response("GitHub OAuth not configured", { status: 400 });

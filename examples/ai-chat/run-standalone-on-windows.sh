@@ -43,7 +43,9 @@ WIN_PS1="$(wslpath -w "$SCRIPT_DIR/run-standalone.ps1")"
 WIN_TEMP="$(cmd.exe /c "echo %TEMP%" 2>/dev/null | tr -d '\r')"
 WIN_PID_FILE="$(wslpath "$WIN_TEMP")/windows-agent-standalone.pid"
 
-powershell.exe -ExecutionPolicy Bypass -File "$WIN_PS1" \
+# Pipe a long-lived stdin so the node process can detect parent death (pipe close → exit).
+# Background `sleep` keeps the pipe open; when bash dies, sleep dies, pipe closes.
+(sleep 999999) | powershell.exe -ExecutionPolicy Bypass -File "$WIN_PS1" \
   -ProjectDir "$WIN_DIR" \
   -JustBashTarball "$WIN_TARBALL" \
   "$@" &

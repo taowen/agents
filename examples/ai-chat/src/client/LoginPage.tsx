@@ -17,7 +17,7 @@ export function LoginPage() {
   const [copied, setCopied] = useState(false);
   const [error, setError] = useState("");
   const [rejectReason, setRejectReason] = useState("");
-  const pollRef = useRef<ReturnType<typeof setInterval>>();
+  const pollRef = useRef<ReturnType<typeof setInterval> | undefined>(undefined);
 
   const stopPolling = useCallback(() => {
     if (pollRef.current) {

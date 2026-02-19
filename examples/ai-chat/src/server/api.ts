@@ -8,11 +8,8 @@ import {
   listSessions,
   createSession,
   updateSessionTitle,
-  deleteSession,
-  getSettings,
-  upsertSettings
+  deleteSession
 } from "./db";
-import type { UserSettings } from "./db";
 import { handleFileRoutes } from "./api-files";
 
 export async function handleApiRoutes(
@@ -94,36 +91,6 @@ export async function handleApiRoutes(
     if (!deleted) {
       return Response.json({ error: "Session not found" }, { status: 404 });
     }
-    return Response.json({ ok: true });
-  }
-
-  // GET /api/settings
-  if (url.pathname === "/api/settings" && request.method === "GET") {
-    const settings = await getSettings(env.DB, userId);
-    if (!settings) {
-      return Response.json({
-        llm_provider: "builtin"
-      });
-    }
-    // Mask secrets
-    return Response.json({
-      github_client_id: settings.github_client_id,
-      github_configured: !!(
-        settings.github_client_id && settings.github_client_secret
-      ),
-      llm_api_key_set: !!settings.llm_api_key,
-      llm_provider: settings.llm_provider ?? "builtin",
-      llm_base_url: settings.llm_base_url,
-      llm_model: settings.llm_model
-    });
-  }
-
-  // PUT /api/settings
-  if (url.pathname === "/api/settings" && request.method === "PUT") {
-    const body = (await request.json()) as Partial<
-      Omit<UserSettings, "user_id">
-    >;
-    await upsertSettings(env.DB, userId, body);
     return Response.json({ ok: true });
   }
 

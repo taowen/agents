@@ -99,7 +99,9 @@ export class HttpFsAdapter implements IFileSystem {
     _options?: WriteFileOptions | BufferEncoding
   ): Promise<void> {
     const body =
-      typeof content === "string" ? new TextEncoder().encode(content) : content;
+      typeof content === "string"
+        ? new TextEncoder().encode(content)
+        : (content as BodyInit);
     const resp = await fetch(
       this.baseUrl + `/api/files/content?path=${encodeURIComponent(path)}`,
       { method: "PUT", body }

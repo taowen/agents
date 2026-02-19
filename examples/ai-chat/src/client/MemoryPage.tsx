@@ -1,4 +1,4 @@
-import { useState, useEffect } from "react";
+import { useState } from "react";
 import {
   FloppyDiskIcon,
   ArrowLeftIcon,
@@ -7,6 +7,7 @@ import {
 } from "@phosphor-icons/react";
 import { Button, Text } from "@cloudflare/kumo";
 import { useMemory } from "./api";
+import { Skeleton } from "./Skeleton";
 
 interface MemoryPageProps {
   onBack: () => void;
@@ -14,22 +15,18 @@ interface MemoryPageProps {
 }
 
 export function MemoryPage({ onBack, onOpenSidebar }: MemoryPageProps) {
-  const { memory: fetchedMemory, mutateMemory } = useMemory();
+  const { memory, isLoading, mutateMemory } = useMemory();
 
-  const [memProfile, setMemProfile] = useState("");
-  const [memPreferences, setMemPreferences] = useState("");
-  const [memEntities, setMemEntities] = useState("");
+  // Dirty tracking: only track fields the user has explicitly changed
+  const [dirty, setDirty] = useState<Record<string, string>>({});
   const [saving, setSaving] = useState(false);
   const [saved, setSaved] = useState(false);
   const [error, setError] = useState("");
 
-  useEffect(() => {
-    if (fetchedMemory) {
-      setMemProfile(fetchedMemory.profile);
-      setMemPreferences(fetchedMemory.preferences);
-      setMemEntities(fetchedMemory.entities);
-    }
-  }, [fetchedMemory]);
+  const field = (key: string) =>
+    dirty[key] ?? memory?.[key as keyof typeof memory] ?? "";
+  const setField = (key: string, value: string) =>
+    setDirty((prev) => ({ ...prev, [key]: value }));
 
   const handleSave = async () => {
     setSaving(true);
@@ -40,14 +37,15 @@ export function MemoryPage({ onBack, onOpenSidebar }: MemoryPageProps) {
         method: "PUT",
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({
-          profile: memProfile,
-          preferences: memPreferences,
-          entities: memEntities
+          profile: field("profile"),
+          preferences: field("preferences"),
+          entities: field("entities")
         })
       });
       if (!res.ok) throw new Error(await res.text());
       setSaved(true);
       await mutateMemory();
+      setDirty({});
     } catch (e) {
       setError(e instanceof Error ? e.message : "Save failed");
     } finally {
@@ -94,12 +92,16 @@ export function MemoryPage({ onBack, onOpenSidebar }: MemoryPageProps) {
                 — name, role, background
               </span>
             </label>
-            <textarea
-              value={memProfile}
-              onChange={(e) => setMemProfile(e.target.value)}
-              placeholder="e.g. Name: Alice, Role: Frontend developer"
-              className={`${inputClass} min-h-[100px] resize-y`}
-            />
+            {isLoading ? (
+              <Skeleton className="h-[100px] w-full" />
+            ) : (
+              <textarea
+                value={field("profile")}
+                onChange={(e) => setField("profile", e.target.value)}
+                placeholder="e.g. Name: Alice, Role: Frontend developer"
+                className={`${inputClass} min-h-[100px] resize-y`}
+              />
+            )}
           </div>
 
           <div className="rounded-xl ring ring-kumo-line bg-kumo-base p-5">
@@ -109,12 +111,18 @@ export function MemoryPage({ onBack, onOpenSidebar }: MemoryPageProps) {
                 — coding style, communication habits
               </span>
             </label>
-            <textarea
-              value={memPreferences}
-              onChange={(e) => setMemPreferences(e.target.value)}
-              placeholder={"e.g. - Prefers TypeScript\n- Likes concise answers"}
-              className={`${inputClass} min-h-[100px] resize-y`}
-            />
+            {isLoading ? (
+              <Skeleton className="h-[100px] w-full" />
+            ) : (
+              <textarea
+                value={field("preferences")}
+                onChange={(e) => setField("preferences", e.target.value)}
+                placeholder={
+                  "e.g. - Prefers TypeScript\n- Likes concise answers"
+                }
+                className={`${inputClass} min-h-[100px] resize-y`}
+              />
+            )}
           </div>
 
           <div className="rounded-xl ring ring-kumo-line bg-kumo-base p-5">
@@ -124,14 +132,18 @@ export function MemoryPage({ onBack, onOpenSidebar }: MemoryPageProps) {
                 — projects, people, companies
               </span>
             </label>
-            <textarea
-              value={memEntities}
-              onChange={(e) => setMemEntities(e.target.value)}
-              placeholder={
-                "e.g. - Project: ai-chat (Cloudflare Workers app)\n- Company: Acme Corp"
-              }
-              className={`${inputClass} min-h-[100px] resize-y`}
-            />
+            {isLoading ? (
+              <Skeleton className="h-[100px] w-full" />
+            ) : (
+              <textarea
+                value={field("entities")}
+                onChange={(e) => setField("entities", e.target.value)}
+                placeholder={
+                  "e.g. - Project: ai-chat (Cloudflare Workers app)\n- Company: Acme Corp"
+                }
+                className={`${inputClass} min-h-[100px] resize-y`}
+              />
+            )}
           </div>
 
           <div className="flex items-center gap-3">

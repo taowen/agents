@@ -1,10 +1,13 @@
+import type { MountableFs } from "just-bash";
 import type { GitResult, GitMount } from "./helpers";
+import { generateUnifiedDiff } from "./diff";
 
 export async function gitShow(
   match: GitMount,
-  args: string[]
+  args: string[],
+  mountableFs?: MountableFs
 ): Promise<GitResult> {
-  const { gitFs } = match;
+  const { gitFs, mountPoint } = match;
   const stat = args.includes("--stat");
 
   const entries = await gitFs.getLog(1);
@@ -40,6 +43,20 @@ export async function gitShow(
       lines.push(
         ` ${allPaths.length} file${allPaths.length !== 1 ? "s" : ""} changed`
       );
+    }
+  } else if (mountableFs) {
+    // Show unified diff for current overlay changes
+    const status = await gitFs.getStatus();
+    const allPaths = [...status.added, ...status.modified, ...status.deleted];
+    if (allPaths.length > 0) {
+      lines.push("");
+      const diffOutput = await generateUnifiedDiff(
+        gitFs,
+        mountableFs,
+        mountPoint,
+        status
+      );
+      lines.push(diffOutput);
     }
   }
 

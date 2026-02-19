@@ -406,10 +406,6 @@ async function handleAnnotate(
         X: String(Math.round(x)),
         Y: String(Math.round(y))
       };
-      if (params.normX !== undefined && params.normY !== undefined) {
-        env.NORM_X = String(params.normX);
-        env.NORM_Y = String(params.normY);
-      }
       const { stdout } = await runPowerShell(script("annotate-image.ps1"), {
         timeout: 15000,
         maxBuffer: 20 * 1024 * 1024,

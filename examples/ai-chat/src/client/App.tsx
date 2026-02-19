@@ -8,6 +8,7 @@ import { AgentActivityPanel } from "./AgentActivityPanel";
 import { useBridge } from "./use-bridge";
 import { useBridgeViewer } from "./use-bridge-viewer";
 import { useAuth, useSessions } from "./api";
+import { AppShellSkeleton } from "./Skeleton";
 import "./windows-agent.css";
 
 export interface UserInfo {
@@ -107,11 +108,13 @@ function AuthenticatedApp({
           if (!confirmed) return;
         }
       }
-      await deleteSession(id);
+      // Switch active session BEFORE deleting so the Chat component
+      // transitions in the same render as the sidebar update, avoiding a flash.
       if (activeSessionId === id) {
         const remaining = (sessions ?? []).filter((s) => s.id !== id);
         setActiveSessionId(remaining.length > 0 ? remaining[0].id : null);
       }
+      await deleteSession(id);
     } catch (e) {
       console.error("Failed to delete session:", e);
     }
@@ -139,6 +142,7 @@ function AuthenticatedApp({
     sessions: sessions ?? [],
     activeSessionId,
     user,
+    isLoading,
     onNewSession: () => {
       handleNewSession();
       setSidebarOpen(false);
@@ -204,8 +208,9 @@ function AuthenticatedApp({
               onOpenSidebar={() => setSidebarOpen(true)}
             />
           ) : (
-            <div className="flex items-center justify-center h-full text-kumo-inactive">
-              Loading...
+            <div className="flex-1 flex flex-col items-center justify-center gap-3 p-8">
+              <div className="animate-pulse rounded bg-kumo-elevated h-4 w-48" />
+              <div className="animate-pulse rounded bg-kumo-elevated h-4 w-32" />
             </div>
           )}
         </div>
@@ -228,11 +233,7 @@ export default function App() {
   const enableBridge = !!window.workWithWindows;
 
   if (isLoading) {
-    return (
-      <div className="flex items-center justify-center h-screen text-kumo-inactive">
-        Loading...
-      </div>
-    );
+    return <AppShellSkeleton />;
   }
 
   if (!authenticated) {
@@ -240,13 +241,7 @@ export default function App() {
   }
 
   return (
-    <Suspense
-      fallback={
-        <div className="flex items-center justify-center h-screen text-kumo-inactive">
-          Loading...
-        </div>
-      }
-    >
+    <Suspense fallback={<AppShellSkeleton />}>
       <AuthenticatedApp user={user!} enableBridge={enableBridge} />
     </Suspense>
   );

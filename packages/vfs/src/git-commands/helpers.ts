@@ -7,7 +7,7 @@ export const VERSION = "git version 2.47.0 (vfs)\n";
 export const USAGE_TEXT = `usage: git <command>
 
 Available commands:
-  clone  status  commit  push  log  diff  branch  remote  show  rev-parse  version
+  clone  status  commit  push  pull  log  diff  branch  remote  show  rev-parse  version
 `;
 
 export function stripLeadingSlash(path: string): string {

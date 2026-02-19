@@ -311,9 +311,18 @@ export class MCPClientManager {
         }
       }
 
-      const parsedOptions: MCPServerOptions | null = server.server_options
-        ? JSON.parse(server.server_options)
-        : null;
+      let parsedOptions: MCPServerOptions | null = null;
+      if (server.server_options) {
+        try {
+          parsedOptions = JSON.parse(server.server_options);
+        } catch (e) {
+          console.error(
+            `[MCPClientManager] Failed to parse server_options for ${server.id}:`,
+            e
+          );
+          continue;
+        }
+      }
 
       const authProvider = this.createAuthProvider(
         server.id,
@@ -978,9 +987,10 @@ export class MCPClientManager {
       }
     }
 
-    return Object.fromEntries(
-      getNamespacedData(this.mcpConnections, "tools").map((tool) => {
-        return [
+    const entries: [string, unknown][] = [];
+    for (const tool of getNamespacedData(this.mcpConnections, "tools")) {
+      try {
+        entries.push([
           `tool_${tool.serverId.replace(/-/g, "")}_${tool.name}`,
           {
             description: tool.description,
@@ -1003,14 +1013,22 @@ export class MCPClientManager {
               }
               return result;
             },
-            inputSchema: this.jsonSchema!(tool.inputSchema as JSONSchema7),
+            inputSchema: tool.inputSchema
+              ? this.jsonSchema!(tool.inputSchema as JSONSchema7)
+              : undefined,
             outputSchema: tool.outputSchema
               ? this.jsonSchema!(tool.outputSchema as JSONSchema7)
               : undefined
           }
-        ];
-      })
-    );
+        ]);
+      } catch (e) {
+        console.error(
+          `[getAITools] Failed to map tool "${tool.name}" from server "${tool.serverId}":`,
+          e
+        );
+      }
+    }
+    return Object.fromEntries(entries);
   }
 
   /**

@@ -177,6 +177,7 @@ export function Chat({
             <Button
               variant="secondary"
               shape="square"
+              aria-label="Clear history"
               icon={<TrashIcon size={16} />}
               onClick={clearHistory}
               className="sm:hidden"

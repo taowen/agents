@@ -26,11 +26,8 @@ const bashToolDef = tool({
 const screenToolDef = tool({
   description:
     "Control the Windows desktop screen. Take screenshots, click, type, press keys, move mouse, and scroll. " +
-    "Use 'screenshot' first to see what's on screen, then interact with elements using normalized 0-1000 coordinates. " +
-    "IMPORTANT: Coordinates are RELATIVE POSITIONS, not pixel sizes. " +
-    "x=0 means the left edge, x=999 means the right edge, y=0 means the top edge, y=999 means the bottom edge. " +
-    "For example, the center of the image is always (500, 500) regardless of the image's actual pixel dimensions. " +
-    "The system automatically converts these relative positions to actual pixel positions. " +
+    "Each action automatically returns a follow-up screenshot showing the result. " +
+    "Coordinates use a 0-999 grid: (0,0)=top-left corner, (999,999)=bottom-right corner, (500,500)=center. " +
     "Use 'annotate' with x,y to draw a red crosshair on the last screenshot — verify your target before clicking.",
   inputSchema: z.object({
     action: z
@@ -47,11 +44,11 @@ const screenToolDef = tool({
     x: z
       .number()
       .optional()
-      .describe("X coordinate in normalized 0-1000 range"),
+      .describe("X position in 0-999 range (0=left edge, 999=right edge)"),
     y: z
       .number()
       .optional()
-      .describe("Y coordinate in normalized 0-1000 range"),
+      .describe("Y position in 0-999 range (0=top edge, 999=bottom edge)"),
     text: z.string().optional().describe("Text to type"),
     key: z.string().optional().describe("Key name to press"),
     modifiers: z.array(z.string()).optional().describe("Modifier keys"),
@@ -61,7 +58,12 @@ const screenToolDef = tool({
       .describe("Mouse button"),
     doubleClick: z.boolean().optional().describe("Double-click"),
     direction: z.enum(["up", "down"]).optional().describe("Scroll direction"),
-    amount: z.number().optional().describe("Scroll amount")
+    amount: z
+      .number()
+      .optional()
+      .describe(
+        "Scroll wheel notches (default 3, use 30-50 to scroll through long pages or chat history)"
+      )
   })
 });
 
@@ -102,10 +104,10 @@ const SYSTEM_PROMPT =
   "You have a 'win' tool for window management: list_windows, focus/activate, move/resize, minimize/maximize/restore, window_screenshot.\n" +
   "\n" +
   "COORDINATE SYSTEM:\n" +
-  "Coordinates are RELATIVE POSITIONS in range 0-999, NOT pixel values.\n" +
-  "x=0 is the left edge, x=999 is the right edge. y=0 is the top edge, y=999 is the bottom edge.\n" +
-  "The image center is always (500,500) no matter the actual image size.\n" +
-  "Example: a button at 70% from left and 85% from top → x=700, y=850.\n" +
+  "All coordinates use a 0-999 grid mapped to the screenshot image.\n" +
+  "(0,0) = top-left corner, (999,999) = bottom-right corner, (500,500) = center.\n" +
+  "Examples: top-right corner = (999,0), bottom-left corner = (0,999).\n" +
+  "A button at roughly 70% from left and 85% from top → x=700, y=850.\n" +
   "\n" +
   "SCREENSHOT STRATEGY:\n" +
   "PREFER win({ action: 'window_screenshot', handle }) over screen({ action: 'screenshot' }).\n" +
@@ -116,12 +118,13 @@ const SYSTEM_PROMPT =
   "then use win({ action: 'window_screenshot', handle }) to capture just that window.\n" +
   "\n" +
   "WORKFLOW RULES:\n" +
-  "1. Take a screenshot before every action. Never assume previous action succeeded.\n" +
-  "2. After each click or key_press, take another screenshot to verify.\n" +
-  "3. If wrong window is in front, use win({ action: 'focus_window' }) then screenshot again.\n" +
+  "1. Every action (click, type, key_press, scroll, mouse_move) automatically includes a follow-up screenshot — you see the result immediately without calling screenshot again.\n" +
+  "2. Only call screenshot/window_screenshot explicitly when you need to see the screen for the FIRST time or after switching windows.\n" +
+  "3. If wrong window is in front, use win({ action: 'focus_window' }) then the follow-up screenshot will show the new state.\n" +
   "4. Use coordinates from the MOST RECENT screenshot only.\n" +
   "5. Before clicking, use screen({ action: 'annotate', x, y }) to verify target coords.\n" +
-  "6. Do NOT include base64 image data in your text response.";
+  "6. Do NOT include base64 image data in your text response.\n" +
+  "7. When scrolling, ALWAYS provide x,y coordinates pointing to the CENTER of the area you want to scroll (e.g. the chat message area, not the sidebar). Use a small amount (3-5) so you don't skip content.";
 
 // ---- Logging helpers ----
 
@@ -151,7 +154,8 @@ function formatScreenLog(
     return `[agent] screen: annotate ${norm}${pixel} → ${result.width}x${result.height}`;
   }
   if (action === "scroll") {
-    return `[agent] screen: scroll ${result.direction} ${result.amount}${result.desktopX !== undefined ? ` at desktop(${result.desktopX},${result.desktopY})` : ""} → success`;
+    const norm = normX !== undefined ? `norm(${normX},${normY})→` : "";
+    return `[agent] screen: scroll ${result.direction} ${result.amount}${norm ? ` at ${norm}` : ""}${result.desktopX !== undefined ? `desktop(${result.desktopX},${result.desktopY})` : ""} → success`;
   }
   return `[agent] screen: ${action} → success`;
 }
@@ -216,7 +220,55 @@ export function createAgentLoop(config: AgentLoopConfig): AgentLoop {
   let lastScreenshotWidth = 0;
   let lastScreenshotHeight = 0;
   let lastScreenshotIsWindow = false;
+  let lastWindowHandle: number | null = null;
 
+  /** Take a follow-up screenshot after an action, reusing the last screenshot mode. */
+  async function autoScreenshot(
+    onLog?: (msg: string) => void
+  ): Promise<ScreenControlResult | null> {
+    await new Promise((r) => setTimeout(r, 300)); // wait for UI update
+    try {
+      if (lastScreenshotIsWindow && lastWindowHandle) {
+        const result = await executeScreenControl({
+          action: "window_screenshot",
+          handle: lastWindowHandle
+        });
+        onLog?.(
+          `[agent] autoScreenshot: window_screenshot handle=${lastWindowHandle} → ${result.success ? `${result.width}x${result.height}` : result.error}`
+        );
+        return result;
+      }
+      const result = await executeScreenControl({ action: "screenshot" });
+      onLog?.(
+        `[agent] autoScreenshot: screenshot → ${result.success ? `${result.width}x${result.height}` : result.error}`
+      );
+      return result;
+    } catch (e) {
+      onLog?.(`[agent] autoScreenshot: error → ${e}`);
+      return null;
+    }
+  }
+
+  /** Remove old screenshot images from history to prevent token bloat. */
+  function stripOldImages(): void {
+    for (const msg of history) {
+      if (msg.role !== "user" || typeof msg.content === "string") continue;
+      const parts = msg.content as unknown as Array<{
+        type: string;
+        [k: string]: unknown;
+      }>;
+      for (let i = parts.length - 1; i >= 0; i--) {
+        if (parts[i].type === "image") {
+          parts[i] = {
+            type: "text",
+            text: "[Previous screenshot removed]"
+          } as any;
+        }
+      }
+    }
+  }
+
+  /** Convert 0-999 normalized coordinates to pixel coordinates. */
   function normToPixel(normX: number, normY: number): { x: number; y: number } {
     return {
       x: Math.round((normX / 1000) * lastScreenshotWidth),
@@ -305,8 +357,6 @@ export function createAgentLoop(config: AgentLoopConfig): AgentLoop {
           toolResultContent = JSON.stringify(bashResult);
         } else if (tc.toolName === "screen") {
           const screenArgs = tc.args as unknown as ScreenControlParams;
-          let logNormX: number | undefined;
-          let logNormY: number | undefined;
 
           // Normalize action aliases
           const originalAction = screenArgs.action;
@@ -315,7 +365,9 @@ export function createAgentLoop(config: AgentLoopConfig): AgentLoop {
             screenArgs.doubleClick = true;
           }
 
-          // Convert normalized 0-1000 coords to pixel coords
+          // Coordinate conversion: 0-999 normalized → pixel
+          let savedNormX: number | undefined;
+          let savedNormY: number | undefined;
           const coordActions = ["click", "mouse_move", "scroll", "annotate"];
           if (
             coordActions.includes(screenArgs.action) &&
@@ -324,26 +376,19 @@ export function createAgentLoop(config: AgentLoopConfig): AgentLoop {
             lastScreenshotWidth > 0 &&
             lastScreenshotHeight > 0
           ) {
-            logNormX = screenArgs.x;
-            logNormY = screenArgs.y;
-            const pixel = normToPixel(screenArgs.x, screenArgs.y);
+            savedNormX = screenArgs.x;
+            savedNormY = screenArgs.y;
 
-            // Bounds check: reject clicks outside window when in window-screenshot mode
+            // Range check: normalized coordinates must be 0-999
             if (
-              lastScreenshotIsWindow &&
-              screenArgs.action !== "annotate" &&
-              (pixel.x < 0 ||
-                pixel.x >= lastScreenshotWidth ||
-                pixel.y < 0 ||
-                pixel.y >= lastScreenshotHeight)
+              savedNormX < 0 ||
+              savedNormX > 999 ||
+              savedNormY < 0 ||
+              savedNormY > 999
             ) {
-              const errMsg =
-                `Error: coordinates out of bounds. ` +
-                `Normalized (${logNormX}, ${logNormY}) → pixel (${pixel.x}, ${pixel.y}) ` +
-                `is outside window (${lastScreenshotWidth}x${lastScreenshotHeight}). ` +
-                `Your coordinates are wrong — use values within 0-999 that correspond to positions inside the window screenshot.`;
+              const errMsg = `Error: coordinates out of range. x=${savedNormX}, y=${savedNormY}. Use values 0-999.`;
               onLog?.(
-                `[agent] screen: ${screenArgs.action} → REJECTED out-of-bounds`
+                `[agent] screen: ${screenArgs.action} → REJECTED out-of-range`
               );
               history.push({
                 role: "tool" as const,
@@ -359,6 +404,8 @@ export function createAgentLoop(config: AgentLoopConfig): AgentLoop {
               continue;
             }
 
+            // Convert to pixel coordinates
+            const pixel = normToPixel(savedNormX, savedNormY);
             screenArgs.x = pixel.x;
             screenArgs.y = pixel.y;
           }
@@ -366,10 +413,6 @@ export function createAgentLoop(config: AgentLoopConfig): AgentLoop {
           // Inject stored screenshot for annotate action
           if (screenArgs.action === "annotate" && lastScreenshotBase64) {
             screenArgs.base64 = lastScreenshotBase64;
-            if (logNormX !== undefined) {
-              screenArgs.normX = logNormX;
-              screenArgs.normY = logNormY;
-            }
           }
 
           const screenResult = await executeScreenControl(screenArgs);
@@ -377,7 +420,7 @@ export function createAgentLoop(config: AgentLoopConfig): AgentLoop {
             ...screenResult,
             action: screenArgs.action
           };
-          onLog?.(formatScreenLog(resultWithAction, logNormX, logNormY));
+          onLog?.(formatScreenLog(resultWithAction, savedNormX, savedNormY));
 
           const lines: string[] = [];
           lines.push(
@@ -385,17 +428,80 @@ export function createAgentLoop(config: AgentLoopConfig): AgentLoop {
           );
           if (resultWithAction.error)
             lines.push(`Error: ${resultWithAction.error}`);
-          if (resultWithAction.width && resultWithAction.height)
+          if (
+            resultWithAction.action === "annotate" &&
+            savedNormX !== undefined
+          ) {
+            lines.push(`Annotated at (${savedNormX}, ${savedNormY}).`);
             lines.push(
-              `Screen: ${resultWithAction.width}x${resultWithAction.height}`
+              `If the crosshair is on the correct target, click with x=${savedNormX}, y=${savedNormY} (use these EXACT numbers).`
             );
+          }
           toolResultContent = lines.join("\n");
+
+          // Auto-screenshot after interactive actions
+          const autoScreenshotActions = [
+            "click",
+            "scroll",
+            "type",
+            "key_press",
+            "mouse_move"
+          ];
+          if (
+            autoScreenshotActions.includes(resultWithAction.action) &&
+            resultWithAction.success
+          ) {
+            const autoResult = await autoScreenshot(onLog);
+            if (autoResult?.success && autoResult.base64) {
+              // Update stored screenshot state
+              lastScreenshotBase64 = autoResult.base64;
+              if (autoResult.width && autoResult.height) {
+                lastScreenshotWidth = autoResult.width;
+                lastScreenshotHeight = autoResult.height;
+              }
+
+              onScreenshot?.(
+                currentStep,
+                resultWithAction.action + "+auto_screenshot",
+                autoResult.base64
+              );
+
+              history.push({
+                role: "tool" as const,
+                content: [
+                  {
+                    type: "tool-result" as const,
+                    toolCallId: tc.toolCallId,
+                    toolName: tc.toolName,
+                    output: { type: "text", value: toolResultContent }
+                  }
+                ]
+              });
+              stripOldImages();
+              history.push({
+                role: "user",
+                content: [
+                  {
+                    type: "text",
+                    text: "Here is the screenshot after the action:"
+                  },
+                  {
+                    type: "image",
+                    image: autoResult.base64,
+                    mediaType: "image/png"
+                  }
+                ]
+              });
+              continue;
+            }
+          }
 
           if (resultWithAction.base64) {
             // Store for future annotate/coord conversion (but not from annotate itself)
             if (resultWithAction.action !== "annotate") {
               lastScreenshotBase64 = resultWithAction.base64;
               lastScreenshotIsWindow = false;
+              lastWindowHandle = null;
               if (resultWithAction.width && resultWithAction.height) {
                 lastScreenshotWidth = resultWithAction.width;
                 lastScreenshotHeight = resultWithAction.height;
@@ -419,6 +525,7 @@ export function createAgentLoop(config: AgentLoopConfig): AgentLoop {
                 }
               ]
             });
+            stripOldImages();
             history.push({
               role: "user",
               content: [
@@ -459,19 +566,12 @@ export function createAgentLoop(config: AgentLoopConfig): AgentLoop {
             resultWithAction.action === "window_screenshot" &&
             resultWithAction.base64
           ) {
-            const lines: string[] = [];
-            lines.push(
-              `Action: window_screenshot | Success: ${resultWithAction.success}`
-            );
-            if (resultWithAction.width && resultWithAction.height)
-              lines.push(
-                `Window size: ${resultWithAction.width}x${resultWithAction.height}`
-              );
-            toolResultContent = lines.join("\n");
+            toolResultContent = `Action: window_screenshot | Success: ${resultWithAction.success}`;
 
             // Store for future annotate/coord conversion
             lastScreenshotBase64 = resultWithAction.base64;
             lastScreenshotIsWindow = true;
+            lastWindowHandle = (winArgs.handle as number) ?? null;
             if (resultWithAction.width && resultWithAction.height) {
               lastScreenshotWidth = resultWithAction.width;
               lastScreenshotHeight = resultWithAction.height;
@@ -494,6 +594,7 @@ export function createAgentLoop(config: AgentLoopConfig): AgentLoop {
                 }
               ]
             });
+            stripOldImages();
             history.push({
               role: "user",
               content: [
@@ -515,6 +616,69 @@ export function createAgentLoop(config: AgentLoopConfig): AgentLoop {
               lines.push(`Error: ${resultWithAction.error}`);
             if (resultWithAction.message) lines.push(resultWithAction.message);
             toolResultContent = lines.join("\n");
+
+            // Auto-screenshot after window management actions
+            const winAutoActions = [
+              "focus_window",
+              "resize_window",
+              "maximize_window",
+              "restore_window"
+            ];
+            if (
+              winAutoActions.includes(resultWithAction.action) &&
+              resultWithAction.success
+            ) {
+              // If focus_window was called with a handle, use it for window_screenshot
+              if (
+                resultWithAction.action === "focus_window" &&
+                winArgs.handle
+              ) {
+                lastWindowHandle = winArgs.handle as number;
+                lastScreenshotIsWindow = true;
+              }
+              const autoResult = await autoScreenshot(onLog);
+              if (autoResult?.success && autoResult.base64) {
+                lastScreenshotBase64 = autoResult.base64;
+                if (autoResult.width && autoResult.height) {
+                  lastScreenshotWidth = autoResult.width;
+                  lastScreenshotHeight = autoResult.height;
+                }
+
+                onScreenshot?.(
+                  currentStep,
+                  resultWithAction.action + "+auto_screenshot",
+                  autoResult.base64
+                );
+
+                history.push({
+                  role: "tool" as const,
+                  content: [
+                    {
+                      type: "tool-result" as const,
+                      toolCallId: tc.toolCallId,
+                      toolName: tc.toolName,
+                      output: { type: "text", value: toolResultContent }
+                    }
+                  ]
+                });
+                stripOldImages();
+                history.push({
+                  role: "user",
+                  content: [
+                    {
+                      type: "text",
+                      text: "Here is the screenshot after the action:"
+                    },
+                    {
+                      type: "image",
+                      image: autoResult.base64,
+                      mediaType: "image/png"
+                    }
+                  ]
+                });
+                continue;
+              }
+            }
           }
         } else {
           toolResultContent = "Unknown tool";
@@ -566,6 +730,7 @@ export function createAgentLoop(config: AgentLoopConfig): AgentLoop {
     lastScreenshotWidth = 0;
     lastScreenshotHeight = 0;
     lastScreenshotIsWindow = false;
+    lastWindowHandle = null;
   }
 
   return { runAgent, reset };

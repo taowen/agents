@@ -3,13 +3,34 @@
  * for the authenticated user, so the client can call the LLM provider directly.
  */
 
-import { getSettings } from "./db";
-
 export interface LlmConfig {
   provider: "openai-compatible" | "google";
   baseURL: string;
   apiKey: string;
   model: string;
+}
+
+async function readLlmConfig(
+  db: D1Database,
+  userId: string
+): Promise<{
+  provider: string;
+  api_key: string;
+  base_url: string;
+  model: string;
+} | null> {
+  const row = await db
+    .prepare(
+      "SELECT CAST(content AS TEXT) as content FROM files WHERE user_id=? AND path=?"
+    )
+    .bind(userId, "/etc/llm.json")
+    .first<{ content: string | null }>();
+  if (!row?.content) return null;
+  try {
+    return JSON.parse(row.content);
+  } catch {
+    return null;
+  }
 }
 
 export async function handleLlmRoutes(
@@ -21,34 +42,34 @@ export async function handleLlmRoutes(
 
   // GET /api/llm/config — return full LLM config for client-side direct calls
   if (url.pathname === "/api/llm/config" && request.method === "GET") {
-    const settings = await getSettings(env.DB, userId);
-    const llmProvider = settings?.llm_provider ?? "builtin";
+    const fileConfig = await readLlmConfig(env.DB, userId);
 
     let config: LlmConfig;
 
-    if (llmProvider === "builtin") {
+    if (!fileConfig) {
+      // Builtin
       config = {
         provider: "openai-compatible",
         baseURL: "https://ark.cn-beijing.volces.com/api/v3",
         apiKey: env.ARK_API_KEY,
         model: "doubao-seed-2-0-pro-260215"
       };
-    } else if (llmProvider === "openai-compatible") {
+    } else if (fileConfig.provider === "openai-compatible") {
       config = {
         provider: "openai-compatible",
-        baseURL: settings?.llm_base_url || "",
-        apiKey: settings?.llm_api_key || "",
-        model: settings?.llm_model || ""
+        baseURL: fileConfig.base_url || "",
+        apiKey: fileConfig.api_key || "",
+        model: fileConfig.model || ""
       };
     } else {
       // google
       config = {
         provider: "google",
         baseURL:
-          settings?.llm_base_url ||
+          fileConfig.base_url ||
           "https://generativelanguage.googleapis.com/v1beta",
-        apiKey: settings?.llm_api_key || env.GOOGLE_AI_API_KEY,
-        model: settings?.llm_model || "gemini-2.0-flash"
+        apiKey: fileConfig.api_key || env.GOOGLE_AI_API_KEY,
+        model: fileConfig.model || "gemini-2.0-flash"
       };
     }
 

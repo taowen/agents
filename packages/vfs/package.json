@@ -5,6 +5,7 @@
   "type": "module",
   "main": "src/index.ts",
   "dependencies": {
+    "diff": "^8.0.2",
     "isomorphic-git": "^1.27.2",
     "just-bash": "file:../just-bash"
   },

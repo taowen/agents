@@ -2,7 +2,10 @@ import useSWR from "swr";
 import type { SessionInfo } from "./SessionSidebar";
 import type { UserInfo } from "./App";
 
-const fetcher = (url: string) => fetch(url).then((r) => r.json());
+const fetcher = async <T = any>(url: string): Promise<T> => {
+  const res = await fetch(url);
+  return res.json() as Promise<T>;
+};
 
 // --- Auth ---
 
@@ -69,24 +72,46 @@ export function useSessions() {
   };
 }
 
-// --- Settings ---
+// --- /etc JSON fetcher (shared by LLM, GitHub, MCP hooks) ---
 
-export interface Settings {
-  github_client_id?: string;
-  github_configured?: boolean;
-  llm_api_key_set?: boolean;
-  llm_provider?: string;
-  llm_base_url?: string;
-  llm_model?: string;
+const etcJsonFetcher = async (url: string) => {
+  const res = await fetch(url);
+  if (res.status === 404) return null;
+  if (!res.ok) throw new Error(`HTTP ${res.status}`);
+  const buf = await res.arrayBuffer();
+  return JSON.parse(new TextDecoder().decode(buf));
+};
+
+// --- LLM Config ---
+
+export interface LlmFileConfig {
+  provider: string;
+  api_key: string;
+  base_url: string;
+  model: string;
 }
 
-export function useSettings() {
-  const {
-    data: settings,
-    isLoading,
-    mutate: mutateSettings
-  } = useSWR<Settings>("/api/settings", fetcher);
-  return { settings, isLoading, mutateSettings };
+export function useLlmConfig() {
+  const { data, isLoading, mutate } = useSWR<LlmFileConfig | null>(
+    "/api/files/content?path=%2Fetc%2Fllm.json",
+    etcJsonFetcher
+  );
+  return { llmConfig: data ?? null, isLoading, mutateLlmConfig: mutate };
+}
+
+// --- GitHub Config ---
+
+export interface GithubFileConfig {
+  client_id: string;
+  client_secret: string;
+}
+
+export function useGithubConfig() {
+  const { data, isLoading, mutate } = useSWR<GithubFileConfig | null>(
+    "/api/files/content?path=%2Fetc%2Fgithub.json",
+    etcJsonFetcher
+  );
+  return { githubConfig: data ?? null, isLoading, mutateGithubConfig: mutate };
 }
 
 // --- Memory ---
@@ -104,4 +129,20 @@ export function useMemory() {
     mutate: mutateMemory
   } = useSWR<MemoryFiles>("/api/memory", fetcher);
   return { memory, isLoading, mutateMemory };
+}
+
+// --- MCP Servers ---
+
+export interface McpServerEntry {
+  name: string;
+  url: string;
+  headers?: Record<string, string>;
+}
+
+export function useMcpServers() {
+  const { data, isLoading, mutate } = useSWR<McpServerEntry[]>(
+    "/api/files/content?path=%2Fetc%2Fmcp-servers.json",
+    (u: string) => etcJsonFetcher(u).then((d) => d ?? [])
+  );
+  return { mcpServers: data ?? [], isLoading, mutateMcpServers: mutate };
 }

@@ -5,7 +5,7 @@ import { GearIcon, CheckCircleIcon, XCircleIcon } from "@phosphor-icons/react";
 
 type ToolUIPart = Extract<
   UIMessage["parts"][number],
-  { type: "tool-invocation" }
+  { type: `tool-${string}` } | { type: "dynamic-tool" }
 >;
 
 function BashToolOutput({ part }: { part: ToolUIPart }) {

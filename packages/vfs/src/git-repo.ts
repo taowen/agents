@@ -400,6 +400,11 @@ export class GitRepo {
     return blob;
   }
 
+  async readBlobUtf8(filepath: string): Promise<string> {
+    const blob = await this.readBlob(filepath);
+    return new TextDecoder().decode(blob);
+  }
+
   async findEntry(filepath: string): Promise<GitTreeEntry | null> {
     const normalized = normalizePath(filepath);
     if (normalized === "/") {
@@ -530,6 +535,82 @@ export class GitRepo {
 
     this.remoteOid = this.commitOid;
     await this.saveMetadata();
+  }
+
+  async pull(
+    onAuth?: () => { username: string; password?: string }
+  ): Promise<{ updated: boolean; fromOid: string; toOid: string }> {
+    await this.ensureInitialized();
+
+    const fromOid = this.commitOid!;
+
+    // Reject pull if there are unpushed local commits
+    if (this.hasUnpushedCommits()) {
+      throw new Error("pull with local commits not supported, push first");
+    }
+
+    // Extract short branch name (ref may be "refs/heads/main" or just "main")
+    const branch = this.ref
+      ? this.ref.startsWith("refs/heads/")
+        ? this.ref.slice("refs/heads/".length)
+        : this.ref
+      : "main";
+
+    // Fetch latest from remote
+    await git.fetch({
+      fs: this.memFs,
+      http: this.httpTransport,
+      dir: GitRepo.DIR,
+      gitdir: GitRepo.GITDIR,
+      ref: branch,
+      singleBranch: true,
+      onAuth: onAuth ?? this.onAuth,
+      cache: this.cache
+    });
+
+    // Resolve the fetched remote ref
+    let latestOid: string;
+    try {
+      latestOid = await git.resolveRef({
+        fs: this.memFs,
+        gitdir: GitRepo.GITDIR,
+        ref: `refs/remotes/origin/${branch}`
+      });
+    } catch {
+      // Fallback: try refs/heads directly
+      latestOid = await git.resolveRef({
+        fs: this.memFs,
+        gitdir: GitRepo.GITDIR,
+        ref: `refs/heads/${branch}`
+      });
+    }
+
+    if (latestOid === fromOid) {
+      return { updated: false, fromOid, toOid: fromOid };
+    }
+
+    // Fast-forward: update commitOid + remoteOid, clear tree cache
+    this.commitOid = latestOid;
+    this.remoteOid = latestOid;
+    this.treeCache.clear();
+
+    // Read commit timestamp
+    const [commit] = await git.log({
+      fs: this.memFs,
+      gitdir: GitRepo.GITDIR,
+      ref: latestOid,
+      depth: 1,
+      cache: this.cache
+    });
+    if (commit) {
+      this.commitMtime = new Date(commit.commit.committer.timestamp * 1000);
+    }
+
+    // Persist to R2
+    await this.savePackToR2();
+    await this.saveMetadata();
+
+    return { updated: true, fromOid, toOid: latestOid };
   }
 
   // ---- Internal helpers ----

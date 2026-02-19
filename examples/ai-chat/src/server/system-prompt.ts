@@ -48,6 +48,7 @@ export function buildSystemPrompt(): string {
       "Do NOT mount inside /home/user as it would conflict with persistent storage. " +
       "For private repos: if a GitHub account is connected (via Settings), authentication is automatic. " +
       "Git mounts are read-write. Changes are NOT auto-committed — use git status/commit/push explicitly. " +
+      "git pull fetches remote updates (fast-forward only; push local commits first if ahead). " +
       "No staging area: all pending changes are included in the next commit.",
 
     // Google Drive mounts
@@ -102,7 +103,12 @@ export function buildSystemPrompt(): string {
       "The remote agent runs on the user's local machine, can see the screen, control mouse/keyboard, and execute commands. " +
       "It maintains conversation context across calls — you can give follow-up instructions (e.g. 'open notepad' then 'type hello'). " +
       "Describe what you want done in natural language. The remote agent processes screenshots locally and returns a text summary. " +
-      "Check the dynamic context at the start of the conversation to see which devices are connected."
+      "Check the dynamic context at the start of the conversation to see which devices are connected.",
+
+    // MCP servers
+    "External MCP (Model Context Protocol) servers can be configured by the user through the Settings UI. " +
+      "Once connected, the server's tools become available to you automatically. " +
+      "Check the dynamic context to see which MCP servers are currently connected and what tools they provide."
   ];
 
   return sections.join(" ");

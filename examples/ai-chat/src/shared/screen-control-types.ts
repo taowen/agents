@@ -19,8 +19,6 @@ export interface ScreenControlParams {
   title?: string;
   width?: number;
   height?: number;
-  normX?: number;
-  normY?: number;
 }
 
 export interface ScreenControlResult {

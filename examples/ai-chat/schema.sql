@@ -16,15 +16,7 @@ CREATE TABLE IF NOT EXISTS sessions (
 );
 CREATE INDEX IF NOT EXISTS idx_sessions_user ON sessions(user_id, updated_at);
 
-CREATE TABLE IF NOT EXISTS user_settings (
-  user_id TEXT PRIMARY KEY REFERENCES users(id),
-  github_client_id TEXT,
-  github_client_secret TEXT,
-  llm_api_key TEXT,
-  llm_provider TEXT DEFAULT 'google',
-  llm_base_url TEXT DEFAULT 'https://generativelanguage.googleapis.com/v1beta',
-  llm_model TEXT DEFAULT 'gemini-2.0-flash'
-);
+DROP TABLE IF EXISTS user_settings;
 
 CREATE TABLE IF NOT EXISTS files (
   user_id TEXT NOT NULL,

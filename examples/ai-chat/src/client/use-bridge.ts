@@ -193,7 +193,9 @@ export function useBridge(deviceName: string) {
   const [status, setStatus] = useState<BridgeStatus>("disconnected");
   const [logs, setLogs] = useState<BridgeLog[]>([]);
   const wsRef = useRef<WebSocket | null>(null);
-  const reconnectTimer = useRef<ReturnType<typeof setTimeout>>();
+  const reconnectTimer = useRef<ReturnType<typeof setTimeout> | undefined>(
+    undefined
+  );
   const agentAbortRef = useRef<AbortController | null>(null);
 
   const addLog = useCallback((message: string) => {

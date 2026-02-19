@@ -19,18 +19,6 @@ export interface Session {
   updated_at: string;
 }
 
-export type LlmProvider = "builtin" | "google" | "openai-compatible";
-
-export interface UserSettings {
-  user_id: string;
-  github_client_id: string | null;
-  github_client_secret: string | null;
-  llm_api_key: string | null;
-  llm_provider: LlmProvider | null;
-  llm_base_url: string | null;
-  llm_model: string | null;
-}
-
 export async function findOrCreateUser(
   db: D1Database,
   user: { id: string; email: string; name?: string; picture?: string }
@@ -131,74 +119,4 @@ export async function deleteSession(
     .bind(sessionId, userId)
     .run();
   return (result.meta.changes ?? 0) > 0;
-}
-
-export async function getSettings(
-  db: D1Database,
-  userId: string
-): Promise<UserSettings | null> {
-  return db
-    .prepare("SELECT * FROM user_settings WHERE user_id = ?")
-    .bind(userId)
-    .first<UserSettings>();
-}
-
-export async function upsertSettings(
-  db: D1Database,
-  userId: string,
-  partial: Partial<Omit<UserSettings, "user_id">>
-): Promise<void> {
-  const existing = await getSettings(db, userId);
-
-  if (!existing) {
-    await db
-      .prepare(
-        `INSERT INTO user_settings (user_id, github_client_id, github_client_secret, llm_api_key, llm_provider, llm_base_url, llm_model)
-         VALUES (?, ?, ?, ?, ?, ?, ?)`
-      )
-      .bind(
-        userId,
-        partial.github_client_id ?? null,
-        partial.github_client_secret ?? null,
-        partial.llm_api_key ?? null,
-        partial.llm_provider ?? "builtin",
-        partial.llm_base_url ?? null,
-        partial.llm_model ?? null
-      )
-      .run();
-  } else {
-    await db
-      .prepare(
-        `UPDATE user_settings SET
-           github_client_id = ?,
-           github_client_secret = ?,
-           llm_api_key = ?,
-           llm_provider = ?,
-           llm_base_url = ?,
-           llm_model = ?
-         WHERE user_id = ?`
-      )
-      .bind(
-        partial.github_client_id !== undefined
-          ? partial.github_client_id
-          : existing.github_client_id,
-        partial.github_client_secret !== undefined
-          ? partial.github_client_secret
-          : existing.github_client_secret,
-        partial.llm_api_key !== undefined
-          ? partial.llm_api_key
-          : existing.llm_api_key,
-        partial.llm_provider !== undefined
-          ? partial.llm_provider
-          : existing.llm_provider,
-        partial.llm_base_url !== undefined
-          ? partial.llm_base_url
-          : existing.llm_base_url,
-        partial.llm_model !== undefined
-          ? partial.llm_model
-          : existing.llm_model,
-        userId
-      )
-      .run();
-  }
 }

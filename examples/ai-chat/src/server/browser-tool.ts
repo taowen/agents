@@ -83,7 +83,13 @@ async function capturePageState(page: Page): Promise<{
   return { screenshot, url, title, text };
 }
 
-function toModelOutput(output: unknown) {
+function toModelOutput({
+  output
+}: {
+  toolCallId: string;
+  input: unknown;
+  output: unknown;
+}) {
   const result = output as {
     action: string;
     success: boolean;
@@ -93,7 +99,10 @@ function toModelOutput(output: unknown) {
     screenshot: string;
     error?: string;
   };
-  const parts: Array<{ type: string; [key: string]: unknown }> = [];
+  const parts: Array<
+    | { type: "text"; text: string }
+    | { type: "media"; data: string; mediaType: string }
+  > = [];
   // Text summary
   const lines: string[] = [];
   lines.push(`Action: ${result.action} | Success: ${result.success}`);
@@ -105,7 +114,7 @@ function toModelOutput(output: unknown) {
   // Screenshot as image
   if (result.screenshot) {
     parts.push({
-      type: "image-data",
+      type: "media",
       data: result.screenshot,
       mediaType: "image/png"
     });

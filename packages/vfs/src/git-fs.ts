@@ -106,6 +106,12 @@ export class GitFs {
     return this.repo.push(onAuth);
   }
 
+  async pull(
+    onAuth?: () => { username: string; password?: string }
+  ): Promise<{ updated: boolean; fromOid: string; toOid: string }> {
+    return this.repo.pull(onAuth);
+  }
+
   async commitAndPush(
     message: string,
     author: { name: string; email: string },
@@ -143,6 +149,10 @@ export class GitFs {
 
   async getLog(maxCount?: number): Promise<LogEntry[]> {
     return this.repo.getLog(maxCount);
+  }
+
+  async readBlobUtf8(path: string): Promise<string> {
+    return this.repo.readBlobUtf8(path);
   }
 
   // ---- IFileSystem: read operations (overlay-aware) ----
