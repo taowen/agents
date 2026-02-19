@@ -121,7 +121,8 @@ async function runPowerShell(
 // ---- Run arbitrary PowerShell command ----
 
 export async function runPowerShellCommand(
-  command: string
+  command: string,
+  extraEnv?: Record<string, string>
 ): Promise<{ stdout: string; stderr: string; exitCode: number }> {
   try {
     const { stdout, stderr } = await execFileAsync(
@@ -138,7 +139,7 @@ export async function runPowerShellCommand(
         timeout: 30000,
         maxBuffer: 5 * 1024 * 1024,
         windowsHide: true,
-        env: process.env
+        env: extraEnv ? { ...process.env, ...extraEnv } : process.env
       }
     );
     return { stdout: stdout.trimEnd(), stderr: stderr.trimEnd(), exitCode: 0 };
@@ -151,6 +152,44 @@ export async function runPowerShellCommand(
         err.code === "ERR_CHILD_PROCESS_STDIO_MAXBUFFER" ? 1 : (err.status ?? 1)
     };
   }
+}
+
+// ---- PowerShell executor factory ----
+
+export function createPowerShellExecutor(options?: {
+  cloudUrl?: string;
+  getSessionCookie?: () => Promise<string | undefined>;
+}): (
+  command: string
+) => Promise<{ stdout: string; stderr: string; exitCode: number }> {
+  const cloudDriveScript = path.join(SCRIPTS_DIR, "cloud-drive.ps1");
+  const cloudUrl = options?.cloudUrl;
+  const getSessionCookie = options?.getSessionCookie;
+
+  return async (command: string) => {
+    const fullCommand = cloudUrl
+      ? `. '${cloudDriveScript}'; ${command}`
+      : command;
+    const extraEnv: Record<string, string> = {};
+    if (cloudUrl) extraEnv.CLOUD_BASE = cloudUrl;
+    if (getSessionCookie) {
+      const cookie = await getSessionCookie();
+      if (cookie) extraEnv.CLOUD_COOKIE = cookie;
+    }
+    return runPowerShellCommand(
+      fullCommand,
+      Object.keys(extraEnv).length ? extraEnv : undefined
+    );
+  };
+}
+
+// ---- Cloud drive cleanup ----
+
+export function cleanupCloudDrive(): void {
+  const dllPath = path.join(os.tmpdir(), "CloudFSProvider-v2.dll");
+  try {
+    fs.unlinkSync(dllPath);
+  } catch {}
 }
 
 // ---- Coordinate offset state ----

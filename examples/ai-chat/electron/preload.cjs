@@ -17,5 +17,13 @@ contextBridge.exposeInMainWorld("workWithWindows", {
   screenControl: (params) => ipcRenderer.invoke("screen-control", params),
 
   /** Run an arbitrary PowerShell command */
-  executePowerShell: (params) => ipcRenderer.invoke("powershell:exec", params)
+  executePowerShell: (params) => ipcRenderer.invoke("powershell:exec", params),
+
+  /** Debug: receive task from HTTP debug server */
+  onDebugTask: (callback) => {
+    ipcRenderer.on("debug:task", (_event, data) => callback(data));
+  },
+
+  /** Debug: send task result back to main process */
+  sendDebugResult: (data) => ipcRenderer.send("debug:task-result", data)
 });

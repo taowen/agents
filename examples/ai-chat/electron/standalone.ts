@@ -10,15 +10,13 @@
  *   LLM_BASE_URL  - API base URL (required for openai-compatible)
  *   LLM_API_KEY   - API key (required)
  *   LLM_MODEL     - Model name (required)
+ *   CLOUD_URL     - Cloud server URL for cloud:\ PSDrive (optional)
  */
 import fs from "node:fs";
 import path from "node:path";
 import os from "node:os";
-import { screenControl, runPowerShellCommand } from "./win-automation.ts";
+import { screenControl, createPowerShellExecutor } from "./win-automation.ts";
 import { createAgentLoop } from "../src/shared/agent-loop.ts";
-import { Bash, InMemoryFs, MountableFs } from "just-bash";
-import { NodeFsAdapter } from "./node-fs-adapter.ts";
-import { detectDrives } from "./detect-drives.ts";
 import { createOpenAICompatible } from "@ai-sdk/openai-compatible";
 import { createGoogleGenerativeAI } from "@ai-sdk/google";
 import type { LanguageModel } from "ai";
@@ -100,22 +98,24 @@ process.stdin.on("end", () => {
 
 // ---- Run agent ----
 
-const mountableFs = new MountableFs({ base: new InMemoryFs() });
-for (const drive of detectDrives()) {
-  mountableFs.mount(drive.mountPoint, new NodeFsAdapter(drive.root), "winfs");
-}
-const bash = new Bash({ fs: mountableFs, cwd: "/home" });
+const cloudUrl = process.env.CLOUD_URL;
+const cloudCookie = process.env.CLOUD_COOKIE;
+const psExecutor = createPowerShellExecutor({
+  cloudUrl: cloudUrl || undefined,
+  getSessionCookie: cloudCookie ? async () => cloudCookie : undefined
+});
 
 const agent = createAgentLoop({
   getModel: () => model,
-  executeBash: (cmd) => bash.exec(cmd),
+  executePowerShell: psExecutor,
   executeScreenControl: screenControl,
-  executePowerShell: runPowerShellCommand,
+  hasCloudDrive: !!cloudUrl,
   maxSteps: 20
 });
 
 log(`[standalone] Provider: ${provider}`);
 log(`[standalone] Model: ${modelName}`);
+log(`[standalone] Cloud URL: ${cloudUrl || "(none)"}`);
 log(`[standalone] Prompt: ${prompt}`);
 log(`[standalone] Log dir: ${logDir}`);
 log("");

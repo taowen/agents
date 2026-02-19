@@ -254,7 +254,9 @@ export function createTools(deps: CreateToolsDeps): ToolSet {
     tools.remote_desktop = tool({
       description:
         "Send a message to a connected remote desktop agent. " +
-        "The remote agent can see the screen, control mouse/keyboard, and execute commands. " +
+        "The remote agent can see the screen, control mouse/keyboard, and execute PowerShell commands. " +
+        "It has a cloud:\\ drive that maps to your persistent filesystem (cloud:\\home\\user = /home/user, cloud:\\data = /data). " +
+        "Use it to transfer files between cloud and Windows, or to run Windows-native tasks. " +
         "It maintains conversation context across calls — you can give follow-up instructions. " +
         "Describe what you want done in natural language. Returns the agent's text response.",
       inputSchema: z.object({

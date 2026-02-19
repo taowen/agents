@@ -1,16 +1,34 @@
-import { app, BrowserWindow, ipcMain } from "electron";
+import { app, BrowserWindow, ipcMain, session } from "electron";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
 import fs from "node:fs";
+import http from "node:http";
 import { NodeFsAdapter } from "./node-fs-adapter.ts";
 import { detectDrives } from "./detect-drives.ts";
-import { screenControl, runPowerShellCommand } from "./win-automation.ts";
+import {
+  screenControl,
+  createPowerShellExecutor,
+  cleanupCloudDrive
+} from "./win-automation.ts";
 import type { FsStat } from "just-bash";
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 
 const PROD_URL = "https://ai.connect-screen.com";
 const APP_URL = process.env.AGENT_URL || PROD_URL;
+
+async function getSessionCookie(): Promise<string | undefined> {
+  const cookies = await session.defaultSession.cookies.get({
+    name: "session",
+    url: APP_URL
+  });
+  return cookies[0]?.value;
+}
+
+const psExecutor = createPowerShellExecutor({
+  cloudUrl: APP_URL,
+  getSessionCookie
+});
 
 // --- IPC Handlers ---
 
@@ -20,7 +38,7 @@ function setupScreenControl(): void {
 
 function setupPowerShellHandler(): void {
   ipcMain.handle("powershell:exec", (_event, params: { command: string }) =>
-    runPowerShellCommand(params.command)
+    psExecutor(params.command)
   );
 }
 
@@ -143,6 +161,128 @@ function appendLog(level: string, msg: string): void {
   fs.appendFileSync(LOG_FILE, line);
 }
 
+// --- Debug HTTP Server ---
+
+function setupDebugHttpServer(): void {
+  // Map of pending debug task requests: taskId → response callback
+  const pendingTasks = new Map<
+    string,
+    { res: http.ServerResponse; timer: ReturnType<typeof setTimeout> }
+  >();
+  let taskIdCounter = 0;
+
+  // Listen for results from the renderer
+  ipcMain.on(
+    "debug:task-result",
+    (_event, data: { taskId: string; response?: string; error?: string }) => {
+      const pending = pendingTasks.get(data.taskId);
+      if (!pending) return;
+      clearTimeout(pending.timer);
+      pendingTasks.delete(data.taskId);
+
+      const body = JSON.stringify(
+        data.error ? { error: data.error } : { response: data.response }
+      );
+      pending.res.writeHead(200, { "Content-Type": "application/json" });
+      pending.res.end(body);
+    }
+  );
+
+  const server = http.createServer(async (req, res) => {
+    // CORS headers for convenience
+    res.setHeader("Access-Control-Allow-Origin", "*");
+    res.setHeader("Access-Control-Allow-Methods", "GET, POST, OPTIONS");
+    res.setHeader("Access-Control-Allow-Headers", "Content-Type");
+    if (req.method === "OPTIONS") {
+      res.writeHead(204);
+      res.end();
+      return;
+    }
+
+    const url = new URL(req.url || "/", `http://${req.headers.host}`);
+
+    // --- GET /status ---
+    if (req.method === "GET" && url.pathname === "/status") {
+      const hasCookie = !!(await getSessionCookie());
+      res.writeHead(200, { "Content-Type": "application/json" });
+      res.end(JSON.stringify({ appUrl: APP_URL, hasCookie }));
+      return;
+    }
+
+    // --- POST /exec ---
+    if (req.method === "POST" && url.pathname === "/exec") {
+      const body = await readBody(req);
+      try {
+        const { command } = JSON.parse(body);
+        if (!command) {
+          res.writeHead(400, { "Content-Type": "application/json" });
+          res.end(JSON.stringify({ error: "missing 'command' field" }));
+          return;
+        }
+        const result = await psExecutor(command);
+        res.writeHead(200, { "Content-Type": "application/json" });
+        res.end(JSON.stringify(result));
+      } catch (err: any) {
+        res.writeHead(500, { "Content-Type": "application/json" });
+        res.end(JSON.stringify({ error: err.message }));
+      }
+      return;
+    }
+
+    // --- POST /task ---
+    if (req.method === "POST" && url.pathname === "/task") {
+      const body = await readBody(req);
+      let prompt: string;
+      try {
+        prompt = JSON.parse(body).prompt;
+      } catch {
+        res.writeHead(400, { "Content-Type": "application/json" });
+        res.end(JSON.stringify({ error: "invalid JSON or missing 'prompt'" }));
+        return;
+      }
+
+      const win = BrowserWindow.getAllWindows()[0];
+      if (!win) {
+        res.writeHead(503, { "Content-Type": "application/json" });
+        res.end(JSON.stringify({ error: "no renderer window" }));
+        return;
+      }
+
+      const taskId = String(++taskIdCounter);
+      // Timeout after 5 minutes
+      const timer = setTimeout(
+        () => {
+          pendingTasks.delete(taskId);
+          res.writeHead(504, { "Content-Type": "application/json" });
+          res.end(JSON.stringify({ error: "task timed out" }));
+        },
+        5 * 60 * 1000
+      );
+
+      pendingTasks.set(taskId, { res, timer });
+      win.webContents.send("debug:task", { taskId, prompt });
+      return;
+    }
+
+    // --- 404 ---
+    res.writeHead(404, { "Content-Type": "application/json" });
+    res.end(JSON.stringify({ error: "not found" }));
+  });
+
+  server.listen(9960, "127.0.0.1", () => {
+    appendLog("info", "Debug HTTP server listening on http://127.0.0.1:9960");
+  });
+}
+
+function readBody(req: http.IncomingMessage): Promise<string> {
+  return new Promise((resolve, reject) => {
+    const chunks: Buffer[] = [];
+    req.on("data", (c) => chunks.push(c));
+    req.on("end", () => resolve(Buffer.concat(chunks).toString()));
+    req.on("error", reject);
+  });
+}
+
 function createWindow(): void {
   const win = new BrowserWindow({
     width: 1000,
@@ -168,9 +308,29 @@ function createWindow(): void {
 }
 
 app.whenReady().then(() => {
+  // Bypass CORS for LLM API requests — the renderer calls the LLM provider
+  // directly (e.g. ark.cn-beijing.volces.com) which doesn't set CORS headers.
+  const appOrigin = new URL(APP_URL).origin;
+  session.defaultSession.webRequest.onHeadersReceived((details, callback) => {
+    const url = details.url;
+    // Only patch responses from external origins (not the app itself)
+    if (!url.startsWith(appOrigin)) {
+      const headers = details.responseHeaders ?? {};
+      headers["access-control-allow-origin"] = ["*"];
+      headers["access-control-allow-headers"] = ["*"];
+      headers["access-control-allow-methods"] = [
+        "GET, POST, PUT, DELETE, OPTIONS"
+      ];
+      callback({ responseHeaders: headers });
+      return;
+    }
+    callback({});
+  });
+
   setupScreenControl();
   setupPowerShellHandler();
   setupFileSystemHandlers();
+  setupDebugHttpServer();
   createWindow();
 
   app.on("activate", () => {
@@ -182,4 +342,8 @@ app.whenReady().then(() => {
 
 app.on("window-all-closed", () => {
   app.quit();
+});
+
+app.on("will-quit", () => {
+  cleanupCloudDrive();
 });

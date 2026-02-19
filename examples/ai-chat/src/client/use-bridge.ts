@@ -2,9 +2,6 @@ import { useCallback, useEffect, useRef, useState } from "react";
 import { createOpenAICompatible } from "@ai-sdk/openai-compatible";
 import { createGoogleGenerativeAI } from "@ai-sdk/google";
 import type { LanguageModel } from "ai";
-import { Bash, InMemoryFs, MountableFs, defineCommand } from "just-bash";
-import { WindowsFsAdapter } from "./windows-fs-adapter";
-import { HttpFsAdapter } from "./http-fs-adapter";
 import type { LlmConfig } from "../server/llm-proxy";
 import type {
   ScreenControlParams,
@@ -16,16 +13,9 @@ import type { AgentLoop } from "../shared/agent-loop";
 
 // ---- Types ----
 
-interface FsOpResult {
-  ok: boolean;
-  result?: unknown;
-  error?: string;
-  code?: string;
-}
-
-interface DriveInfo {
-  mountPoint: string;
-  root: string;
+interface DebugTaskData {
+  taskId: string;
+  prompt: string;
 }
 
 interface WorkWithWindows {
@@ -33,72 +23,18 @@ interface WorkWithWindows {
   platform: string;
   screenControl: (params: ScreenControlParams) => Promise<ScreenControlResult>;
   executePowerShell?: (params: { command: string }) => Promise<BashResult>;
-  fileSystem?: (params: Record<string, unknown>) => Promise<FsOpResult>;
-  detectDrives?: () => Promise<DriveInfo[]>;
+  onDebugTask?: (callback: (data: DebugTaskData) => void) => void;
+  sendDebugResult?: (data: {
+    taskId: string;
+    response?: string;
+    error?: string;
+  }) => void;
 }
 
 declare global {
   interface Window {
     workWithWindows?: WorkWithWindows;
   }
-}
-
-// ---- Filesystem setup ----
-
-const mountableFs = new MountableFs({ base: new InMemoryFs() });
-
-const mountCmd = defineCommand("mount", async (args) => {
-  if (args.length > 0) {
-    return {
-      stdout: "",
-      stderr: "mount: read-only (use the cloud agent to manage mounts)\n",
-      exitCode: 1
-    };
-  }
-  const mounts = mountableFs.getMounts();
-  const lines = mounts.map(
-    (m) => `${m.fsType || "unknown"} on ${m.mountPoint}`
-  );
-  return {
-    stdout: lines.length ? lines.join("\n") + "\n" : "",
-    stderr: "",
-    exitCode: 0
-  };
-});
-
-const bash = new Bash({
-  fs: mountableFs,
-  cwd: "/home",
-  customCommands: [mountCmd]
-});
-
-let windowsMountsInitialized = false;
-
-async function initWindowsMounts() {
-  if (windowsMountsInitialized) return;
-  if (!window.workWithWindows?.detectDrives) return;
-  windowsMountsInitialized = true;
-
-  try {
-    const drives = await window.workWithWindows.detectDrives();
-    const ipcFn = window.workWithWindows.fileSystem!;
-    for (const drive of drives) {
-      const adapter = new WindowsFsAdapter(drive.root, ipcFn);
-      mountableFs.mount(drive.mountPoint, adapter, "winfs");
-    }
-  } catch (err) {
-    console.error("Failed to init Windows mounts:", err);
-  }
-}
-
-let cloudMountInitialized = false;
-
-function initCloudMount() {
-  if (cloudMountInitialized) return;
-  cloudMountInitialized = true;
-
-  const adapter = new HttpFsAdapter();
-  mountableFs.mount("/cloud", adapter, "http");
 }
 
 // ---- Model resolution ----
@@ -163,12 +99,11 @@ let agentInstance: AgentLoop | null = null;
 
 function getOrCreateAgent(): AgentLoop {
   if (agentInstance) return agentInstance;
-  const hasPowerShell = !!window.workWithWindows?.executePowerShell;
   agentInstance = createAgentLoop({
     getModel,
-    executeBash: (cmd) => bash.exec(cmd),
+    executePowerShell,
     executeScreenControl,
-    ...(hasPowerShell ? { executePowerShell } : {}),
+    hasCloudDrive: true,
     maxSteps: 10
   });
   return agentInstance;
@@ -179,8 +114,6 @@ async function runLocalAgent(
   onLog?: (msg: string) => void,
   abortSignal?: AbortSignal
 ): Promise<string> {
-  await initWindowsMounts();
-  initCloudMount();
   const agent = getOrCreateAgent();
   return agent.runAgent(userMessage, { onLog, abortSignal });
 }
@@ -216,6 +149,7 @@ export function useBridge(deviceName: string) {
   const agentAbortRef = useRef<AbortController | null>(null);
 
   const addLog = useCallback((message: string) => {
+    console.log(`[bridge] ${message}`);
     const time = new Date().toLocaleTimeString();
     setLogs((prev) => [...prev.slice(-99), { time, message }]);
     // Also relay the log upstream to BridgeManager for viewer broadcast
@@ -317,6 +251,31 @@ export function useBridge(deviceName: string) {
       addLog("WebSocket error");
     };
   }, [deviceName, addLog]);
+
+  // Listen for debug tasks from the Electron main process (HTTP debug server)
+  useEffect(() => {
+    if (!window.workWithWindows?.onDebugTask) return;
+    window.workWithWindows.onDebugTask(async (data) => {
+      addLog(
+        `[debug] Received task ${data.taskId}: ${data.prompt.slice(0, 100)}`
+      );
+      try {
+        const response = await runLocalAgent(data.prompt, addLog);
+        addLog(`[debug] Task ${data.taskId} complete`);
+        window.workWithWindows?.sendDebugResult?.({
+          taskId: data.taskId,
+          response
+        });
+      } catch (err) {
+        const errMsg = err instanceof Error ? err.message : String(err);
+        addLog(`[debug] Task ${data.taskId} error: ${errMsg}`);
+        window.workWithWindows?.sendDebugResult?.({
+          taskId: data.taskId,
+          error: errMsg
+        });
+      }
+    });
+  }, [addLog]);
 
   useEffect(() => {
     connect();

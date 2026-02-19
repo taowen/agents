@@ -33,6 +33,54 @@ export async function handleFileRequest(
     if (url.pathname === "/api/files/list" && request.method === "GET") {
       const rawPath = url.searchParams.get("path") || "/";
       const path = normalizePath(rawPath);
+      const isRecursive = url.searchParams.get("recursive") === "1";
+
+      if (isRecursive) {
+        const result: Array<{
+          name: string;
+          path: string;
+          isDirectory: boolean;
+          size: number;
+          mtime: string | null;
+        }> = [];
+        const queue = [{ dirPath: path, prefix: "" }];
+        while (queue.length > 0) {
+          const { dirPath, prefix } = queue.shift()!;
+          let names: string[];
+          try {
+            names = await fs.readdir(dirPath);
+          } catch {
+            continue;
+          }
+          for (const name of names) {
+            const childPath =
+              dirPath === "/" ? `/${name}` : `${dirPath}/${name}`;
+            const childPrefix = prefix ? `${prefix}/${name}` : name;
+            try {
+              const st = await fs.stat(childPath);
+              result.push({
+                name,
+                path: childPrefix,
+                isDirectory: st.isDirectory,
+                size: st.size,
+                mtime: st.mtime?.toISOString() ?? null
+              });
+              if (st.isDirectory) {
+                queue.push({ dirPath: childPath, prefix: childPrefix });
+              }
+            } catch {
+              result.push({
+                name,
+                path: childPrefix,
+                isDirectory: false,
+                size: 0,
+                mtime: null
+              });
+            }
+          }
+        }
+        return Response.json({ entries: result });
+      }
 
       const names = await fs.readdir(path);
       const entries = await Promise.all(

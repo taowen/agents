@@ -156,6 +156,164 @@ function resolveAdapter(
   return null;
 }
 
+type ListEntry = {
+  name: string;
+  path: string;
+  isDirectory: boolean;
+  size: number;
+  mtime: string | null;
+};
+
+/** Recursively list entries from a DO (git mount). */
+async function doListRecursive(
+  absPath: string,
+  prefix: string,
+  result: ListEntry[],
+  env: Env,
+  userId: string
+): Promise<void> {
+  const doId = env.ChatAgent.idFromName(`_files_${userId}`);
+  const stub = env.ChatAgent.get(doId);
+  const doUrl = `https://do.internal/api/files/list?path=${encodeURIComponent(absPath)}&recursive=1`;
+  const resp = await stub.fetch(
+    new Request(doUrl, {
+      headers: new Headers({
+        "x-user-id": userId,
+        "x-partykit-room": `_files_${userId}`
+      })
+    })
+  );
+  if (!resp.ok) return;
+  const data = (await resp.json()) as { entries?: ListEntry[] };
+  if (data.entries) {
+    for (const entry of data.entries) {
+      result.push({
+        ...entry,
+        path: prefix ? `${prefix}/${entry.path}` : entry.path
+      });
+    }
+  }
+}
+
+/** Recursively list using an adapter (D1/R2/GDrive), including git-mount virtual children. */
+async function adapterListRecursive(
+  adapter: D1FsAdapter | R2FsAdapter | GoogleDriveFsAdapter,
+  relPath: string,
+  absPath: string,
+  prefix: string,
+  result: ListEntry[],
+  gitMounts: string[],
+  env: Env,
+  userId: string
+): Promise<void> {
+  const names = await adapter.readdir(relPath);
+  const existing = new Set(names);
+
+  for (const name of names) {
+    const childRel = relPath === "/" ? `/${name}` : `${relPath}/${name}`;
+    const childAbs = absPath === "/" ? `/${name}` : `${absPath}/${name}`;
+    const childPrefix = prefix ? `${prefix}/${name}` : name;
+    try {
+      const st = await adapter.stat(childRel);
+      result.push({
+        name,
+        path: childPrefix,
+        isDirectory: st.isDirectory,
+        size: st.size,
+        mtime: st.mtime?.toISOString() ?? null
+      });
+      if (st.isDirectory) {
+        await adapterListRecursive(
+          adapter,
+          childRel,
+          childAbs,
+          childPrefix,
+          result,
+          gitMounts,
+          env,
+          userId
+        );
+      }
+    } catch {
+      result.push({
+        name,
+        path: childPrefix,
+        isDirectory: false,
+        size: 0,
+        mtime: null
+      });
+    }
+  }
+
+  for (const vName of getVirtualChildren(absPath, gitMounts)) {
+    if (!existing.has(vName)) {
+      const childAbs = absPath === "/" ? `/${vName}` : `${absPath}/${vName}`;
+      const childPrefix = prefix ? `${prefix}/${vName}` : vName;
+      result.push({
+        name: vName,
+        path: childPrefix,
+        isDirectory: true,
+        size: 0,
+        mtime: null
+      });
+      await doListRecursive(childAbs, childPrefix, result, env, userId);
+    }
+  }
+}
+
+/** Recursively list virtual directory children, resolving to adapters or DO as needed. */
+async function virtualListRecursive(
+  absPath: string,
+  prefix: string,
+  result: ListEntry[],
+  fstabEntries: FstabEntry[],
+  gitMounts: string[],
+  allMounts: string[],
+  env: Env,
+  userId: string
+): Promise<void> {
+  const children = getVirtualChildren(absPath, allMounts);
+  for (const name of children) {
+    const childAbs = absPath === "/" ? `/${name}` : `${absPath}/${name}`;
+    const childPrefix = prefix ? `${prefix}/${name}` : name;
+    result.push({
+      name,
+      path: childPrefix,
+      isDirectory: true,
+      size: 0,
+      mtime: null
+    });
+    if (isUnderMount(childAbs, gitMounts)) {
+      await doListRecursive(childAbs, childPrefix, result, env, userId);
+    } else {
+      const resolved = resolveAdapter(childAbs, fstabEntries, env, userId);
+      if (resolved) {
+        await adapterListRecursive(
+          resolved.adapter,
+          resolved.relPath,
+          childAbs,
+          childPrefix,
+          result,
+          gitMounts,
+          env,
+          userId
+        );
+      } else {
+        await virtualListRecursive(
+          childAbs,
+          childPrefix,
+          result,
+          fstabEntries,
+          gitMounts,
+          allMounts,
+          env,
+          userId
+        );
+      }
+    }
+  }
+}
+
 export async function handleFileRoutes(
   request: Request,
   env: Env,
@@ -237,6 +395,8 @@ export async function handleFileRoutes(
 
     // GET /api/files/list
     if (url.pathname === "/api/files/list" && request.method === "GET") {
+      const isRecursive = url.searchParams.get("recursive") === "1";
+
       if (!resolved) {
         // Virtual directory (e.g. "/" or "/home")
         const children = getVirtualChildren(path, allMounts);
@@ -246,6 +406,20 @@ export async function handleFileRoutes(
             { status: 404 }
           );
         }
+        if (isRecursive) {
+          const result: ListEntry[] = [];
+          await virtualListRecursive(
+            path,
+            "",
+            result,
+            entries,
+            gitMounts,
+            allMounts,
+            env,
+            userId
+          );
+          return Response.json({ entries: result });
+        }
         return Response.json({
           entries: children.map((name) => ({
             name,
@@ -254,6 +428,21 @@ export async function handleFileRoutes(
             mtime: null
           }))
         });
+      }
+
+      if (isRecursive) {
+        const result: ListEntry[] = [];
+        await adapterListRecursive(
+          resolved.adapter,
+          resolved.relPath,
+          path,
+          "",
+          result,
+          gitMounts,
+          env,
+          userId
+        );
+        return Response.json({ entries: result });
       }
 
       const { adapter, relPath } = resolved;

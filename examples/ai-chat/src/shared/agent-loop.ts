@@ -16,13 +16,6 @@ import { normalizeAction, isDoubleClickAlias } from "./action-aliases.ts";
 
 // ---- Tool definitions ----
 
-const bashToolDef = tool({
-  description: "Execute a bash command in a virtual in-memory filesystem",
-  inputSchema: z.object({
-    command: z.string().describe("The bash command to execute")
-  })
-});
-
 const screenToolDef = tool({
   description:
     "Control the Windows desktop screen. Take screenshots, click, type, press keys, move mouse, and scroll. " +
@@ -110,9 +103,9 @@ const windowToolDef = tool({
 
 // ---- System prompt ----
 
-const SYSTEM_PROMPT =
+const SYSTEM_PROMPT_BASE =
   "You are a remote desktop agent running on a Windows machine.\n" +
-  "You have access to a bash shell. Use `mount` to see available filesystems.\n" +
+  "You have a `powershell` tool for running PowerShell commands on the Windows host.\n" +
   "You have the Windows desktop screen. You can take screenshots, click, type, press keys, move the mouse, and scroll.\n" +
   "You have a 'win' tool for window management: list_windows, focus/activate, move/resize, minimize/maximize/restore, window_screenshot.\n" +
   "\n" +
@@ -138,6 +131,25 @@ const SYSTEM_PROMPT =
   "5. Before clicking, use screen({ action: 'annotate', x, y }) to verify target coords.\n" +
   "6. Do NOT include base64 image data in your text response.\n" +
   "7. When scrolling, ALWAYS provide x,y coordinates pointing to the CENTER of the area you want to scroll (e.g. the chat message area, not the sidebar). Use a small amount (3-5) so you don't skip content.";
+
+const CLOUD_DRIVE_PROMPT =
+  "\n\nCLOUD FILE STORAGE:\n" +
+  "You have a cloud file storage mounted as the cloud:\\ PowerShell drive. " +
+  "This drive is backed by the user's cloud bash environment — they share the same filesystem:\n" +
+  "  cloud:\\home\\user  = /home/user  (persistent user files)\n" +
+  "  cloud:\\data       = /data       (persistent large file storage)\n" +
+  "  cloud:\\etc        = /etc        (persistent config)\n\n" +
+  "Use standard PowerShell cmdlets:\n" +
+  "- Get-ChildItem cloud:\\           # list root (home, data, etc, mnt)\n" +
+  "- Get-ChildItem cloud:\\home\\user  # list user's files\n" +
+  "- Get-Content cloud:\\home\\user\\file.txt     # read file\n" +
+  '- Set-Content cloud:\\home\\user\\file.txt -Value "hello"  # write file\n' +
+  "- Copy-Item cloud:\\home\\user\\file.txt C:\\Users\\...\\Desktop\\  # download to Windows\n" +
+  "- Copy-Item C:\\Users\\...\\report.pdf cloud:\\home\\user\\       # upload from Windows\n" +
+  "- Remove-Item cloud:\\home\\user\\old.txt      # delete\n" +
+  "- New-Item cloud:\\home\\user\\subdir -ItemType Directory  # mkdir\n\n" +
+  "IMPORTANT: The user (or the main cloud agent) may ask you to transfer files between Windows and cloud. " +
+  "Use Copy-Item to move files in either direction.";
 
 // ---- Logging helpers ----
 
@@ -203,11 +215,11 @@ function formatWinLog(
 
 export interface AgentLoopConfig {
   getModel: () => LanguageModel | Promise<LanguageModel>;
-  executeBash: (command: string) => Promise<BashResult>;
+  executePowerShell: (command: string) => Promise<BashResult>;
   executeScreenControl: (
     params: ScreenControlParams
   ) => Promise<ScreenControlResult>;
-  executePowerShell?: (command: string) => Promise<BashResult>;
+  hasCloudDrive?: boolean;
   maxSteps?: number;
 }
 
@@ -228,9 +240,9 @@ export interface AgentLoop {
 export function createAgentLoop(config: AgentLoopConfig): AgentLoop {
   const {
     getModel,
-    executeBash,
-    executeScreenControl,
     executePowerShell,
+    executeScreenControl,
+    hasCloudDrive = false,
     maxSteps = 20
   } = config;
 
@@ -309,20 +321,14 @@ export function createAgentLoop(config: AgentLoopConfig): AgentLoop {
 
     const model = await getModel();
     const tools: Record<string, ReturnType<typeof tool>> = {
-      bash: bashToolDef,
+      powershell: powershellToolDef,
       screen: screenToolDef,
       win: windowToolDef
     };
-    if (executePowerShell) {
-      tools.powershell = powershellToolDef;
-    }
 
-    const systemPrompt = executePowerShell
-      ? SYSTEM_PROMPT +
-        "\n\nYou also have a 'powershell' tool for running arbitrary PowerShell commands on the Windows host. " +
-        "Use it for system administration, registry queries, process management, software installation, " +
-        "or any native Windows task that the bash shell cannot handle."
-      : SYSTEM_PROMPT;
+    const systemPrompt = hasCloudDrive
+      ? SYSTEM_PROMPT_BASE + CLOUD_DRIVE_PROMPT
+      : SYSTEM_PROMPT_BASE;
     let finalText = "";
 
     for (let step = 0; step < maxSteps; step++) {
@@ -330,6 +336,7 @@ export function createAgentLoop(config: AgentLoopConfig): AgentLoop {
         onLog?.("[agent] aborted before step " + (step + 1));
         return finalText || "[Agent aborted]";
       }
+      const stepStart = Date.now();
       onLog?.(`[agent] step ${step + 1}...`);
 
       const result = streamText({
@@ -363,6 +370,11 @@ export function createAgentLoop(config: AgentLoopConfig): AgentLoop {
         }
       }
 
+      const llmMs = Date.now() - stepStart;
+      onLog?.(
+        `[agent] step ${step + 1} LLM: ${llmMs}ms, tools: ${toolCalls.length}, text: ${stepText.length} chars`
+      );
+
       const response = await result.response;
       history.push(...response.messages);
 
@@ -377,15 +389,7 @@ export function createAgentLoop(config: AgentLoopConfig): AgentLoop {
         let toolResultContent: string;
         const currentStep = stepCounter++;
 
-        if (tc.toolName === "bash") {
-          const bashResult = await executeBash(
-            (tc.args as { command: string }).command
-          );
-          onLog?.(
-            `[agent] bash: exit=${bashResult.exitCode} stdout=${bashResult.stdout.slice(0, 100)}`
-          );
-          toolResultContent = JSON.stringify(bashResult);
-        } else if (tc.toolName === "powershell" && executePowerShell) {
+        if (tc.toolName === "powershell") {
           const psResult = await executePowerShell(
             (tc.args as { command: string }).command
           );
@@ -736,10 +740,17 @@ export function createAgentLoop(config: AgentLoopConfig): AgentLoop {
       }
     }
 
-    // Final summary step without tools
+    // Final summary step — only if the model never produced text output
     if (abortSignal?.aborted) {
       return finalText || "[Agent aborted]";
     }
+    if (finalText) {
+      onLog?.("[agent] skipping summary (already have text output)");
+      return finalText;
+    }
+
+    onLog?.("[agent] requesting summary...");
+    const summaryStart = Date.now();
     history.push({
       role: "user",
       content: "Summarize what you did and the result."
@@ -758,6 +769,7 @@ export function createAgentLoop(config: AgentLoopConfig): AgentLoop {
     }
     const summaryResp = await summary.response;
     history.push(...summaryResp.messages);
+    onLog?.(`[agent] summary LLM: ${Date.now() - summaryStart}ms`);
 
     return finalText || "[Agent completed without text output]";
   }

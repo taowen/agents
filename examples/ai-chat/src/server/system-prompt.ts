@@ -100,10 +100,19 @@ export function buildSystemPrompt(): string {
 
     // Remote desktop
     "You may have a remote_desktop tool available when a user's Windows desktop agent is connected. " +
-      "The remote agent runs on the user's local machine, can see the screen, control mouse/keyboard, and execute commands. " +
+      "The remote agent runs on the user's local machine, can see the screen, control mouse/keyboard, and execute PowerShell commands. " +
       "It maintains conversation context across calls — you can give follow-up instructions (e.g. 'open notepad' then 'type hello'). " +
       "Describe what you want done in natural language. The remote agent processes screenshots locally and returns a text summary. " +
-      "Check the dynamic context at the start of the conversation to see which devices are connected.",
+      "Check the dynamic context at the start of the conversation to see which devices are connected.\n" +
+      "CLOUD DRIVE ON REMOTE DESKTOP:\n" +
+      "The remote desktop agent has a cloud:\\ PowerShell drive that maps to YOUR persistent filesystem. " +
+      "cloud:\\home\\user = your /home/user, cloud:\\data = your /data, cloud:\\etc = your /etc. " +
+      "This means you can share files between the cloud bash environment and the Windows desktop:\n" +
+      "- To send a file to Windows: write it in bash (e.g. to /home/user/export.txt), then tell the remote agent to read or copy it " +
+      "(e.g. 'Copy-Item cloud:\\home\\user\\export.txt C:\\Users\\...\\Desktop\\export.txt').\n" +
+      "- To get a file from Windows: tell the remote agent to copy it to cloud drive " +
+      "(e.g. 'Copy-Item C:\\Users\\...\\report.pdf cloud:\\home\\user\\report.pdf'), then read it in bash.\n" +
+      "- The remote agent can directly read/write cloud files via Get-Content/Set-Content on cloud:\\ paths.",
 
     // MCP servers
     "External MCP (Model Context Protocol) servers can be configured by the user through the Settings UI. " +

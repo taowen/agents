@@ -50,6 +50,14 @@ if (-not (Test-Path $ElectronDest)) {
 }
 Copy-Item (Join-Path (Join-Path $ProjectDir "electron") "*") -Destination $ElectronDest -Recurse -Force
 
+# Copy src/shared/ — electron code imports from ../src/shared/
+$SharedSrc = Join-Path $ProjectDir "src\shared"
+$SharedDest = Join-Path $WorkDir "src\shared"
+if (-not (Test-Path $SharedDest)) {
+    New-Item -ItemType Directory -Path $SharedDest -Force | Out-Null
+}
+Copy-Item (Join-Path $SharedSrc "*") -Destination $SharedDest -Recurse -Force
+
 # Write PID so the WSL wrapper script can taskkill the whole process tree
 $pidFile = Join-Path $env:TEMP "windows-agent-build.pid"
 [System.IO.File]::WriteAllText($pidFile, "$PID")
