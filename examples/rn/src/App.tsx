@@ -7,8 +7,7 @@ import {
   ScrollView,
   StyleSheet,
   Linking,
-  AppState,
-  DeviceEventEmitter
+  AppState
 } from "react-native";
 import AsyncStorage from "@react-native-async-storage/async-storage";
 import AccessibilityBridge from "./NativeAccessibilityBridge";
@@ -80,26 +79,28 @@ function App(): React.JSX.Element {
   }, [checkService]);
 
   // Listen for broadcast-triggered tasks (from TaskReceiver)
+  // Poll for broadcast-triggered tasks (from TaskReceiver)
   useEffect(() => {
-    const sub = DeviceEventEmitter.addListener("onTaskReceived", (event) => {
-      console.log("[onTaskReceived]", JSON.stringify(event));
-      const broadcastTask = event.task;
-      if (!broadcastTask) return;
-
-      // Use broadcast config overrides if provided, otherwise use stored config
-      const taskConfig: LlmConfig = {
-        baseURL: event.apiUrl || config.baseURL,
-        apiKey: event.apiKey || config.apiKey,
-        model: event.model || config.model
-      };
-
-      if (!taskConfig.baseURL || !taskConfig.apiKey) return;
+    const timer = setInterval(() => {
       if (agentRef.current.isRunning) return;
+      const raw = AccessibilityBridge.pollPendingTask();
+      if (!raw) return;
 
-      setLogs([]);
-      agentRef.current.execute(broadcastTask, taskConfig, addLog);
-    });
-    return () => sub.remove();
+      try {
+        const event = JSON.parse(raw);
+        const taskConfig: LlmConfig = {
+          baseURL: event.apiUrl || config.baseURL,
+          apiKey: event.apiKey || config.apiKey,
+          model: event.model || config.model
+        };
+
+        if (!taskConfig.baseURL || !taskConfig.apiKey) return;
+
+        setLogs([]);
+        agentRef.current.execute(event.task, taskConfig, addLog);
+      } catch {}
+    }, 1000);
+    return () => clearInterval(timer);
   }, [config, addLog]);
 
   const saveConfig = useCallback(async () => {

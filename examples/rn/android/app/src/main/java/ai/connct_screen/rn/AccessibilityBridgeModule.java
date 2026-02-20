@@ -4,15 +4,11 @@ import android.content.Context;
 import android.util.Log;
 
 import androidx.annotation.NonNull;
-import androidx.annotation.Nullable;
 
-import com.facebook.react.bridge.Arguments;
 import com.facebook.react.bridge.Promise;
 import com.facebook.react.bridge.ReactApplicationContext;
 import com.facebook.react.bridge.ReactContextBaseJavaModule;
 import com.facebook.react.bridge.ReactMethod;
-import com.facebook.react.bridge.WritableMap;
-import com.facebook.react.modules.core.DeviceEventManagerModule;
 
 import com.google.android.accessibility.selecttospeak.SelectToSpeakService;
 
@@ -27,17 +23,11 @@ import java.util.Locale;
 public class AccessibilityBridgeModule extends ReactContextBaseJavaModule {
 
     private static final String TAG = "A11yAgent";
-    private static AccessibilityBridgeModule instance;
+    private static volatile String pendingTask = null;
     private int screenCounter = 0;
 
     AccessibilityBridgeModule(ReactApplicationContext context) {
         super(context);
-        instance = this;
-    }
-
-    @Nullable
-    static AccessibilityBridgeModule getInstance() {
-        return instance;
     }
 
     @NonNull
@@ -46,12 +36,15 @@ public class AccessibilityBridgeModule extends ReactContextBaseJavaModule {
         return "AccessibilityBridge";
     }
 
-    void sendEvent(String eventName, WritableMap params) {
-        ReactApplicationContext ctx = getReactApplicationContext();
-        if (ctx.hasActiveReactInstance()) {
-            ctx.getJSModule(DeviceEventManagerModule.RCTDeviceEventEmitter.class)
-               .emit(eventName, params);
-        }
+    static void setPendingTask(String taskJson) {
+        pendingTask = taskJson;
+    }
+
+    @ReactMethod(isBlockingSynchronousMethod = true)
+    public String pollPendingTask() {
+        String task = pendingTask;
+        pendingTask = null;
+        return task != null ? task : "";
     }
 
     private SelectToSpeakService requireService() {
@@ -172,16 +165,6 @@ public class AccessibilityBridgeModule extends ReactContextBaseJavaModule {
     }
 
     // --- Async methods ---
-
-    @ReactMethod
-    public void addListener(String eventName) {
-        // Required for NativeEventEmitter
-    }
-
-    @ReactMethod
-    public void removeListeners(double count) {
-        // Required for NativeEventEmitter
-    }
 
     @ReactMethod
     public void isServiceRunning(Promise promise) {

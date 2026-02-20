@@ -5,12 +5,7 @@ import android.content.Context;
 import android.content.Intent;
 import android.util.Log;
 
-import com.facebook.react.ReactApplication;
-import com.facebook.react.ReactHost;
-import com.facebook.react.bridge.Arguments;
-import com.facebook.react.bridge.ReactContext;
-import com.facebook.react.bridge.WritableMap;
-import com.facebook.react.modules.core.DeviceEventManagerModule;
+import org.json.JSONObject;
 
 public class TaskReceiver extends BroadcastReceiver {
 
@@ -24,33 +19,21 @@ public class TaskReceiver extends BroadcastReceiver {
             return;
         }
 
-        ReactApplication app = (ReactApplication) context.getApplicationContext();
-        ReactHost reactHost = app.getReactHost();
-        if (reactHost == null) {
-            Log.d(TAG, "[ERROR] ReactHost not available");
-            return;
+        try {
+            JSONObject json = new JSONObject();
+            json.put("task", task);
+
+            String apiUrl = intent.getStringExtra("api_url");
+            String apiKey = intent.getStringExtra("api_key");
+            String model = intent.getStringExtra("model");
+            if (apiUrl != null) json.put("apiUrl", apiUrl);
+            if (apiKey != null) json.put("apiKey", apiKey);
+            if (model != null) json.put("model", model);
+
+            Log.d(TAG, "[TASK] Setting pending task: " + task);
+            AccessibilityBridgeModule.setPendingTask(json.toString());
+        } catch (Exception e) {
+            Log.e(TAG, "[ERROR] Failed to create task JSON", e);
         }
-
-        ReactContext reactContext = reactHost.getCurrentReactContext();
-        if (reactContext == null) {
-            Log.d(TAG, "[ERROR] ReactContext not available (app may not be fully loaded)");
-            return;
-        }
-
-        WritableMap params = Arguments.createMap();
-        params.putString("task", task);
-
-        String apiUrl = intent.getStringExtra("api_url");
-        String apiKey = intent.getStringExtra("api_key");
-        String model = intent.getStringExtra("model");
-        if (apiUrl != null) params.putString("apiUrl", apiUrl);
-        if (apiKey != null) params.putString("apiKey", apiKey);
-        if (model != null) params.putString("model", model);
-
-        Log.d(TAG, "[TASK] Emitting onTaskReceived to RN: " + task);
-
-        reactContext
-                .getJSModule(DeviceEventManagerModule.RCTDeviceEventEmitter.class)
-                .emit("onTaskReceived", params);
     }
 }
