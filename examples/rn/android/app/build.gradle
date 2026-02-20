@@ -91,6 +91,11 @@ android {
             keyPassword 'android'
         }
     }
+    externalNativeBuild {
+        cmake {
+            path "src/main/jni/CMakeLists.txt"
+        }
+    }
     buildTypes {
         debug {
             signingConfig signingConfigs.debug
@@ -117,6 +122,17 @@ task copyLlmConfig {
     }
 }
 preBuild.dependsOn copyLlmConfig
+
+// Build standalone agent JS (esbuild: TS → JS into assets)
+task buildAgentJs(type: Exec) {
+    def projectRoot = file("../../")
+    workingDir projectRoot
+    commandLine "npx", "esbuild",
+        "src/agent-standalone.ts",
+        "--bundle", "--format=iife", "--target=es2020",
+        "--outfile=android/app/src/main/assets/agent-standalone.js"
+}
+preBuild.dependsOn buildAgentJs
 
 dependencies {
     // The version of react-native is set by the React Native Gradle Plugin

@@ -1,31 +1,15 @@
 import { NativeModules } from "react-native";
 
 interface AccessibilityBridgeInterface {
-  // Sync methods (blocking, called from Hermes eval)
-  getScreen(): string;
-  clickByText(text: string): boolean;
-  clickByDesc(desc: string): boolean;
-  clickByCoords(x: number, y: number): boolean;
-  longClickByText(text: string): boolean;
-  longClickByDesc(desc: string): boolean;
-  longClickByCoords(x: number, y: number): boolean;
-  scrollScreen(direction: string): boolean;
-  scrollElement(text: string, direction: string): string;
-  typeText(text: string): boolean;
-  pressHome(): boolean;
-  pressBack(): boolean;
-  pressRecents(): boolean;
-  showNotifications(): boolean;
-  sleepMs(ms: number): boolean;
-  launchApp(name: string): string;
-  listApps(): string;
+  // Sync methods (log file)
   appendLogLine(line: string): boolean;
   clearLogFile(): boolean;
 
   // Async methods
   isServiceRunning(): Promise<boolean>;
-  resetScreens(): Promise<void>;
   readAssetConfig(): Promise<string>;
+  saveConfig(baseURL: string, apiKey: string, model: string): Promise<void>;
+  runAgentTask(task: string, configJson: string): Promise<string>;
 }
 
 const { AccessibilityBridge } = NativeModules;

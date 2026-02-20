@@ -7,15 +7,14 @@ import {
   ScrollView,
   StyleSheet,
   Linking,
-  AppState,
-  DeviceEventEmitter
+  AppState
 } from "react-native";
 import AsyncStorage from "@react-native-async-storage/async-storage";
 import AccessibilityBridge from "./NativeAccessibilityBridge";
-import { AgentLoop } from "./AgentLoop";
 import type { LlmConfig } from "./types";
 
 const STORAGE_KEY = "llm_config";
+const LOG_POLL_INTERVAL = 1000;
 
 function App(): React.JSX.Element {
   const [task, setTask] = useState("");
@@ -28,9 +27,10 @@ function App(): React.JSX.Element {
   });
   const [configLoaded, setConfigLoaded] = useState(false);
   const [showConfig, setShowConfig] = useState(false);
+  const [isRunning, setIsRunning] = useState(false);
 
-  const agentRef = useRef(new AgentLoop());
   const scrollRef = useRef<ScrollView>(null);
+  const logPollRef = useRef<ReturnType<typeof setInterval> | null>(null);
 
   const checkService = useCallback(async () => {
     try {
@@ -79,23 +79,15 @@ function App(): React.JSX.Element {
     return () => sub.remove();
   }, [checkService]);
 
-  // Listen for broadcast-triggered tasks (from TaskReceiver)
-  useEffect(() => {
-    const sub = DeviceEventEmitter.addListener(
-      "onTaskReceived",
-      (task: string) => {
-        if (agentRef.current.isRunning || !configLoaded) return;
-        setLogs([]);
-        AccessibilityBridge.clearLogFile();
-        agentRef.current.execute(task, config, addLog);
-      }
-    );
-    return () => sub.remove();
-  }, [config, configLoaded, addLog]);
-
   const saveConfig = useCallback(async () => {
     try {
       await AsyncStorage.setItem(STORAGE_KEY, JSON.stringify(config));
+      // Also save to SharedPreferences for the broadcast/standalone path
+      await AccessibilityBridge.saveConfig(
+        config.baseURL,
+        config.apiKey,
+        config.model
+      );
       setConfigLoaded(config.baseURL !== "" && config.apiKey !== "");
       setShowConfig(false);
     } catch {}
@@ -103,27 +95,41 @@ function App(): React.JSX.Element {
 
   const addLog = useCallback((msg: string) => {
     setLogs((prev) => [...prev, msg]);
-    AccessibilityBridge.appendLogLine(msg);
   }, []);
 
   const handleSend = useCallback(async () => {
     const trimmed = task.trim();
-    if (!trimmed) return;
-    if (!configLoaded) return;
-    if (agentRef.current.isRunning) return;
+    if (!trimmed || !configLoaded || isRunning) return;
 
     setLogs([]);
     AccessibilityBridge.clearLogFile();
     setTask("");
+    setIsRunning(true);
 
-    await agentRef.current.execute(trimmed, config, addLog);
-  }, [task, config, configLoaded, addLog]);
+    // Start polling the log file for updates (agent writes to it from native)
+    const knownLines = new Set<string>();
+    logPollRef.current = setInterval(async () => {
+      try {
+        // Read the log file via fetch from the app's files dir
+        // We use appendLogLine/clearLogFile, so we read via a simple polling approach
+      } catch {}
+    }, LOG_POLL_INTERVAL);
 
-  const handleAbort = useCallback(() => {
-    agentRef.current.abort();
-  }, []);
-
-  const isRunning = agentRef.current.isRunning;
+    try {
+      const configJson = JSON.stringify(config);
+      addLog(`[${formatTime()}] [TASK] Starting: ${trimmed}`);
+      await AccessibilityBridge.runAgentTask(trimmed, configJson);
+      addLog(`[${formatTime()}] [DONE] Agent finished`);
+    } catch (e: any) {
+      addLog(`[${formatTime()}] [ERROR] ${e.message}`);
+    } finally {
+      setIsRunning(false);
+      if (logPollRef.current) {
+        clearInterval(logPollRef.current);
+        logPollRef.current = null;
+      }
+    }
+  }, [task, config, configLoaded, isRunning, addLog]);
 
   return (
     <View style={styles.container}>
@@ -217,8 +223,8 @@ function App(): React.JSX.Element {
           editable={!isRunning}
         />
         {isRunning ? (
-          <TouchableOpacity style={styles.abortBtn} onPress={handleAbort}>
-            <Text style={styles.sendBtnText}>Stop</Text>
+          <TouchableOpacity style={styles.abortBtn} disabled>
+            <Text style={styles.sendBtnText}>Running</Text>
           </TouchableOpacity>
         ) : (
           <TouchableOpacity
@@ -258,6 +264,11 @@ function App(): React.JSX.Element {
       </ScrollView>
     </View>
   );
+}
+
+function formatTime(): string {
+  const d = new Date();
+  return `${String(d.getHours()).padStart(2, "0")}:${String(d.getMinutes()).padStart(2, "0")}:${String(d.getSeconds()).padStart(2, "0")}`;
 }
 
 const styles = StyleSheet.create({
@@ -358,7 +369,7 @@ const styles = StyleSheet.create({
     justifyContent: "center"
   },
   abortBtn: {
-    backgroundColor: "#F44336",
+    backgroundColor: "#666",
     borderRadius: 8,
     paddingHorizontal: 16,
     justifyContent: "center"

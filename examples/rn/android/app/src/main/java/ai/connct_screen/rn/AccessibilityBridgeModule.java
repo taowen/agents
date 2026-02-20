@@ -1,6 +1,7 @@
 package ai.connct_screen.rn;
 
 import android.content.Context;
+import android.content.SharedPreferences;
 import android.util.Log;
 
 import androidx.annotation.NonNull;
@@ -9,7 +10,6 @@ import com.facebook.react.bridge.Promise;
 import com.facebook.react.bridge.ReactApplicationContext;
 import com.facebook.react.bridge.ReactContextBaseJavaModule;
 import com.facebook.react.bridge.ReactMethod;
-import com.facebook.react.modules.core.DeviceEventManagerModule.RCTDeviceEventEmitter;
 
 import com.google.android.accessibility.selecttospeak.SelectToSpeakService;
 
@@ -19,17 +19,18 @@ import java.io.FileOutputStream;
 import java.io.InputStream;
 import java.io.InputStreamReader;
 import java.io.OutputStreamWriter;
-import java.util.Locale;
 
+/**
+ * React Native bridge module — now simplified to UI-related methods only.
+ * All screen-action methods (click, scroll, etc.) have moved to standalone
+ * Hermes via HermesAgentRunner + standalone_hermes.cpp.
+ */
 public class AccessibilityBridgeModule extends ReactContextBaseJavaModule {
 
     private static final String TAG = "A11yAgent";
-    private static ReactApplicationContext reactContext;
-    private int screenCounter = 0;
 
     AccessibilityBridgeModule(ReactApplicationContext context) {
         super(context);
-        reactContext = context;
     }
 
     @NonNull
@@ -38,14 +39,7 @@ public class AccessibilityBridgeModule extends ReactContextBaseJavaModule {
         return "AccessibilityBridge";
     }
 
-    static void setPendingTask(String task) {
-        if (reactContext != null && reactContext.hasActiveReactInstance()) {
-            reactContext.getJSModule(RCTDeviceEventEmitter.class)
-                    .emit("onTaskReceived", task);
-        } else {
-            Log.w(TAG, "[setPendingTask] React context not ready, dropping task");
-        }
-    }
+    // --- Log file methods (sync, used by RN UI) ---
 
     @ReactMethod(isBlockingSynchronousMethod = true)
     public boolean appendLogLine(String line) {
@@ -75,150 +69,11 @@ public class AccessibilityBridgeModule extends ReactContextBaseJavaModule {
         return true;
     }
 
-    private SelectToSpeakService requireService() {
-        SelectToSpeakService service = SelectToSpeakService.getInstance();
-        if (service == null) {
-            throw new RuntimeException("Accessibility service is not running");
-        }
-        return service;
-    }
-
-    // --- Sync methods (called from Hermes via eval) ---
-
-    @ReactMethod(isBlockingSynchronousMethod = true)
-    public String getScreen() {
-        SelectToSpeakService service = requireService();
-        String tree = service.getAccessibilityTree();
-        screenCounter++;
-        String filename = String.format(Locale.US, "screen_%03d.txt", screenCounter);
-        try {
-            Context appContext = getReactApplicationContext().getApplicationContext();
-            File screensDir = new File(appContext.getFilesDir(), "screens");
-            if (!screensDir.exists()) screensDir.mkdirs();
-            File file = new File(screensDir, filename);
-            FileOutputStream fos = new FileOutputStream(file);
-            OutputStreamWriter writer = new OutputStreamWriter(fos, "UTF-8");
-            writer.write(tree);
-            writer.flush();
-            writer.close();
-        } catch (Exception ignored) {
-        }
-        Log.d(TAG, "[getScreen] saved " + filename + " (" + tree.length() + " chars)");
-        return tree;
-    }
-
-    @ReactMethod(isBlockingSynchronousMethod = true)
-    public boolean clickByText(String text) {
-        return requireService().clickByText(text);
-    }
-
-    @ReactMethod(isBlockingSynchronousMethod = true)
-    public boolean clickByDesc(String desc) {
-        return requireService().clickByDesc(desc);
-    }
-
-    @ReactMethod(isBlockingSynchronousMethod = true)
-    public boolean clickByCoords(double x, double y) {
-        return requireService().clickByCoordinates((int) x, (int) y);
-    }
-
-    @ReactMethod(isBlockingSynchronousMethod = true)
-    public boolean longClickByText(String text) {
-        return requireService().longClickByText(text);
-    }
-
-    @ReactMethod(isBlockingSynchronousMethod = true)
-    public boolean longClickByDesc(String desc) {
-        return requireService().longClickByDesc(desc);
-    }
-
-    @ReactMethod(isBlockingSynchronousMethod = true)
-    public boolean longClickByCoords(double x, double y) {
-        return requireService().longClickByCoordinates((int) x, (int) y);
-    }
-
-    @ReactMethod(isBlockingSynchronousMethod = true)
-    public boolean scrollScreen(String direction) {
-        return requireService().scrollScreen(direction);
-    }
-
-    @ReactMethod(isBlockingSynchronousMethod = true)
-    public String scrollElement(String text, String direction) {
-        return requireService().scrollElementByText(text, direction);
-    }
-
-    @ReactMethod(isBlockingSynchronousMethod = true)
-    public boolean typeText(String text) {
-        return requireService().inputText(text);
-    }
-
-    @ReactMethod(isBlockingSynchronousMethod = true)
-    public boolean pressHome() {
-        return requireService().globalAction(android.accessibilityservice.AccessibilityService.GLOBAL_ACTION_HOME);
-    }
-
-    @ReactMethod(isBlockingSynchronousMethod = true)
-    public boolean pressBack() {
-        return requireService().globalAction(android.accessibilityservice.AccessibilityService.GLOBAL_ACTION_BACK);
-    }
-
-    @ReactMethod(isBlockingSynchronousMethod = true)
-    public boolean pressRecents() {
-        return requireService().globalAction(android.accessibilityservice.AccessibilityService.GLOBAL_ACTION_RECENTS);
-    }
-
-    @ReactMethod(isBlockingSynchronousMethod = true)
-    public boolean showNotifications() {
-        return requireService().globalAction(android.accessibilityservice.AccessibilityService.GLOBAL_ACTION_NOTIFICATIONS);
-    }
-
-    @ReactMethod(isBlockingSynchronousMethod = true)
-    public boolean sleepMs(double ms) {
-        try {
-            Thread.sleep((long) ms);
-        } catch (InterruptedException e) {
-            Thread.currentThread().interrupt();
-        }
-        return true;
-    }
-
-    @ReactMethod(isBlockingSynchronousMethod = true)
-    public String launchApp(String name) {
-        return requireService().launchApp(name);
-    }
-
-    @ReactMethod(isBlockingSynchronousMethod = true)
-    public String listApps() {
-        return requireService().listApps();
-    }
-
     // --- Async methods ---
 
     @ReactMethod
     public void isServiceRunning(Promise promise) {
         promise.resolve(SelectToSpeakService.getInstance() != null);
-    }
-
-    @ReactMethod
-    public void resetScreens(Promise promise) {
-        try {
-            Context appContext = getReactApplicationContext().getApplicationContext();
-            File screensDir = new File(appContext.getFilesDir(), "screens");
-            if (screensDir.exists()) {
-                File[] files = screensDir.listFiles();
-                if (files != null) {
-                    for (File f : files) {
-                        f.delete();
-                    }
-                }
-            } else {
-                screensDir.mkdirs();
-            }
-            screenCounter = 0;
-            promise.resolve(null);
-        } catch (Exception e) {
-            promise.reject("RESET_ERROR", e.getMessage(), e);
-        }
     }
 
     @ReactMethod
@@ -236,5 +91,42 @@ public class AccessibilityBridgeModule extends ReactContextBaseJavaModule {
         } catch (Exception e) {
             promise.reject("ASSET_ERROR", "Failed to read llm-config.json: " + e.getMessage(), e);
         }
+    }
+
+    /**
+     * Save LLM config to SharedPreferences so that TaskReceiver (broadcast path)
+     * can also read it without going through React Native.
+     */
+    @ReactMethod
+    public void saveConfig(String baseURL, String apiKey, String model, Promise promise) {
+        try {
+            Context appContext = getReactApplicationContext().getApplicationContext();
+            SharedPreferences prefs = appContext.getSharedPreferences("llm_config", Context.MODE_PRIVATE);
+            prefs.edit()
+                    .putString("baseURL", baseURL)
+                    .putString("apiKey", apiKey)
+                    .putString("model", model)
+                    .apply();
+            promise.resolve(null);
+        } catch (Exception e) {
+            promise.reject("SAVE_ERROR", e.getMessage(), e);
+        }
+    }
+
+    /**
+     * Run agent task via standalone Hermes (HermesAgentRunner).
+     * Runs on a background thread; resolves when the agent completes.
+     */
+    @ReactMethod
+    public void runAgentTask(String task, String configJson, Promise promise) {
+        new Thread(() -> {
+            try {
+                HermesAgentRunner.runAgent(task, configJson);
+                promise.resolve("done");
+            } catch (Exception e) {
+                Log.e(TAG, "[runAgentTask] failed", e);
+                promise.reject("AGENT_ERROR", e.getMessage(), e);
+            }
+        }, "hermes-agent").start();
     }
 }
