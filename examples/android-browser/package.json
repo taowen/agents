@@ -1,0 +1,13 @@
+{
+  "name": "android-browser-agent",
+  "version": "0.0.1",
+  "private": true,
+  "scripts": {
+    "build:extractor": "esbuild src/dom-extractor.ts --bundle --format=iife --target=es2020 --outfile=app/src/main/assets/dom-extractor.js",
+    "build": "npm run build:extractor"
+  },
+  "devDependencies": {
+    "esbuild": "^0.25.0",
+    "typescript": "^5.8.3"
+  }
+}

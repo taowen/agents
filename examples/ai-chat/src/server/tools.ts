@@ -28,6 +28,56 @@ export function createBashTool(bash: Bash, ensureMounted: () => Promise<void>) {
   });
 }
 
+// ---- Device tools ----
+
+export function createDeviceTools(env: Env, userId: string): ToolSet {
+  return {
+    list_devices: tool({
+      description:
+        "List online devices connected to this user's account. Returns an array of devices with deviceId, deviceName, and connectedAt.",
+      inputSchema: z.object({}),
+      execute: async () => {
+        const id = env.DeviceHub.idFromName(userId);
+        const stub = env.DeviceHub.get(id);
+        const res = await stub.fetch(new Request("http://hub/devices"));
+        return await res.json();
+      }
+    }),
+    device_agent: tool({
+      description:
+        "Dispatch a task to a connected Android device for execution. " +
+        "The device has an AI agent that can interact with the phone UI (tap, scroll, type, read screen, open apps, etc.). " +
+        "Use this when the user asks to do something on their phone/device, such as opening an app, searching, sending messages, etc. " +
+        "The task description should be a clear natural language instruction of what to do on the device.",
+      inputSchema: z.object({
+        task: z
+          .string()
+          .describe(
+            "Natural language description of the task to execute on the device"
+          ),
+        deviceId: z
+          .string()
+          .optional()
+          .describe(
+            "Specific device ID to target. If omitted, the first available device is used."
+          )
+      }),
+      execute: async ({ task, deviceId }) => {
+        const id = env.DeviceHub.idFromName(userId);
+        const stub = env.DeviceHub.get(id);
+        const res = await stub.fetch(
+          new Request("http://hub/dispatch", {
+            method: "POST",
+            headers: { "Content-Type": "application/json" },
+            body: JSON.stringify({ task, deviceId })
+          })
+        );
+        return await res.json();
+      }
+    })
+  };
+}
+
 export interface CreateToolsDeps {
   bashTool: ReturnType<typeof createBashTool>;
   schedule: (

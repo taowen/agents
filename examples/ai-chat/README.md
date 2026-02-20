@@ -283,6 +283,22 @@ explorer.exe "C:\Users\%USERNAME%\AppData\Local\Temp\windows-agent-standalone\lo
 - `run-standalone.ps1` — Windows-side launcher (copies files to temp dir, npm install, runs tsx)
 - `run-standalone-on-windows.sh` — WSL-side launcher (builds just-bash, packs tarball, calls PS1)
 
+## D1 schema management
+
+D1 does **not** auto-apply `schema.sql` on deploy. When you add or alter tables in `schema.sql`, you must manually apply the changes to the remote database:
+
+```bash
+npx wrangler d1 execute ai-chat-db --remote --file schema.sql
+```
+
+All statements use `CREATE TABLE IF NOT EXISTS` / `CREATE INDEX IF NOT EXISTS`, so re-running is safe. Verify with:
+
+```bash
+npx wrangler d1 execute ai-chat-db --remote --command "SELECT name FROM sqlite_master WHERE type='table' ORDER BY name;"
+```
+
+> **Past incident (BUG-MLUSHN3O-0311):** `/api/usage` returned 500 because `usage_archive` and `device_messages` tables existed in `schema.sql` but were never created on the remote D1 database. Fixed by running the command above.
+
 ## Sentry error monitoring
 
 The project integrates `@sentry/cloudflare` for error tracking and performance tracing. Set the `SENTRY_DSN` secret via `wrangler secret put SENTRY_DSN` to enable it.
@@ -339,6 +355,7 @@ curl -s "https://us.sentry.io/api/0/issues/{issue_id}/events/latest/" \
 | `SqlError: Durable Object reset because its code was updated` | Transient — DOs restart after deploy, safe to ignore |
 | 500 on API routes with no Sentry issue | Error not captured — add `try/catch` + `Sentry.captureException(e)` to the handler |
 | `tryN.baseDelayMs.baseDelayMs` | DO retry loop hitting the reset window after deploy |
+| `D1_ERROR: no such table: <name>: SQLITE_ERROR` | D1 schema out of sync — new table in `schema.sql` but never applied to remote. Fix: `npx wrangler d1 execute ai-chat-db --remote --file schema.sql` |
 
 ### Limitations
 
@@ -354,6 +371,54 @@ curl -s "https://us.sentry.io/api/0/issues/{issue_id}/events/latest/" \
 | `entries[type=breadcrumbs].data.values` | Chronological log of console, fetch, and schedule events leading up to the error |
 | `contexts.trace` | Distributed trace ID for correlating spans |
 | `tags` | Environment, handler status, runtime info |
+
+## Self-testing API endpoints
+
+The app has a device auth flow that Claude Code (or any headless client) can use to obtain a Bearer token and call authenticated API endpoints directly, without manually using the web UI.
+
+### Run the self-test script
+
+```bash
+npx tsx examples/ai-chat/scripts/self-test.ts
+```
+
+On first run, the script will:
+1. `POST /auth/device/start` to get a 6-character code
+2. Print the code prominently — ask the user to approve it at `https://ai.connect-screen.com/device`
+3. Poll `/auth/device/check` until approved, then cache the Bearer token to `scripts/.self-test-token`
+4. Call `GET /api/usage` with the token and print the response
+
+On subsequent runs, the cached token is reused automatically (no user interaction needed). Delete `scripts/.self-test-token` to force re-authentication.
+
+Pass a custom base URL for local dev:
+
+```bash
+npx tsx examples/ai-chat/scripts/self-test.ts http://localhost:5173
+```
+
+### Claude Code workflow
+
+When debugging authenticated API endpoints, Claude Code should:
+
+1. Run the script **in background**: `npx tsx examples/ai-chat/scripts/self-test.ts` (with `run_in_background: true`)
+2. After ~3 seconds, read the output file to check for the device code or cached token result
+3. If a `DEVICE CODE: XXXXXX` appears, tell the user: "Please approve code **XXXXXX** at https://ai.connect-screen.com/device"
+4. Wait for the script to complete — it will call the API and print the response
+5. On subsequent runs the cached token is reused, so no user interaction is needed
+
+### Combine with wrangler tail for full observability
+
+In a separate terminal, stream live Worker logs:
+
+```bash
+npx wrangler tail --format json
+```
+
+Then run the self-test script. You'll see the `[usage]` and auth logs fire in real time alongside the script output.
+
+### Extending
+
+The token returned by the script works with any authenticated endpoint. To test a different route, add a fetch call with `Authorization: Bearer ${token}` after step 3 in `scripts/self-test.ts`.
 
 ## Try it
 

@@ -26,7 +26,7 @@ export function UsagePage({ onBack, onOpenSidebar }: UsagePageProps) {
   const start = selectedDate + "T00";
   const end = selectedDate + "T23";
 
-  const { usage, isLoading } = useUsageStats(start, end);
+  const { usage, error, isLoading } = useUsageStats(start, end);
 
   // Summary totals
   const totals = usage.reduce(
@@ -83,6 +83,17 @@ export function UsagePage({ onBack, onOpenSidebar }: UsagePageProps) {
             className="px-3 py-1.5 rounded-lg border border-kumo-line bg-kumo-elevated text-kumo-default text-sm focus:outline-none focus:ring-2 focus:ring-kumo-ring"
           />
         </div>
+
+        {/* Error banner */}
+        {error && (
+          <div className="rounded-xl bg-red-50 dark:bg-red-950/30 border border-red-200 dark:border-red-800 p-3 mb-5">
+            <Text size="sm" variant="secondary">
+              <span className="text-red-700 dark:text-red-400">
+                Failed to load usage data. Please try again later.
+              </span>
+            </Text>
+          </div>
+        )}
 
         {/* Summary row */}
         <div className="rounded-xl ring ring-kumo-line bg-kumo-base p-4 mb-5">

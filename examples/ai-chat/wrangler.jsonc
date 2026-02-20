@@ -11,6 +11,10 @@
       {
         "class_name": "ChatAgent",
         "name": "ChatAgent"
+      },
+      {
+        "class_name": "DeviceHub",
+        "name": "DeviceHub"
       }
     ]
   },
@@ -47,6 +51,10 @@
     {
       "deleted_classes": ["BridgeManager"],
       "tag": "v3"
+    },
+    {
+      "new_sqlite_classes": ["DeviceHub"],
+      "tag": "v4"
     }
   ],
   "name": "ai-chat-example",

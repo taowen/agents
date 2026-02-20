@@ -6,6 +6,7 @@ import { apiRoutes } from "./api";
 import { handleGitHubOAuth } from "./github-oauth";
 
 export { ChatAgent } from "./chat-agent";
+export { DeviceHub } from "./device-hub";
 
 type AppEnv = { Bindings: Env; Variables: { userId: string } };
 

@@ -2,6 +2,7 @@ package ai.connct_screen.rn;
 
 import android.content.Context;
 import android.content.SharedPreferences;
+import android.os.Build;
 import android.util.Log;
 
 import androidx.annotation.NonNull;
@@ -13,11 +14,8 @@ import com.facebook.react.bridge.ReactMethod;
 
 import com.google.android.accessibility.selecttospeak.SelectToSpeakService;
 
-import java.io.BufferedReader;
 import java.io.File;
 import java.io.FileOutputStream;
-import java.io.InputStream;
-import java.io.InputStreamReader;
 import java.io.OutputStreamWriter;
 
 /**
@@ -37,6 +35,13 @@ public class AccessibilityBridgeModule extends ReactContextBaseJavaModule {
     @Override
     public String getName() {
         return "AccessibilityBridge";
+    }
+
+    // --- Device info (sync) ---
+
+    @ReactMethod(isBlockingSynchronousMethod = true)
+    public String getDeviceName() {
+        return Build.MANUFACTURER + " " + Build.MODEL;
     }
 
     // --- Log file methods (sync, used by RN UI) ---
@@ -74,23 +79,6 @@ public class AccessibilityBridgeModule extends ReactContextBaseJavaModule {
     @ReactMethod
     public void isServiceRunning(Promise promise) {
         promise.resolve(SelectToSpeakService.getInstance() != null);
-    }
-
-    @ReactMethod
-    public void readAssetConfig(Promise promise) {
-        try {
-            InputStream is = getReactApplicationContext().getAssets().open("llm-config.json");
-            BufferedReader reader = new BufferedReader(new InputStreamReader(is, "UTF-8"));
-            StringBuilder sb = new StringBuilder();
-            String line;
-            while ((line = reader.readLine()) != null) {
-                sb.append(line);
-            }
-            reader.close();
-            promise.resolve(sb.toString());
-        } catch (Exception e) {
-            promise.reject("ASSET_ERROR", "Failed to read llm-config.json: " + e.getMessage(), e);
-        }
     }
 
     /**

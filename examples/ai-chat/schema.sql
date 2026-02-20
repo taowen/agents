@@ -44,3 +44,11 @@ CREATE TABLE IF NOT EXISTS usage_archive (
   PRIMARY KEY (user_id, session_id, hour)
 );
 CREATE INDEX IF NOT EXISTS idx_usage_archive_user_hour ON usage_archive(user_id, hour);
+
+CREATE TABLE IF NOT EXISTS device_messages (
+  id TEXT PRIMARY KEY,
+  user_id TEXT NOT NULL,
+  message TEXT NOT NULL,
+  created_at DATETIME DEFAULT CURRENT_TIMESTAMP
+);
+CREATE INDEX IF NOT EXISTS idx_device_messages_user ON device_messages(user_id, created_at);

@@ -6,9 +6,6 @@ import android.content.Intent;
 import android.content.SharedPreferences;
 import android.util.Log;
 
-import java.io.BufferedReader;
-import java.io.InputStream;
-import java.io.InputStreamReader;
 
 public class TaskReceiver extends BroadcastReceiver {
 
@@ -24,8 +21,7 @@ public class TaskReceiver extends BroadcastReceiver {
 
         Log.d(TAG, "[TASK] Received task: " + task);
 
-        // Read LLM config — try SharedPreferences first (written by RN app),
-        // then fall back to asset llm-config.json
+        // Read LLM config from SharedPreferences (written by RN app after device login)
         String configJson = readConfig(context);
         if (configJson == null) {
             Log.e(TAG, "[ERROR] No LLM config found");
@@ -45,7 +41,6 @@ public class TaskReceiver extends BroadcastReceiver {
     }
 
     private String readConfig(Context context) {
-        // 1. Try SharedPreferences (set by RN UI)
         try {
             SharedPreferences prefs = context.getSharedPreferences("llm_config", Context.MODE_PRIVATE);
             String baseURL = prefs.getString("baseURL", null);
@@ -58,21 +53,6 @@ public class TaskReceiver extends BroadcastReceiver {
             }
         } catch (Exception e) {
             Log.w(TAG, "[readConfig] SharedPreferences failed", e);
-        }
-
-        // 2. Fall back to asset
-        try {
-            InputStream is = context.getAssets().open("llm-config.json");
-            BufferedReader reader = new BufferedReader(new InputStreamReader(is, "UTF-8"));
-            StringBuilder sb = new StringBuilder();
-            String line;
-            while ((line = reader.readLine()) != null) {
-                sb.append(line);
-            }
-            reader.close();
-            return sb.toString();
-        } catch (Exception e) {
-            Log.w(TAG, "[readConfig] asset llm-config.json not found", e);
         }
 
         return null;

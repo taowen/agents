@@ -15,6 +15,8 @@ import type { LlmConfig } from "./types";
 
 const STORAGE_KEY = "llm_config";
 const LOG_POLL_INTERVAL = 1000;
+const SERVER_URL = "https://ai.connect-screen.com";
+const DEVICE_POLL_INTERVAL = 2000;
 
 function App(): React.JSX.Element {
   const [task, setTask] = useState("");
@@ -26,11 +28,20 @@ function App(): React.JSX.Element {
     model: ""
   });
   const [configLoaded, setConfigLoaded] = useState(false);
-  const [showConfig, setShowConfig] = useState(false);
   const [isRunning, setIsRunning] = useState(false);
+  const [deviceCode, setDeviceCode] = useState<string | null>(null);
+  const [loginStatus, setLoginStatus] = useState<
+    "idle" | "polling" | "approved" | "error"
+  >("idle");
+
+  const [cloudConnected, setCloudConnected] = useState(false);
 
   const scrollRef = useRef<ScrollView>(null);
   const logPollRef = useRef<ReturnType<typeof setInterval> | null>(null);
+  const devicePollRef = useRef<ReturnType<typeof setInterval> | null>(null);
+  const wsRef = useRef<WebSocket | null>(null);
+  const wsReconnectRef = useRef<ReturnType<typeof setTimeout> | null>(null);
+  const isRunningRef = useRef(false);
 
   const checkService = useCallback(async () => {
     try {
@@ -41,7 +52,7 @@ function App(): React.JSX.Element {
     }
   }, []);
 
-  // Load config on mount
+  // Load config on mount — only trust AsyncStorage (written after device login)
   useEffect(() => {
     (async () => {
       try {
@@ -49,24 +60,8 @@ function App(): React.JSX.Element {
         if (stored) {
           setConfig(JSON.parse(stored));
           setConfigLoaded(true);
-          return;
         }
       } catch {}
-
-      // Fallback to bundled asset
-      try {
-        const assetJson = await AccessibilityBridge.readAssetConfig();
-        const parsed = JSON.parse(assetJson);
-        const cfg: LlmConfig = {
-          baseURL: parsed.baseURL || "",
-          apiKey: parsed.apiKey || "",
-          model: parsed.model || "gpt-4o"
-        };
-        setConfig(cfg);
-        setConfigLoaded(cfg.baseURL !== "" && cfg.apiKey !== "");
-      } catch {
-        setConfigLoaded(false);
-      }
     })();
   }, []);
 
@@ -79,19 +74,187 @@ function App(): React.JSX.Element {
     return () => sub.remove();
   }, [checkService]);
 
-  const saveConfig = useCallback(async () => {
+  // WebSocket connection to cloud for receiving dispatched tasks
+  useEffect(() => {
+    if (!configLoaded || !config.apiKey) return;
+
+    let alive = true;
+
+    function connect() {
+      if (!alive) return;
+      const wsUrl = `wss://ai.connect-screen.com/api/device/ws?token=${encodeURIComponent(config.apiKey)}`;
+      const ws = new WebSocket(wsUrl);
+      wsRef.current = ws;
+
+      ws.onopen = () => {
+        setCloudConnected(true);
+        const name = AccessibilityBridge.getDeviceName();
+        ws.send(
+          JSON.stringify({
+            type: "ready",
+            deviceName: name,
+            deviceId: name
+          })
+        );
+      };
+
+      ws.onmessage = async (event) => {
+        try {
+          const data = JSON.parse(
+            typeof event.data === "string" ? event.data : ""
+          );
+          if (data.type === "ping") {
+            ws.send(JSON.stringify({ type: "pong" }));
+            return;
+          }
+          if (data.type === "task" && data.taskId && data.description) {
+            // Reject if already running a task
+            if (isRunningRef.current) {
+              ws.send(
+                JSON.stringify({
+                  type: "result",
+                  taskId: data.taskId,
+                  result: "Device busy",
+                  success: false
+                })
+              );
+              return;
+            }
+            // Execute the task via the native agent
+            setLogs((prev) => [
+              ...prev,
+              `[${formatTime()}] [CLOUD] Task: ${data.description}`
+            ]);
+            setIsRunning(true);
+            isRunningRef.current = true;
+            try {
+              const configJson = JSON.stringify(config);
+              await AccessibilityBridge.runAgentTask(
+                data.description,
+                configJson
+              );
+              ws.send(
+                JSON.stringify({
+                  type: "result",
+                  taskId: data.taskId,
+                  result: "Task completed successfully",
+                  success: true
+                })
+              );
+              setLogs((prev) => [...prev, `[${formatTime()}] [CLOUD] Done`]);
+            } catch (e: any) {
+              ws.send(
+                JSON.stringify({
+                  type: "result",
+                  taskId: data.taskId,
+                  result: e.message || "Task failed",
+                  success: false
+                })
+              );
+              setLogs((prev) => [
+                ...prev,
+                `[${formatTime()}] [CLOUD] Error: ${e.message}`
+              ]);
+            } finally {
+              setIsRunning(false);
+              isRunningRef.current = false;
+            }
+          }
+        } catch {}
+      };
+
+      ws.onclose = () => {
+        setCloudConnected(false);
+        wsRef.current = null;
+        if (alive) {
+          wsReconnectRef.current = setTimeout(connect, 5000);
+        }
+      };
+
+      ws.onerror = () => {
+        // onclose will fire after onerror
+      };
+    }
+
+    connect();
+
+    return () => {
+      alive = false;
+      if (wsReconnectRef.current) {
+        clearTimeout(wsReconnectRef.current);
+        wsReconnectRef.current = null;
+      }
+      if (wsRef.current) {
+        wsRef.current.close();
+        wsRef.current = null;
+      }
+      setCloudConnected(false);
+    };
+  }, [configLoaded, config.apiKey]);
+
+  const stopDevicePoll = useCallback(() => {
+    if (devicePollRef.current) {
+      clearInterval(devicePollRef.current);
+      devicePollRef.current = null;
+    }
+  }, []);
+
+  const startDeviceLogin = useCallback(async () => {
+    setLoginStatus("idle");
+    setDeviceCode(null);
     try {
-      await AsyncStorage.setItem(STORAGE_KEY, JSON.stringify(config));
-      // Also save to SharedPreferences for the broadcast/standalone path
-      await AccessibilityBridge.saveConfig(
-        config.baseURL,
-        config.apiKey,
-        config.model
-      );
-      setConfigLoaded(config.baseURL !== "" && config.apiKey !== "");
-      setShowConfig(false);
-    } catch {}
-  }, [config]);
+      const res = await fetch(`${SERVER_URL}/auth/device/start`, {
+        method: "POST"
+      });
+      const data = (await res.json()) as { code: string };
+      setDeviceCode(data.code);
+      setLoginStatus("polling");
+
+      // Poll for approval
+      devicePollRef.current = setInterval(async () => {
+        try {
+          const checkRes = await fetch(
+            `${SERVER_URL}/auth/device/check?code=${data.code}`
+          );
+          const checkData = (await checkRes.json()) as {
+            status: string;
+            token?: string;
+            baseURL?: string;
+            model?: string;
+          };
+          if (checkData.status === "approved" && checkData.token) {
+            stopDevicePoll();
+            const newConfig: LlmConfig = {
+              baseURL: checkData.baseURL || "",
+              apiKey: checkData.token,
+              model: checkData.model || ""
+            };
+            setConfig(newConfig);
+            await AsyncStorage.setItem(STORAGE_KEY, JSON.stringify(newConfig));
+            await AccessibilityBridge.saveConfig(
+              newConfig.baseURL,
+              newConfig.apiKey,
+              newConfig.model
+            );
+            setConfigLoaded(true);
+            setLoginStatus("approved");
+            setDeviceCode(null);
+          } else if (checkData.status === "expired") {
+            stopDevicePoll();
+            setLoginStatus("error");
+          }
+        } catch {}
+      }, DEVICE_POLL_INTERVAL);
+    } catch {
+      setLoginStatus("error");
+    }
+  }, [stopDevicePoll]);
+
+  const cancelDeviceLogin = useCallback(() => {
+    stopDevicePoll();
+    setDeviceCode(null);
+    setLoginStatus("idle");
+  }, [stopDevicePoll]);
 
   const addLog = useCallback((msg: string) => {
     setLogs((prev) => [...prev, msg]);
@@ -105,6 +268,7 @@ function App(): React.JSX.Element {
     AccessibilityBridge.clearLogFile();
     setTask("");
     setIsRunning(true);
+    isRunningRef.current = true;
 
     // Start polling the log file for updates (agent writes to it from native)
     const knownLines = new Set<string>();
@@ -124,6 +288,7 @@ function App(): React.JSX.Element {
       addLog(`[${formatTime()}] [ERROR] ${e.message}`);
     } finally {
       setIsRunning(false);
+      isRunningRef.current = false;
       if (logPollRef.current) {
         clearInterval(logPollRef.current);
         logPollRef.current = null;
@@ -131,6 +296,47 @@ function App(): React.JSX.Element {
     }
   }, [task, config, configLoaded, isRunning, addLog]);
 
+  if (!configLoaded) {
+    // Login screen
+    return (
+      <View style={styles.container}>
+        <View style={styles.loginScreen}>
+          <Text style={styles.loginTitle}>RN Agent</Text>
+
+          {loginStatus === "polling" && deviceCode ? (
+            <View style={styles.deviceCodePanel}>
+              <Text style={styles.deviceCodeLabel}>
+                Open ai.connect-screen.com/device and enter:
+              </Text>
+              <Text style={styles.deviceCodeText}>{deviceCode}</Text>
+              <Text style={styles.deviceCodeHint}>Waiting for approval...</Text>
+              <TouchableOpacity onPress={cancelDeviceLogin}>
+                <Text style={styles.cancelText}>Cancel</Text>
+              </TouchableOpacity>
+            </View>
+          ) : loginStatus === "error" ? (
+            <View style={styles.deviceCodePanel}>
+              <Text style={styles.errorText}>
+                Code expired or failed. Try again.
+              </Text>
+              <TouchableOpacity onPress={startDeviceLogin}>
+                <Text style={styles.retryText}>Retry</Text>
+              </TouchableOpacity>
+            </View>
+          ) : (
+            <TouchableOpacity
+              style={styles.loginBtn}
+              onPress={startDeviceLogin}
+            >
+              <Text style={styles.loginBtnText}>Login</Text>
+            </TouchableOpacity>
+          )}
+        </View>
+      </View>
+    );
+  }
+
+  // Task screen (logged in)
   return (
     <View style={styles.container}>
       {/* Header */}
@@ -140,11 +346,23 @@ function App(): React.JSX.Element {
           <View
             style={[
               styles.statusDot,
-              { backgroundColor: serviceRunning ? "#4CAF50" : "#F44336" }
+              { backgroundColor: cloudConnected ? "#2196F3" : "#666" }
             ]}
           />
           <Text style={styles.statusText}>
-            {serviceRunning ? "Service ON" : "Service OFF"}
+            {cloudConnected ? "Cloud" : "Offline"}
+          </Text>
+          <View
+            style={[
+              styles.statusDot,
+              {
+                backgroundColor: serviceRunning ? "#4CAF50" : "#F44336",
+                marginLeft: 8
+              }
+            ]}
+          />
+          <Text style={styles.statusText}>
+            {serviceRunning ? "Service" : "No Svc"}
           </Text>
         </View>
       </View>
@@ -161,14 +379,6 @@ function App(): React.JSX.Element {
         </TouchableOpacity>
         <TouchableOpacity
           style={styles.smallBtn}
-          onPress={() => setShowConfig(!showConfig)}
-        >
-          <Text style={styles.smallBtnText}>
-            {showConfig ? "Hide Config" : "LLM Config"}
-          </Text>
-        </TouchableOpacity>
-        <TouchableOpacity
-          style={styles.smallBtn}
           onPress={() => {
             checkService();
           }}
@@ -176,40 +386,6 @@ function App(): React.JSX.Element {
           <Text style={styles.smallBtnText}>Refresh</Text>
         </TouchableOpacity>
       </View>
-
-      {/* Config panel */}
-      {showConfig && (
-        <View style={styles.configPanel}>
-          <TextInput
-            style={styles.configInput}
-            placeholder="Base URL"
-            placeholderTextColor="#999"
-            value={config.baseURL}
-            onChangeText={(t) => setConfig((prev) => ({ ...prev, baseURL: t }))}
-            autoCapitalize="none"
-          />
-          <TextInput
-            style={styles.configInput}
-            placeholder="API Key"
-            placeholderTextColor="#999"
-            value={config.apiKey}
-            onChangeText={(t) => setConfig((prev) => ({ ...prev, apiKey: t }))}
-            autoCapitalize="none"
-            secureTextEntry
-          />
-          <TextInput
-            style={styles.configInput}
-            placeholder="Model (e.g. gpt-4o)"
-            placeholderTextColor="#999"
-            value={config.model}
-            onChangeText={(t) => setConfig((prev) => ({ ...prev, model: t }))}
-            autoCapitalize="none"
-          />
-          <TouchableOpacity style={styles.saveBtn} onPress={saveConfig}>
-            <Text style={styles.saveBtnText}>Save</Text>
-          </TouchableOpacity>
-        </View>
-      )}
 
       {/* Task input */}
       <View style={styles.inputRow}>
@@ -228,12 +404,9 @@ function App(): React.JSX.Element {
           </TouchableOpacity>
         ) : (
           <TouchableOpacity
-            style={[
-              styles.sendBtn,
-              (!configLoaded || !task.trim()) && styles.disabledBtn
-            ]}
+            style={[styles.sendBtn, !task.trim() && styles.disabledBtn]}
             onPress={handleSend}
-            disabled={!configLoaded || !task.trim()}
+            disabled={!task.trim()}
           >
             <Text style={styles.sendBtnText}>Send</Text>
           </TouchableOpacity>
@@ -249,11 +422,7 @@ function App(): React.JSX.Element {
         }
       >
         {logs.length === 0 ? (
-          <Text style={styles.logPlaceholder}>
-            {configLoaded
-              ? "Enter a task and tap Send"
-              : "Configure LLM settings first"}
-          </Text>
+          <Text style={styles.logPlaceholder}>Enter a task and tap Send</Text>
         ) : (
           logs.map((line, i) => (
             <Text key={i} style={styles.logLine}>
@@ -320,32 +489,6 @@ const styles = StyleSheet.create({
     color: "#e0e0e0",
     fontSize: 13
   },
-  configPanel: {
-    backgroundColor: "#16213e",
-    borderRadius: 8,
-    padding: 10,
-    marginBottom: 8,
-    borderWidth: 1,
-    borderColor: "#0f3460"
-  },
-  configInput: {
-    backgroundColor: "#0f3460",
-    color: "#eee",
-    borderRadius: 6,
-    padding: 8,
-    marginBottom: 6,
-    fontSize: 14
-  },
-  saveBtn: {
-    backgroundColor: "#e94560",
-    borderRadius: 6,
-    padding: 8,
-    alignItems: "center"
-  },
-  saveBtnText: {
-    color: "#fff",
-    fontWeight: "bold"
-  },
   inputRow: {
     flexDirection: "row",
     gap: 8,
@@ -387,6 +530,76 @@ const styles = StyleSheet.create({
     backgroundColor: "#0a0a1a",
     borderRadius: 8,
     padding: 8
+  },
+  loginScreen: {
+    flex: 1,
+    justifyContent: "center",
+    alignItems: "center"
+  },
+  loginTitle: {
+    fontSize: 32,
+    fontWeight: "bold",
+    color: "#eee",
+    marginBottom: 40
+  },
+  loginBtn: {
+    backgroundColor: "#e94560",
+    borderRadius: 8,
+    paddingHorizontal: 40,
+    paddingVertical: 14
+  },
+  loginBtnText: {
+    color: "#fff",
+    fontWeight: "bold",
+    fontSize: 18
+  },
+  deviceCodePanel: {
+    backgroundColor: "#16213e",
+    borderRadius: 8,
+    padding: 12,
+    marginBottom: 8,
+    borderWidth: 1,
+    borderColor: "#0f3460",
+    alignItems: "center"
+  },
+  deviceCodeLabel: {
+    color: "#ccc",
+    fontSize: 12,
+    marginBottom: 8,
+    textAlign: "center"
+  },
+  deviceCodeText: {
+    color: "#fff",
+    fontSize: 28,
+    fontWeight: "bold",
+    fontFamily: "monospace",
+    letterSpacing: 6,
+    marginBottom: 8
+  },
+  deviceCodeHint: {
+    color: "#999",
+    fontSize: 12,
+    marginBottom: 4
+  },
+  cancelText: {
+    color: "#e94560",
+    fontSize: 13,
+    marginTop: 4
+  },
+  approvedText: {
+    color: "#4CAF50",
+    fontSize: 14,
+    fontWeight: "bold"
+  },
+  errorText: {
+    color: "#F44336",
+    fontSize: 13,
+    marginBottom: 4
+  },
+  retryText: {
+    color: "#e94560",
+    fontSize: 13,
+    fontWeight: "bold"
   },
   logPlaceholder: {
     color: "#666",

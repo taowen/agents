@@ -3,8 +3,14 @@ import react from "@vitejs/plugin-react";
 import tailwindcss from "@tailwindcss/vite";
 import { sentryVitePlugin } from "@sentry/vite-plugin";
 import { defineConfig } from "vite";
+import dotenv from "dotenv";
+
+dotenv.config({ path: ".env.sentry" });
 
 export default defineConfig({
+  define: {
+    __SENTRY_DSN__: JSON.stringify(process.env.SENTRY_DSN || "")
+  },
   plugins: [
     react(),
     cloudflare(),

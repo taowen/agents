@@ -28,7 +28,7 @@ import {
 } from "./llm-config";
 import { handleFileRequest } from "./file-api";
 import { writeChatHistory, readMemoryBlock } from "./chat-history";
-import { createBashTool, createTools } from "./tools";
+import { createBashTool, createTools, createDeviceTools } from "./tools";
 
 /**
  * AI Chat Agent with sandboxed bash tool via just-bash.
@@ -198,6 +198,32 @@ class ChatAgentBase extends AIChatAgent {
       return Response.json(schedules);
     }
     if (url.pathname.endsWith("/get-usage")) {
+      // Diagnostic: total message count and sample metadata
+      const totalRows = this.ctx.storage.sql
+        .exec(`SELECT COUNT(*) as cnt FROM cf_ai_chat_agent_messages`)
+        .toArray();
+      const totalCount = (totalRows[0] as { cnt: number })?.cnt ?? 0;
+
+      const withUsage = this.ctx.storage.sql
+        .exec(
+          `SELECT COUNT(*) as cnt FROM cf_ai_chat_agent_messages WHERE json_extract(message, '$.metadata.usage') IS NOT NULL`
+        )
+        .toArray();
+      const usageCount = (withUsage[0] as { cnt: number })?.cnt ?? 0;
+
+      // Sample one message to see its JSON structure
+      const sample = this.ctx.storage.sql
+        .exec(
+          `SELECT json_extract(message, '$.metadata') as meta FROM cf_ai_chat_agent_messages LIMIT 1`
+        )
+        .toArray();
+      const sampleMeta =
+        sample.length > 0 ? (sample[0] as { meta: string })?.meta : "NO_ROWS";
+
+      console.log(
+        `[get-usage] total_msgs=${totalCount} with_usage=${usageCount} sample_meta=${sampleMeta}`
+      );
+
       const since = url.searchParams.get("since");
       const baseQuery = `SELECT
           strftime('%Y-%m-%dT%H', created_at) as hour,
@@ -468,6 +494,7 @@ class ChatAgentBase extends AIChatAgent {
             cancelSchedule: (id) => this.cancelSchedule(id),
             getTimezone: () => this.getTimezone()
           }),
+          ...createDeviceTools(this.env, this.userId!),
           ...mcpTools
         } as ToolSet;
       }

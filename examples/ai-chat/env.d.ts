@@ -8,6 +8,7 @@ declare namespace Cloudflare {
   interface Env {
     AI: Ai;
     ChatAgent: DurableObjectNamespace<import("./src/server/index").ChatAgent>;
+    DeviceHub: DurableObjectNamespace<import("./src/server/index").DeviceHub>;
     DB: D1Database;
     BUILTIN_LLM_PROVIDER: string;
     BUILTIN_LLM_BASE_URL: string;

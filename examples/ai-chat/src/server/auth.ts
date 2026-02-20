@@ -11,6 +11,8 @@ const COOKIE_NAME = "session";
 const COOKIE_MAX_AGE = 30 * 24 * 60 * 60; // 30 days in seconds
 const EMAIL_DOMAIN = "connect-screen.com";
 const EMAIL_TOKEN_TTL = 5 * 60; // 5 minutes in seconds
+const DEVICE_CODE_TTL = 10 * 60; // 10 minutes in seconds
+const DEVICE_CODE_CHARS = "ABCDEFGHJKLMNPQRSTUVWXYZ23456789"; // no 0/O/1/I
 
 // ---- HMAC helpers ----
 
@@ -135,6 +137,44 @@ async function verifyOAuthState(
   }
 }
 
+// ---- Device token helpers ----
+
+export async function createDeviceToken(
+  userId: string,
+  secret: string
+): Promise<string> {
+  const payloadB64 = btoa(JSON.stringify({ userId, iat: Date.now() }));
+  const sig = await hmacSign(payloadB64, secret);
+  return `device.${payloadB64}.${sig}`;
+}
+
+export async function validateDeviceToken(
+  token: string,
+  secret: string
+): Promise<string | null> {
+  if (!token.startsWith("device.")) return null;
+  const rest = token.slice(7); // strip "device."
+  const dotIdx = rest.indexOf(".");
+  if (dotIdx === -1) return null;
+  const payloadB64 = rest.slice(0, dotIdx);
+  const sigHex = rest.slice(dotIdx + 1);
+  const valid = await hmacVerify(payloadB64, sigHex, secret);
+  if (!valid) return null;
+  try {
+    const payload = JSON.parse(atob(payloadB64)) as { userId: string };
+    return payload.userId;
+  } catch {
+    return null;
+  }
+}
+
+function generateDeviceCode(): string {
+  const bytes = crypto.getRandomValues(new Uint8Array(6));
+  return Array.from(bytes)
+    .map((b) => DEVICE_CODE_CHARS[b % DEVICE_CODE_CHARS.length])
+    .join("");
+}
+
 // ---- Public API ----
 
 /**
@@ -143,7 +183,7 @@ async function verifyOAuthState(
 export async function handleAuthRoutes(
   request: Request,
   env: Env
-): Promise<Response | null> {
+): Promise<Response> {
   const url = new URL(request.url);
 
   // GET /auth/google — redirect to Google OAuth
@@ -274,6 +314,40 @@ export async function handleAuthRoutes(
     });
   }
 
+  // POST /auth/device/start — generate device code for RN app login
+  if (url.pathname === "/auth/device/start" && request.method === "POST") {
+    const code = generateDeviceCode();
+    await env.OTP_KV.put(
+      `device-login:${code}`,
+      JSON.stringify({ status: "pending" }),
+      { expirationTtl: DEVICE_CODE_TTL }
+    );
+    return Response.json({ code });
+  }
+
+  // GET /auth/device/check?code= — RN app polls for approval
+  if (url.pathname === "/auth/device/check" && request.method === "GET") {
+    const code = url.searchParams.get("code")?.toUpperCase();
+    if (!code) {
+      return new Response("Missing code", { status: 400 });
+    }
+    const raw = await env.OTP_KV.get(`device-login:${code}`);
+    if (!raw) {
+      return Response.json({ status: "expired" });
+    }
+    const data = JSON.parse(raw) as {
+      status: string;
+      token?: string;
+      baseURL?: string;
+      model?: string;
+    };
+    if (data.status === "approved") {
+      // One-time read: delete after returning
+      await env.OTP_KV.delete(`device-login:${code}`);
+    }
+    return Response.json(data);
+  }
+
   // POST /auth/email/start — generate token, store in KV
   if (url.pathname === "/auth/email/start" && request.method === "POST") {
     const token = crypto.randomUUID().replace(/-/g, "").slice(0, 16);
@@ -345,7 +419,7 @@ export async function handleAuthRoutes(
     });
   }
 
-  return null;
+  return new Response("Not found", { status: 404 });
 }
 
 // ---- Email authentication helpers ----
@@ -542,18 +616,34 @@ async function storeGDriveCredentials(
 }
 
 /**
- * Validate session cookie and return userId, or 401 Response.
+ * Validate session cookie or Bearer device token and return userId, or 401 Response.
  */
 export async function requireAuth(
   request: Request,
   env: Env
 ): Promise<string | Response> {
-  const userId = await validateSessionCookie(request, env.AUTH_SECRET);
-  if (!userId) {
-    return new Response(JSON.stringify({ error: "Unauthorized" }), {
-      status: 401,
-      headers: { "Content-Type": "application/json" }
-    });
+  // Try session cookie first
+  const cookieUserId = await validateSessionCookie(request, env.AUTH_SECRET);
+  if (cookieUserId) return cookieUserId;
+
+  // Try Bearer token
+  const authHeader = request.headers.get("Authorization");
+  if (authHeader?.startsWith("Bearer ")) {
+    const token = authHeader.slice(7);
+    const tokenUserId = await validateDeviceToken(token, env.AUTH_SECRET);
+    if (tokenUserId) return tokenUserId;
   }
-  return userId;
+
+  // Try ?token= query param (needed for WebSocket connections from devices)
+  const url = new URL(request.url);
+  const queryToken = url.searchParams.get("token");
+  if (queryToken) {
+    const tokenUserId = await validateDeviceToken(queryToken, env.AUTH_SECRET);
+    if (tokenUserId) return tokenUserId;
+  }
+
+  return new Response(JSON.stringify({ error: "Unauthorized" }), {
+    status: 401,
+    headers: { "Content-Type": "application/json" }
+  });
 }

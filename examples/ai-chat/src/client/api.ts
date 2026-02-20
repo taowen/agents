@@ -159,11 +159,20 @@ export interface UsageRow {
 }
 
 export function useUsageStats(start: string, end: string) {
-  const { data, isLoading, mutate } = useSWR<UsageRow[]>(
+  const { data, error, isLoading, mutate } = useSWR<UsageRow[]>(
     `/api/usage?start=${encodeURIComponent(start)}&end=${encodeURIComponent(end)}`,
-    fetcher
+    async (url: string) => {
+      const res = await fetch(url);
+      if (!res.ok) throw new Error(`Usage fetch failed: ${res.status}`);
+      return res.json() as Promise<UsageRow[]>;
+    }
   );
-  return { usage: data ?? [], isLoading, mutateUsage: mutate };
+  return {
+    usage: Array.isArray(data) ? data : [],
+    error,
+    isLoading,
+    mutateUsage: mutate
+  };
 }
 
 // --- Bug Reports ---

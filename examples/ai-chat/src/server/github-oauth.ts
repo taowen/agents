@@ -27,7 +27,7 @@ export async function handleGitHubOAuth(
   request: Request,
   env: Env,
   userId: string
-): Promise<Response | null> {
+): Promise<Response> {
   const url = new URL(request.url);
 
   // GET /oauth/github — initiate OAuth flow
@@ -118,5 +118,5 @@ export async function handleGitHubOAuth(
     return Response.redirect(url.origin + "/", 302);
   }
 
-  return null;
+  return new Response("Not found", { status: 404 });
 }

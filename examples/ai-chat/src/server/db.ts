@@ -151,7 +151,7 @@ export async function getMemoryFiles(
     const row = results[i].results[0] as { content: string | null } | undefined;
     data[keys[i]] = row?.content ?? "";
   }
-  return data as MemoryFiles;
+  return data as unknown as MemoryFiles;
 }
 
 export async function putMemoryFiles(

@@ -15,6 +15,7 @@ import {
   putMemoryFiles
 } from "./db";
 import { handleFileRoutes } from "./api-files";
+import { createDeviceToken } from "./auth";
 
 type ApiEnv = { Bindings: Env; Variables: { userId: string } };
 
@@ -62,14 +63,15 @@ async function fetchDoUsage(
   sessionId: string,
   since?: string
 ): Promise<UsageRow[]> {
-  const doId = env.ChatAgent.idFromName(`${userId}:${sessionId}`);
+  const isolatedName = encodeURIComponent(`${userId}:${sessionId}`);
+  const doId = env.ChatAgent.idFromName(isolatedName);
   const stub = env.ChatAgent.get(doId);
   const url = since
     ? `http://agent/get-usage?since=${encodeURIComponent(since)}`
     : "http://agent/get-usage";
   const res = await stub.fetch(
     new Request(url, {
-      headers: { "x-partykit-room": `${userId}:${sessionId}` }
+      headers: { "x-partykit-room": isolatedName }
     })
   );
   return res.ok ? ((await res.json()) as UsageRow[]) : [];
@@ -158,14 +160,15 @@ api.delete("/sessions/:id", async (c) => {
 api.get("/sessions/:id/schedules", async (c) => {
   const userId = c.get("userId");
   const sessionId = c.req.param("id");
-  const id = c.env.ChatAgent.idFromName(`${userId}:${sessionId}`);
+  const isolatedName = encodeURIComponent(`${userId}:${sessionId}`);
+  const id = c.env.ChatAgent.idFromName(isolatedName);
   const stub = c.env.ChatAgent.get(id);
   return stub.fetch(
     new Request("http://agent/get-schedules", {
       headers: {
         "x-user-id": userId,
         "x-session-id": sessionId,
-        "x-partykit-room": `${userId}:${sessionId}`
+        "x-partykit-room": isolatedName
       }
     })
   );
@@ -185,7 +188,9 @@ api.post("/sessions/:id/report-bug", async (c) => {
     .toUpperCase()}`;
 
   // Compute sessionDir from the DO ID (first 12 hex chars)
-  const doId = c.env.ChatAgent.idFromName(`${userId}:${sessionId}`);
+  const doId = c.env.ChatAgent.idFromName(
+    encodeURIComponent(`${userId}:${sessionId}`)
+  );
   const sessionDir = doId.toString().slice(0, 12);
 
   // Query D1 for recent chat messages
@@ -251,44 +256,80 @@ api.get("/usage", async (c) => {
     const sessions = await listSessions(c.env.DB, userId);
     const activeIds = sessions.map((s) => s.id);
 
-    // 1. Query max cached hour per active session
-    const maxHours = new Map<string, string>();
-    if (activeIds.length > 0) {
-      const placeholders = activeIds.map(() => "?").join(",");
-      const cached = await c.env.DB.prepare(
-        `SELECT session_id, MAX(hour) as max_hour FROM usage_archive
-       WHERE user_id = ? AND session_id IN (${placeholders})
-       GROUP BY session_id`
-      )
-        .bind(userId, ...activeIds)
-        .all<{ session_id: string; max_hour: string }>();
-      for (const r of cached.results) {
-        maxHours.set(r.session_id, r.max_hour);
-      }
-    }
+    console.log(
+      `[usage] userId=${userId} sessions=${activeIds.length} start=${start} end=${end}`
+    );
+    Sentry.addBreadcrumb({
+      category: "usage",
+      message: `sessions=${activeIds.length} start=${start} end=${end}`,
+      level: "info"
+    });
 
-    // 2. D1 archive — exclude active sessions (their data comes fresh from DO)
-    let archivedQuery = `SELECT hour, SUM(request_count) as request_count,
-     SUM(input_tokens) as input_tokens, SUM(cache_read_tokens) as cache_read_tokens,
-     SUM(cache_write_tokens) as cache_write_tokens, SUM(output_tokens) as output_tokens
-     FROM usage_archive WHERE user_id = ? AND hour >= ? AND hour <= ?`;
-    const archivedBinds: unknown[] = [userId, start, end];
-    if (activeIds.length > 0) {
-      const ph = activeIds.map(() => "?").join(",");
-      archivedQuery += ` AND session_id NOT IN (${ph})`;
-      archivedBinds.push(...activeIds);
+    // 1-2. D1 archive queries (wrapped so failures don't block DO fetches)
+    const maxHours = new Map<string, string>();
+    let archivedResults: {
+      hour: string;
+      request_count: number;
+      input_tokens: number;
+      cache_read_tokens: number;
+      cache_write_tokens: number;
+      output_tokens: number;
+    }[] = [];
+
+    try {
+      // 1. Query max cached hour per active session
+      if (activeIds.length > 0) {
+        const placeholders = activeIds.map(() => "?").join(",");
+        const cached = await c.env.DB.prepare(
+          `SELECT session_id, MAX(hour) as max_hour FROM usage_archive
+         WHERE user_id = ? AND session_id IN (${placeholders})
+         GROUP BY session_id`
+        )
+          .bind(userId, ...activeIds)
+          .all<{ session_id: string; max_hour: string }>();
+        for (const r of cached.results) {
+          maxHours.set(r.session_id, r.max_hour);
+        }
+      }
+
+      // 2. D1 archive — exclude active sessions (their data comes fresh from DO)
+      let archivedQuery = `SELECT hour, SUM(request_count) as request_count,
+       SUM(input_tokens) as input_tokens, SUM(cache_read_tokens) as cache_read_tokens,
+       SUM(cache_write_tokens) as cache_write_tokens, SUM(output_tokens) as output_tokens
+       FROM usage_archive WHERE user_id = ? AND hour >= ? AND hour <= ?`;
+      const archivedBinds: unknown[] = [userId, start, end];
+      if (activeIds.length > 0) {
+        const ph = activeIds.map(() => "?").join(",");
+        archivedQuery += ` AND session_id NOT IN (${ph})`;
+        archivedBinds.push(...activeIds);
+      }
+      archivedQuery += ` GROUP BY hour`;
+      const archived = await c.env.DB.prepare(archivedQuery)
+        .bind(...archivedBinds)
+        .all<{
+          hour: string;
+          request_count: number;
+          input_tokens: number;
+          cache_read_tokens: number;
+          cache_write_tokens: number;
+          output_tokens: number;
+        }>();
+      archivedResults = archived.results;
+      console.log(
+        `[usage] D1 archive: ${archivedResults.length} rows, maxHours=${maxHours.size} sessions cached`
+      );
+      Sentry.addBreadcrumb({
+        category: "usage",
+        message: `D1 archive: ${archivedResults.length} rows, maxHours=${maxHours.size}`,
+        level: "info"
+      });
+    } catch (e) {
+      console.error(
+        "D1 usage_archive query failed (continuing with DO data):",
+        e
+      );
+      Sentry.captureException(e);
     }
-    archivedQuery += ` GROUP BY hour`;
-    const archived = await c.env.DB.prepare(archivedQuery)
-      .bind(...archivedBinds)
-      .all<{
-        hour: string;
-        request_count: number;
-        input_tokens: number;
-        cache_read_tokens: number;
-        cache_write_tokens: number;
-        output_tokens: number;
-      }>();
 
     // 3. Incremental fetch from active DOs (only >= max cached hour)
     const activeResults = await Promise.allSettled(
@@ -299,10 +340,29 @@ api.get("/usage", async (c) => {
       })
     );
 
+    // 3b. Log each DO result
+    for (const [i, r] of activeResults.entries()) {
+      if (r.status === "fulfilled") {
+        console.log(
+          `[usage] DO ${sessions[i].id}: ${r.value.rows.length} rows`
+        );
+      } else {
+        console.error(`[usage] DO ${sessions[i].id} FAILED:`, r.reason);
+      }
+    }
+    Sentry.addBreadcrumb({
+      category: "usage",
+      message: `DO fetches: ${activeResults.filter((r) => r.status === "fulfilled").length}/${activeResults.length} succeeded`,
+      level: "info"
+    });
+
     // 4. Fire-and-forget: cache incremental data to D1
     const cachePromises: Promise<void>[] = [];
     for (const r of activeResults) {
-      if (r.status !== "fulfilled") continue;
+      if (r.status === "rejected") {
+        console.error("fetchDoUsage failed:", r.reason);
+        continue;
+      }
       cachePromises.push(
         cacheSessionUsage(c.env.DB, userId, r.value.sessionId, r.value.rows)
       );
@@ -322,7 +382,7 @@ api.get("/usage", async (c) => {
       }
     >();
 
-    for (const row of archived.results) {
+    for (const row of archivedResults) {
       map.set(row.hour, { ...row });
     }
 
@@ -350,15 +410,196 @@ api.get("/usage", async (c) => {
       }
     }
 
+    // 6. Add device_messages usage
+    const deviceUsage = await c.env.DB.prepare(
+      `SELECT
+        strftime('%Y-%m-%dT%H', created_at) as hour,
+        COUNT(*) as request_count,
+        SUM(json_extract(message, '$.metadata.usage.inputTokens')) as input_tokens,
+        SUM(json_extract(message, '$.metadata.usage.cacheReadTokens')) as cache_read_tokens,
+        SUM(json_extract(message, '$.metadata.usage.cacheWriteTokens')) as cache_write_tokens,
+        SUM(json_extract(message, '$.metadata.usage.outputTokens')) as output_tokens
+      FROM device_messages
+      WHERE user_id = ? AND strftime('%Y-%m-%dT%H', created_at) >= ? AND strftime('%Y-%m-%dT%H', created_at) <= ?
+        AND json_extract(message, '$.metadata.usage') IS NOT NULL
+      GROUP BY hour`
+    )
+      .bind(userId, start, end)
+      .all<UsageRow>();
+
+    console.log(`[usage] device_messages: ${deviceUsage.results.length} rows`);
+    Sentry.addBreadcrumb({
+      category: "usage",
+      message: `device_messages: ${deviceUsage.results.length} rows`,
+      level: "info"
+    });
+
+    for (const row of deviceUsage.results) {
+      const existing = map.get(row.hour);
+      if (existing) {
+        existing.request_count += row.request_count || 0;
+        existing.input_tokens += row.input_tokens || 0;
+        existing.cache_read_tokens += row.cache_read_tokens || 0;
+        existing.cache_write_tokens += row.cache_write_tokens || 0;
+        existing.output_tokens += row.output_tokens || 0;
+      } else {
+        map.set(row.hour, {
+          hour: row.hour,
+          request_count: row.request_count || 0,
+          input_tokens: row.input_tokens || 0,
+          cache_read_tokens: row.cache_read_tokens || 0,
+          cache_write_tokens: row.cache_write_tokens || 0,
+          output_tokens: row.output_tokens || 0
+        });
+      }
+    }
+
     const merged = [...map.values()].sort((a, b) =>
       a.hour.localeCompare(b.hour)
     );
+
+    console.log(
+      `[usage] merged: ${merged.length} hours, total_input=${merged.reduce((s, r) => s + r.input_tokens, 0)}`
+    );
+    Sentry.addBreadcrumb({
+      category: "usage",
+      message: `merged: ${merged.length} hours`,
+      level: "info"
+    });
+
     return c.json(merged);
   } catch (e) {
     console.error("GET /usage failed:", e);
     Sentry.captureException(e);
     return c.json({ error: String(e) }, 500);
   }
+});
+
+// POST /device/approve — web user approves a device code
+api.post("/device/approve", async (c) => {
+  const userId = c.get("userId");
+  const { code } = await c.req.json<{ code: string }>();
+  const upperCode = code?.toUpperCase();
+  if (!upperCode) {
+    return c.json({ error: "Missing code" }, 400);
+  }
+
+  const raw = await c.env.OTP_KV.get(`device-login:${upperCode}`);
+  if (!raw) {
+    return c.json({ error: "Code expired or invalid" }, 404);
+  }
+  const data = JSON.parse(raw) as { status: string };
+  if (data.status !== "pending") {
+    return c.json({ error: "Code already used" }, 409);
+  }
+
+  const token = await createDeviceToken(userId, c.env.AUTH_SECRET);
+  const origin = new URL(c.req.url).origin;
+
+  await c.env.OTP_KV.put(
+    `device-login:${upperCode}`,
+    JSON.stringify({
+      status: "approved",
+      token,
+      baseURL: `${origin}/api/proxy/v1`,
+      model: c.env.BUILTIN_LLM_MODEL
+    }),
+    { expirationTtl: 60 } // short TTL — device will read it soon
+  );
+
+  return c.json({ ok: true });
+});
+
+// POST /proxy/v1/chat/completions — OpenAI-compatible LLM proxy
+api.post("/proxy/v1/chat/completions", async (c) => {
+  const userId = c.get("userId");
+  const body = await c.req.json();
+
+  // Forward to upstream LLM
+  const upstreamRes = await fetch(
+    `${c.env.BUILTIN_LLM_BASE_URL}/chat/completions`,
+    {
+      method: "POST",
+      headers: {
+        "Content-Type": "application/json",
+        Authorization: `Bearer ${c.env.BUILTIN_LLM_API_KEY}`
+      },
+      body: JSON.stringify({
+        ...body,
+        model: body.model || c.env.BUILTIN_LLM_MODEL
+      })
+    }
+  );
+
+  if (!upstreamRes.ok) {
+    const errText = await upstreamRes.text();
+    return new Response(errText, {
+      status: upstreamRes.status,
+      headers: { "Content-Type": "application/json" }
+    });
+  }
+
+  const responseBody = (await upstreamRes.json()) as {
+    choices?: { message?: { content?: string; tool_calls?: unknown } }[];
+    usage?: {
+      prompt_tokens?: number;
+      completion_tokens?: number;
+      prompt_tokens_details?: { cached_tokens?: number };
+    };
+  };
+
+  // Fire-and-forget: store assistant message with usage in D1
+  const choice = responseBody.choices?.[0]?.message;
+  if (choice) {
+    const assistantMsg = {
+      role: "assistant",
+      content: choice.content,
+      tool_calls: choice.tool_calls,
+      metadata: {
+        usage: {
+          inputTokens: responseBody.usage?.prompt_tokens || 0,
+          outputTokens: responseBody.usage?.completion_tokens || 0,
+          cacheReadTokens:
+            responseBody.usage?.prompt_tokens_details?.cached_tokens || 0,
+          cacheWriteTokens: 0
+        }
+      }
+    };
+    c.executionCtx.waitUntil(
+      c.env.DB.prepare(
+        "INSERT INTO device_messages (id, user_id, message) VALUES (?, ?, ?)"
+      )
+        .bind(crypto.randomUUID(), userId, JSON.stringify(assistantMsg))
+        .run()
+    );
+  }
+
+  return Response.json(responseBody);
+});
+
+// GET /device/ws — WebSocket upgrade, forwarded to DeviceHub DO
+api.get("/device/ws", async (c) => {
+  const userId = c.get("userId");
+  const id = c.env.DeviceHub.idFromName(userId);
+  const stub = c.env.DeviceHub.get(id);
+  const url = new URL(c.req.url);
+  url.pathname = "/connect";
+  return stub.fetch(
+    new Request(url.toString(), {
+      method: c.req.method,
+      headers: c.req.raw.headers,
+      body: c.req.raw.body
+    })
+  );
+});
+
+// GET /devices — list online devices for the current user
+api.get("/devices", async (c) => {
+  const userId = c.get("userId");
+  const id = c.env.DeviceHub.idFromName(userId);
+  const stub = c.env.DeviceHub.get(id);
+  const res = await stub.fetch(new Request("http://hub/devices"));
+  return new Response(res.body, { status: res.status, headers: res.headers });
 });
 
 // File Manager routes — delegate to existing handler

@@ -1,10 +1,12 @@
-import { Suspense, useState, useEffect, useRef } from "react";
+import { Suspense, useState, useEffect, useRef, useCallback } from "react";
 import { LoginPage } from "./LoginPage";
+import { DevicePage } from "./DevicePage";
 import { SessionSidebar } from "./SessionSidebar";
 import { SettingsPage } from "./SettingsPage";
 import { MemoryPage } from "./MemoryPage";
 import { UsagePage } from "./UsagePage";
 import { Chat } from "./Chat";
+import { BugReportFloat } from "./BugReportFloat";
 import { useAuth, useSessions } from "./api";
 import { AppShellSkeleton } from "./Skeleton";
 
@@ -23,7 +25,26 @@ function AuthenticatedApp({ user }: { user: UserInfo }) {
     "chat"
   );
   const [sidebarOpen, setSidebarOpen] = useState(false);
+  const [bugReportOpen, setBugReportOpen] = useState(false);
   const autoCreatingRef = useRef(false);
+
+  // Global keyboard shortcut: Ctrl+Shift+B / Cmd+Shift+B
+  useEffect(() => {
+    const handler = (e: KeyboardEvent) => {
+      if (
+        e.shiftKey &&
+        (e.ctrlKey || e.metaKey) &&
+        e.key.toLowerCase() === "b"
+      ) {
+        e.preventDefault();
+        setBugReportOpen((prev) => !prev);
+      }
+    };
+    window.addEventListener("keydown", handler);
+    return () => window.removeEventListener("keydown", handler);
+  }, []);
+
+  const handleOpenBugReport = useCallback(() => setBugReportOpen(true), []);
 
   // Select first session when sessions load and nothing is active
   useEffect(() => {
@@ -192,6 +213,7 @@ function AuthenticatedApp({ user }: { user: UserInfo }) {
               sessionId={activeSessionId}
               onFirstMessage={handleFirstMessage}
               onOpenSidebar={() => setSidebarOpen(true)}
+              onOpenBugReport={handleOpenBugReport}
             />
           ) : (
             <div className="flex-1 flex flex-col items-center justify-center gap-3 p-8">
@@ -201,11 +223,22 @@ function AuthenticatedApp({ user }: { user: UserInfo }) {
           )}
         </div>
       </div>
+
+      <BugReportFloat
+        open={bugReportOpen}
+        onClose={() => setBugReportOpen(false)}
+        sessionId={activeSessionId}
+      />
     </div>
   );
 }
 
 export default function App() {
+  // /device path renders the device approval page
+  if (window.location.pathname === "/device") {
+    return <DevicePage />;
+  }
+
   const { user, authenticated, isLoading } = useAuth();
 
   if (isLoading) {
