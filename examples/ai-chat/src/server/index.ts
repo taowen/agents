@@ -6,7 +6,6 @@ import { handleLlmRoutes } from "./llm-proxy";
 import { handleGitHubOAuth } from "./github-oauth";
 
 export { ChatAgent } from "./chat-agent";
-export { BridgeManager } from "./bridge-manager";
 
 const sentryHandler = Sentry.withSentry(
   (env: Env) => ({
@@ -58,16 +57,11 @@ const sentryHandler = Sentry.withSentry(
       if (agentMatch) {
         const agentName = agentMatch[1];
         const restOfPath = agentMatch[3] || "";
-        if (agentName === "bridge-manager") {
-          // BridgeManager: DO name = userId only (shared across all sessions)
-          url.pathname = `/agents/${agentName}/${encodeURIComponent(userId)}${restOfPath}`;
-        } else {
-          // ChatAgent: DO name = userId:sessionId for per-session isolation
-          const sessionId = decodeURIComponent(agentMatch[2]);
-          headers.set("x-session-id", sessionId);
-          const isolatedName = encodeURIComponent(`${userId}:${sessionId}`);
-          url.pathname = `/agents/${agentName}/${isolatedName}${restOfPath}`;
-        }
+        // ChatAgent: DO name = userId:sessionId for per-session isolation
+        const sessionId = decodeURIComponent(agentMatch[2]);
+        headers.set("x-session-id", sessionId);
+        const isolatedName = encodeURIComponent(`${userId}:${sessionId}`);
+        url.pathname = `/agents/${agentName}/${isolatedName}${restOfPath}`;
       }
       const agentReq = new Request(url.toString(), {
         method: request.method,

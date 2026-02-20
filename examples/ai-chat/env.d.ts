@@ -3,14 +3,11 @@
 declare namespace Cloudflare {
   interface GlobalProps {
     mainModule: typeof import("./src/server/index");
-    durableNamespaces: "ChatAgent" | "BridgeManager";
+    durableNamespaces: "ChatAgent";
   }
   interface Env {
     AI: Ai;
     ChatAgent: DurableObjectNamespace<import("./src/server/index").ChatAgent>;
-    BridgeManager: DurableObjectNamespace<
-      import("./src/server/index").BridgeManager
-    >;
     DB: D1Database;
     BUILTIN_LLM_PROVIDER: string;
     BUILTIN_LLM_BASE_URL: string;

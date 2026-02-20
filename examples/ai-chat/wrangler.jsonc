@@ -11,10 +11,6 @@
       {
         "class_name": "ChatAgent",
         "name": "ChatAgent"
-      },
-      {
-        "class_name": "BridgeManager",
-        "name": "BridgeManager"
       }
     ]
   },
@@ -43,6 +39,10 @@
     {
       "new_sqlite_classes": ["BridgeManager"],
       "tag": "v2"
+    },
+    {
+      "deleted_classes": ["BridgeManager"],
+      "tag": "v3"
     }
   ],
   "name": "ai-chat-example",

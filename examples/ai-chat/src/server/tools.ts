@@ -29,72 +29,6 @@ export function createBashTool(bash: Bash, ensureMounted: () => Promise<void>) {
   });
 }
 
-/**
- * Fetch the list of connected remote desktop devices from BridgeManager DO.
- */
-export type BridgeDevicesCache = {
-  data: { deviceName: string }[];
-  fetchedAt: number;
-} | null;
-
-const BRIDGE_DEVICES_TTL = 30_000; // 30 seconds
-
-export async function getAvailableBridgeDevices(
-  env: Env,
-  userId: string,
-  cache: BridgeDevicesCache
-): Promise<{ data: { deviceName: string }[]; cache: BridgeDevicesCache }> {
-  const now = Date.now();
-  if (cache && now - cache.fetchedAt < BRIDGE_DEVICES_TTL) {
-    return { data: cache.data, cache };
-  }
-  try {
-    const id = env.BridgeManager.idFromName(userId);
-    const stub = env.BridgeManager.get(id);
-    const resp = await stub.fetch(
-      new Request("http://bridge/devices", {
-        method: "GET",
-        headers: { "x-partykit-room": userId }
-      })
-    );
-    const data = (await resp.json()) as { deviceName: string }[];
-    const newCache = { data, fetchedAt: now };
-    return { data, cache: newCache };
-  } catch (e) {
-    console.error("getAvailableBridgeDevices:", e);
-    Sentry.captureException(e);
-    return { data: [], cache };
-  }
-}
-
-/**
- * Send a message to a remote desktop agent via BridgeManager and wait for the response.
- */
-export async function sendToRemoteDesktop(
-  env: Env,
-  userId: string,
-  deviceName: string,
-  content: string
-): Promise<string> {
-  const id = env.BridgeManager.idFromName(userId);
-  const stub = env.BridgeManager.get(id);
-  const resp = await stub.fetch(
-    new Request("http://bridge/message", {
-      method: "POST",
-      headers: {
-        "Content-Type": "application/json",
-        "x-partykit-room": userId
-      },
-      body: JSON.stringify({ deviceName, content })
-    })
-  );
-  const data = (await resp.json()) as { response?: string; error?: string };
-  if (data.error) {
-    return `[Error] ${data.error}`;
-  }
-  return data.response || "[No response from remote desktop]";
-}
-
 export interface CreateToolsDeps {
   bashTool: ReturnType<typeof createBashTool>;
   browserState: BrowserState;
@@ -113,9 +47,6 @@ export interface CreateToolsDeps {
   }>;
   cancelSchedule: (id: string) => Promise<boolean>;
   getTimezone: () => Promise<string>;
-  bridgeDevices: { deviceName: string }[];
-  env: Env;
-  userId: string;
 }
 
 export function createTools(deps: CreateToolsDeps): ToolSet {
@@ -248,41 +179,6 @@ export function createTools(deps: CreateToolsDeps): ToolSet {
       }
     })
   };
-
-  // Add remote_desktop tool when bridge devices are available
-  if (deps.bridgeDevices.length > 0) {
-    tools.remote_desktop = tool({
-      description:
-        "Send a message to a connected remote desktop agent. " +
-        "The remote agent can see the screen, control mouse/keyboard, and execute PowerShell commands. " +
-        "It has a cloud:\\ drive that maps to your persistent filesystem (cloud:\\home\\user = /home/user, cloud:\\data = /data). " +
-        "Use it to transfer files between cloud and Windows, or to run Windows-native tasks. " +
-        "It maintains conversation context across calls — you can give follow-up instructions. " +
-        "Describe what you want done in natural language. Returns the agent's text response.",
-      inputSchema: z.object({
-        message: z
-          .string()
-          .describe("What to do on the remote desktop, in natural language"),
-        device: z
-          .string()
-          .optional()
-          .describe("Device name (omit if only one device)")
-      }),
-      execute: async ({ message, device }) => {
-        const targetDevice =
-          device ||
-          (deps.bridgeDevices.length === 1
-            ? deps.bridgeDevices[0].deviceName
-            : "default");
-        return sendToRemoteDesktop(
-          deps.env,
-          deps.userId,
-          targetDevice,
-          message
-        );
-      }
-    });
-  }
 
   return tools;
 }

@@ -30,12 +30,7 @@ import {
 } from "./llm-config";
 import { handleFileRequest } from "./file-api";
 import { writeChatHistory, readMemoryBlock } from "./chat-history";
-import {
-  createBashTool,
-  getAvailableBridgeDevices,
-  createTools,
-  type BridgeDevicesCache
-} from "./tools";
+import { createBashTool, createTools } from "./tools";
 
 /**
  * AI Chat Agent with sandboxed bash tool via just-bash.
@@ -52,7 +47,6 @@ class ChatAgentBase extends AIChatAgent {
   private userId: string | null = null;
   private sessionUuid: string | null = null;
   private cachedLlmConfig: LlmConfigCache = null;
-  private cachedBridgeDevices: BridgeDevicesCache = null;
   private mcpServersLoaded = false;
 
   // System prompt cache — computed once per session, invalidated on clear history
@@ -363,18 +357,6 @@ class ChatAgentBase extends AIChatAgent {
           await getCachedLlmConfig(this.mountableFs, this.cachedLlmConfig);
         this.cachedLlmConfig = newLlmCache;
 
-        const { data: bridgeDevices, cache: newBridgeCache } =
-          await Sentry.startSpan(
-            { name: "getAvailableBridgeDevices", op: "fetch" },
-            () =>
-              getAvailableBridgeDevices(
-                this.env,
-                this.userId!,
-                this.cachedBridgeDevices
-              )
-          );
-        this.cachedBridgeDevices = newBridgeCache;
-
         const [llmModel, memoryBlock] = await Promise.all([
           Sentry.startSpan({ name: "getLlmModel", op: "config" }, () =>
             getLlmModel(this.env, llmConfig)
@@ -392,14 +374,6 @@ class ChatAgentBase extends AIChatAgent {
           `Chat history directory: /home/user/.chat/${this.sessionDir}/`,
           memoryBlock
         ];
-        if (bridgeDevices.length > 0) {
-          const names = bridgeDevices.map((d) => d.deviceName).join(", ");
-          dynamicParts.push(
-            `\nConnected remote desktop devices: ${names}. ` +
-              "Use the remote_desktop tool to send instructions to these devices. " +
-              "The remote agent can see the screen, control mouse/keyboard, and maintains conversation context."
-          );
-        }
         // Inject connected MCP server info
         const mcpState = this.getMcpServers();
         const mcpEntries = Object.entries(mcpState.servers);
@@ -434,10 +408,7 @@ class ChatAgentBase extends AIChatAgent {
               this.schedule(when, method, payload),
             getSchedules: () => this.getSchedules(),
             cancelSchedule: (id) => this.cancelSchedule(id),
-            getTimezone: () => this.getTimezone(),
-            bridgeDevices,
-            env: this.env,
-            userId: this.userId!
+            getTimezone: () => this.getTimezone()
           }),
           ...mcpTools
         } as ToolSet;
