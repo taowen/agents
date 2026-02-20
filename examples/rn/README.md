@@ -34,49 +34,51 @@ Key files:
 
 ## Build & Deploy
 
+JS is bundled into the debug APK (no Metro dev server needed — `debuggableVariants = []` in build.gradle).
+
 ```sh
-# Bundle JS (verify TS compiles)
-cd examples/rn
-npx react-native bundle --platform android --dev false --entry-file index.js \
-  --bundle-output /tmp/rn-test-bundle.js --assets-dest /tmp/rn-test-assets
-
-# Build APK
-cd android && ./gradlew assembleDebug
-
-# Install
+cd examples/rn/android && ./gradlew assembleDebug
 adb install -r app/build/outputs/apk/debug/app-debug.apk
-
-# Launch
 adb shell am start -n ai.connct_screen.rn/.MainActivity
 ```
 
 ## Trigger task via broadcast
 
+The broadcast sends the task string directly to JS via `DeviceEventEmitter` (no polling, no JSON wrapping). **Important:** use `-p` to target the package explicitly and quote the whole `am` command for `adb shell` so multi-word tasks aren't split:
+
 ```sh
-adb shell am broadcast -a ai.connct_screen.rn.EXECUTE_TASK \
-  --es task "open calculator" \
-  --es api_url "https://api.openai.com/v1" \
-  --es api_key "sk-..." \
-  --es model "gpt-4o"
+adb shell "am broadcast -a ai.connct_screen.rn.EXECUTE_TASK -p ai.connct_screen.rn --es task 'open calculator'"
 ```
 
-If the app already has LLM config saved (via the in-app config panel), the broadcast only needs `--es task "..."`.
+The app uses LLM config from the in-app config panel (AsyncStorage) or the bundled `android/llm-config.json` asset.
 
 ## Debugging
 
-### View app logs
+### View agent log file
+
+Each task execution writes logs to `files/agent-log.txt` (cleared on each new task). Read it via:
 
 ```sh
-# Filter by app PID
-PID=$(adb shell pidof ai.connct_screen.rn)
-adb logcat --pid=$PID
+adb shell "run-as ai.connct_screen.rn cat files/agent-log.txt"
+```
 
+### View accessibility tree snapshots
+
+Each `get_screen()` call saves the tree to `files/screens/screen_NNN.txt`:
+
+```sh
+adb shell "run-as ai.connct_screen.rn cat files/screens/screen_001.txt"
+```
+
+### View logcat
+
+```sh
 # Filter by tag
 adb logcat -s A11yAgent
 adb logcat -s ReactNativeJS
 
-# Search for errors in all recent logs from the app process
-adb logcat -d | grep "$PID" | grep -iE "error|exception|fatal"
+# Filter by app PID
+adb logcat --pid=$(adb shell pidof ai.connct_screen.rn)
 ```
 
 ### Common errors
@@ -91,9 +93,7 @@ If you need a sync method that logically returns nothing, return `boolean` (e.g.
 
 **Red screen: "Packager does not seem to be running"**
 
-Debug builds try to connect to Metro dev server. Either:
-- Run `npm start` in the project root, or
-- Build a release APK: `./gradlew assembleRelease`
+This happens if `debuggableVariants` in `build.gradle` includes `"debug"` (the default). With `debuggableVariants = []`, JS is bundled into the APK and Metro is not needed.
 
 ## LLM Config
 

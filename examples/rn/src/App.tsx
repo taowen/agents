@@ -7,7 +7,8 @@ import {
   ScrollView,
   StyleSheet,
   Linking,
-  AppState
+  AppState,
+  DeviceEventEmitter
 } from "react-native";
 import AsyncStorage from "@react-native-async-storage/async-storage";
 import AccessibilityBridge from "./NativeAccessibilityBridge";
@@ -79,29 +80,18 @@ function App(): React.JSX.Element {
   }, [checkService]);
 
   // Listen for broadcast-triggered tasks (from TaskReceiver)
-  // Poll for broadcast-triggered tasks (from TaskReceiver)
   useEffect(() => {
-    const timer = setInterval(() => {
-      if (agentRef.current.isRunning) return;
-      const raw = AccessibilityBridge.pollPendingTask();
-      if (!raw) return;
-
-      try {
-        const event = JSON.parse(raw);
-        const taskConfig: LlmConfig = {
-          baseURL: event.apiUrl || config.baseURL,
-          apiKey: event.apiKey || config.apiKey,
-          model: event.model || config.model
-        };
-
-        if (!taskConfig.baseURL || !taskConfig.apiKey) return;
-
+    const sub = DeviceEventEmitter.addListener(
+      "onTaskReceived",
+      (task: string) => {
+        if (agentRef.current.isRunning || !configLoaded) return;
         setLogs([]);
-        agentRef.current.execute(event.task, taskConfig, addLog);
-      } catch {}
-    }, 1000);
-    return () => clearInterval(timer);
-  }, [config, addLog]);
+        AccessibilityBridge.clearLogFile();
+        agentRef.current.execute(task, config, addLog);
+      }
+    );
+    return () => sub.remove();
+  }, [config, configLoaded, addLog]);
 
   const saveConfig = useCallback(async () => {
     try {
@@ -113,6 +103,7 @@ function App(): React.JSX.Element {
 
   const addLog = useCallback((msg: string) => {
     setLogs((prev) => [...prev, msg]);
+    AccessibilityBridge.appendLogLine(msg);
   }, []);
 
   const handleSend = useCallback(async () => {
@@ -122,6 +113,7 @@ function App(): React.JSX.Element {
     if (agentRef.current.isRunning) return;
 
     setLogs([]);
+    AccessibilityBridge.clearLogFile();
     setTask("");
 
     await agentRef.current.execute(trimmed, config, addLog);

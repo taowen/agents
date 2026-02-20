@@ -9,6 +9,7 @@ import com.facebook.react.bridge.Promise;
 import com.facebook.react.bridge.ReactApplicationContext;
 import com.facebook.react.bridge.ReactContextBaseJavaModule;
 import com.facebook.react.bridge.ReactMethod;
+import com.facebook.react.modules.core.DeviceEventManagerModule.RCTDeviceEventEmitter;
 
 import com.google.android.accessibility.selecttospeak.SelectToSpeakService;
 
@@ -23,11 +24,12 @@ import java.util.Locale;
 public class AccessibilityBridgeModule extends ReactContextBaseJavaModule {
 
     private static final String TAG = "A11yAgent";
-    private static volatile String pendingTask = null;
+    private static ReactApplicationContext reactContext;
     private int screenCounter = 0;
 
     AccessibilityBridgeModule(ReactApplicationContext context) {
         super(context);
+        reactContext = context;
     }
 
     @NonNull
@@ -36,15 +38,41 @@ public class AccessibilityBridgeModule extends ReactContextBaseJavaModule {
         return "AccessibilityBridge";
     }
 
-    static void setPendingTask(String taskJson) {
-        pendingTask = taskJson;
+    static void setPendingTask(String task) {
+        if (reactContext != null && reactContext.hasActiveReactInstance()) {
+            reactContext.getJSModule(RCTDeviceEventEmitter.class)
+                    .emit("onTaskReceived", task);
+        } else {
+            Log.w(TAG, "[setPendingTask] React context not ready, dropping task");
+        }
     }
 
     @ReactMethod(isBlockingSynchronousMethod = true)
-    public String pollPendingTask() {
-        String task = pendingTask;
-        pendingTask = null;
-        return task != null ? task : "";
+    public boolean appendLogLine(String line) {
+        try {
+            Context appContext = getReactApplicationContext().getApplicationContext();
+            File logFile = new File(appContext.getFilesDir(), "agent-log.txt");
+            FileOutputStream fos = new FileOutputStream(logFile, true);
+            OutputStreamWriter writer = new OutputStreamWriter(fos, "UTF-8");
+            writer.write(line + "\n");
+            writer.flush();
+            writer.close();
+        } catch (Exception e) {
+            Log.e(TAG, "[appendLogLine] failed", e);
+        }
+        return true;
+    }
+
+    @ReactMethod(isBlockingSynchronousMethod = true)
+    public boolean clearLogFile() {
+        try {
+            Context appContext = getReactApplicationContext().getApplicationContext();
+            File logFile = new File(appContext.getFilesDir(), "agent-log.txt");
+            if (logFile.exists()) logFile.delete();
+        } catch (Exception e) {
+            Log.e(TAG, "[clearLogFile] failed", e);
+        }
+        return true;
     }
 
     private SelectToSpeakService requireService() {

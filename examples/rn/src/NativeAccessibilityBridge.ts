@@ -19,7 +19,8 @@ interface AccessibilityBridgeInterface {
   sleepMs(ms: number): boolean;
   launchApp(name: string): string;
   listApps(): string;
-  pollPendingTask(): string | null;
+  appendLogLine(line: string): boolean;
+  clearLogFile(): boolean;
 
   // Async methods
   isServiceRunning(): Promise<boolean>;
