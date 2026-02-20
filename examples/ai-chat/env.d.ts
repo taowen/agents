@@ -14,7 +14,7 @@ declare namespace Cloudflare {
     BUILTIN_LLM_API_KEY: string;
     BUILTIN_LLM_MODEL: string;
     ARK_API_KEY: string;
-    MYBROWSER: Fetcher;
+
     AUTH_SECRET: string;
     GOOGLE_CLIENT_ID: string;
     GOOGLE_CLIENT_SECRET: string;

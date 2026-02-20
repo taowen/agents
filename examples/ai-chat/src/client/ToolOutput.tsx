@@ -83,79 +83,6 @@ function BashToolOutput({ part }: { part: ToolUIPart }) {
   );
 }
 
-function BrowserToolOutput({ part }: { part: ToolUIPart }) {
-  const browserInput = part.input as
-    | {
-        action?: string;
-        url?: string;
-        selector?: string;
-        text?: string;
-        direction?: string;
-      }
-    | undefined;
-  const browserOutput = part.output as
-    | {
-        action?: string;
-        success?: boolean;
-        url?: string;
-        title?: string;
-        text?: string;
-        screenshot?: string;
-        error?: string;
-      }
-    | undefined;
-
-  if (!browserOutput) return null;
-
-  const action = browserOutput.action || browserInput?.action || "";
-  const url = browserOutput.url || browserInput?.url || "";
-  const summaryText = `${action}${url ? " " + url : ""}`;
-  const summaryShort =
-    summaryText.length > 70 ? summaryText.slice(0, 70) + "\u2026" : summaryText;
-
-  return (
-    <div className="flex justify-start">
-      <details className="max-w-[85%]">
-        <summary className="cursor-pointer list-none flex items-center gap-2 px-3 py-1.5 rounded-lg bg-kumo-base ring ring-kumo-line hover:bg-kumo-elevated transition-colors">
-          <GearIcon size={12} className="text-kumo-inactive shrink-0" />
-          <span className="font-mono text-xs text-kumo-secondary truncate">
-            {summaryShort}
-          </span>
-          {browserOutput.success ? (
-            <Badge variant="secondary">OK</Badge>
-          ) : (
-            <Badge variant="destructive">Failed</Badge>
-          )}
-        </summary>
-        <div className="mt-1 px-3 py-2 rounded-lg bg-kumo-base ring ring-kumo-line space-y-2">
-          {browserOutput.error && (
-            <Text size="xs" variant="error">
-              {browserOutput.error}
-            </Text>
-          )}
-          {browserOutput.url && browserOutput.title && (
-            <Text size="xs" variant="secondary">
-              {browserOutput.title} — {browserOutput.url}
-            </Text>
-          )}
-          {browserOutput.screenshot && (
-            <img
-              src={`data:image/png;base64,${browserOutput.screenshot}`}
-              alt="Browser screenshot"
-              className="rounded border border-kumo-line max-w-full"
-            />
-          )}
-          {browserOutput.text && (
-            <pre className="p-2 bg-kumo-elevated rounded overflow-x-auto text-xs text-kumo-secondary max-h-[300px] overflow-y-auto">
-              {browserOutput.text}
-            </pre>
-          )}
-        </div>
-      </details>
-    </div>
-  );
-}
-
 function GenericToolOutput({ part }: { part: ToolUIPart }) {
   const toolName = getToolName(part);
 
@@ -273,7 +200,6 @@ export function ToolOutput({
   if (part.state === "output-available") {
     const toolName = getToolName(part);
     if (toolName === "bash") return <BashToolOutput part={part} />;
-    if (toolName === "browser") return <BrowserToolOutput part={part} />;
     return <GenericToolOutput part={part} />;
   }
 

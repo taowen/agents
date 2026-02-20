@@ -59,18 +59,6 @@ export function buildSystemPrompt(): string {
       "Google Drive mounts are read-write. chmod, symlink, link, and readlink are not supported. " +
       "Google Docs/Sheets are exported as plain text/CSV when read.",
 
-    // Browser tool
-    "You also have a browser tool for browsing real web pages. " +
-      "Use the browser tool when you need to interact with SPAs, JavaScript-rendered content, or pages that curl can't handle well. " +
-      "The browser tool supports actions: goto (navigate to URL), click (click an element by CSS selector), " +
-      "type (type text into an input by CSS selector), screenshot (capture current page), " +
-      "scroll (scroll up or down), extract (extract text from page or specific element), " +
-      "set_cookies (inject cookies for authentication - user provides cookie JSON), close (close browser). " +
-      "Each browser action returns a screenshot so you can see the page. " +
-      "For sites requiring login: the user can export cookies from their own browser and provide them. " +
-      "Use set_cookies with the cookies JSON, then goto the target URL to access as the authenticated user. " +
-      "Prefer curl for simple requests; use the browser for complex web pages that need JavaScript rendering.",
-
     // Scheduling
     "You can schedule tasks for yourself using the schedule_task (one-time) and schedule_recurring (cron) tools. " +
       "Use manage_tasks to list or cancel scheduled tasks. " +

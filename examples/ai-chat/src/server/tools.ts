@@ -2,7 +2,6 @@ import * as Sentry from "@sentry/cloudflare";
 import { tool, type ToolSet } from "ai";
 import { z } from "zod";
 import type { Bash } from "just-bash";
-import { createBrowserTool, type BrowserState } from "./browser-tool";
 
 export function createBashTool(bash: Bash, ensureMounted: () => Promise<void>) {
   return tool({
@@ -31,8 +30,6 @@ export function createBashTool(bash: Bash, ensureMounted: () => Promise<void>) {
 
 export interface CreateToolsDeps {
   bashTool: ReturnType<typeof createBashTool>;
-  browserState: BrowserState;
-  mybrowser: Fetcher;
   schedule: (
     when: Date | number | string,
     method: any,
@@ -52,7 +49,6 @@ export interface CreateToolsDeps {
 export function createTools(deps: CreateToolsDeps): ToolSet {
   const tools: ToolSet = {
     bash: deps.bashTool,
-    browser: createBrowserTool(deps.browserState, deps.mybrowser),
     schedule_task: tool({
       description:
         "Schedule a one-time task. Provide EITHER delaySeconds (e.g. 60 for 1 minute) " +

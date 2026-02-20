@@ -13,11 +13,7 @@ import {
 } from "ai";
 import type { Bash } from "just-bash";
 import type { MountableFs } from "just-bash";
-import {
-  createBrowserState,
-  createBrowserTool,
-  type BrowserState
-} from "./browser-tool";
+
 import { buildSystemPrompt } from "./system-prompt";
 
 // Extracted modules
@@ -43,7 +39,6 @@ class ChatAgentBase extends AIChatAgent {
   private mountableFs!: MountableFs;
   private mounted = false;
   private mountPromise: Promise<void> | null = null;
-  private browserState: BrowserState;
   private userId: string | null = null;
   private sessionUuid: string | null = null;
   private cachedLlmConfig: LlmConfigCache = null;
@@ -57,7 +52,6 @@ class ChatAgentBase extends AIChatAgent {
 
   constructor(ctx: DurableObjectState, env: Env) {
     super(ctx, env);
-    this.browserState = createBrowserState();
   }
 
   /**
@@ -222,8 +216,7 @@ class ChatAgentBase extends AIChatAgent {
               `User timezone: ${tz}`,
             prompt: payload.prompt,
             tools: {
-              bash: createBashTool(this.bash, () => this.ensureMounted()),
-              browser: createBrowserTool(this.browserState, this.env.MYBROWSER)
+              bash: createBashTool(this.bash, () => this.ensureMounted())
             },
             stopWhen: stepCountIs(10)
           });
@@ -402,8 +395,6 @@ class ChatAgentBase extends AIChatAgent {
         this.cachedTools = {
           ...createTools({
             bashTool: createBashTool(this.bash, () => this.ensureMounted()),
-            browserState: this.browserState,
-            mybrowser: this.env.MYBROWSER,
             schedule: (when, method, payload) =>
               this.schedule(when, method, payload),
             getSchedules: () => this.getSchedules(),
