@@ -13,9 +13,9 @@
     "@cloudflare/vite-plugin": "^1.25.0",
     "@vitejs/plugin-react": "^5.1.4",
     "chess.js": "^1.4.0",
-    "react": "^19.2.4",
+    "react": "^19.2.3",
     "react-chessboard": "^5.10.0",
-    "react-dom": "^19.2.4",
+    "react-dom": "^19.2.3",
     "vite": "^7.3.1",
     "vite-plugin-singlefile": "^2.3.0"
   },

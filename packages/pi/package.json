@@ -1,0 +1,28 @@
+{
+  "name": "pi",
+  "version": "0.0.1",
+  "type": "module",
+  "private": true,
+  "main": "src/index.ts",
+  "dependencies": {
+    "ai": "^6.0.86",
+    "zod": "^4.3.6"
+  },
+  "devDependencies": {
+    "@ai-sdk/anthropic": "*",
+    "@ai-sdk/google": "*",
+    "@ai-sdk/openai": "*",
+    "typescript": "*",
+    "vitest": "*"
+  },
+  "peerDependencies": {
+    "@ai-sdk/anthropic": "*",
+    "@ai-sdk/google": "*",
+    "@ai-sdk/openai": "*"
+  },
+  "peerDependenciesMeta": {
+    "@ai-sdk/anthropic": { "optional": true },
+    "@ai-sdk/google": { "optional": true },
+    "@ai-sdk/openai": { "optional": true }
+  }
+}
