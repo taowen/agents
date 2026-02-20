@@ -197,6 +197,26 @@ class ChatAgentBase extends AIChatAgent {
       const schedules = this.getSchedules();
       return Response.json(schedules);
     }
+    if (url.pathname.endsWith("/get-usage")) {
+      const since = url.searchParams.get("since");
+      const baseQuery = `SELECT
+          strftime('%Y-%m-%dT%H', created_at) as hour,
+          COUNT(*) as request_count,
+          SUM(json_extract(message, '$.metadata.usage.inputTokens')) as input_tokens,
+          SUM(json_extract(message, '$.metadata.usage.cacheReadTokens')) as cache_read_tokens,
+          SUM(json_extract(message, '$.metadata.usage.cacheWriteTokens')) as cache_write_tokens,
+          SUM(json_extract(message, '$.metadata.usage.outputTokens')) as output_tokens
+        FROM cf_ai_chat_agent_messages
+        WHERE json_extract(message, '$.metadata.usage') IS NOT NULL
+        GROUP BY hour`;
+      const rows = since
+        ? this.ctx.storage.sql.exec(
+            baseQuery + ` HAVING hour >= ? ORDER BY hour`,
+            since
+          )
+        : this.ctx.storage.sql.exec(baseQuery + ` ORDER BY hour`);
+      return Response.json(rows.toArray());
+    }
     if (url.pathname.startsWith("/api/files")) {
       const uid = await this.getUserId(request);
       this.doInitBash(uid);

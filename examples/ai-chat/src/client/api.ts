@@ -147,6 +147,25 @@ export function useMcpServers() {
   return { mcpServers: data ?? [], isLoading, mutateMcpServers: mutate };
 }
 
+// --- Usage Stats ---
+
+export interface UsageRow {
+  hour: string;
+  request_count: number;
+  input_tokens: number;
+  cache_read_tokens: number;
+  cache_write_tokens: number;
+  output_tokens: number;
+}
+
+export function useUsageStats(start: string, end: string) {
+  const { data, isLoading, mutate } = useSWR<UsageRow[]>(
+    `/api/usage?start=${encodeURIComponent(start)}&end=${encodeURIComponent(end)}`,
+    fetcher
+  );
+  return { usage: data ?? [], isLoading, mutateUsage: mutate };
+}
+
 // --- Bug Reports ---
 
 export async function reportBug(

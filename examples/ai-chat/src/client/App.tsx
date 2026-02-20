@@ -3,6 +3,7 @@ import { LoginPage } from "./LoginPage";
 import { SessionSidebar } from "./SessionSidebar";
 import { SettingsPage } from "./SettingsPage";
 import { MemoryPage } from "./MemoryPage";
+import { UsagePage } from "./UsagePage";
 import { Chat } from "./Chat";
 import { useAuth, useSessions } from "./api";
 import { AppShellSkeleton } from "./Skeleton";
@@ -18,7 +19,9 @@ function AuthenticatedApp({ user }: { user: UserInfo }) {
   const { sessions, isLoading, createSession, deleteSession, renameSession } =
     useSessions();
   const [activeSessionId, setActiveSessionId] = useState<string | null>(null);
-  const [view, setView] = useState<"chat" | "settings" | "memory">("chat");
+  const [view, setView] = useState<"chat" | "settings" | "memory" | "usage">(
+    "chat"
+  );
   const [sidebarOpen, setSidebarOpen] = useState(false);
   const autoCreatingRef = useRef(false);
 
@@ -139,6 +142,10 @@ function AuthenticatedApp({ user }: { user: UserInfo }) {
     onOpenMemory: () => {
       setView("memory");
       setSidebarOpen(false);
+    },
+    onOpenUsage: () => {
+      setView("usage");
+      setSidebarOpen(false);
     }
   };
 
@@ -171,6 +178,11 @@ function AuthenticatedApp({ user }: { user: UserInfo }) {
             />
           ) : view === "memory" ? (
             <MemoryPage
+              onBack={() => setView("chat")}
+              onOpenSidebar={() => setSidebarOpen(true)}
+            />
+          ) : view === "usage" ? (
+            <UsagePage
               onBack={() => setView("chat")}
               onOpenSidebar={() => setSidebarOpen(true)}
             />

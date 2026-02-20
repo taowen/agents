@@ -287,7 +287,7 @@ explorer.exe "C:\Users\%USERNAME%\AppData\Local\Temp\windows-agent-standalone\lo
 
 The project integrates `@sentry/cloudflare` for error tracking and performance tracing. Set the `SENTRY_DSN` secret via `wrangler secret put SENTRY_DSN` to enable it.
 
-### Querying logs via Sentry API
+### Setup
 
 Create an auth token at **Sentry Settings > Auth Tokens**, then save it locally:
 
@@ -299,25 +299,52 @@ SENTRY_PROJECT=cloudflare-worker
 SENTRY_BASE_URL=https://us.sentry.io
 ```
 
-Common API queries (all use the regional base URL `https://us.sentry.io`):
+### Diagnostic workflow
+
+When you see a 500 error or unexpected behavior:
+
+**Step 1: List recent unresolved issues**
 
 ```bash
-TOKEN="$(grep SENTRY_AUTH_TOKEN examples/ai-chat/.env.sentry | cut -d= -f2)"
-
-# List unresolved issues (most recent first)
-curl -s -H "Authorization: Bearer $TOKEN" \
-  'https://us.sentry.io/api/0/projects/txom/cloudflare-worker/issues/?query=is:unresolved&sort=date&limit=10'
-
-# Get the latest event (full stack trace + breadcrumbs) for a specific issue
-curl -s -H "Authorization: Bearer $TOKEN" \
-  'https://us.sentry.io/api/0/issues/{issue_id}/events/latest/'
-
-# List recent events for the project
-curl -s -H "Authorization: Bearer $TOKEN" \
-  'https://us.sentry.io/api/0/projects/txom/cloudflare-worker/events/?limit=10'
+source examples/ai-chat/.env.sentry
+curl -s "https://us.sentry.io/api/0/projects/txom/cloudflare-worker/issues/?query=is:unresolved&sort=date&limit=10" \
+  -H "Authorization: Bearer $SENTRY_AUTH_TOKEN" | jq '.[] | {id, title, lastSeen, count}'
 ```
 
-Pipe through `python3 -m json.tool` for pretty-printed output, or use `jq`.
+**Step 2: Get the latest event for a specific issue**
+
+Copy the `id` from step 1 and fetch the full event:
+
+```bash
+curl -s "https://us.sentry.io/api/0/issues/{issue_id}/events/latest/" \
+  -H "Authorization: Bearer $SENTRY_AUTH_TOKEN" | jq '{
+    message: .message,
+    exception: [.entries[] | select(.type == "exception") | .data.values[] | {type, value}],
+    request: .request,
+    tags: [.tags[] | select(.key == "url" or .key == "transaction" or .key == "user_id" or .key == "session_uuid")]
+  }'
+```
+
+**Step 3: Check breadcrumbs for context**
+
+```bash
+curl -s "https://us.sentry.io/api/0/issues/{issue_id}/events/latest/" \
+  -H "Authorization: Bearer $SENTRY_AUTH_TOKEN" | jq '[.entries[] | select(.type == "breadcrumbs") | .data.values[-10:][]]'
+```
+
+### Common patterns
+
+| Symptom | Likely cause |
+|---------|-------------|
+| `SqlError: Durable Object reset because its code was updated` | Transient — DOs restart after deploy, safe to ignore |
+| 500 on API routes with no Sentry issue | Error not captured — add `try/catch` + `Sentry.captureException(e)` to the handler |
+| `tryN.baseDelayMs.baseDelayMs` | DO retry loop hitting the reset window after deploy |
+
+### Limitations
+
+- **Worker-level Hono route errors** may not appear in Sentry unless explicitly captured with `Sentry.captureException()` inside a `try/catch` block. The Sentry middleware wraps the top-level fetch but uncaught exceptions in sub-routers can sometimes be swallowed by Hono's error handling.
+- **DO errors** are instrumented via `instrumentDurableObjectWithSentry` and appear automatically.
+- **`wrangler tail`** (`npx wrangler tail --format json`) shows real-time `console.log`/`console.error` output. Useful when Sentry doesn't capture the error.
 
 ### Key fields in the event response
 

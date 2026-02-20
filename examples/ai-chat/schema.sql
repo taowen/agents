@@ -31,3 +31,16 @@ CREATE TABLE IF NOT EXISTS files (
   PRIMARY KEY (user_id, path)
 );
 CREATE INDEX IF NOT EXISTS idx_files_parent ON files(user_id, parent_path);
+
+CREATE TABLE IF NOT EXISTS usage_archive (
+  user_id TEXT NOT NULL,
+  session_id TEXT NOT NULL,
+  hour TEXT NOT NULL,
+  request_count INTEGER DEFAULT 0,
+  input_tokens INTEGER DEFAULT 0,
+  cache_read_tokens INTEGER DEFAULT 0,
+  cache_write_tokens INTEGER DEFAULT 0,
+  output_tokens INTEGER DEFAULT 0,
+  PRIMARY KEY (user_id, session_id, hour)
+);
+CREATE INDEX IF NOT EXISTS idx_usage_archive_user_hour ON usage_archive(user_id, hour);

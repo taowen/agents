@@ -3,6 +3,7 @@ import {
   PlusIcon,
   GearIcon,
   BrainIcon,
+  ChartBarIcon,
   TrashIcon,
   ChatCircleIcon,
   SignOutIcon,
@@ -36,6 +37,7 @@ interface SessionSidebarProps {
   onRenameSession: (id: string, title: string) => void;
   onOpenSettings: () => void;
   onOpenMemory: () => void;
+  onOpenUsage: () => void;
 }
 
 export function SessionSidebar({
@@ -48,7 +50,8 @@ export function SessionSidebar({
   onDeleteSession,
   onRenameSession,
   onOpenSettings,
-  onOpenMemory
+  onOpenMemory,
+  onOpenUsage
 }: SessionSidebarProps) {
   const [editingId, setEditingId] = useState<string | null>(null);
   const [editTitle, setEditTitle] = useState("");
@@ -164,6 +167,15 @@ export function SessionSidebar({
         >
           <BrainIcon size={14} />
           <span>Memory</span>
+        </button>
+
+        {/* Usage link */}
+        <button
+          onClick={onOpenUsage}
+          className="flex items-center gap-2 w-full px-3 py-2 rounded-lg text-sm text-kumo-secondary hover:bg-kumo-elevated hover:text-kumo-default transition-colors"
+        >
+          <ChartBarIcon size={14} />
+          <span>Usage</span>
         </button>
 
         {/* Settings link */}

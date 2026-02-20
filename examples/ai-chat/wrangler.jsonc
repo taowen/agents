@@ -4,7 +4,7 @@
   "compatibility_flags": ["nodejs_compat"],
   "assets": {
     "not_found_handling": "single-page-application",
-    "run_worker_first": ["/agents/*", "/oauth/*", "/auth/*", "/api/*", "/mcp-callback/*"]
+    "run_worker_first": ["/agents/*", "/oauth/*", "/auth/*", "/api/*", "/mcp-callback/*", "/download"]
   },
   "durable_objects": {
     "bindings": [
@@ -28,6 +28,10 @@
     {
       "binding": "R2",
       "bucket_name": "ai-chat-files"
+    },
+    {
+      "binding": "R2_PUBLIC",
+      "bucket_name": "ai-chat-public"
     }
   ],
   "main": "src/server/index.ts",
