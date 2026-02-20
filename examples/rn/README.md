@@ -14,6 +14,7 @@ AgentLoop.ts  ──>  executeCode(code)  [eval() in Hermes]
                      ├── globalThis.long_click(...)  ──>  longClickByText / longClickByDesc / longClickByCoords
                      ├── globalThis.scroll(dir)     ──>  scrollScreen()
                      ├── globalThis.type_text(...)   ──>  typeText()
+                     ├── globalThis.take_screenshot()──>  takeScreenshotSync() → base64 JPEG
                      ├── globalThis.sleep(ms)       ──>  sleepMs()
                      ├── ...                        ──>  pressHome / pressBack / launchApp / listApps / ...
                      │
@@ -29,7 +30,7 @@ Key files:
 | `src/LlmClient.ts` | HTTP client for OpenAI-compatible chat completions API |
 | `src/App.tsx` | UI: task input, log viewer, LLM config, broadcast event listener |
 | `AccessibilityBridgeModule.java` | Sync native methods bridging to SelectToSpeakService |
-| `SelectToSpeakService.java` | Core accessibility service (reads UI tree, performs clicks/scrolls) |
+| `SelectToSpeakService.java` | Core accessibility service (reads UI tree, performs clicks/scrolls, takes screenshots) |
 | `TaskReceiver.java` | BroadcastReceiver that emits `onTaskReceived` event to RN |
 
 ## Build & Deploy
@@ -94,6 +95,22 @@ If you need a sync method that logically returns nothing, return `boolean` (e.g.
 **Red screen: "Packager does not seem to be running"**
 
 This happens if `debuggableVariants` in `build.gradle` includes `"debug"` (the default). With `debuggableVariants = []`, JS is bundled into the APK and Metro is not needed.
+
+## Screenshot (`take_screenshot()`)
+
+When the accessibility tree lacks text/desc (e.g. Feishu's `ImageView` buttons), the agent can capture a screenshot and send it to the LLM as a vision input.
+
+How it works:
+1. JS calls `take_screenshot()` which invokes `AccessibilityService.takeScreenshot()` (API 30+)
+2. The async callback is blocked with `CountDownLatch` (10s timeout)
+3. `HardwareBuffer` → `Bitmap` → scaled to 720px wide → JPEG q=80 → Base64
+4. The base64 string is intercepted in `executeCode()` — JS gets a short placeholder, while the actual image is injected as a `user` message with `image_url` content type
+5. `trimMessages()` keeps only the most recent screenshot to avoid context bloat
+
+Requirements:
+- `accessibility_service_config.xml` must have `android:canTakeScreenshot="true"`
+- After changing this config, the accessibility service must be **re-enabled** in system settings
+- API 30+ (Android 11+). Returns an error string on older devices
 
 ## LLM Config
 

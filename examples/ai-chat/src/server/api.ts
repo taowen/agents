@@ -1,173 +1,184 @@
 /**
  * API routes for session management and user settings.
- * All routes require authentication (userId already validated).
+ * All routes require authentication (userId set by auth middleware).
  */
 
+import { Hono } from "hono";
+import * as Sentry from "@sentry/cloudflare";
 import {
   getUser,
   listSessions,
   createSession,
   updateSessionTitle,
-  deleteSession
+  deleteSession,
+  getMemoryFiles,
+  putMemoryFiles
 } from "./db";
 import { handleFileRoutes } from "./api-files";
 
-export async function handleApiRoutes(
-  request: Request,
-  env: Env,
-  userId: string
-): Promise<Response | null> {
-  const url = new URL(request.url);
+type ApiEnv = { Bindings: Env; Variables: { userId: string } };
 
-  // GET /api/user
-  if (url.pathname === "/api/user" && request.method === "GET") {
-    const user = await getUser(env.DB, userId);
-    if (!user) {
-      return Response.json({ error: "User not found" }, { status: 404 });
-    }
-    return Response.json({
-      id: user.id,
-      email: user.email,
-      name: user.name,
-      picture: user.picture
-    });
+const api = new Hono<ApiEnv>();
+
+// GET /user
+api.get("/user", async (c) => {
+  const userId = c.get("userId");
+  const user = await getUser(c.env.DB, userId);
+  if (!user) {
+    return c.json({ error: "User not found" }, 404);
   }
+  return c.json({
+    id: user.id,
+    email: user.email,
+    name: user.name,
+    picture: user.picture
+  });
+});
 
-  // GET /api/sessions
-  if (url.pathname === "/api/sessions" && request.method === "GET") {
-    const sessions = await listSessions(env.DB, userId);
-    return Response.json(sessions);
+// GET /sessions
+api.get("/sessions", async (c) => {
+  const userId = c.get("userId");
+  const sessions = await listSessions(c.env.DB, userId);
+  return c.json(sessions);
+});
+
+// POST /sessions
+api.post("/sessions", async (c) => {
+  const userId = c.get("userId");
+  let title: string | undefined;
+  try {
+    const body = await c.req.json<{ title?: string }>();
+    title = body.title;
+  } catch {
+    // empty body is fine
   }
+  const session = await createSession(c.env.DB, userId, title);
+  return c.json(session, 201);
+});
 
-  // POST /api/sessions
-  if (url.pathname === "/api/sessions" && request.method === "POST") {
-    let title: string | undefined;
-    try {
-      const body = (await request.json()) as { title?: string };
-      title = body.title;
-    } catch {
-      // empty body is fine
-    }
-    const session = await createSession(env.DB, userId, title);
-    return Response.json(session, { status: 201 });
+// PATCH /sessions/:id
+api.patch("/sessions/:id", async (c) => {
+  const userId = c.get("userId");
+  const sessionId = c.req.param("id");
+  const body = await c.req.json<{ title?: string }>();
+  if (!body.title) {
+    return c.json({ error: "title is required" }, 400);
   }
-
-  // PATCH /api/sessions/:id
-  const patchMatch = url.pathname.match(/^\/api\/sessions\/([^/]+)$/);
-  if (patchMatch && request.method === "PATCH") {
-    const sessionId = patchMatch[1];
-    const body = (await request.json()) as { title?: string };
-    if (!body.title) {
-      return Response.json({ error: "title is required" }, { status: 400 });
-    }
-    const updated = await updateSessionTitle(
-      env.DB,
-      sessionId,
-      userId,
-      body.title
-    );
-    if (!updated) {
-      return Response.json({ error: "Session not found" }, { status: 404 });
-    }
-    return Response.json({ ok: true });
-  }
-
-  // GET /api/sessions/:id/schedules
-  const schedulesMatch = url.pathname.match(
-    /^\/api\/sessions\/([^/]+)\/schedules$/
+  const updated = await updateSessionTitle(
+    c.env.DB,
+    sessionId,
+    userId,
+    body.title
   );
-  if (schedulesMatch && request.method === "GET") {
-    const sessionId = schedulesMatch[1];
-    const id = env.ChatAgent.idFromName(`${userId}:${sessionId}`);
-    const stub = env.ChatAgent.get(id);
-    return stub.fetch(new Request("http://agent/get-schedules"));
+  if (!updated) {
+    return c.json({ error: "Session not found" }, 404);
   }
+  return c.json({ ok: true });
+});
 
-  // DELETE /api/sessions/:id
-  const deleteMatch = url.pathname.match(/^\/api\/sessions\/([^/]+)$/);
-  if (deleteMatch && request.method === "DELETE") {
-    const sessionId = deleteMatch[1];
-    const deleted = await deleteSession(env.DB, sessionId, userId);
-    if (!deleted) {
-      return Response.json({ error: "Session not found" }, { status: 404 });
-    }
-    return Response.json({ ok: true });
+// DELETE /sessions/:id
+api.delete("/sessions/:id", async (c) => {
+  const userId = c.get("userId");
+  const sessionId = c.req.param("id");
+  const deleted = await deleteSession(c.env.DB, sessionId, userId);
+  if (!deleted) {
+    return c.json({ error: "Session not found" }, 404);
   }
+  return c.json({ ok: true });
+});
 
-  // GET /api/memory
-  if (url.pathname === "/api/memory" && request.method === "GET") {
-    const paths = [
-      "/home/user/.memory/profile.md",
-      "/home/user/.memory/preferences.md",
-      "/home/user/.memory/entities.md"
-    ];
-    const results = await env.DB.batch(
-      paths.map((p) =>
-        env.DB.prepare(
-          "SELECT CAST(content AS TEXT) as content FROM files WHERE user_id=? AND path=?"
-        ).bind(userId, p)
-      )
-    );
-    const keys = ["profile", "preferences", "entities"];
-    const data: Record<string, string> = {};
-    for (let i = 0; i < keys.length; i++) {
-      const row = results[i].results[0] as
-        | { content: string | null }
-        | undefined;
-      data[keys[i]] = row?.content ?? "";
-    }
-    return Response.json(data);
-  }
+// GET /sessions/:id/schedules — proxy to DO
+api.get("/sessions/:id/schedules", async (c) => {
+  const userId = c.get("userId");
+  const sessionId = c.req.param("id");
+  const id = c.env.ChatAgent.idFromName(`${userId}:${sessionId}`);
+  const stub = c.env.ChatAgent.get(id);
+  return stub.fetch(
+    new Request("http://agent/get-schedules", {
+      headers: {
+        "x-user-id": userId,
+        "x-session-id": sessionId,
+        "x-partykit-room": `${userId}:${sessionId}`
+      }
+    })
+  );
+});
 
-  // PUT /api/memory
-  if (url.pathname === "/api/memory" && request.method === "PUT") {
-    const body = (await request.json()) as {
-      profile?: string;
-      preferences?: string;
-      entities?: string;
-    };
-    const enc = new TextEncoder();
-    const mkdirSql = `INSERT OR IGNORE INTO files (user_id, path, parent_path, name, content, is_directory, mode, size, mtime)
-       VALUES (?, ?, ?, ?, NULL, 1, 16877, 0, unixepoch('now'))`;
-    const fileSql = `INSERT INTO files (user_id, path, parent_path, name, content, is_directory, mode, size, mtime)
-       VALUES (?, ?, ?, ?, ?, 0, 33188, ?, unixepoch('now'))
-       ON CONFLICT(user_id, path) DO UPDATE SET content=excluded.content, size=excluded.size, mtime=unixepoch('now')`;
+// POST /sessions/:id/report-bug — handled directly in the worker
+api.post("/sessions/:id/report-bug", async (c) => {
+  const userId = c.get("userId");
+  const sessionId = c.req.param("id");
 
-    const stmts: D1PreparedStatement[] = [
-      env.DB.prepare(mkdirSql).bind(
-        userId,
-        "/home/user/.memory",
-        "/home/user",
-        ".memory"
-      )
-    ];
+  const { description } = await c.req.json<{ description: string }>();
+  const reportId = `BUG-${Date.now().toString(36).toUpperCase()}-${Array.from(
+    crypto.getRandomValues(new Uint8Array(2))
+  )
+    .map((b) => b.toString(16).padStart(2, "0"))
+    .join("")
+    .toUpperCase()}`;
 
-    const fileMap: Record<string, string | undefined> = {
-      "profile.md": body.profile,
-      "preferences.md": body.preferences,
-      "entities.md": body.entities
-    };
-    for (const [name, content] of Object.entries(fileMap)) {
-      if (content === undefined) continue;
-      const buf = enc.encode(content);
-      stmts.push(
-        env.DB.prepare(fileSql).bind(
-          userId,
-          `/home/user/.memory/${name}`,
-          "/home/user/.memory",
-          name,
-          buf,
-          buf.length
-        )
-      );
-    }
-    await env.DB.batch(stmts);
-    return Response.json({ ok: true });
-  }
+  // Compute sessionDir from the DO ID (first 12 hex chars)
+  const doId = c.env.ChatAgent.idFromName(`${userId}:${sessionId}`);
+  const sessionDir = doId.toString().slice(0, 12);
 
-  // File Manager routes
-  const fileResponse = await handleFileRoutes(request, env, userId);
+  // Query D1 for recent chat messages
+  const chatPrefix = `/home/user/.chat/${sessionDir}/`;
+  const rows = await c.env.DB.prepare(
+    `SELECT path, CAST(content AS TEXT) as content FROM files
+     WHERE user_id = ? AND parent_path = ? AND is_directory = 0
+     ORDER BY mtime DESC LIMIT 10`
+  )
+    .bind(userId, chatPrefix.slice(0, -1))
+    .all<{ path: string; content: string }>();
+
+  const recentMessages = rows.results.map((r) => {
+    const text = r.content || "";
+    return { path: r.path, text: text.slice(0, 500) };
+  });
+
+  Sentry.withScope((scope) => {
+    scope.setUser({ id: userId });
+    scope.setTag("report_id", reportId);
+    scope.setTag("user_id", userId);
+    scope.setTag("session_uuid", sessionId);
+    scope.setContext("bug_report", {
+      description,
+      reportId,
+      sessionUuid: sessionId,
+      userId
+    });
+    scope.setContext("recent_messages", { messages: recentMessages });
+    Sentry.captureMessage(`[Bug Report ${reportId}] ${description}`, "warning");
+  });
+
+  return c.json({ reportId });
+});
+
+// GET /memory
+api.get("/memory", async (c) => {
+  const userId = c.get("userId");
+  const data = await getMemoryFiles(c.env.DB, userId);
+  return c.json(data);
+});
+
+// PUT /memory
+api.put("/memory", async (c) => {
+  const userId = c.get("userId");
+  const body = await c.req.json<{
+    profile?: string;
+    preferences?: string;
+    entities?: string;
+  }>();
+  await putMemoryFiles(c.env.DB, userId, body);
+  return c.json({ ok: true });
+});
+
+// File Manager routes — delegate to existing handler
+api.all("/files/*", async (c) => {
+  const userId = c.get("userId");
+  const fileResponse = await handleFileRoutes(c.req.raw, c.env, userId);
   if (fileResponse) return fileResponse;
+  return c.json({ error: "Not found" }, 404);
+});
 
-  return null;
-}
+export { api as apiRoutes };

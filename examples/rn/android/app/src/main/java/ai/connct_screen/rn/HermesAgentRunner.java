@@ -42,6 +42,12 @@ public class HermesAgentRunner {
 
     // --- Static callbacks invoked from C++ via JNI ---
 
+    public static String nativeTakeScreenshot() {
+        SelectToSpeakService service = SelectToSpeakService.getInstance();
+        if (service == null) return "ERROR: accessibility service not running";
+        return service.takeScreenshotSync();
+    }
+
     public static String nativeGetScreen() {
         SelectToSpeakService service = SelectToSpeakService.getInstance();
         if (service == null) return "(accessibility service not running)";

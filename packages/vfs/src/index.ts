@@ -29,3 +29,5 @@ export {
 export type { GitHubOAuthDeps } from "./github-oauth";
 export { GoogleDriveFsAdapter } from "./gdrive-fs-adapter";
 export { MockR2Bucket } from "./mock-r2-bucket";
+export { buildFsTypeRegistry, initBash, doFstabMount } from "./fs-init";
+export type { FsBindings, InitBashOptions } from "./fs-init";

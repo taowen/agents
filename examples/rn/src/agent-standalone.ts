@@ -2,17 +2,15 @@
  * agent-standalone.ts
  *
  * Self-contained agent loop that runs in a standalone Hermes runtime
- * (inside the AccessibilityService process). No imports — all globals
- * are provided by C++ host functions registered in standalone_hermes.cpp:
- *
- *   get_screen(), click(target), long_click(target), scroll(dir),
- *   scroll_element(text, dir), type_text(text), press_home(), press_back(),
- *   press_recents(), show_notifications(), launch_app(name), list_apps(),
- *   sleep(ms), log(msg), http_post(url, headersJson, body)
+ * (inside the AccessibilityService process). Host function metadata lives
+ * in host-api.ts; prompt & tool definitions are generated in prompt.ts.
  */
+
+import { SYSTEM_PROMPT, TOOLS } from "./prompt";
 
 // Declare globals provided by C++ host functions (for TypeScript only)
 declare function get_screen(): string;
+declare function take_screenshot(): string;
 declare function click(
   target: string | { desc?: string; x?: number; y?: number }
 ): boolean;
@@ -41,67 +39,15 @@ const KEEP_RECENT_TOOL_RESULTS = 3;
 const MAX_GET_SCREEN_PER_EXEC = 5;
 const EXEC_TIMEOUT_MS = 30_000;
 
-const SYSTEM_PROMPT =
-  "You are a mobile automation assistant controlling a phone via Android Accessibility Service.\n" +
-  "You can see the screen's accessibility tree where each node shows: class type, text, content description (desc), bounds coordinates, and properties.\n\n" +
-  "You operate by writing JavaScript code using the execute_js tool. All calls are synchronous. Available global functions:\n" +
-  "- get_screen() → returns accessibility tree as string\n" +
-  '- click(target) → click by text: click("OK"), by desc: click({desc:"加"}), or by coords: click({x:100,y:200})\n' +
-  "- long_click(target) → same syntax as click, but long-press\n" +
-  '- scroll(direction) → "up"/"down"/"left"/"right"\n' +
-  "- type_text(text) → type into focused input\n" +
-  "- press_home() / press_back() → navigation\n" +
-  "- press_recents() → open recent tasks list (for switching apps)\n" +
-  "- show_notifications() → pull down notification shade\n" +
-  "- launch_app(name) → launch app by name or package name\n" +
-  '- list_apps() → returns installed launchable apps, one per line: "AppName (package.name)"\n' +
-  "- scroll_element(text, direction) → scroll a specific scrollable element found by text\n" +
-  "- sleep(ms) → wait for UI to settle\n" +
-  "- log(msg) → log a message\n\n" +
-  "Tips:\n" +
-  "- Execute a SHORT sequence of actions (5-10 operations max), then return the result\n" +
-  "- Do NOT write for/while loops that call get_screen() or scroll() repeatedly\n" +
-  "- get_screen() is limited to 5 calls per execute_js\n" +
-  "- Use globalThis to store state between calls\n" +
-  '- click("text") matches BOTH text and desc attributes. Use click({desc:"X"}) for desc-only match\n' +
-  "- Bounds format: [left,top][right,bottom]. Center: x=(left+right)/2, y=(top+bottom)/2\n" +
-  "- After actions, call sleep(500) then get_screen() to verify results\n" +
-  "- If click by text fails, calculate coordinates from bounds and use click({x, y})\n" +
-  '- To open an app, prefer launch_app("AppName") over navigating the home screen\n' +
-  '- For NumberPicker/time selectors, use scroll_element("当前值", "up"/"down") to change values\n' +
-  "- When the task is complete, respond with a text summary (no tool call)";
-
-const TOOLS = [
-  {
-    type: "function",
-    function: {
-      name: "execute_js",
-      description:
-        "Execute JavaScript code. Execute a short linear sequence of actions. " +
-        "Available globals: get_screen(), click(target), long_click(target), scroll(dir), " +
-        "type_text(text), press_home(), press_back(), press_recents(), show_notifications(), " +
-        "launch_app(name), list_apps(), scroll_element(text, dir), " +
-        "sleep(ms), log(msg). get_screen() is limited to 5 calls per execution. " +
-        "Do NOT use loops to scroll and check screen repeatedly. " +
-        "The globalThis object persists across calls - use it to store context.",
-      parameters: {
-        type: "object",
-        properties: {
-          code: {
-            type: "string",
-            description:
-              "JavaScript code to execute. All screen automation functions are available as globals."
-          }
-        },
-        required: ["code"]
-      }
-    }
-  }
-];
+interface ContentPart {
+  type: string;
+  text?: string;
+  image_url?: { url: string };
+}
 
 interface ChatMessage {
   role: string;
-  content: string | null;
+  content: string | ContentPart[] | null;
   tool_calls?: ToolCall[];
   tool_call_id?: string;
 }
@@ -201,9 +147,18 @@ function callLLM(
   throw new Error(lastError || "LLM request failed after retries");
 }
 
-function executeCode(code: string): string {
+function executeCode(
+  code: string,
+  thinking?: string
+): { text: string; screenshot?: string } {
+  if (thinking) {
+    agentLog("[THINK] " + thinking);
+  }
+  agentLog("[CODE] " + code);
+
   const actionLog: string[] = [];
   let getScreenCount = 0;
+  let capturedScreenshot: string | undefined;
   const deadline = Date.now() + EXEC_TIMEOUT_MS;
 
   // Wrap host functions with logging and limits
@@ -225,25 +180,47 @@ function executeCode(code: string): string {
     return tree;
   };
 
+  const origTakeScreenshot = take_screenshot;
+  (globalThis as any).take_screenshot = function (): string {
+    if (Date.now() > deadline) throw new Error("Script execution timeout");
+    const b64 = origTakeScreenshot();
+    if (b64.startsWith("ERROR:")) {
+      actionLog.push("[take_screenshot] " + b64);
+      return b64;
+    }
+    capturedScreenshot = b64;
+    actionLog.push(
+      "[take_screenshot] captured (" + b64.length + " chars base64)"
+    );
+    return "screenshot captured - image will be sent to you";
+  };
+
   try {
     // Use indirect eval to run in global scope
     const result = (0, eval)(code);
     const resultStr = result === undefined ? "undefined" : String(result);
+    let text: string;
     if (actionLog.length > 0) {
       actionLog.push("[Script returned] " + resultStr);
-      return actionLog.join("\n");
+      text = actionLog.join("\n");
+    } else {
+      text = resultStr;
     }
-    return resultStr;
+    return { text, screenshot: capturedScreenshot };
   } catch (e: any) {
     const error = "[JS Error] " + (e.message || String(e));
+    let text: string;
     if (actionLog.length > 0) {
       actionLog.push(error);
-      return actionLog.join("\n");
+      text = actionLog.join("\n");
+    } else {
+      text = error;
     }
-    return error;
+    return { text, screenshot: capturedScreenshot };
   } finally {
-    // Restore original
+    // Restore originals
     (globalThis as any).get_screen = origGetScreen;
+    (globalThis as any).take_screenshot = origTakeScreenshot;
   }
 }
 
@@ -254,13 +231,30 @@ function trimMessages(messages: ChatMessage[]): void {
     if (msg.role === "tool") {
       toolCount++;
       if (toolCount > KEEP_RECENT_TOOL_RESULTS) {
-        const content = msg.content || "";
-        if (content.length > 200) {
+        const content = msg.content;
+        if (typeof content === "string" && content.length > 200) {
           msg.content =
             content.substring(0, 200) +
             "...(truncated, " +
             content.length +
             " chars total)";
+        }
+      }
+    }
+  }
+
+  // Keep only the most recent screenshot user message; replace older ones
+  let screenshotCount = 0;
+  for (let i = messages.length - 1; i >= 0; i--) {
+    const msg = messages[i];
+    if (msg.role === "user" && Array.isArray(msg.content)) {
+      const hasImage = msg.content.some(
+        (p: ContentPart) => p.type === "image_url"
+      );
+      if (hasImage) {
+        screenshotCount++;
+        if (screenshotCount > 1) {
+          msg.content = "[previous screenshot removed]";
         }
       }
     }
@@ -304,25 +298,47 @@ function runAgent(task: string, configJson: string): string {
       agentLog("[STEP " + step + "] LLM returned tool_calls: " + toolNames);
 
       for (const toolCall of response.toolCalls) {
-        let result: string;
+        let resultText: string;
+        let screenshot: string | undefined;
         if (toolCall.function.name === "execute_js") {
           const args = JSON.parse(toolCall.function.arguments);
-          result = executeCode(args.code);
+          const execResult = executeCode(
+            args.code,
+            response.content ?? undefined
+          );
+          resultText = execResult.text;
+          screenshot = execResult.screenshot;
         } else {
-          result = "Unknown tool: " + toolCall.function.name;
+          resultText = "Unknown tool: " + toolCall.function.name;
         }
 
         const logResult =
-          result.length > 200
-            ? result.substring(0, 200) + "... (" + result.length + " chars)"
-            : result;
+          resultText.length > 200
+            ? resultText.substring(0, 200) +
+              "... (" +
+              resultText.length +
+              " chars)"
+            : resultText;
         agentLog("[TOOL] " + toolCall.function.name + " -> " + logResult);
 
         messages.push({
           role: "tool",
           tool_call_id: toolCall.id,
-          content: result
+          content: resultText
         });
+
+        // Inject screenshot as a user vision message
+        if (screenshot) {
+          messages.push({
+            role: "user",
+            content: [
+              {
+                type: "image_url",
+                image_url: { url: "data:image/jpeg;base64," + screenshot }
+              }
+            ]
+          });
+        }
       }
     } else {
       const finalContent = response.content || "(no response)";

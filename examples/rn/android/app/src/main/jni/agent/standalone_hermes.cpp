@@ -58,6 +58,7 @@ static std::string jstringToStd(JNIEnv* env, jstring js) {
 struct JniCache {
     jclass clazz;
     jmethodID getScreen;
+    jmethodID takeScreenshot;
     jmethodID clickByText;
     jmethodID clickByDesc;
     jmethodID clickByCoords;
@@ -84,6 +85,7 @@ static void resolveJniCache(JNIEnv* env) {
     jclass cls = env->FindClass("ai/connct_screen/rn/HermesAgentRunner");
     g_cache.clazz            = (jclass)env->NewGlobalRef(cls);
     g_cache.getScreen        = env->GetStaticMethodID(cls, "nativeGetScreen",        "()Ljava/lang/String;");
+    g_cache.takeScreenshot   = env->GetStaticMethodID(cls, "nativeTakeScreenshot",  "()Ljava/lang/String;");
     g_cache.clickByText      = env->GetStaticMethodID(cls, "nativeClickByText",      "(Ljava/lang/String;)Z");
     g_cache.clickByDesc      = env->GetStaticMethodID(cls, "nativeClickByDesc",      "(Ljava/lang/String;)Z");
     g_cache.clickByCoords    = env->GetStaticMethodID(cls, "nativeClickByCoords",    "(II)Z");
@@ -133,6 +135,9 @@ static void resolveJniCache(JNIEnv* env) {
 static void registerHostFunctions(Runtime& rt) {
     // get_screen() -> string
     REGISTER_SIMPLE_STRING_FN(rt, "get_screen", getScreen);
+
+    // take_screenshot() -> string (base64 JPEG or error)
+    REGISTER_SIMPLE_STRING_FN(rt, "take_screenshot", takeScreenshot);
 
     // click(target) -> bool
     // Supports: click("text"), click({desc:"..."}), click({x:N, y:N})

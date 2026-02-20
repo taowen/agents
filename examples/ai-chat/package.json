@@ -14,11 +14,11 @@
     "@cloudflare/agents-ui": "*",
     "@cloudflare/ai-chat": "*",
     "@cloudflare/kumo": "^1.5.0",
-
     "@phosphor-icons/react": "^2.1.10",
     "@sentry/cloudflare": "^10.39.0",
     "@tailwindcss/typography": "^0.5.19",
     "agents": "*",
+    "hono": "^4.11.9",
     "just-bash": "file:../../packages/just-bash",
     "react-markdown": "^10.1.0",
     "remark-gfm": "^4.0.1",
@@ -26,6 +26,7 @@
     "vfs": "file:../../packages/vfs"
   },
   "devDependencies": {
+    "@sentry/vite-plugin": "^4.9.1",
     "@tailwindcss/vite": "^4",
     "tailwindcss": "^4.1.18"
   }

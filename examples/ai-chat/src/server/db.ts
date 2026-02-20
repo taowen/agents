@@ -120,3 +120,78 @@ export async function deleteSession(
     .run();
   return (result.meta.changes ?? 0) > 0;
 }
+
+export interface MemoryFiles {
+  profile: string;
+  preferences: string;
+  entities: string;
+}
+
+export async function getMemoryFiles(
+  db: D1Database,
+  userId: string
+): Promise<MemoryFiles> {
+  const paths = [
+    "/home/user/.memory/profile.md",
+    "/home/user/.memory/preferences.md",
+    "/home/user/.memory/entities.md"
+  ];
+  const results = await db.batch(
+    paths.map((p) =>
+      db
+        .prepare(
+          "SELECT CAST(content AS TEXT) as content FROM files WHERE user_id=? AND path=?"
+        )
+        .bind(userId, p)
+    )
+  );
+  const keys = ["profile", "preferences", "entities"] as const;
+  const data: Record<string, string> = {};
+  for (let i = 0; i < keys.length; i++) {
+    const row = results[i].results[0] as { content: string | null } | undefined;
+    data[keys[i]] = row?.content ?? "";
+  }
+  return data as MemoryFiles;
+}
+
+export async function putMemoryFiles(
+  db: D1Database,
+  userId: string,
+  body: { profile?: string; preferences?: string; entities?: string }
+): Promise<void> {
+  const enc = new TextEncoder();
+  const mkdirSql = `INSERT OR IGNORE INTO files (user_id, path, parent_path, name, content, is_directory, mode, size, mtime)
+     VALUES (?, ?, ?, ?, NULL, 1, 16877, 0, unixepoch('now'))`;
+  const fileSql = `INSERT INTO files (user_id, path, parent_path, name, content, is_directory, mode, size, mtime)
+     VALUES (?, ?, ?, ?, ?, 0, 33188, ?, unixepoch('now'))
+     ON CONFLICT(user_id, path) DO UPDATE SET content=excluded.content, size=excluded.size, mtime=unixepoch('now')`;
+
+  const stmts: D1PreparedStatement[] = [
+    db
+      .prepare(mkdirSql)
+      .bind(userId, "/home/user/.memory", "/home/user", ".memory")
+  ];
+
+  const fileMap: Record<string, string | undefined> = {
+    "profile.md": body.profile,
+    "preferences.md": body.preferences,
+    "entities.md": body.entities
+  };
+  for (const [name, content] of Object.entries(fileMap)) {
+    if (content === undefined) continue;
+    const buf = enc.encode(content);
+    stmts.push(
+      db
+        .prepare(fileSql)
+        .bind(
+          userId,
+          `/home/user/.memory/${name}`,
+          "/home/user/.memory",
+          name,
+          buf,
+          buf.length
+        )
+    );
+  }
+  await db.batch(stmts);
+}

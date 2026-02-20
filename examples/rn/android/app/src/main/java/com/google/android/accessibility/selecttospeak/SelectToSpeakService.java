@@ -5,16 +5,23 @@ import android.accessibilityservice.GestureDescription;
 import android.content.Intent;
 import android.content.pm.ApplicationInfo;
 import android.content.pm.PackageManager;
+import android.graphics.Bitmap;
 import android.graphics.Path;
 import android.graphics.Rect;
+import android.hardware.HardwareBuffer;
+import android.os.Build;
 import android.os.Bundle;
+import android.util.Base64;
 import android.util.Log;
+import android.view.Display;
 import android.view.accessibility.AccessibilityEvent;
 import android.view.accessibility.AccessibilityNodeInfo;
 
+import java.io.ByteArrayOutputStream;
 import java.util.ArrayList;
 import java.util.Collections;
 import java.util.List;
+import java.util.concurrent.CountDownLatch;
 
 public class SelectToSpeakService extends AccessibilityService {
 
@@ -134,6 +141,71 @@ public class SelectToSpeakService extends AccessibilityService {
     }
 
     // ========== Agent action methods ==========
+
+    public String takeScreenshotSync() {
+        if (Build.VERSION.SDK_INT < Build.VERSION_CODES.R) {
+            return "ERROR: takeScreenshot requires API 30+";
+        }
+
+        final CountDownLatch latch = new CountDownLatch(1);
+        final String[] resultHolder = { null };
+
+        takeScreenshot(Display.DEFAULT_DISPLAY,
+                getMainExecutor(),
+                new TakeScreenshotCallback() {
+                    @Override
+                    public void onSuccess(ScreenshotResult screenshot) {
+                        try {
+                            HardwareBuffer hwBuffer = screenshot.getHardwareBuffer();
+                            Bitmap hwBitmap = Bitmap.wrapHardwareBuffer(hwBuffer,
+                                    screenshot.getColorSpace());
+                            hwBuffer.close();
+                            if (hwBitmap == null) {
+                                resultHolder[0] = "ERROR: wrapHardwareBuffer returned null";
+                                latch.countDown();
+                                return;
+                            }
+                            // Copy to software bitmap for compress()
+                            Bitmap swBitmap = hwBitmap.copy(Bitmap.Config.ARGB_8888, false);
+                            hwBitmap.recycle();
+
+                            // Scale to 720px wide
+                            int origW = swBitmap.getWidth();
+                            int origH = swBitmap.getHeight();
+                            int targetW = 720;
+                            int targetH = (int) ((long) origH * targetW / origW);
+                            Bitmap scaled = Bitmap.createScaledBitmap(swBitmap, targetW, targetH, true);
+                            if (scaled != swBitmap) swBitmap.recycle();
+
+                            ByteArrayOutputStream baos = new ByteArrayOutputStream();
+                            scaled.compress(Bitmap.CompressFormat.JPEG, 80, baos);
+                            scaled.recycle();
+
+                            resultHolder[0] = Base64.encodeToString(baos.toByteArray(), Base64.NO_WRAP);
+                            Log.d(AGENT_TAG, "[SCREENSHOT] captured, base64 length=" + resultHolder[0].length());
+                        } catch (Exception e) {
+                            resultHolder[0] = "ERROR: " + e.getMessage();
+                        }
+                        latch.countDown();
+                    }
+
+                    @Override
+                    public void onFailure(int errorCode) {
+                        resultHolder[0] = "ERROR: takeScreenshot failed, code=" + errorCode;
+                        latch.countDown();
+                    }
+                });
+
+        try {
+            boolean ok = latch.await(10, java.util.concurrent.TimeUnit.SECONDS);
+            if (!ok) return "ERROR: takeScreenshot timed out (10s)";
+        } catch (InterruptedException e) {
+            Thread.currentThread().interrupt();
+            return "ERROR: takeScreenshot interrupted";
+        }
+
+        return resultHolder[0];
+    }
 
     public String getAccessibilityTree() {
         AccessibilityNodeInfo root = getRootInActiveWindow();

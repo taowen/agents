@@ -146,3 +146,18 @@ export function useMcpServers() {
   );
   return { mcpServers: data ?? [], isLoading, mutateMcpServers: mutate };
 }
+
+// --- Bug Reports ---
+
+export async function reportBug(
+  sessionId: string,
+  description: string
+): Promise<{ reportId: string }> {
+  const res = await fetch(`/api/sessions/${sessionId}/report-bug`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ description })
+  });
+  if (!res.ok) throw new Error(`Report bug failed: ${res.status}`);
+  return res.json() as Promise<{ reportId: string }>;
+}

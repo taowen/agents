@@ -17,7 +17,9 @@ import type { MountableFs } from "just-bash";
 import { buildSystemPrompt } from "./system-prompt";
 
 // Extracted modules
-import { initBash, doFstabMount } from "./fs-init";
+import { initBash, doFstabMount } from "vfs";
+import type { FsBindings } from "vfs";
+import { createSessionsCommand } from "./session-commands";
 import { ensureMcpServers } from "./mcp-config";
 import {
   getCachedLlmConfig,
@@ -54,13 +56,28 @@ class ChatAgentBase extends AIChatAgent {
     super(ctx, env);
   }
 
+  private get fsBindings(): FsBindings {
+    return {
+      db: this.env.DB,
+      r2: this.env.R2,
+      googleClientId: this.env.GOOGLE_CLIENT_ID,
+      googleClientSecret: this.env.GOOGLE_CLIENT_SECRET
+    };
+  }
+
   /**
    * Initialize bash + filesystem for the given userId.
    */
   private doInitBash(userId: string): void {
     if (this.bash && this.userId === userId) return;
     this.userId = userId;
-    const { bash, mountableFs } = initBash(this.env, userId);
+    const { bash, mountableFs } = initBash({
+      bindings: this.fsBindings,
+      userId,
+      customCommands: [
+        createSessionsCommand(this.env.DB, userId, this.env.ChatAgent)
+      ]
+    });
     this.bash = bash;
     this.mountableFs = mountableFs;
     this.mounted = false;
@@ -75,7 +92,7 @@ class ChatAgentBase extends AIChatAgent {
     if (!this.mountPromise) {
       this.mountPromise = doFstabMount(
         this.mountableFs,
-        this.env,
+        this.fsBindings,
         this.userId!
       ).then(
         () => {
@@ -139,15 +156,38 @@ class ChatAgentBase extends AIChatAgent {
     return this.ctx.id.toString().slice(0, 12);
   }
 
+  /** Tag all Sentry events with session/user context for correlation. */
+  private applySentryTags(): void {
+    if (this.userId) {
+      Sentry.setUser({ id: this.userId });
+      Sentry.setTag("user_id", this.userId);
+    }
+    if (this.sessionUuid) {
+      Sentry.setTag("session_uuid", this.sessionUuid);
+    }
+    Sentry.setTag("do_id", this.ctx.id.toString());
+  }
+
+  async fetch(request: Request): Promise<Response> {
+    const response = await super.fetch(request);
+    if (response.status >= 500) {
+      const url = new URL(request.url);
+      const body = await response.clone().text();
+      Sentry.captureMessage(
+        `DO ${request.method} ${url.pathname} → ${response.status}: ${body.slice(0, 200)}`,
+        "error"
+      );
+    }
+    return response;
+  }
+
   onError(connectionOrError: Connection | unknown, error?: unknown): void {
+    this.applySentryTags();
+    const err = error !== undefined ? error : connectionOrError;
+    console.error("ChatAgent error:", err);
+    Sentry.captureException(err);
     if (error !== undefined) {
-      console.error("ChatAgent error:", error);
-      if (error instanceof Error) Sentry.captureException(error);
       super.onError(connectionOrError as Connection, error);
-    } else {
-      console.error("ChatAgent error:", connectionOrError);
-      if (connectionOrError instanceof Error)
-        Sentry.captureException(connectionOrError);
     }
   }
 
@@ -161,6 +201,7 @@ class ChatAgentBase extends AIChatAgent {
       const uid = await this.getUserId(request);
       this.doInitBash(uid);
       await this.ensureMounted();
+      this.applySentryTags();
       return handleFileRequest(request, this.mountableFs);
     }
     return super.onRequest(request);
@@ -173,6 +214,7 @@ class ChatAgentBase extends AIChatAgent {
     const uid = await this.getUserId(ctx.request);
     await this.getSessionUuid(ctx.request);
     this.doInitBash(uid);
+    this.applySentryTags();
     const origin = new URL(ctx.request.url).origin;
     await this.ctx.storage.put("callbackOrigin", origin);
     return super.onConnect(connection, ctx);
@@ -197,6 +239,10 @@ class ChatAgentBase extends AIChatAgent {
             const uid = await this.getUserId();
             this.doInitBash(uid);
           }
+          if (!this.sessionUuid) {
+            await this.getSessionUuid();
+          }
+          this.applySentryTags();
 
           const { data: llmConfig, cache } = await getCachedLlmConfig(
             this.mountableFs,
@@ -279,6 +325,7 @@ class ChatAgentBase extends AIChatAgent {
       if (!this.sessionUuid) {
         await this.getSessionUuid();
       }
+      this.applySentryTags();
 
       // Ensure /etc and fstab mounts are ready before any filesystem access
       await this.ensureMounted();

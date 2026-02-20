@@ -12,10 +12,12 @@ import {
 import {
   PaperPlaneRightIcon,
   StopIcon,
-  TrashIcon,
   CloudSunIcon,
   ListIcon,
-  FolderIcon
+  FolderIcon,
+  BugIcon,
+  CopyIcon,
+  XIcon
 } from "@phosphor-icons/react";
 import ReactMarkdown from "react-markdown";
 import remarkGfm from "remark-gfm";
@@ -26,6 +28,7 @@ import {
   MIME_TYPES,
   getExtension
 } from "../shared/file-utils";
+import { reportBug } from "./api";
 
 const AT_REF_REGEX = /@(\/[\w./-]+\.\w+)/g;
 
@@ -73,6 +76,11 @@ export function Chat({
     useState<ConnectionStatus>("connecting");
   const [input, setInput] = useState("");
   const [fileManagerOpen, setFileManagerOpen] = useState(false);
+  const [bugReportOpen, setBugReportOpen] = useState(false);
+  const [bugDescription, setBugDescription] = useState("");
+  const [bugReportId, setBugReportId] = useState<string | null>(null);
+  const [bugSubmitting, setBugSubmitting] = useState(false);
+  const [bugError, setBugError] = useState<string | null>(null);
   const messagesEndRef = useRef<HTMLDivElement>(null);
   const firstMessageSent = useRef(false);
 
@@ -87,20 +95,14 @@ export function Chat({
     )
   });
 
-  const {
-    messages,
-    sendMessage,
-    clearHistory,
-    addToolApprovalResponse,
-    status,
-    stop
-  } = useAgentChat({
-    agent,
-    body: {
-      clientVersion: "1.0.0",
-      timezone: Intl.DateTimeFormat().resolvedOptions().timeZone
-    }
-  });
+  const { messages, sendMessage, addToolApprovalResponse, status, stop } =
+    useAgentChat({
+      agent,
+      body: {
+        clientVersion: "1.0.0",
+        timezone: Intl.DateTimeFormat().resolvedOptions().timeZone
+      }
+    });
 
   const isStreaming = status === "streaming";
   const isConnected = connectionStatus === "connected";
@@ -147,6 +149,27 @@ export function Chat({
     });
   }, []);
 
+  const handleBugSubmit = useCallback(async () => {
+    if (!bugDescription.trim()) return;
+    setBugSubmitting(true);
+    setBugError(null);
+    try {
+      const { reportId } = await reportBug(sessionId, bugDescription.trim());
+      setBugReportId(reportId);
+    } catch (e) {
+      setBugError(e instanceof Error ? e.message : "Failed to submit report");
+    } finally {
+      setBugSubmitting(false);
+    }
+  }, [bugDescription, sessionId]);
+
+  const handleBugClose = useCallback(() => {
+    setBugReportOpen(false);
+    setBugDescription("");
+    setBugReportId(null);
+    setBugError(null);
+  }, []);
+
   return (
     <div className="flex flex-col h-screen bg-kumo-elevated">
       {/* Header */}
@@ -177,19 +200,11 @@ export function Chat({
             <Button
               variant="secondary"
               shape="square"
-              aria-label="Clear history"
-              icon={<TrashIcon size={16} />}
-              onClick={clearHistory}
-              className="sm:hidden"
+              aria-label="Report bug"
+              icon={<BugIcon size={16} />}
+              onClick={() => setBugReportOpen(true)}
+              title="Report Bug"
             />
-            <Button
-              variant="secondary"
-              icon={<TrashIcon size={16} />}
-              onClick={clearHistory}
-              className="hidden sm:inline-flex"
-            >
-              Clear
-            </Button>
           </div>
         </div>
       </header>
@@ -341,6 +356,76 @@ export function Chat({
         onClose={() => setFileManagerOpen(false)}
         onInsertFile={handleInsertFile}
       />
+
+      {/* Bug Report Modal */}
+      {bugReportOpen && (
+        <div className="fixed inset-0 z-50 flex items-center justify-center bg-black/50">
+          <div className="bg-kumo-base rounded-xl border border-kumo-line shadow-lg w-full max-w-md mx-4 p-6">
+            <div className="flex items-center justify-between mb-4">
+              <h2 className="text-lg font-semibold text-kumo-default">
+                Report Bug
+              </h2>
+              <button
+                onClick={handleBugClose}
+                className="p-1 rounded-lg hover:bg-kumo-elevated text-kumo-secondary hover:text-kumo-default transition-colors"
+              >
+                <XIcon size={18} />
+              </button>
+            </div>
+
+            {!bugReportId ? (
+              <>
+                <textarea
+                  value={bugDescription}
+                  onChange={(e) => setBugDescription(e.target.value)}
+                  placeholder="Describe what went wrong..."
+                  rows={4}
+                  className="w-full rounded-lg border border-kumo-line bg-kumo-elevated text-kumo-default placeholder:text-kumo-tertiary p-3 text-sm resize-none focus:outline-none focus:ring-2 focus:ring-kumo-ring"
+                  disabled={bugSubmitting}
+                />
+                {bugError && (
+                  <p className="mt-2 text-sm text-red-500">{bugError}</p>
+                )}
+                <div className="flex justify-end gap-2 mt-4">
+                  <Button variant="secondary" onClick={handleBugClose}>
+                    Cancel
+                  </Button>
+                  <Button
+                    variant="primary"
+                    onClick={handleBugSubmit}
+                    disabled={!bugDescription.trim() || bugSubmitting}
+                  >
+                    {bugSubmitting ? "Submitting..." : "Submit"}
+                  </Button>
+                </div>
+              </>
+            ) : (
+              <>
+                <p className="text-sm text-kumo-secondary mb-3">
+                  Bug report submitted. Share this ID with the developer:
+                </p>
+                <div className="flex items-center gap-2 bg-kumo-elevated rounded-lg border border-kumo-line p-3">
+                  <code className="flex-1 text-sm font-mono text-kumo-default">
+                    {bugReportId}
+                  </code>
+                  <button
+                    onClick={() => navigator.clipboard.writeText(bugReportId)}
+                    className="p-1.5 rounded-md hover:bg-kumo-base text-kumo-secondary hover:text-kumo-default transition-colors"
+                    title="Copy to clipboard"
+                  >
+                    <CopyIcon size={16} />
+                  </button>
+                </div>
+                <div className="flex justify-end mt-4">
+                  <Button variant="secondary" onClick={handleBugClose}>
+                    Close
+                  </Button>
+                </div>
+              </>
+            )}
+          </div>
+        </div>
+      )}
     </div>
   );
 }
