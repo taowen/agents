@@ -42,7 +42,7 @@ The first minor release of `@cloudflare/ai-chat` — a major step up from the `a
   **Docs:**
   - New `docs/chat-agents.md` — comprehensive AIChatAgent and useAgentChat reference
   - Rewritten README, migration guides, human-in-the-loop, resumable streaming, client tools docs
-  - New `examples/ai-chat/` example with modern patterns and Workers AI
+  - New `app/ai-chat/` example with modern patterns and Workers AI
 
   **Deprecations (with console.warn):**
   - `createToolsFromClientSchemas()`, `extractClientToolSchemas()`, `detectToolsRequiringConfirmation()`

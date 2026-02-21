@@ -8,7 +8,8 @@
     "lint": "eslint .",
     "start": "react-native start",
     "test": "jest",
-    "build:agent": "esbuild src/agent-standalone.ts --bundle --format=iife --target=es2020 --outfile=android/app/src/main/assets/agent-standalone.js"
+    "build:agent": "esbuild src/agent-standalone.ts --bundle --format=iife --target=es2020 --outfile=android/app/src/main/assets/agent-standalone.js",
+    "publish:apk": "tsx scripts/publish.ts"
   },
   "dependencies": {
     "@react-native-async-storage/async-storage": "^2.2.0",

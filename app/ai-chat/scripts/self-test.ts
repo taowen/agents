@@ -1,4 +1,4 @@
-// Usage: npx tsx examples/ai-chat/scripts/self-test.ts [base-url]
+// Usage: npx tsx app/ai-chat/scripts/self-test.ts [base-url]
 //
 // Authenticates via device auth flow, then tests API endpoints.
 // Token is cached in scripts/.self-test-token for reuse across runs.

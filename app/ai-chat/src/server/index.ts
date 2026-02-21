@@ -17,7 +17,8 @@ app.all("/auth/*", (c) => handleAuthRoutes(c.req.raw, c.env));
 
 // 1.5 Public download page & R2 public file serving — no auth required
 app.get("/download", (c) => {
-  const apkUrl = "https://ai.connect-screen.com/api/public/connect-screen.apk";
+  const apkUrl =
+    "https://ai.connect-screen.com/api/public/connect-screen-635a540.apk";
   const qrUrl = `https://api.qrserver.com/v1/create-qr-code/?data=${encodeURIComponent(apkUrl)}&size=200x200`;
   const html = `<!DOCTYPE html>
 <html lang="en">

@@ -995,7 +995,7 @@ The chat protocol uses typed JSON messages over WebSocket:
 
 ## Examples
 
-- [AI Chat Example](../examples/ai-chat/) — Modern example with server tools, client tools, and approval
+- [AI Chat Example](../app/ai-chat/) — Modern example with server tools, client tools, and approval
 - [Resumable Stream Chat](../examples/resumable-stream-chat/) — Automatic stream resumption demo
 - [Human in the Loop Guide](../guides/human-in-the-loop/) — Tool approval with `needsApproval` and `onToolCall`
 - [Playground](../examples/playground/) — Kitchen-sink demo of all SDK features
