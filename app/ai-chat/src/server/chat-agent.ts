@@ -5,7 +5,6 @@ import * as Sentry from "@sentry/cloudflare";
 import { instrumentDurableObjectWithSentry } from "@sentry/cloudflare";
 import {
   streamText,
-  generateText,
   convertToModelMessages,
   pruneMessages,
   stepCountIs,
@@ -29,19 +28,15 @@ import {
 import { handleFileRequest } from "./file-api";
 import { writeChatHistory, readMemoryBlock } from "./chat-history";
 import { createBashTool, createTools, createDeviceTools } from "./tools";
-
-interface DeviceInfo {
-  type: "device";
-  deviceName: string;
-  deviceId: string;
-  connectedAt: number;
-}
-
-interface PendingTask {
-  resolve: (value: { result: string; success: boolean }) => void;
-  reject: (reason: Error) => void;
-  timer: ReturnType<typeof setTimeout>;
-}
+import { DeviceHub, isDeviceSession, type LlmProxyConfig } from "./device-hub";
+import {
+  queryUsageData,
+  logUsageDiagnostics,
+  checkQuota,
+  archiveSessionUsage,
+  type QuotaCache
+} from "./usage-tracker";
+import { runScheduledTask } from "./scheduled-tasks";
 
 /**
  * AI Chat Agent with sandboxed bash tool via just-bash.
@@ -58,26 +53,7 @@ class ChatAgentBase extends AIChatAgent {
   private sessionUuid: string | null = null;
   private cachedLlmConfig: LlmConfigCache = null;
   private mcpServersLoaded = false;
-  private pendingTasks = new Map<string, PendingTask>();
-
-  private isDeviceSession(): boolean {
-    return !!this.sessionUuid?.startsWith("device-");
-  }
-
-  private getDeviceName(): string {
-    return this.sessionUuid!.slice("device-".length);
-  }
-
-  /** Get all device WebSockets connected to this DO. */
-  private getDeviceWebSockets(): WebSocket[] {
-    return this.ctx.getWebSockets("device");
-  }
-
-  /** Get the first connected device WebSocket, or null. */
-  private getDeviceWs(): WebSocket | null {
-    const sockets = this.getDeviceWebSockets();
-    return sockets.length > 0 ? sockets[0] : null;
-  }
+  private deviceHub: DeviceHub;
 
   // System prompt cache — computed once per session, invalidated on clear history
   private cachedSystemPrompt: string | null = null;
@@ -86,25 +62,14 @@ class ChatAgentBase extends AIChatAgent {
   private cachedTools: ToolSet | null = null;
 
   // Quota check cache — avoid per-message D1 queries
-  private quotaCheckCache: { exceeded: boolean; checkedAt: number } | null =
-    null;
+  private quotaCheckCache: QuotaCache | null = null;
 
   constructor(ctx: DurableObjectState, env: Env) {
     super(ctx, env);
+    this.deviceHub = new DeviceHub(ctx);
     const parentAlarm = this.alarm.bind(this);
     (this as any).alarm = async () => {
-      const deviceSockets = this.getDeviceWebSockets();
-      for (const ws of deviceSockets) {
-        try {
-          ws.send(JSON.stringify({ type: "ping" }));
-        } catch {
-          // Dead socket — runtime will clean it up
-        }
-      }
-
-      if (deviceSockets.length > 0) {
-        await this.ctx.storage.setAlarm(Date.now() + 30_000);
-      }
+      await this.deviceHub.sendHeartbeats();
       await parentAlarm();
     };
   }
@@ -226,18 +191,18 @@ class ChatAgentBase extends AIChatAgent {
 
     // Device liveness check — used by tools and API to check if a device is online
     if (url.pathname.endsWith("/status")) {
-      const deviceSockets = this.getDeviceWebSockets();
+      const deviceSockets = this.deviceHub.getWebSockets();
       return Response.json({ online: deviceSockets.length > 0 });
     }
 
     // Device WebSocket — custom protocol, bypasses agents framework
     if (url.pathname.endsWith("/device-connect")) {
-      return this.handleDeviceConnect(request);
+      return this.deviceHub.handleConnect(request);
     }
 
     // Task dispatch endpoint — used by device_agent tool
     if (url.pathname.endsWith("/dispatch")) {
-      return this.handleDispatch(request);
+      return this.deviceHub.handleDispatch(request, () => this.getUserId());
     }
 
     const response = await super.fetch(request);
@@ -249,90 +214,6 @@ class ChatAgentBase extends AIChatAgent {
       );
     }
     return response;
-  }
-
-  private async handleDeviceConnect(request: Request): Promise<Response> {
-    const upgradeHeader = request.headers.get("Upgrade");
-    if (!upgradeHeader || upgradeHeader.toLowerCase() !== "websocket") {
-      return new Response("Expected WebSocket", { status: 426 });
-    }
-
-    // Persist userId from the auth middleware
-    const uid = request.headers.get("x-user-id");
-    if (uid) {
-      await this.ctx.storage.put("userId", uid);
-      this.userId = uid;
-    }
-    const sid = request.headers.get("x-session-id");
-    if (sid) {
-      await this.ctx.storage.put("sessionUuid", sid);
-      this.sessionUuid = sid;
-    }
-
-    const pair = new WebSocketPair();
-    // Tag as "device" so we can distinguish from web client connections
-    this.ctx.acceptWebSocket(pair[1], ["device"]);
-
-    // Start heartbeat alarm if not already running
-    const alarm = await this.ctx.storage.getAlarm();
-    if (!alarm) {
-      await this.ctx.storage.setAlarm(Date.now() + 30_000);
-    }
-
-    return new Response(null, { status: 101, webSocket: pair[0] });
-  }
-
-  private async handleDispatch(request: Request): Promise<Response> {
-    // Ensure userId is available
-    const uid = request.headers.get("x-user-id");
-    if (uid) {
-      await this.ctx.storage.put("userId", uid);
-      this.userId = uid;
-    }
-
-    const body = (await request.json()) as {
-      task: string;
-      timeoutMs?: number;
-    };
-    const { task, timeoutMs = 5 * 60 * 1000 } = body;
-
-    const deviceWs = this.getDeviceWs();
-    if (!deviceWs) {
-      return Response.json({ error: "No device connected" }, { status: 404 });
-    }
-
-    const taskId = crypto.randomUUID();
-
-    try {
-      deviceWs.send(
-        JSON.stringify({ type: "task", taskId, description: task })
-      );
-    } catch (e) {
-      return Response.json(
-        { error: "Failed to send to device" },
-        { status: 502 }
-      );
-    }
-
-    const resultPromise = new Promise<{ result: string; success: boolean }>(
-      (resolve, reject) => {
-        const timer = setTimeout(() => {
-          this.pendingTasks.delete(taskId);
-          reject(new Error("Task timed out"));
-        }, timeoutMs);
-        this.pendingTasks.set(taskId, { resolve, reject, timer });
-      }
-    );
-
-    try {
-      const { result, success } = await resultPromise;
-      return Response.json({ taskId, result, success });
-    } catch (e) {
-      return Response.json(
-        { error: e instanceof Error ? e.message : "Unknown error" },
-        { status: 504 }
-      );
-    }
   }
 
   onError(connectionOrError: Connection | unknown, error?: unknown): void {
@@ -352,50 +233,9 @@ class ChatAgentBase extends AIChatAgent {
       return Response.json(schedules);
     }
     if (url.pathname.endsWith("/get-usage")) {
-      // Diagnostic: total message count and sample metadata
-      const totalRows = this.ctx.storage.sql
-        .exec(`SELECT COUNT(*) as cnt FROM cf_ai_chat_agent_messages`)
-        .toArray();
-      const totalCount = (totalRows[0] as { cnt: number })?.cnt ?? 0;
-
-      const withUsage = this.ctx.storage.sql
-        .exec(
-          `SELECT COUNT(*) as cnt FROM cf_ai_chat_agent_messages WHERE json_extract(message, '$.metadata.usage') IS NOT NULL`
-        )
-        .toArray();
-      const usageCount = (withUsage[0] as { cnt: number })?.cnt ?? 0;
-
-      // Sample one message to see its JSON structure
-      const sample = this.ctx.storage.sql
-        .exec(
-          `SELECT json_extract(message, '$.metadata') as meta FROM cf_ai_chat_agent_messages LIMIT 1`
-        )
-        .toArray();
-      const sampleMeta =
-        sample.length > 0 ? (sample[0] as { meta: string })?.meta : "NO_ROWS";
-
-      console.log(
-        `[get-usage] total_msgs=${totalCount} with_usage=${usageCount} sample_meta=${sampleMeta}`
-      );
-
+      logUsageDiagnostics(this.ctx.storage.sql);
       const since = url.searchParams.get("since");
-      const baseQuery = `SELECT
-          strftime('%Y-%m-%dT%H', created_at) as hour,
-          COALESCE(json_extract(message, '$.metadata.apiKeyType'), 'unknown') as api_key_type,
-          COUNT(*) as request_count,
-          SUM(json_extract(message, '$.metadata.usage.inputTokens')) as input_tokens,
-          SUM(json_extract(message, '$.metadata.usage.cacheReadTokens')) as cache_read_tokens,
-          SUM(json_extract(message, '$.metadata.usage.outputTokens')) as output_tokens
-        FROM cf_ai_chat_agent_messages
-        WHERE json_extract(message, '$.metadata.usage') IS NOT NULL
-        GROUP BY hour, api_key_type`;
-      const rows = since
-        ? this.ctx.storage.sql.exec(
-            baseQuery + ` HAVING hour >= ? ORDER BY hour`,
-            since
-          )
-        : this.ctx.storage.sql.exec(baseQuery + ` ORDER BY hour`);
-      return Response.json(rows.toArray());
+      return Response.json(queryUsageData(this.ctx.storage.sql, since));
     }
     if (url.pathname.startsWith("/api/files")) {
       const uid = await this.getUserId(request);
@@ -437,7 +277,7 @@ class ChatAgentBase extends AIChatAgent {
    */
   async executeScheduledTask(
     payload: { description: string; prompt: string; timezone?: string },
-    schedule: Schedule<{
+    _schedule: Schedule<{
       description: string;
       prompt: string;
       timezone?: string;
@@ -446,131 +286,34 @@ class ChatAgentBase extends AIChatAgent {
     return Sentry.startSpan(
       { name: "executeScheduledTask", op: "schedule" },
       async () => {
-        try {
-          if (!this.userId) {
-            const uid = await this.getUserId();
-            this.doInitBash(uid);
-          }
-          if (!this.sessionUuid) {
-            await this.getSessionUuid();
-          }
-          this.applySentryTags();
-
-          const { data: llmConfig, cache } = await getCachedLlmConfig(
-            this.mountableFs,
-            this.cachedLlmConfig
-          );
-          this.cachedLlmConfig = cache;
-          const model = getLlmModel(this.env, llmConfig);
-
-          const now = new Date();
-          const tz = payload.timezone || (await this.getTimezone());
-
-          const result = await generateText({
-            model,
-            system:
-              "You are a scheduled task executor. Execute the task and report the result.\n" +
-              `Current UTC time: ${now.toISOString()}\n` +
-              `User timezone: ${tz}`,
-            prompt: payload.prompt,
-            tools: {
-              bash: createBashTool(this.bash, () => this.ensureMounted())
-            },
-            stopWhen: stepCountIs(10)
-          });
-
-          const userMsg = {
-            id: crypto.randomUUID(),
-            role: "user" as const,
-            parts: [
-              {
-                type: "text" as const,
-                text: `[Scheduled Task] ${new Date().toISOString()} - ${payload.description}`
-              }
-            ]
-          };
-          const assistantMsg = {
-            id: crypto.randomUUID(),
-            role: "assistant" as const,
-            parts: [{ type: "text" as const, text: result.text }]
-          };
-          await this.persistMessages([...this.messages, userMsg, assistantMsg]);
-        } catch (e) {
-          console.error("executeScheduledTask failed:", e);
-          Sentry.captureException(e);
-          const errorMsg = {
-            id: crypto.randomUUID(),
-            role: "assistant" as const,
-            parts: [
-              {
-                type: "text" as const,
-                text: `[Scheduled Task Failed] ${new Date().toISOString()} - ${payload.description}\nError: ${e instanceof Error ? e.message : String(e)}`
-              }
-            ]
-          };
-          try {
-            await this.persistMessages([...this.messages, errorMsg]);
-          } catch (persistErr) {
-            console.error("Failed to persist error message:", persistErr);
-          }
-          throw e;
+        if (!this.userId) {
+          const uid = await this.getUserId();
+          this.doInitBash(uid);
         }
-      }
-    );
-  }
+        if (!this.sessionUuid) {
+          await this.getSessionUuid();
+        }
+        this.applySentryTags();
 
-  /**
-   * Pure relay for device sessions — no LLM, sends user text directly to the device WebSocket.
-   */
-  private async handleDeviceRelay(): Promise<Response> {
-    const lastMsg = this.messages[this.messages.length - 1];
-    const userText = lastMsg.parts
-      .filter((p: any) => p.type === "text")
-      .map((p: any) => (p as { text: string }).text)
-      .join("\n");
-
-    const deviceWs = this.getDeviceWs();
-    if (!deviceWs) {
-      return new Response("Device not connected", {
-        headers: { "Content-Type": "text/plain" }
-      });
-    }
-
-    const taskId = crypto.randomUUID();
-
-    try {
-      deviceWs.send(
-        JSON.stringify({ type: "task", taskId, description: userText })
-      );
-    } catch (e) {
-      return new Response("Failed to send to device", {
-        headers: { "Content-Type": "text/plain" }
-      });
-    }
-
-    const resultPromise = new Promise<{ result: string; success: boolean }>(
-      (resolve, reject) => {
-        const timer = setTimeout(
-          () => {
-            this.pendingTasks.delete(taskId);
-            reject(new Error("Task timed out"));
-          },
-          5 * 60 * 1000
+        const { data: llmConfig, cache } = await getCachedLlmConfig(
+          this.mountableFs,
+          this.cachedLlmConfig
         );
-        this.pendingTasks.set(taskId, { resolve, reject, timer });
+        this.cachedLlmConfig = cache;
+        const model = getLlmModel(this.env, llmConfig);
+        const timezone = await this.getTimezone();
+
+        await runScheduledTask({
+          messages: this.messages,
+          persistMessages: (msgs) => this.persistMessages(msgs),
+          bash: this.bash,
+          ensureMounted: () => this.ensureMounted(),
+          model,
+          timezone,
+          payload
+        });
       }
     );
-
-    try {
-      const { result, success } = await resultPromise;
-      return new Response(result || (success ? "Done." : "Task failed."), {
-        headers: { "Content-Type": "text/plain" }
-      });
-    } catch (e) {
-      return new Response(e instanceof Error ? e.message : "Task failed", {
-        headers: { "Content-Type": "text/plain" }
-      });
-    }
   }
 
   async onChatMessage(
@@ -594,8 +337,8 @@ class ChatAgentBase extends AIChatAgent {
       this.applySentryTags();
 
       // Device sessions are pure relays — no LLM, no bash, no tools
-      if (this.isDeviceSession()) {
-        return this.handleDeviceRelay();
+      if (isDeviceSession(this.sessionUuid)) {
+        return this.deviceHub.relay(this.messages);
       }
 
       // Ensure /etc and fstab mounts are ready before any filesystem access
@@ -658,22 +401,11 @@ class ChatAgentBase extends AIChatAgent {
 
       // Quota gate: if builtin key and user is over quota, reject
       if (isBuiltinKey) {
-        const now = Date.now();
-        const QUOTA_CACHE_TTL = 30_000; // 30 seconds
-        if (
-          !this.quotaCheckCache ||
-          now - this.quotaCheckCache.checkedAt > QUOTA_CACHE_TTL
-        ) {
-          const row = await this.env.DB.prepare(
-            `SELECT builtin_quota_exceeded_at FROM users WHERE id = ?`
-          )
-            .bind(this.userId!)
-            .first<{ builtin_quota_exceeded_at: string | null }>();
-          this.quotaCheckCache = {
-            exceeded: !!row?.builtin_quota_exceeded_at,
-            checkedAt: now
-          };
-        }
+        this.quotaCheckCache = await checkQuota(
+          this.env.DB,
+          this.userId!,
+          this.quotaCheckCache
+        );
         if (this.quotaCheckCache.exceeded) {
           throw new Error(
             "You have exceeded the builtin API key usage quota. " +
@@ -781,49 +513,8 @@ class ChatAgentBase extends AIChatAgent {
         tools: this.cachedTools!,
         stopWhen: stepCountIs(10),
         onFinish: async () => {
-          // Proactive D1 write: aggregate current hour's usage from DO SQLite
           try {
-            const hour = new Date().toISOString().slice(0, 13);
-            const hourRows = doStorage.sql
-              .exec(
-                `SELECT COALESCE(json_extract(message, '$.metadata.apiKeyType'), 'unknown') as api_key_type,
-                 COUNT(*) as request_count,
-                 SUM(json_extract(message, '$.metadata.usage.inputTokens')) as input_tokens,
-                 SUM(json_extract(message, '$.metadata.usage.cacheReadTokens')) as cache_read_tokens,
-                 SUM(json_extract(message, '$.metadata.usage.outputTokens')) as output_tokens
-                 FROM cf_ai_chat_agent_messages
-                 WHERE json_extract(message, '$.metadata.usage') IS NOT NULL
-                   AND strftime('%Y-%m-%dT%H', created_at) = ?
-                 GROUP BY api_key_type`,
-                hour
-              )
-              .toArray() as {
-              api_key_type: string;
-              request_count: number;
-              input_tokens: number;
-              cache_read_tokens: number;
-              output_tokens: number;
-            }[];
-            for (const row of hourRows) {
-              env.DB.prepare(
-                `INSERT OR REPLACE INTO usage_archive (user_id, session_id, hour, api_key_type, request_count, input_tokens, cache_read_tokens, cache_write_tokens, output_tokens)
-                 VALUES (?, ?, ?, ?, ?, ?, ?, 0, ?)`
-              )
-                .bind(
-                  userId,
-                  sessionId,
-                  hour,
-                  row.api_key_type,
-                  row.request_count,
-                  row.input_tokens || 0,
-                  row.cache_read_tokens || 0,
-                  row.output_tokens || 0
-                )
-                .run()
-                .catch((e: unknown) =>
-                  console.error("usage_archive D1 write failed:", e)
-                );
-            }
+            await archiveSessionUsage(env.DB, doStorage.sql, userId, sessionId);
           } catch (e) {
             console.error("onFinish usage_archive write failed:", e);
           }
@@ -854,7 +545,13 @@ class ChatAgentBase extends AIChatAgent {
   async webSocketMessage(ws: WebSocket, message: string | ArrayBuffer) {
     const tags = this.ctx.getTags(ws);
     if (tags.includes("device")) {
-      return this.handleDeviceWsMessage(ws, message);
+      return this.deviceHub.handleMessage(ws, message, {
+        getUserId: () => this.getUserId(),
+        getSessionUuid: () => this.getSessionUuid(),
+        getLlmProxyConfig: () => this.getLlmProxyConfig(),
+        ensureMounted: () => this.ensureMounted(),
+        env: this.env
+      });
     }
     // Agents framework handles web client messages
     return super.webSocketMessage(ws, message);
@@ -868,13 +565,7 @@ class ChatAgentBase extends AIChatAgent {
   ) {
     const tags = this.ctx.getTags(ws);
     if (tags.includes("device")) {
-      // Reject all pending tasks
-      for (const [taskId, pending] of this.pendingTasks) {
-        clearTimeout(pending.timer);
-        this.pendingTasks.delete(taskId);
-        pending.reject(new Error("Device disconnected"));
-      }
-
+      this.deviceHub.handleClose();
       return;
     }
     return super.webSocketClose(ws, code, reason, wasClean);
@@ -883,184 +574,41 @@ class ChatAgentBase extends AIChatAgent {
   async webSocketError(ws: WebSocket, error: unknown) {
     const tags = this.ctx.getTags(ws);
     if (tags.includes("device")) {
-      // webSocketClose will fire after this — cleanup happens there
+      this.deviceHub.handleError();
       return;
     }
     return super.webSocketError(ws, error);
   }
 
-  private async handleDeviceWsMessage(
-    ws: WebSocket,
-    message: string | ArrayBuffer
-  ): Promise<void> {
-    if (typeof message !== "string") return;
-
-    try {
-      const data = JSON.parse(message);
-
-      if (data.type === "ready") {
-        const info: DeviceInfo = {
-          type: "device",
-          deviceName: data.deviceName || "Unknown Device",
-          deviceId: data.deviceId || "unknown",
-          connectedAt: Date.now()
-        };
-        ws.serializeAttachment(info);
-
-        // Mark device online in D1
-        try {
-          const userId = await this.getUserId();
-          const sessionId = await this.getSessionUuid();
-          if (userId && sessionId) {
-            // Ensure session row exists
-            await this.env.DB.prepare(
-              `INSERT INTO sessions (id, user_id, title) VALUES (?, ?, ?)
-               ON CONFLICT(id) DO UPDATE SET updated_at = datetime('now')`
-            )
-              .bind(sessionId, userId, `Device: ${info.deviceName}`)
-              .run();
-          }
-        } catch (e) {
-          console.error("Failed to update device_online on ready:", e);
-        }
-        return;
-      }
-
-      if (data.type === "llm_request") {
-        await this.handleLlmRequest(ws, data);
-        return;
-      }
-
-      if (data.type === "result") {
-        const pending = this.pendingTasks.get(data.taskId);
-        if (pending) {
-          clearTimeout(pending.timer);
-          this.pendingTasks.delete(data.taskId);
-          pending.resolve({
-            result: data.result || "",
-            success: data.success !== false
-          });
-        }
-        return;
-      }
-
-      // pong — no action needed
-    } catch {
-      // ignore malformed messages
-    }
-  }
-
   /**
-   * Handle an LLM request from the device: use ChatAgent's own config,
-   * call upstream, persist messages, respond.
+   * Build LlmProxyConfig from ChatAgent's own config (for device LLM requests).
    */
-  private async handleLlmRequest(
-    ws: WebSocket,
-    data: { requestId: string; body: Record<string, unknown> }
-  ): Promise<void> {
-    const { requestId, body } = data;
-
-    try {
-      // Ensure userId and bash are initialized
-      if (!this.userId) {
-        const uid = await this.getUserId();
-        this.doInitBash(uid);
-      }
-      await this.ensureMounted();
-
-      // Use ChatAgent's own LLM config (with caching)
-      const { data: llmConfig, cache } = await getCachedLlmConfig(
-        this.mountableFs,
-        this.cachedLlmConfig
-      );
-      this.cachedLlmConfig = cache;
-
-      let upstreamBaseURL = this.env.BUILTIN_LLM_BASE_URL;
-      let upstreamApiKey = this.env.BUILTIN_LLM_API_KEY;
-      let upstreamModel = this.env.BUILTIN_LLM_MODEL;
-      let apiKeyType = "builtin";
-
-      if (llmConfig) {
-        upstreamBaseURL = llmConfig.base_url;
-        upstreamApiKey = llmConfig.api_key;
-        upstreamModel = llmConfig.model || upstreamModel;
-        apiKeyType = "custom";
-      }
-
-      // Call upstream LLM
-      const upstreamRes = await fetch(`${upstreamBaseURL}/chat/completions`, {
-        method: "POST",
-        headers: {
-          "Content-Type": "application/json",
-          Authorization: `Bearer ${upstreamApiKey}`
-        },
-        body: JSON.stringify({
-          ...body,
-          model: (body.model as string) || upstreamModel
-        })
-      });
-      const responseBody = (await upstreamRes.json()) as Record<
-        string,
-        unknown
-      >;
-
-      // NOTE: We do NOT persist messages here. When the web client sends a
-      // message to a device session, the AIChatAgent framework already persists
-      // both the user message (before onChatMessage) and the assistant message
-      // (after handleDeviceRelay returns its Response). Persisting here too
-      // would cause duplicate messages.
-
-      // Write usage to usage_archive for quota tracking
-      const usage = (responseBody as { usage?: Record<string, number> }).usage;
-      if (usage) {
-        const proxyHour = new Date().toISOString().slice(0, 13);
-        this.env.DB.prepare(
-          `INSERT INTO usage_archive (user_id, session_id, hour, api_key_type, request_count, input_tokens, cache_read_tokens, cache_write_tokens, output_tokens)
-           VALUES (?, ?, ?, ?, 1, ?, ?, 0, ?)
-           ON CONFLICT(user_id, session_id, hour, api_key_type) DO UPDATE SET
-             request_count = request_count + 1,
-             input_tokens = input_tokens + excluded.input_tokens,
-             cache_read_tokens = cache_read_tokens + excluded.cache_read_tokens,
-             output_tokens = output_tokens + excluded.output_tokens`
-        )
-          .bind(
-            this.userId!,
-            this.sessionUuid,
-            proxyHour,
-            apiKeyType,
-            usage.prompt_tokens || 0,
-            (usage as any).prompt_tokens_details?.cached_tokens || 0,
-            usage.completion_tokens || 0
-          )
-          .run()
-          .catch((e: unknown) =>
-            console.error("LLM request usage_archive write failed:", e)
-          );
-      }
-
-      // Send LLM response back to device
-      ws.send(
-        JSON.stringify({
-          type: "llm_response",
-          requestId,
-          body: JSON.stringify(responseBody)
-        })
-      );
-    } catch (e) {
-      console.error("ChatAgent: LLM request failed:", e);
-      ws.send(
-        JSON.stringify({
-          type: "llm_response",
-          requestId,
-          body: JSON.stringify({
-            error: {
-              message:
-                e instanceof Error ? e.message : "LLM request failed on server"
-            }
-          })
-        })
-      );
+  private async getLlmProxyConfig(): Promise<LlmProxyConfig> {
+    if (!this.userId) {
+      const uid = await this.getUserId();
+      this.doInitBash(uid);
     }
+
+    const { data: llmConfig, cache } = await getCachedLlmConfig(
+      this.mountableFs,
+      this.cachedLlmConfig
+    );
+    this.cachedLlmConfig = cache;
+
+    if (llmConfig) {
+      return {
+        baseUrl: llmConfig.base_url,
+        apiKey: llmConfig.api_key,
+        model: llmConfig.model || this.env.BUILTIN_LLM_MODEL,
+        apiKeyType: "custom"
+      };
+    }
+    return {
+      baseUrl: this.env.BUILTIN_LLM_BASE_URL,
+      apiKey: this.env.BUILTIN_LLM_API_KEY,
+      model: this.env.BUILTIN_LLM_MODEL,
+      apiKeyType: "builtin"
+    };
   }
 }
 

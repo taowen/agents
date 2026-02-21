@@ -17,68 +17,19 @@ import {
 import { handleFileRoutes } from "./api-files";
 import { createDeviceToken } from "./auth";
 import { QUOTA_LIMITS } from "./quota-config";
+import {
+  aggregateUsage,
+  fetchDoUsage,
+  cacheSessionUsage
+} from "./usage-aggregator";
+import {
+  resolveLlmConfig,
+  checkProxyQuota,
+  callUpstreamLlm,
+  archiveProxyUsage
+} from "./llm-proxy";
 
 type ApiEnv = { Bindings: Env; Variables: { userId: string } };
-
-type UsageRow = {
-  hour: string;
-  api_key_type: string;
-  request_count: number;
-  input_tokens: number | null;
-  cache_read_tokens: number | null;
-  cache_write_tokens: number | null;
-  output_tokens: number | null;
-};
-
-async function cacheSessionUsage(
-  db: D1Database,
-  userId: string,
-  sessionId: string,
-  rows: UsageRow[]
-): Promise<void> {
-  if (rows.length === 0) return;
-  const stmts = rows.map((r) =>
-    db
-      .prepare(
-        `INSERT OR REPLACE INTO usage_archive (user_id, session_id, hour, api_key_type, request_count, input_tokens, cache_read_tokens, cache_write_tokens, output_tokens)
-         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)`
-      )
-      .bind(
-        userId,
-        sessionId,
-        r.hour,
-        r.api_key_type || "unknown",
-        r.request_count,
-        r.input_tokens || 0,
-        r.cache_read_tokens || 0,
-        r.cache_write_tokens || 0,
-        r.output_tokens || 0
-      )
-  );
-  for (let i = 0; i < stmts.length; i += 100) {
-    await db.batch(stmts.slice(i, i + 100));
-  }
-}
-
-async function fetchDoUsage(
-  env: Env,
-  userId: string,
-  sessionId: string,
-  since?: string
-): Promise<UsageRow[]> {
-  const isolatedName = encodeURIComponent(`${userId}:${sessionId}`);
-  const doId = env.ChatAgent.idFromName(isolatedName);
-  const stub = env.ChatAgent.get(doId);
-  const url = since
-    ? `http://agent/get-usage?since=${encodeURIComponent(since)}`
-    : "http://agent/get-usage";
-  const res = await stub.fetch(
-    new Request(url, {
-      headers: { "x-partykit-room": isolatedName }
-    })
-  );
-  return res.ok ? ((await res.json()) as UsageRow[]) : [];
-}
 
 const api = new Hono<ApiEnv>();
 
@@ -256,212 +207,14 @@ api.get("/usage", async (c) => {
       c.req.query("start") || new Date().toISOString().slice(0, 11) + "00";
     const end = c.req.query("end") || new Date().toISOString().slice(0, 13);
 
-    const sessions = await listSessions(c.env.DB, userId);
-    const activeIds = sessions.map((s) => s.id);
-
-    console.log(
-      `[usage] userId=${userId} sessions=${activeIds.length} start=${start} end=${end}`
+    const merged = await aggregateUsage(
+      c.env,
+      c.env.DB,
+      userId,
+      start,
+      end,
+      (p) => c.executionCtx.waitUntil(p)
     );
-    Sentry.addBreadcrumb({
-      category: "usage",
-      message: `sessions=${activeIds.length} start=${start} end=${end}`,
-      level: "info"
-    });
-
-    // 1-2. D1 archive queries (wrapped so failures don't block DO fetches)
-    const maxHours = new Map<string, string>();
-    let archivedResults: {
-      hour: string;
-      api_key_type: string;
-      request_count: number;
-      input_tokens: number;
-      cache_read_tokens: number;
-      cache_write_tokens: number;
-      output_tokens: number;
-    }[] = [];
-
-    try {
-      // 1. Query max cached hour per active session
-      if (activeIds.length > 0) {
-        const placeholders = activeIds.map(() => "?").join(",");
-        const cached = await c.env.DB.prepare(
-          `SELECT session_id, MAX(hour) as max_hour FROM usage_archive
-         WHERE user_id = ? AND session_id IN (${placeholders})
-         GROUP BY session_id`
-        )
-          .bind(userId, ...activeIds)
-          .all<{ session_id: string; max_hour: string }>();
-        for (const r of cached.results) {
-          maxHours.set(r.session_id, r.max_hour);
-        }
-      }
-
-      // 2. D1 archive — exclude active sessions (their data comes fresh from DO)
-      let archivedQuery = `SELECT hour, api_key_type, SUM(request_count) as request_count,
-       SUM(input_tokens) as input_tokens, SUM(cache_read_tokens) as cache_read_tokens,
-       SUM(cache_write_tokens) as cache_write_tokens, SUM(output_tokens) as output_tokens
-       FROM usage_archive WHERE user_id = ? AND hour >= ? AND hour <= ?`;
-      const archivedBinds: unknown[] = [userId, start, end];
-      if (activeIds.length > 0) {
-        const ph = activeIds.map(() => "?").join(",");
-        archivedQuery += ` AND session_id NOT IN (${ph})`;
-        archivedBinds.push(...activeIds);
-      }
-      archivedQuery += ` GROUP BY hour, api_key_type`;
-      const archived = await c.env.DB.prepare(archivedQuery)
-        .bind(...archivedBinds)
-        .all<{
-          hour: string;
-          api_key_type: string;
-          request_count: number;
-          input_tokens: number;
-          cache_read_tokens: number;
-          cache_write_tokens: number;
-          output_tokens: number;
-        }>();
-      archivedResults = archived.results;
-      console.log(
-        `[usage] D1 archive: ${archivedResults.length} rows, maxHours=${maxHours.size} sessions cached`
-      );
-      Sentry.addBreadcrumb({
-        category: "usage",
-        message: `D1 archive: ${archivedResults.length} rows, maxHours=${maxHours.size}`,
-        level: "info"
-      });
-    } catch (e) {
-      console.error(
-        "D1 usage_archive query failed (continuing with DO data):",
-        e
-      );
-      Sentry.captureException(e);
-    }
-
-    // 3. Incremental fetch from active DOs (only >= max cached hour)
-    const activeResults = await Promise.allSettled(
-      sessions.map(async (s) => {
-        const since = maxHours.get(s.id); // undefined → full fetch
-        const rows = await fetchDoUsage(c.env, userId, s.id, since);
-        return { sessionId: s.id, rows };
-      })
-    );
-
-    // 3b. Log each DO result
-    for (const [i, r] of activeResults.entries()) {
-      if (r.status === "fulfilled") {
-        console.log(
-          `[usage] DO ${sessions[i].id}: ${r.value.rows.length} rows`
-        );
-      } else {
-        console.error(`[usage] DO ${sessions[i].id} FAILED:`, r.reason);
-      }
-    }
-    Sentry.addBreadcrumb({
-      category: "usage",
-      message: `DO fetches: ${activeResults.filter((r) => r.status === "fulfilled").length}/${activeResults.length} succeeded`,
-      level: "info"
-    });
-
-    // 4. Fire-and-forget: cache incremental data to D1
-    const cachePromises: Promise<void>[] = [];
-    for (const r of activeResults) {
-      if (r.status === "rejected") {
-        console.error("fetchDoUsage failed:", r.reason);
-        continue;
-      }
-      cachePromises.push(
-        cacheSessionUsage(c.env.DB, userId, r.value.sessionId, r.value.rows)
-      );
-    }
-    c.executionCtx.waitUntil(Promise.allSettled(cachePromises));
-
-    // 5. Merge: D1 archive (non-active) + fresh DO data → aggregate by hour|api_key_type
-    type MergedRow = {
-      hour: string;
-      api_key_type: string;
-      request_count: number;
-      input_tokens: number;
-      cache_read_tokens: number;
-      cache_write_tokens: number;
-      output_tokens: number;
-    };
-    const map = new Map<string, MergedRow>();
-
-    const mergeKey = (hour: string, apiKeyType: string) =>
-      `${hour}|${apiKeyType}`;
-
-    const addToMap = (
-      hour: string,
-      apiKeyType: string,
-      rc: number,
-      it: number,
-      crt: number,
-      cwt: number,
-      ot: number
-    ) => {
-      const key = mergeKey(hour, apiKeyType);
-      const existing = map.get(key);
-      if (existing) {
-        existing.request_count += rc;
-        existing.input_tokens += it;
-        existing.cache_read_tokens += crt;
-        existing.cache_write_tokens += cwt;
-        existing.output_tokens += ot;
-      } else {
-        map.set(key, {
-          hour,
-          api_key_type: apiKeyType,
-          request_count: rc,
-          input_tokens: it,
-          cache_read_tokens: crt,
-          cache_write_tokens: cwt,
-          output_tokens: ot
-        });
-      }
-    };
-
-    for (const row of archivedResults) {
-      addToMap(
-        row.hour,
-        row.api_key_type || "unknown",
-        row.request_count || 0,
-        row.input_tokens || 0,
-        row.cache_read_tokens || 0,
-        row.cache_write_tokens || 0,
-        row.output_tokens || 0
-      );
-    }
-
-    for (const result of activeResults) {
-      if (result.status !== "fulfilled") continue;
-      for (const row of result.value.rows) {
-        if (row.hour < start || row.hour > end) continue;
-        addToMap(
-          row.hour,
-          (row as UsageRow).api_key_type || "unknown",
-          row.request_count || 0,
-          row.input_tokens || 0,
-          row.cache_read_tokens || 0,
-          row.cache_write_tokens || 0,
-          row.output_tokens || 0
-        );
-      }
-    }
-
-    const merged = [...map.values()].sort(
-      (a, b) =>
-        a.hour.localeCompare(b.hour) ||
-        a.api_key_type.localeCompare(b.api_key_type)
-    );
-
-    console.log(
-      `[usage] merged: ${merged.length} hours, total_input=${merged.reduce((s, r) => s + r.input_tokens, 0)}`
-    );
-    Sentry.addBreadcrumb({
-      category: "usage",
-      message: `merged: ${merged.length} hours`,
-      level: "info"
-    });
-
     return c.json(merged);
   } catch (e) {
     console.error("GET /usage failed:", e);
@@ -574,39 +327,12 @@ api.post("/device/approve", async (c) => {
 // POST /proxy/v1/chat/completions — OpenAI-compatible LLM proxy
 api.post("/proxy/v1/chat/completions", async (c) => {
   const userId = c.get("userId");
-
-  // Resolve LLM config: prefer user's custom config over builtin
-  const llmRow = await c.env.DB.prepare(
-    "SELECT content FROM files WHERE user_id = ? AND path = ?"
-  )
-    .bind(userId, "/etc/llm.json")
-    .first<{ content: ArrayBuffer | null }>();
-
-  let upstreamBaseURL = c.env.BUILTIN_LLM_BASE_URL;
-  let upstreamApiKey = c.env.BUILTIN_LLM_API_KEY;
-  let upstreamModel = c.env.BUILTIN_LLM_MODEL;
-  let apiKeyType = "builtin";
-
-  if (llmRow?.content) {
-    try {
-      const cfg = JSON.parse(new TextDecoder().decode(llmRow.content));
-      if (cfg.base_url && cfg.api_key) {
-        upstreamBaseURL = cfg.base_url;
-        upstreamApiKey = cfg.api_key;
-        upstreamModel = cfg.model || upstreamModel;
-        apiKeyType = "custom";
-      }
-    } catch {}
-  }
+  const config = await resolveLlmConfig(c.env.DB, userId, c.env);
 
   // Quota check only for builtin key
-  if (apiKeyType === "builtin") {
-    const quotaRow = await c.env.DB.prepare(
-      `SELECT builtin_quota_exceeded_at FROM users WHERE id = ?`
-    )
-      .bind(userId)
-      .first<{ builtin_quota_exceeded_at: string | null }>();
-    if (quotaRow?.builtin_quota_exceeded_at) {
+  if (config.apiKeyType === "builtin") {
+    const { exceeded } = await checkProxyQuota(c.env.DB, userId);
+    if (exceeded) {
       return c.json(
         {
           error: {
@@ -621,72 +347,24 @@ api.post("/proxy/v1/chat/completions", async (c) => {
   }
 
   const body = await c.req.json();
+  const result = await callUpstreamLlm(config, body);
 
-  // Forward to resolved upstream LLM
-  const upstreamRes = await fetch(`${upstreamBaseURL}/chat/completions`, {
-    method: "POST",
-    headers: {
-      "Content-Type": "application/json",
-      Authorization: `Bearer ${upstreamApiKey}`
-    },
-    body: JSON.stringify({
-      ...body,
-      model: body.model || upstreamModel
-    })
-  });
-
-  if (!upstreamRes.ok) {
-    const errText = await upstreamRes.text();
-    return new Response(errText, {
-      status: upstreamRes.status,
-      headers: { "Content-Type": "application/json" }
-    });
+  if (!result.ok) {
+    return result.response;
   }
-
-  const responseBody = (await upstreamRes.json()) as {
-    choices?: { message?: { content?: string; tool_calls?: unknown } }[];
-    usage?: {
-      prompt_tokens?: number;
-      completion_tokens?: number;
-      prompt_tokens_details?: { cached_tokens?: number };
-    };
-  };
 
   // Fire-and-forget: write to usage_archive for quota enforcement
-  const choice = responseBody.choices?.[0]?.message;
-  if (choice) {
-    const inputTokens = responseBody.usage?.prompt_tokens || 0;
-    const outputTokens = responseBody.usage?.completion_tokens || 0;
-    const cacheReadTokens =
-      responseBody.usage?.prompt_tokens_details?.cached_tokens || 0;
-
-    const proxyHour = new Date().toISOString().slice(0, 13);
-    c.executionCtx.waitUntil(
-      c.env.DB.prepare(
-        `INSERT INTO usage_archive (user_id, session_id, hour, api_key_type, request_count, input_tokens, cache_read_tokens, cache_write_tokens, output_tokens)
-         VALUES (?, '__proxy__', ?, ?, 1, ?, ?, 0, ?)
-         ON CONFLICT(user_id, session_id, hour, api_key_type) DO UPDATE SET
-           request_count = request_count + 1,
-           input_tokens = input_tokens + excluded.input_tokens,
-           cache_read_tokens = cache_read_tokens + excluded.cache_read_tokens,
-           output_tokens = output_tokens + excluded.output_tokens`
-      )
-        .bind(
-          userId,
-          proxyHour,
-          apiKeyType,
-          inputTokens,
-          cacheReadTokens,
-          outputTokens
-        )
-        .run()
-        .catch((e: unknown) =>
-          console.error("proxy usage_archive write failed:", e)
-        )
-    );
+  const usagePromise = archiveProxyUsage(
+    c.env.DB,
+    userId,
+    config.apiKeyType,
+    result.body
+  );
+  if (usagePromise) {
+    c.executionCtx.waitUntil(usagePromise);
   }
 
-  return Response.json(responseBody);
+  return Response.json(result.body);
 });
 
 // GET /devices — list online devices for the current user (checks DO liveness)

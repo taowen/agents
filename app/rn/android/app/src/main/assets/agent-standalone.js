@@ -175,24 +175,9 @@
     }
   ];
 
-  // src/agent-standalone.ts
-  var MAX_STEPS = 30;
-  var KEEP_RECENT_TOOL_RESULTS = 3;
-  var MAX_GET_SCREEN_PER_EXEC = 5;
-  var EXEC_TIMEOUT_MS = 3e4;
-  var COMPACT_THRESHOLD = 100;
-  var COMPACT_KEEP_RECENT = 10;
-  function formatTime() {
-    const d = /* @__PURE__ */ new Date();
-    const pad = (n) => (n < 10 ? "0" : "") + n;
-    return (
-      pad(d.getHours()) + ":" + pad(d.getMinutes()) + ":" + pad(d.getSeconds())
-    );
-  }
-  function agentLog(msg) {
-    const line = "[" + formatTime() + "] " + msg;
-    log(line);
-  }
+  // src/llm-client.ts
+  var MAX_RETRIES = 2;
+  var RETRY_DELAY_MS = 2e3;
   function callLLM(messages, tools, config) {
     const payload = {
       model: config.model,
@@ -205,8 +190,6 @@
     const useLlmChat =
       typeof llm_chat === "function" &&
       (!config.baseURL || config.baseURL.includes("connect-screen.com"));
-    const MAX_RETRIES = 2;
-    const RETRY_DELAY_MS = 2e3;
     let lastError = "";
     for (let attempt = 0; attempt <= MAX_RETRIES; attempt++) {
       if (attempt > 0) {
@@ -228,7 +211,7 @@
       let data;
       try {
         data = JSON.parse(responseStr);
-      } catch (e) {
+      } catch {
         lastError =
           "Failed to parse LLM response: " + responseStr.substring(0, 200);
         if (attempt < MAX_RETRIES) continue;
@@ -257,6 +240,161 @@
       };
     }
     throw new Error(lastError || "LLM request failed after retries");
+  }
+
+  // src/conversation-manager.ts
+  var KEEP_RECENT_TOOL_RESULTS = 3;
+  var COMPACT_THRESHOLD = 100;
+  var COMPACT_KEEP_RECENT = 10;
+  function trimMessages(messages) {
+    let toolCount = 0;
+    for (let i = messages.length - 1; i >= 0; i--) {
+      const msg = messages[i];
+      if (msg.role === "tool") {
+        toolCount++;
+        if (toolCount > KEEP_RECENT_TOOL_RESULTS) {
+          const content = msg.content;
+          if (typeof content === "string" && content.length > 200) {
+            msg.content =
+              content.substring(0, 200) +
+              "...(truncated, " +
+              content.length +
+              " chars total)";
+          }
+        }
+      }
+    }
+    let screenshotCount = 0;
+    for (let i = messages.length - 1; i >= 0; i--) {
+      const msg = messages[i];
+      if (msg.role === "user" && Array.isArray(msg.content)) {
+        const hasImage = msg.content.some((p) => p.type === "image_url");
+        if (hasImage) {
+          screenshotCount++;
+          if (screenshotCount > 1) {
+            msg.content = "[previous screenshot removed]";
+          }
+        }
+      }
+    }
+  }
+  function findSafeCutPoint(messages, idealCut) {
+    for (let i = idealCut; i > 1; i--) {
+      if (
+        messages[i].role === "user" &&
+        typeof messages[i].content === "string"
+      ) {
+        return i;
+      }
+    }
+    return idealCut;
+  }
+  function buildDigest(messages) {
+    const parts = [];
+    for (const msg of messages) {
+      const role = msg.role;
+      let text;
+      if (typeof msg.content === "string") {
+        text = msg.content;
+      } else if (Array.isArray(msg.content)) {
+        text = msg.content
+          .filter((p) => p.type === "text" && p.text)
+          .map((p) => p.text)
+          .join("\n");
+        if (!text) text = "[image]";
+      } else {
+        text = "";
+      }
+      if (role === "tool" && text.length > 200) {
+        text = text.substring(0, 200) + "...(truncated)";
+      }
+      if (role === "assistant" && msg.tool_calls) {
+        const calls = msg.tool_calls
+          .map(
+            (tc) =>
+              tc.function.name +
+              "(" +
+              tc.function.arguments.substring(0, 100) +
+              ")"
+          )
+          .join("; ");
+        text = (text ? text + "\n" : "") + "[called: " + calls + "]";
+      }
+      if (text) {
+        parts.push(role + ": " + text);
+      }
+    }
+    return parts.join("\n\n");
+  }
+  function compactConversation(messages, config, agentLog2) {
+    if (messages.length <= COMPACT_THRESHOLD) return;
+    const idealCut = messages.length - COMPACT_KEEP_RECENT;
+    const cutPoint = findSafeCutPoint(messages, idealCut);
+    if (cutPoint <= 1) return;
+    const toCompact = messages.slice(1, cutPoint);
+    const digest = buildDigest(toCompact);
+    agentLog2(
+      "[COMPACT] Summarizing " +
+        toCompact.length +
+        " messages (cut at " +
+        cutPoint +
+        ")..."
+    );
+    let summary;
+    try {
+      const result = callLLM(
+        [
+          {
+            role: "system",
+            content:
+              "Summarize this conversation between a user and a mobile automation assistant.\nFocus on: tasks requested, what was accomplished, current phone state, important context for continuing.\nBe concise (under 500 words). Output only the summary."
+          },
+          { role: "user", content: digest }
+        ],
+        [],
+        config
+      );
+      summary = result.content || "(empty summary)";
+    } catch (e) {
+      agentLog2(
+        "[COMPACT] Summarization failed: " +
+          e.message +
+          " \u2014 falling back to truncation"
+      );
+      const system = messages[0];
+      const recent = messages.slice(cutPoint);
+      messages.length = 0;
+      messages.push(system, ...recent);
+      return;
+    }
+    agentLog2(
+      "[COMPACT] Summary (" +
+        summary.length +
+        " chars): " +
+        summary.substring(0, 100) +
+        "..."
+    );
+    const summaryMsg = {
+      role: "user",
+      content: "[Prior conversation summary]\n" + summary
+    };
+    messages.splice(1, cutPoint - 1, summaryMsg);
+  }
+
+  // src/agent-standalone.ts
+  var MAX_STEPS = 30;
+  var MAX_GET_SCREEN_PER_EXEC = 5;
+  var EXEC_TIMEOUT_MS = 3e4;
+  function formatTime() {
+    const d = /* @__PURE__ */ new Date();
+    const pad = (n) => (n < 10 ? "0" : "") + n;
+    return (
+      pad(d.getHours()) + ":" + pad(d.getMinutes()) + ":" + pad(d.getSeconds())
+    );
+  }
+  function agentLog(msg) {
+    const line = "[" + formatTime() + "] " + msg;
+    log(line);
   }
   function executeCode(code, thinking) {
     if (thinking) {
@@ -324,141 +462,7 @@
       globalThis.take_screenshot = origTakeScreenshot;
     }
   }
-  function trimMessages(messages) {
-    let toolCount = 0;
-    for (let i = messages.length - 1; i >= 0; i--) {
-      const msg = messages[i];
-      if (msg.role === "tool") {
-        toolCount++;
-        if (toolCount > KEEP_RECENT_TOOL_RESULTS) {
-          const content = msg.content;
-          if (typeof content === "string" && content.length > 200) {
-            msg.content =
-              content.substring(0, 200) +
-              "...(truncated, " +
-              content.length +
-              " chars total)";
-          }
-        }
-      }
-    }
-    let screenshotCount = 0;
-    for (let i = messages.length - 1; i >= 0; i--) {
-      const msg = messages[i];
-      if (msg.role === "user" && Array.isArray(msg.content)) {
-        const hasImage = msg.content.some((p) => p.type === "image_url");
-        if (hasImage) {
-          screenshotCount++;
-          if (screenshotCount > 1) {
-            msg.content = "[previous screenshot removed]";
-          }
-        }
-      }
-    }
-  }
   var conversationMessages = null;
-  function findSafeCutPoint(messages, idealCut) {
-    for (let i = idealCut; i > 1; i--) {
-      if (
-        messages[i].role === "user" &&
-        typeof messages[i].content === "string"
-      ) {
-        return i;
-      }
-    }
-    return idealCut;
-  }
-  function buildDigest(messages) {
-    const parts = [];
-    for (const msg of messages) {
-      const role = msg.role;
-      let text;
-      if (typeof msg.content === "string") {
-        text = msg.content;
-      } else if (Array.isArray(msg.content)) {
-        text = msg.content
-          .filter((p) => p.type === "text" && p.text)
-          .map((p) => p.text)
-          .join("\n");
-        if (!text) text = "[image]";
-      } else {
-        text = "";
-      }
-      if (role === "tool" && text.length > 200) {
-        text = text.substring(0, 200) + "...(truncated)";
-      }
-      if (role === "assistant" && msg.tool_calls) {
-        const calls = msg.tool_calls
-          .map(
-            (tc) =>
-              tc.function.name +
-              "(" +
-              tc.function.arguments.substring(0, 100) +
-              ")"
-          )
-          .join("; ");
-        text = (text ? text + "\n" : "") + "[called: " + calls + "]";
-      }
-      if (text) {
-        parts.push(role + ": " + text);
-      }
-    }
-    return parts.join("\n\n");
-  }
-  function compactConversation(messages, config) {
-    if (messages.length <= COMPACT_THRESHOLD) return;
-    const idealCut = messages.length - COMPACT_KEEP_RECENT;
-    const cutPoint = findSafeCutPoint(messages, idealCut);
-    if (cutPoint <= 1) return;
-    const toCompact = messages.slice(1, cutPoint);
-    const digest = buildDigest(toCompact);
-    agentLog(
-      "[COMPACT] Summarizing " +
-        toCompact.length +
-        " messages (cut at " +
-        cutPoint +
-        ")..."
-    );
-    let summary;
-    try {
-      const result = callLLM(
-        [
-          {
-            role: "system",
-            content:
-              "Summarize this conversation between a user and a mobile automation assistant.\nFocus on: tasks requested, what was accomplished, current phone state, important context for continuing.\nBe concise (under 500 words). Output only the summary."
-          },
-          { role: "user", content: digest }
-        ],
-        [],
-        config
-      );
-      summary = result.content || "(empty summary)";
-    } catch (e) {
-      agentLog(
-        "[COMPACT] Summarization failed: " +
-          e.message +
-          " \u2014 falling back to truncation"
-      );
-      const system = messages[0];
-      const recent = messages.slice(cutPoint);
-      messages.length = 0;
-      messages.push(system, ...recent);
-      return;
-    }
-    agentLog(
-      "[COMPACT] Summary (" +
-        summary.length +
-        " chars): " +
-        summary.substring(0, 100) +
-        "..."
-    );
-    const summaryMsg = {
-      role: "user",
-      content: "[Prior conversation summary]\n" + summary
-    };
-    messages.splice(1, cutPoint - 1, summaryMsg);
-  }
   function runAgent(task, configJson) {
     const config = JSON.parse(configJson);
     agentLog("[TASK] Received task: " + task);
@@ -466,7 +470,7 @@
       conversationMessages = [{ role: "system", content: SYSTEM_PROMPT }];
     }
     conversationMessages.push({ role: "user", content: task });
-    compactConversation(conversationMessages, config);
+    compactConversation(conversationMessages, config, agentLog);
     const messages = conversationMessages;
     for (let step = 1; step <= MAX_STEPS; step++) {
       agentLog("[STEP " + step + "] Calling LLM...");
