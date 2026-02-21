@@ -7,7 +7,8 @@ import {
   ScrollView,
   StyleSheet,
   Linking,
-  AppState
+  AppState,
+  DeviceEventEmitter
 } from "react-native";
 import AsyncStorage from "@react-native-async-storage/async-storage";
 import AccessibilityBridge from "./NativeAccessibilityBridge";
@@ -39,8 +40,6 @@ function App(): React.JSX.Element {
   const scrollRef = useRef<ScrollView>(null);
   const logPollRef = useRef<ReturnType<typeof setInterval> | null>(null);
   const devicePollRef = useRef<ReturnType<typeof setInterval> | null>(null);
-  const wsRef = useRef<WebSocket | null>(null);
-  const wsReconnectRef = useRef<ReturnType<typeof setTimeout> | null>(null);
   const isRunningRef = useRef(false);
 
   const checkService = useCallback(async () => {
@@ -74,123 +73,73 @@ function App(): React.JSX.Element {
     return () => sub.remove();
   }, [checkService]);
 
-  // WebSocket connection to cloud for receiving dispatched tasks
+  // Cloud connection via Java DeviceConnection (OkHttp WebSocket)
+  // Handles both LLM proxying and task dispatch
   useEffect(() => {
     if (!configLoaded || !config.apiKey) return;
 
-    let alive = true;
+    const name = AccessibilityBridge.getDeviceName();
+    const wsUrl = `wss://ai.connect-screen.com/agents/chat-agent/device-${encodeURIComponent(name)}/device-connect?token=${encodeURIComponent(config.apiKey)}`;
+    AccessibilityBridge.connectCloud(wsUrl, name);
 
-    function connect() {
-      if (!alive) return;
-      const wsUrl = `wss://ai.connect-screen.com/api/device/ws?token=${encodeURIComponent(config.apiKey)}`;
-      const ws = new WebSocket(wsUrl);
-      wsRef.current = ws;
-
-      ws.onopen = () => {
-        setCloudConnected(true);
-        const name = AccessibilityBridge.getDeviceName();
-        ws.send(
-          JSON.stringify({
-            type: "ready",
-            deviceName: name,
-            deviceId: name
-          })
+    // Listen for task events pushed from Java DeviceConnection
+    const sub = DeviceEventEmitter.addListener("DeviceTask", async (data) => {
+      if (isRunningRef.current) {
+        AccessibilityBridge.sendTaskResult(data.taskId, "Device busy", false);
+        return;
+      }
+      setLogs((prev) => [
+        ...prev,
+        `[${formatTime()}] [CLOUD] Task: ${data.description}`
+      ]);
+      setIsRunning(true);
+      isRunningRef.current = true;
+      try {
+        const configJson = JSON.stringify(config);
+        const agentResult = await AccessibilityBridge.runAgentTask(
+          data.description,
+          configJson
         );
-      };
-
-      ws.onmessage = async (event) => {
-        try {
-          const data = JSON.parse(
-            typeof event.data === "string" ? event.data : ""
-          );
-          if (data.type === "ping") {
-            ws.send(JSON.stringify({ type: "pong" }));
-            return;
-          }
-          if (data.type === "task" && data.taskId && data.description) {
-            // Reject if already running a task
-            if (isRunningRef.current) {
-              ws.send(
-                JSON.stringify({
-                  type: "result",
-                  taskId: data.taskId,
-                  result: "Device busy",
-                  success: false
-                })
-              );
-              return;
-            }
-            // Execute the task via the native agent
-            setLogs((prev) => [
-              ...prev,
-              `[${formatTime()}] [CLOUD] Task: ${data.description}`
-            ]);
-            setIsRunning(true);
-            isRunningRef.current = true;
-            try {
-              const configJson = JSON.stringify(config);
-              await AccessibilityBridge.runAgentTask(
-                data.description,
-                configJson
-              );
-              ws.send(
-                JSON.stringify({
-                  type: "result",
-                  taskId: data.taskId,
-                  result: "Task completed successfully",
-                  success: true
-                })
-              );
-              setLogs((prev) => [...prev, `[${formatTime()}] [CLOUD] Done`]);
-            } catch (e: any) {
-              ws.send(
-                JSON.stringify({
-                  type: "result",
-                  taskId: data.taskId,
-                  result: e.message || "Task failed",
-                  success: false
-                })
-              );
-              setLogs((prev) => [
-                ...prev,
-                `[${formatTime()}] [CLOUD] Error: ${e.message}`
-              ]);
-            } finally {
-              setIsRunning(false);
-              isRunningRef.current = false;
-            }
-          }
-        } catch {}
-      };
-
-      ws.onclose = () => {
-        setCloudConnected(false);
-        wsRef.current = null;
-        if (alive) {
-          wsReconnectRef.current = setTimeout(connect, 5000);
-        }
-      };
-
-      ws.onerror = () => {
-        // onclose will fire after onerror
-      };
-    }
-
-    connect();
+        AccessibilityBridge.sendTaskResult(
+          data.taskId,
+          agentResult || "done",
+          true
+        );
+        setLogs((prev) => [...prev, `[${formatTime()}] [CLOUD] Done`]);
+      } catch (e: any) {
+        AccessibilityBridge.sendTaskResult(
+          data.taskId,
+          e.message || "Task failed",
+          false
+        );
+        setLogs((prev) => [
+          ...prev,
+          `[${formatTime()}] [CLOUD] Error: ${e.message}`
+        ]);
+      } finally {
+        setIsRunning(false);
+        isRunningRef.current = false;
+      }
+    });
 
     return () => {
-      alive = false;
-      if (wsReconnectRef.current) {
-        clearTimeout(wsReconnectRef.current);
-        wsReconnectRef.current = null;
-      }
-      if (wsRef.current) {
-        wsRef.current.close();
-        wsRef.current = null;
-      }
+      sub.remove();
+      AccessibilityBridge.disconnectCloud();
       setCloudConnected(false);
     };
   }, [configLoaded, config.apiKey]);
+
+  // Listen for real WebSocket connection status from Java DeviceConnection
+  useEffect(() => {
+    setCloudConnected(AccessibilityBridge.isCloudConnected());
+    const sub = DeviceEventEmitter.addListener(
+      "DeviceConnectionStatus",
+      (data: { connected: boolean }) => {
+        setCloudConnected(data.connected);
+      }
+    );
+    return () => sub.remove();
+  }, []);
 
   const stopDevicePoll = useCallback(() => {
     if (devicePollRef.current) {
@@ -343,15 +292,25 @@ function App(): React.JSX.Element {
       <View style={styles.header}>
         <Text style={styles.title}>RN Agent</Text>
         <View style={styles.headerRight}>
-          <View
-            style={[
-              styles.statusDot,
-              { backgroundColor: cloudConnected ? "#2196F3" : "#666" }
-            ]}
-          />
-          <Text style={styles.statusText}>
-            {cloudConnected ? "Cloud" : "Offline"}
-          </Text>
+          <TouchableOpacity
+            style={styles.headerRight}
+            onPress={() => {
+              if (!cloudConnected) {
+                addLog(`[${formatTime()}] [CLOUD] Reconnecting...`);
+                AccessibilityBridge.reconnectCloud();
+              }
+            }}
+          >
+            <View
+              style={[
+                styles.statusDot,
+                { backgroundColor: cloudConnected ? "#2196F3" : "#666" }
+              ]}
+            />
+            <Text style={styles.statusText}>
+              {cloudConnected ? "Cloud" : "Offline"}
+            </Text>
+          </TouchableOpacity>
           <View
             style={[
               styles.statusDot,

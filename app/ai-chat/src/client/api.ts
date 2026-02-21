@@ -1,6 +1,13 @@
 import useSWR from "swr";
+import * as Sentry from "@sentry/react";
 import type { SessionInfo } from "./SessionSidebar";
-import type { UserInfo } from "./App";
+
+export interface UserInfo {
+  id: string;
+  email: string;
+  name: string | null;
+  picture: string | null;
+}
 
 const fetcher = async <T = any>(url: string): Promise<T> => {
   const res = await fetch(url);
@@ -70,6 +77,21 @@ export function useSessions() {
     deleteSession,
     renameSession
   };
+}
+
+// --- Devices ---
+
+export interface DeviceInfo {
+  deviceName: string;
+  sessionId: string;
+  title: string;
+}
+
+export function useDevices() {
+  const { data, isLoading } = useSWR<DeviceInfo[]>("/api/devices", fetcher, {
+    refreshInterval: 10_000
+  });
+  return { devices: data ?? [], isLoading };
 }
 
 // --- /etc JSON fetcher (shared by LLM, GitHub, MCP hooks) ---
@@ -151,6 +173,7 @@ export function useMcpServers() {
 
 export interface UsageRow {
   hour: string;
+  api_key_type: string;
   request_count: number;
   input_tokens: number;
   cache_read_tokens: number;
@@ -175,6 +198,53 @@ export function useUsageStats(start: string, end: string) {
   };
 }
 
+// --- Quota Status ---
+
+export interface QuotaStatus {
+  exceeded: boolean;
+  exceededAt: string | null;
+  hourly: {
+    requests: number;
+    tokens: number;
+    requestLimit: number;
+    tokenLimit: number;
+  };
+  daily: {
+    requests: number;
+    tokens: number;
+    requestLimit: number;
+    tokenLimit: number;
+  };
+}
+
+export function useQuotaStatus() {
+  const { data, isLoading, mutate } = useSWR<QuotaStatus>(
+    "/api/quota",
+    fetcher,
+    { refreshInterval: 60_000 }
+  );
+  return { quota: data ?? null, isLoading, mutateQuota: mutate };
+}
+
+// --- Initial Messages (for Chat) ---
+
+export function useInitialMessages(sessionId: string | undefined) {
+  const { data, isLoading } = useSWR(
+    sessionId ? `/agents/chat-agent/${sessionId}/get-messages` : null,
+    async (url: string) => {
+      const res = await fetch(url);
+      if (!res.ok) {
+        console.error(`[useInitialMessages] ${url} → ${res.status}`);
+        return [];
+      }
+      const text = await res.text();
+      if (!text.trim()) return [];
+      return JSON.parse(text);
+    }
+  );
+  return { messages: data ?? [], isLoading };
+}
+
 // --- Bug Reports ---
 
 export async function reportBug(
@@ -187,5 +257,14 @@ export async function reportBug(
     body: JSON.stringify({ description })
   });
   if (!res.ok) throw new Error(`Report bug failed: ${res.status}`);
-  return res.json() as Promise<{ reportId: string }>;
+  const { reportId } = (await res.json()) as { reportId: string };
+  Sentry.withScope((scope) => {
+    scope.setTag("report_id", reportId);
+    scope.setTag("session_uuid", sessionId);
+    Sentry.captureMessage(
+      `[Client Bug Report ${reportId}] ${description}`,
+      "warning"
+    );
+  });
+  return { reportId };
 }

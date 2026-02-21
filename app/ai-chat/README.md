@@ -40,7 +40,24 @@ Browser                                 Cloudflare Worker
     |                                     |
     +- useAgentChat ---- WebSocket ----> ChatAgent DO
                                           |  +- bash tool (just-bash)
+                                          |  +- device_agent tool
+                                          |
+RN Agent (Android)                        |
+  DeviceConnection.java                   |
+    +- OkHttp WS -- /device-connect ---->-+
+    |  (ping/pong keepalive)
+    +- receives task dispatches
+    +- proxies LLM requests (blocking)
+    +- sends task results
 ```
+
+### Device connection flow
+
+1. The RN agent authenticates via the Device Authorization flow (`POST /auth/device/start` → 6-char code → user approves on web)
+2. Once authorized, the agent opens a WebSocket directly to the user's ChatAgent Durable Object at `/agents/chat-agent/{session}/device-connect`
+3. The ChatAgent tags this WebSocket as `["device"]` and starts a heartbeat alarm
+4. The web user can dispatch tasks to the device via the `device_agent` tool in chat — the ChatAgent forwards these over the device WebSocket
+5. The RN agent executes tasks locally (via Hermes + accessibility APIs) and sends results back
 
 ## Storage architecture
 
@@ -69,19 +86,15 @@ Requires `BUILTIN_LLM_*` secrets for the built-in model (`BUILTIN_LLM_PROVIDER`,
 
 ## D1 schema management
 
-D1 does **not** auto-apply `schema.sql` on deploy. When you add or alter tables in `schema.sql`, you must manually apply the changes to the remote database:
+`schema.sql` is automatically applied to the remote D1 database as part of `npm run deploy` (runs `wrangler d1 execute` before `wrangler deploy`). All statements use `CREATE TABLE IF NOT EXISTS` / `CREATE INDEX IF NOT EXISTS`, so re-running is idempotent.
 
-```bash
-npx wrangler d1 execute ai-chat-db --remote --file schema.sql
-```
+To drop a deprecated table, add `DROP TABLE IF EXISTS <name>;` before any CREATE statements.
 
-All statements use `CREATE TABLE IF NOT EXISTS` / `CREATE INDEX IF NOT EXISTS`, so re-running is safe. Verify with:
+To verify the current remote schema:
 
 ```bash
 npx wrangler d1 execute ai-chat-db --remote --command "SELECT name FROM sqlite_master WHERE type='table' ORDER BY name;"
 ```
-
-> **Past incident (BUG-MLUSHN3O-0311):** `/api/usage` returned 500 because `usage_archive` and `device_messages` tables existed in `schema.sql` but were never created on the remote D1 database. Fixed by running the command above.
 
 ## Sentry error monitoring
 
@@ -131,6 +144,32 @@ curl -s "https://us.sentry.io/api/0/issues/{issue_id}/events/latest/" \
 curl -s "https://us.sentry.io/api/0/issues/{issue_id}/events/latest/" \
   -H "Authorization: Bearer $SENTRY_AUTH_TOKEN" | jq '[.entries[] | select(.type == "breadcrumbs") | .data.values[-10:][]]'
 ```
+
+**Step 4: Look up a user-submitted bug report by ID**
+
+Bug reports (submitted via the in-app "Report Bug" button) are captured as Sentry warnings with a `report_id` tag. To find one:
+
+```bash
+# Search by bug report ID (e.g. BUG-MLVVNHVW-506F)
+curl -s "https://us.sentry.io/api/0/projects/txom/cloudflare-worker/issues/?query=BUG-MLVVNHVW-506F" \
+  -H "Authorization: Bearer $SENTRY_AUTH_TOKEN" | jq '.[] | {id, title, lastSeen}'
+```
+
+Then fetch the full event to see the bug description, session ID, user ID, and recent D1 chat messages:
+
+```bash
+curl -s "https://us.sentry.io/api/0/issues/{issue_id}/events/" \
+  -H "Authorization: Bearer $SENTRY_AUTH_TOKEN" | jq '.[0].contexts'
+```
+
+Key contexts in a bug report event:
+
+| Context | Fields |
+|---------|--------|
+| `bug_report` | `description`, `reportId`, `sessionUuid`, `userId` |
+| `recent_messages` | Last 10 chat messages from D1 (path + text preview) |
+
+Note: `recent_messages` comes from D1 (`files` table, `/.chat/` prefix) — this is a fire-and-forget copy. The authoritative message store is the Durable Object's internal SQLite (`cf_ai_chat_agent_messages` table), which is what the `/get-messages` endpoint reads.
 
 ### Common patterns
 
@@ -203,6 +242,32 @@ Then run the self-test script. You'll see the `[usage]` and auth logs fire in re
 ### Extending
 
 The token returned by the script works with any authenticated endpoint. To test a different route, add a fetch call with `Authorization: Bearer ${token}` after step 3 in `scripts/self-test.ts`.
+
+## Build & Deploy
+
+### ai-chat server
+
+```bash
+cd app/ai-chat
+npm install
+npm run deploy        # builds + deploys to Cloudflare
+npm run dev           # local development
+```
+
+### RN Agent (Android)
+
+```bash
+cd app/rn/android
+./gradlew assembleDebug
+adb install -r app/build/outputs/apk/debug/app-debug.apk
+adb shell am start -n ai.connct_screen.rn/.MainActivity
+```
+
+Check device connection logs:
+
+```bash
+adb logcat -d | grep DeviceConn
+```
 
 ## Try it
 

@@ -3,14 +3,16 @@ CREATE TABLE IF NOT EXISTS users (
   email TEXT NOT NULL,
   name TEXT,
   picture TEXT,
+  builtin_quota_exceeded_at TEXT,    -- set by cron when builtin-key usage exceeds limits
   created_at TEXT DEFAULT (datetime('now')),
   updated_at TEXT DEFAULT (datetime('now'))
 );
 
 CREATE TABLE IF NOT EXISTS sessions (
-  id TEXT PRIMARY KEY,               -- UUID
+  id TEXT PRIMARY KEY,               -- UUID or 'device-{name}' for device sessions
   user_id TEXT NOT NULL REFERENCES users(id),
   title TEXT DEFAULT 'New Chat',
+  device_online INTEGER DEFAULT 0,   -- DEPRECATED: no longer written; liveness checked via DO /status endpoint
   created_at TEXT DEFAULT (datetime('now')),
   updated_at TEXT DEFAULT (datetime('now'))
 );
@@ -32,23 +34,17 @@ CREATE TABLE IF NOT EXISTS files (
 );
 CREATE INDEX IF NOT EXISTS idx_files_parent ON files(user_id, parent_path);
 
+DROP TABLE IF EXISTS usage_archive;
 CREATE TABLE IF NOT EXISTS usage_archive (
   user_id TEXT NOT NULL,
   session_id TEXT NOT NULL,
   hour TEXT NOT NULL,
+  api_key_type TEXT NOT NULL DEFAULT 'unknown',
   request_count INTEGER DEFAULT 0,
   input_tokens INTEGER DEFAULT 0,
   cache_read_tokens INTEGER DEFAULT 0,
   cache_write_tokens INTEGER DEFAULT 0,
   output_tokens INTEGER DEFAULT 0,
-  PRIMARY KEY (user_id, session_id, hour)
+  PRIMARY KEY (user_id, session_id, hour, api_key_type)
 );
 CREATE INDEX IF NOT EXISTS idx_usage_archive_user_hour ON usage_archive(user_id, hour);
-
-CREATE TABLE IF NOT EXISTS device_messages (
-  id TEXT PRIMARY KEY,
-  user_id TEXT NOT NULL,
-  message TEXT NOT NULL,
-  created_at DATETIME DEFAULT CURRENT_TIMESTAMP
-);
-CREATE INDEX IF NOT EXISTS idx_device_messages_user ON device_messages(user_id, created_at);

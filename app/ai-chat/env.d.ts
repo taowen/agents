@@ -8,7 +8,6 @@ declare namespace Cloudflare {
   interface Env {
     AI: Ai;
     ChatAgent: DurableObjectNamespace<import("./src/server/index").ChatAgent>;
-    DeviceHub: DurableObjectNamespace<import("./src/server/index").DeviceHub>;
     DB: D1Database;
     BUILTIN_LLM_PROVIDER: string;
     BUILTIN_LLM_BASE_URL: string;
@@ -22,6 +21,7 @@ declare namespace Cloudflare {
     GITHUB_CLIENT_ID?: string;
     GITHUB_CLIENT_SECRET?: string;
     SENTRY_DSN?: string;
+    ADMIN_SECRET?: string;
     R2?: R2Bucket;
     R2_PUBLIC: R2Bucket;
     OTP_KV: KVNamespace;

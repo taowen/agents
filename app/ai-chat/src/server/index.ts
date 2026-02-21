@@ -4,9 +4,9 @@ import { routeAgentRequest } from "agents";
 import { handleAuthRoutes, requireAuth, handleIncomingEmail } from "./auth";
 import { apiRoutes } from "./api";
 import { handleGitHubOAuth } from "./github-oauth";
+import { QUOTA_LIMITS } from "./quota-config";
 
 export { ChatAgent } from "./chat-agent";
-export { DeviceHub } from "./device-hub";
 
 type AppEnv = { Bindings: Env; Variables: { userId: string } };
 
@@ -133,5 +133,60 @@ export default {
   ...sentryHandler,
   async email(message: ForwardableEmailMessage, env: Env) {
     await handleIncomingEmail(message, env);
+  },
+  async scheduled(_event: ScheduledEvent, env: Env, ctx: ExecutionContext) {
+    const now = new Date();
+    const currentHour = now.toISOString().slice(0, 13);
+    const todayStart = now.toISOString().slice(0, 10) + "T00";
+
+    try {
+      // Find users exceeding any builtin-key quota limit
+      const overQuota = await env.DB.prepare(
+        `SELECT user_id,
+          SUM(CASE WHEN hour = ? THEN request_count ELSE 0 END) as hourly_reqs,
+          SUM(CASE WHEN hour = ? THEN input_tokens + output_tokens ELSE 0 END) as hourly_tokens,
+          SUM(request_count) as daily_reqs,
+          SUM(input_tokens + output_tokens) as daily_tokens
+        FROM usage_archive
+        WHERE api_key_type = 'builtin' AND hour >= ?
+        GROUP BY user_id
+        HAVING hourly_reqs > ? OR hourly_tokens > ? OR daily_reqs > ? OR daily_tokens > ?`
+      )
+        .bind(
+          currentHour,
+          currentHour,
+          todayStart,
+          QUOTA_LIMITS.HOURLY_REQUEST_LIMIT,
+          QUOTA_LIMITS.HOURLY_TOKEN_LIMIT,
+          QUOTA_LIMITS.DAILY_REQUEST_LIMIT,
+          QUOTA_LIMITS.DAILY_TOKEN_LIMIT
+        )
+        .all<{
+          user_id: string;
+          hourly_reqs: number;
+          hourly_tokens: number;
+          daily_reqs: number;
+          daily_tokens: number;
+        }>();
+
+      if (overQuota.results.length > 0) {
+        const userIds = overQuota.results.map((r) => r.user_id);
+        console.log(
+          `[cron] disabling ${userIds.length} over-quota users:`,
+          userIds
+        );
+        // Batch update: disable users who don't already have the flag set
+        const stmts = userIds.map((uid) =>
+          env.DB.prepare(
+            `UPDATE users SET builtin_quota_exceeded_at = datetime('now') WHERE id = ? AND builtin_quota_exceeded_at IS NULL`
+          ).bind(uid)
+        );
+        for (let i = 0; i < stmts.length; i += 100) {
+          await env.DB.batch(stmts.slice(i, i + 100));
+        }
+      }
+    } catch (e) {
+      console.error("[cron] quota enforcement failed:", e);
+    }
   }
 };

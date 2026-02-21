@@ -1,4 +1,5 @@
 import { useState } from "react";
+import { useNavigate, useLocation } from "react-router";
 import {
   PlusIcon,
   GearIcon,
@@ -7,10 +8,12 @@ import {
   TrashIcon,
   ChatCircleIcon,
   SignOutIcon,
-  PencilSimpleIcon
+  PencilSimpleIcon,
+  DeviceMobileIcon
 } from "@phosphor-icons/react";
 import { Button, Text } from "@cloudflare/kumo";
 import { SessionListSkeleton } from "./Skeleton";
+import type { DeviceInfo, UserInfo } from "./api";
 
 export interface SessionInfo {
   id: string;
@@ -19,15 +22,9 @@ export interface SessionInfo {
   updated_at: string;
 }
 
-interface UserInfo {
-  id: string;
-  email: string;
-  name: string | null;
-  picture: string | null;
-}
-
 interface SessionSidebarProps {
   sessions: SessionInfo[];
+  devices: DeviceInfo[];
   activeSessionId: string | null;
   user: UserInfo | null;
   isLoading?: boolean;
@@ -35,26 +32,23 @@ interface SessionSidebarProps {
   onSelectSession: (id: string) => void;
   onDeleteSession: (id: string) => void;
   onRenameSession: (id: string, title: string) => void;
-  onOpenSettings: () => void;
-  onOpenMemory: () => void;
-  onOpenUsage: () => void;
 }
 
 export function SessionSidebar({
   sessions,
+  devices,
   activeSessionId,
   user,
   isLoading,
   onNewSession,
   onSelectSession,
   onDeleteSession,
-  onRenameSession,
-  onOpenSettings,
-  onOpenMemory,
-  onOpenUsage
+  onRenameSession
 }: SessionSidebarProps) {
   const [editingId, setEditingId] = useState<string | null>(null);
   const [editTitle, setEditTitle] = useState("");
+  const navigate = useNavigate();
+  const location = useLocation();
 
   const startEditing = (session: SessionInfo) => {
     setEditingId(session.id);
@@ -71,6 +65,8 @@ export function SessionSidebar({
   const cancelEdit = () => {
     setEditingId(null);
   };
+
+  const isNavActive = (path: string) => location.pathname === path;
 
   return (
     <div className="w-64 h-screen flex flex-col bg-kumo-base border-r border-kumo-line">
@@ -158,12 +154,51 @@ export function SessionSidebar({
         ) : null}
       </div>
 
+      {/* Devices */}
+      {devices.length > 0 && (
+        <div className="px-2 pb-2">
+          <div className="px-3 py-1.5 text-xs font-medium text-kumo-inactive uppercase tracking-wide">
+            Devices
+          </div>
+          <div className="space-y-0.5">
+            {devices.map((device) => {
+              const deviceSessionId = device.sessionId;
+              const isActive = deviceSessionId === activeSessionId;
+              return (
+                <div
+                  key={device.sessionId}
+                  className={`flex items-center gap-2 px-3 py-2 rounded-lg cursor-pointer text-sm transition-colors ${
+                    isActive
+                      ? "bg-kumo-elevated text-kumo-default"
+                      : "text-kumo-secondary hover:bg-kumo-elevated/50 hover:text-kumo-default"
+                  }`}
+                  onClick={() => onSelectSession(deviceSessionId)}
+                >
+                  <DeviceMobileIcon
+                    size={14}
+                    className="shrink-0 text-kumo-inactive"
+                  />
+                  <span className="flex-1 min-w-0 truncate">
+                    {device.deviceName}
+                  </span>
+                  <span className="shrink-0 w-2 h-2 rounded-full bg-green-500" />
+                </div>
+              );
+            })}
+          </div>
+        </div>
+      )}
+
       {/* Bottom section */}
       <div className="border-t border-kumo-line p-3 space-y-2">
         {/* Memory link */}
         <button
-          onClick={onOpenMemory}
-          className="flex items-center gap-2 w-full px-3 py-2 rounded-lg text-sm text-kumo-secondary hover:bg-kumo-elevated hover:text-kumo-default transition-colors"
+          onClick={() => navigate("/memory")}
+          className={`flex items-center gap-2 w-full px-3 py-2 rounded-lg text-sm transition-colors ${
+            isNavActive("/memory")
+              ? "bg-kumo-elevated text-kumo-default"
+              : "text-kumo-secondary hover:bg-kumo-elevated hover:text-kumo-default"
+          }`}
         >
           <BrainIcon size={14} />
           <span>Memory</span>
@@ -171,8 +206,12 @@ export function SessionSidebar({
 
         {/* Usage link */}
         <button
-          onClick={onOpenUsage}
-          className="flex items-center gap-2 w-full px-3 py-2 rounded-lg text-sm text-kumo-secondary hover:bg-kumo-elevated hover:text-kumo-default transition-colors"
+          onClick={() => navigate("/usage")}
+          className={`flex items-center gap-2 w-full px-3 py-2 rounded-lg text-sm transition-colors ${
+            isNavActive("/usage")
+              ? "bg-kumo-elevated text-kumo-default"
+              : "text-kumo-secondary hover:bg-kumo-elevated hover:text-kumo-default"
+          }`}
         >
           <ChartBarIcon size={14} />
           <span>Usage</span>
@@ -180,8 +219,12 @@ export function SessionSidebar({
 
         {/* Settings link */}
         <button
-          onClick={onOpenSettings}
-          className="flex items-center gap-2 w-full px-3 py-2 rounded-lg text-sm text-kumo-secondary hover:bg-kumo-elevated hover:text-kumo-default transition-colors"
+          onClick={() => navigate("/settings")}
+          className={`flex items-center gap-2 w-full px-3 py-2 rounded-lg text-sm transition-colors ${
+            isNavActive("/settings")
+              ? "bg-kumo-elevated text-kumo-default"
+              : "text-kumo-secondary hover:bg-kumo-elevated hover:text-kumo-default"
+          }`}
         >
           <GearIcon size={14} />
           <span>Settings</span>

@@ -11,10 +11,6 @@
       {
         "class_name": "ChatAgent",
         "name": "ChatAgent"
-      },
-      {
-        "class_name": "DeviceHub",
-        "name": "DeviceHub"
       }
     ]
   },
@@ -22,7 +18,8 @@
     {
       "binding": "DB",
       "database_name": "ai-chat-db",
-      "database_id": "615cce83-8d31-4a0e-922c-052bf499c1b1"
+      "database_id": "615cce83-8d31-4a0e-922c-052bf499c1b1",
+      "migrations_dir": "migrations"
     }
   ],
   "kv_namespaces": [
@@ -55,6 +52,10 @@
     {
       "new_sqlite_classes": ["DeviceHub"],
       "tag": "v4"
+    },
+    {
+      "deleted_classes": ["DeviceHub"],
+      "tag": "v5"
     }
   ],
   "name": "ai-chat-example",
@@ -66,5 +67,8 @@
   ],
   "observability": {
     "enabled": true
+  },
+  "triggers": {
+    "crons": ["* * * * *"]
   }
 }

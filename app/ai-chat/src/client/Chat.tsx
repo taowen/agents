@@ -1,9 +1,12 @@
 import { useCallback, useState, useEffect, useRef } from "react";
+import { useParams, useOutletContext } from "react-router";
 import { useAgent } from "agents/react";
 import { useAgentChat } from "@cloudflare/ai-chat/react";
 import { isToolUIPart } from "ai";
 import type { UIMessage, FileUIPart } from "ai";
-import { Button, Badge, InputArea, Empty } from "@cloudflare/kumo";
+import { Button, Badge, InputArea, Empty, Text } from "@cloudflare/kumo";
+import { useQuotaStatus, useInitialMessages } from "./api";
+import type { AuthLayoutContext } from "./AuthLayout";
 import {
   ConnectionIndicator,
   ModeToggle,
@@ -59,20 +62,103 @@ function getMessageText(message: UIMessage): string {
     .join("");
 }
 
-export function Chat({
+function ChatSkeleton({ onOpenSidebar }: { onOpenSidebar: () => void }) {
+  return (
+    <div className="flex flex-col h-screen bg-kumo-elevated">
+      <header className="px-4 md:px-5 py-3 md:py-4 bg-kumo-base border-b border-kumo-line">
+        <div className="max-w-3xl mx-auto flex items-center justify-between">
+          <div className="flex items-center gap-3">
+            <button
+              onClick={onOpenSidebar}
+              className="md:hidden p-1.5 -ml-1.5 rounded-lg hover:bg-kumo-elevated text-kumo-secondary hover:text-kumo-default transition-colors"
+            >
+              <ListIcon size={20} />
+            </button>
+            <h1 className="text-sm sm:text-lg font-semibold text-kumo-default">
+              Work With Your Agent
+            </h1>
+          </div>
+          <div className="flex items-center gap-3">
+            <div className="h-5 w-20 rounded bg-kumo-line animate-pulse" />
+            <div className="h-8 w-16 rounded bg-kumo-line animate-pulse" />
+          </div>
+        </div>
+      </header>
+      <div className="flex-1 overflow-y-auto">
+        <div className="max-w-3xl mx-auto px-4 md:px-5 py-6 space-y-5">
+          {[1, 2, 3].map((i) => (
+            <div
+              key={i}
+              className={`flex ${i % 2 === 1 ? "justify-end" : "justify-start"}`}
+            >
+              <div
+                className={`max-w-[85%] px-4 py-2.5 rounded-2xl ${i % 2 === 1 ? "rounded-br-md bg-kumo-contrast/10" : "rounded-bl-md bg-kumo-base"}`}
+              >
+                <div className="h-4 w-48 rounded bg-kumo-line animate-pulse" />
+                {i % 2 === 0 && (
+                  <div className="h-4 w-32 rounded bg-kumo-line animate-pulse mt-2" />
+                )}
+              </div>
+            </div>
+          ))}
+        </div>
+      </div>
+      <div className="border-t border-kumo-line bg-kumo-base">
+        <div className="max-w-3xl mx-auto px-4 md:px-5 py-3 md:py-4">
+          <div className="flex items-end gap-3 rounded-xl border border-kumo-line bg-kumo-base p-3">
+            <div className="flex-1 h-12 rounded bg-kumo-line animate-pulse" />
+            <div className="h-9 w-9 rounded bg-kumo-line animate-pulse mb-0.5" />
+          </div>
+        </div>
+      </div>
+    </div>
+  );
+}
+
+export function Chat() {
+  const { sessionId } = useParams<{ sessionId: string }>();
+  const { messages: initialMessages, isLoading } =
+    useInitialMessages(sessionId);
+  const { onFirstMessage, onOpenSidebar, onOpenBugReport } =
+    useOutletContext<AuthLayoutContext>();
+
+  if (isLoading) {
+    return <ChatSkeleton onOpenSidebar={onOpenSidebar} />;
+  }
+
+  return (
+    <ChatInner
+      key={sessionId}
+      sessionId={sessionId!}
+      initialMessages={initialMessages}
+      onFirstMessage={onFirstMessage}
+      onOpenSidebar={onOpenSidebar}
+      onOpenBugReport={onOpenBugReport}
+    />
+  );
+}
+
+function ChatInner({
   sessionId,
+  initialMessages,
   onFirstMessage,
   onOpenSidebar,
   onOpenBugReport
 }: {
   sessionId: string;
+  initialMessages: UIMessage[];
   onFirstMessage: (text: string) => void;
-  onOpenSidebar?: () => void;
-  onOpenBugReport?: () => void;
+  onOpenSidebar: () => void;
+  onOpenBugReport: () => void;
 }) {
+  const isDeviceSession = sessionId.startsWith("device-");
+  const deviceName = isDeviceSession ? sessionId.slice("device-".length) : null;
+
   const [connectionStatus, setConnectionStatus] =
     useState<ConnectionStatus>("connecting");
   const [input, setInput] = useState("");
+  const inputRef = useRef(input);
+  inputRef.current = input;
   const [fileManagerOpen, setFileManagerOpen] = useState(false);
   const messagesEndRef = useRef<HTMLDivElement>(null);
   const firstMessageSent = useRef(false);
@@ -91,11 +177,15 @@ export function Chat({
   const { messages, sendMessage, addToolApprovalResponse, status, stop } =
     useAgentChat({
       agent,
+      getInitialMessages: null,
+      messages: initialMessages,
       body: {
         clientVersion: "1.0.0",
         timezone: Intl.DateTimeFormat().resolvedOptions().timeZone
       }
     });
+
+  const { quota } = useQuotaStatus();
 
   const isStreaming = status === "streaming";
   const isConnected = connectionStatus === "connected";
@@ -105,8 +195,9 @@ export function Chat({
   }, [messages]);
 
   const send = useCallback(async () => {
-    const text = input.trim();
+    const text = inputRef.current.trim();
     if (!text) return;
+    inputRef.current = "";
     setInput("");
 
     // Collect file parts from @references in text
@@ -133,7 +224,7 @@ export function Chat({
       firstMessageSent.current = true;
       onFirstMessage(text);
     }
-  }, [input, isStreaming, sendMessage, stop, onFirstMessage]);
+  }, [isStreaming, sendMessage, stop, onFirstMessage]);
 
   const handleInsertFile = useCallback((path: string) => {
     setInput((prev) => {
@@ -155,19 +246,21 @@ export function Chat({
               <ListIcon size={20} />
             </button>
             <h1 className="text-sm sm:text-lg font-semibold text-kumo-default">
-              Work With Your Agent
+              {deviceName ? `Device: ${deviceName}` : "Work With Your Agent"}
             </h1>
           </div>
           <div className="flex items-center gap-3">
             <ConnectionIndicator status={connectionStatus} />
-            <Button
-              variant="secondary"
-              icon={<FolderIcon size={16} />}
-              onClick={() => setFileManagerOpen(true)}
-              title="Files"
-            >
-              Files
-            </Button>
+            {!isDeviceSession && (
+              <Button
+                variant="secondary"
+                icon={<FolderIcon size={16} />}
+                onClick={() => setFileManagerOpen(true)}
+                title="Files"
+              >
+                Files
+              </Button>
+            )}
             <ModeToggle />
             <Button
               variant="secondary"
@@ -180,6 +273,20 @@ export function Chat({
           </div>
         </div>
       </header>
+
+      {/* Quota exceeded banner */}
+      {quota?.exceeded && (
+        <div className="px-4 md:px-5 py-2 bg-amber-50 dark:bg-amber-950/30 border-b border-amber-200 dark:border-amber-800">
+          <div className="max-w-3xl mx-auto">
+            <Text size="sm" variant="secondary">
+              <span className="text-amber-700 dark:text-amber-400">
+                Builtin API key quota exceeded. Please configure your own API
+                key in Settings to continue.
+              </span>
+            </Text>
+          </div>
+        </div>
+      )}
 
       {/* Messages */}
       <div className="flex-1 overflow-y-auto">

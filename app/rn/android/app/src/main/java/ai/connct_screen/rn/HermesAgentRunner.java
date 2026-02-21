@@ -229,6 +229,18 @@ public class HermesAgentRunner {
         }
     }
 
+    /**
+     * Route LLM requests through the DeviceConnection WebSocket.
+     * Called from C++ host function (llm_chat). Blocks until response arrives.
+     */
+    public static String nativeLlmChat(String body) {
+        DeviceConnection conn = DeviceConnection.getInstance();
+        if (conn == null || !conn.isConnected()) {
+            return "{\"error\":{\"message\":\"Not connected to cloud\"}}";
+        }
+        return conn.sendLlmRequest(body);
+    }
+
     public static void nativeAppendLog(String line) {
         SelectToSpeakService service = SelectToSpeakService.getInstance();
         if (service == null) {
@@ -255,7 +267,7 @@ public class HermesAgentRunner {
      * This blocks the calling thread until the agent completes.
      * Should be called from a background thread (not the main/UI thread).
      */
-    public static void runAgent(String task, String configJson) {
+    public static String runAgent(String task, String configJson) {
         Log.d(TAG, "[runAgent] Starting agent with task: " + task);
         screenCounter = 0;
 
@@ -266,13 +278,13 @@ public class HermesAgentRunner {
             SelectToSpeakService service = SelectToSpeakService.getInstance();
             if (service == null) {
                 Log.e(TAG, "[runAgent] Accessibility service not running");
-                return;
+                return "Error: Accessibility service not running";
             }
             String agentJs = loadAsset(service, "agent-standalone.js");
             if (agentJs == null) {
                 Log.e(TAG, "[runAgent] Failed to load agent-standalone.js from assets");
                 nativeDestroyRuntime();
-                return;
+                return "Error: Failed to load agent JS";
             }
 
             // Load and execute the agent JS (defines runAgent function)
@@ -288,8 +300,10 @@ public class HermesAgentRunner {
                 "runAgent-call"
             );
             Log.d(TAG, "[runAgent] Agent completed: " + result);
+            return result;
         } catch (Exception e) {
             Log.e(TAG, "[runAgent] Error", e);
+            return "Error: " + e.getMessage();
         } finally {
             try {
                 nativeDestroyRuntime();

@@ -1,4 +1,5 @@
 import { useState } from "react";
+import { useNavigate, useOutletContext } from "react-router";
 import {
   GithubLogoIcon,
   ArrowSquareOutIcon,
@@ -15,14 +16,12 @@ import {
   useMcpServers,
   type McpServerEntry
 } from "./api";
+import type { AuthLayoutContext } from "./AuthLayout";
 import { FormFieldSkeleton, Skeleton } from "./Skeleton";
 
-interface SettingsPageProps {
-  onBack: () => void;
-  onOpenSidebar?: () => void;
-}
-
-export function SettingsPage({ onBack, onOpenSidebar }: SettingsPageProps) {
+export function SettingsPage() {
+  const navigate = useNavigate();
+  const { onOpenSidebar } = useOutletContext<AuthLayoutContext>();
   const { llmConfig, isLoading: llmLoading, mutateLlmConfig } = useLlmConfig();
   const {
     githubConfig,
@@ -148,7 +147,7 @@ export function SettingsPage({ onBack, onOpenSidebar }: SettingsPageProps) {
             <ListIcon size={20} />
           </button>
           <button
-            onClick={onBack}
+            onClick={() => navigate("/")}
             className="p-1.5 rounded-lg hover:bg-kumo-elevated text-kumo-secondary hover:text-kumo-default transition-colors"
           >
             <ArrowLeftIcon size={18} />

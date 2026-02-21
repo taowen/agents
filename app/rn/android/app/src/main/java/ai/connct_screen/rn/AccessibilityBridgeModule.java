@@ -74,11 +74,42 @@ public class AccessibilityBridgeModule extends ReactContextBaseJavaModule {
         return true;
     }
 
+    @ReactMethod(isBlockingSynchronousMethod = true)
+    public boolean isCloudConnected() {
+        return DeviceConnection.getInstance().isConnected();
+    }
+
     // --- Async methods ---
 
     @ReactMethod
     public void isServiceRunning(Promise promise) {
         promise.resolve(SelectToSpeakService.getInstance() != null);
+    }
+
+    @ReactMethod
+    public void connectCloud(String url, String deviceName, Promise promise) {
+        DeviceConnection conn = DeviceConnection.getInstance();
+        conn.setReactContext(getReactApplicationContext());
+        conn.connect(url, deviceName);
+        promise.resolve(null);
+    }
+
+    @ReactMethod
+    public void disconnectCloud(Promise promise) {
+        DeviceConnection.getInstance().disconnect();
+        promise.resolve(null);
+    }
+
+    @ReactMethod
+    public void reconnectCloud(Promise promise) {
+        DeviceConnection.getInstance().reconnect();
+        promise.resolve(null);
+    }
+
+    @ReactMethod
+    public void sendTaskResult(String taskId, String result, boolean success, Promise promise) {
+        DeviceConnection.getInstance().sendTaskResult(taskId, result, success);
+        promise.resolve(null);
     }
 
     /**
@@ -109,8 +140,8 @@ public class AccessibilityBridgeModule extends ReactContextBaseJavaModule {
     public void runAgentTask(String task, String configJson, Promise promise) {
         new Thread(() -> {
             try {
-                HermesAgentRunner.runAgent(task, configJson);
-                promise.resolve("done");
+                String result = HermesAgentRunner.runAgent(task, configJson);
+                promise.resolve(result != null ? result : "done");
             } catch (Exception e) {
                 Log.e(TAG, "[runAgentTask] failed", e);
                 promise.reject("AGENT_ERROR", e.getMessage(), e);

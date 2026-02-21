@@ -76,6 +76,7 @@ struct JniCache {
     jmethodID listApps;
     jmethodID sleepMs;
     jmethodID httpPost;
+    jmethodID llmChat;
     jmethodID appendLog;
 };
 
@@ -103,6 +104,7 @@ static void resolveJniCache(JNIEnv* env) {
     g_cache.listApps         = env->GetStaticMethodID(cls, "nativeListApps",         "()Ljava/lang/String;");
     g_cache.sleepMs          = env->GetStaticMethodID(cls, "nativeSleepMs",          "(J)V");
     g_cache.httpPost         = env->GetStaticMethodID(cls, "nativeHttpPost",         "(Ljava/lang/String;Ljava/lang/String;Ljava/lang/String;)Ljava/lang/String;");
+    g_cache.llmChat          = env->GetStaticMethodID(cls, "nativeLlmChat",          "(Ljava/lang/String;)Ljava/lang/String;");
     g_cache.appendLog        = env->GetStaticMethodID(cls, "nativeAppendLog",        "(Ljava/lang/String;)V");
     env->DeleteLocalRef(cls);
 }
@@ -320,6 +322,22 @@ static void registerHostFunctions(Runtime& rt) {
                 std::string str = jstringToStd(env, result);
                 env->DeleteLocalRef(jurl);
                 env->DeleteLocalRef(jheaders);
+                env->DeleteLocalRef(jbody);
+                if (result) env->DeleteLocalRef(result);
+                return String::createFromUtf8(rt, str);
+            }));
+
+    // llm_chat(body) -> string  (routes through DeviceConnection WebSocket)
+    rt.global().setProperty(rt, "llm_chat",
+        Function::createFromHostFunction(rt, PropNameID::forAscii(rt, "llm_chat"), 1,
+            [](Runtime& rt, const Value&, const Value* args, size_t count) -> Value {
+                if (count < 1) return String::createFromUtf8(rt, "{\"error\":{\"message\":\"need body\"}}");
+                JNIEnv* env = getEnv();
+                std::string body = args[0].asString(rt).utf8(rt);
+                jstring jbody = env->NewStringUTF(body.c_str());
+                jstring result = (jstring)env->CallStaticObjectMethod(
+                    g_cache.clazz, g_cache.llmChat, jbody);
+                std::string str = jstringToStd(env, result);
                 env->DeleteLocalRef(jbody);
                 if (result) env->DeleteLocalRef(result);
                 return String::createFromUtf8(rt, str);

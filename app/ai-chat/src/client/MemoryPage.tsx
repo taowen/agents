@@ -1,4 +1,5 @@
 import { useState } from "react";
+import { useNavigate, useOutletContext } from "react-router";
 import {
   FloppyDiskIcon,
   ArrowLeftIcon,
@@ -7,14 +8,12 @@ import {
 } from "@phosphor-icons/react";
 import { Button, Text } from "@cloudflare/kumo";
 import { useMemory } from "./api";
+import type { AuthLayoutContext } from "./AuthLayout";
 import { Skeleton } from "./Skeleton";
 
-interface MemoryPageProps {
-  onBack: () => void;
-  onOpenSidebar?: () => void;
-}
-
-export function MemoryPage({ onBack, onOpenSidebar }: MemoryPageProps) {
+export function MemoryPage() {
+  const navigate = useNavigate();
+  const { onOpenSidebar } = useOutletContext<AuthLayoutContext>();
   const { memory, isLoading, mutateMemory } = useMemory();
 
   // Dirty tracking: only track fields the user has explicitly changed
@@ -68,7 +67,7 @@ export function MemoryPage({ onBack, onOpenSidebar }: MemoryPageProps) {
             <ListIcon size={20} />
           </button>
           <button
-            onClick={onBack}
+            onClick={() => navigate("/")}
             className="p-1.5 rounded-lg hover:bg-kumo-elevated text-kumo-secondary hover:text-kumo-default transition-colors"
           >
             <ArrowLeftIcon size={18} />

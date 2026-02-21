@@ -16,11 +16,13 @@ import {
 } from "./db";
 import { handleFileRoutes } from "./api-files";
 import { createDeviceToken } from "./auth";
+import { QUOTA_LIMITS } from "./quota-config";
 
 type ApiEnv = { Bindings: Env; Variables: { userId: string } };
 
 type UsageRow = {
   hour: string;
+  api_key_type: string;
   request_count: number;
   input_tokens: number | null;
   cache_read_tokens: number | null;
@@ -38,13 +40,14 @@ async function cacheSessionUsage(
   const stmts = rows.map((r) =>
     db
       .prepare(
-        `INSERT OR REPLACE INTO usage_archive (user_id, session_id, hour, request_count, input_tokens, cache_read_tokens, cache_write_tokens, output_tokens)
-         VALUES (?, ?, ?, ?, ?, ?, ?, ?)`
+        `INSERT OR REPLACE INTO usage_archive (user_id, session_id, hour, api_key_type, request_count, input_tokens, cache_read_tokens, cache_write_tokens, output_tokens)
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)`
       )
       .bind(
         userId,
         sessionId,
         r.hour,
+        r.api_key_type || "unknown",
         r.request_count,
         r.input_tokens || 0,
         r.cache_read_tokens || 0,
@@ -205,7 +208,7 @@ api.post("/sessions/:id/report-bug", async (c) => {
 
   const recentMessages = rows.results.map((r) => {
     const text = r.content || "";
-    return { path: r.path, text: text.slice(0, 500) };
+    return `${r.path}: ${text.slice(0, 200)}`;
   });
 
   Sentry.withScope((scope) => {
@@ -269,6 +272,7 @@ api.get("/usage", async (c) => {
     const maxHours = new Map<string, string>();
     let archivedResults: {
       hour: string;
+      api_key_type: string;
       request_count: number;
       input_tokens: number;
       cache_read_tokens: number;
@@ -293,7 +297,7 @@ api.get("/usage", async (c) => {
       }
 
       // 2. D1 archive — exclude active sessions (their data comes fresh from DO)
-      let archivedQuery = `SELECT hour, SUM(request_count) as request_count,
+      let archivedQuery = `SELECT hour, api_key_type, SUM(request_count) as request_count,
        SUM(input_tokens) as input_tokens, SUM(cache_read_tokens) as cache_read_tokens,
        SUM(cache_write_tokens) as cache_write_tokens, SUM(output_tokens) as output_tokens
        FROM usage_archive WHERE user_id = ? AND hour >= ? AND hour <= ?`;
@@ -303,11 +307,12 @@ api.get("/usage", async (c) => {
         archivedQuery += ` AND session_id NOT IN (${ph})`;
         archivedBinds.push(...activeIds);
       }
-      archivedQuery += ` GROUP BY hour`;
+      archivedQuery += ` GROUP BY hour, api_key_type`;
       const archived = await c.env.DB.prepare(archivedQuery)
         .bind(...archivedBinds)
         .all<{
           hour: string;
+          api_key_type: string;
           request_count: number;
           input_tokens: number;
           cache_read_tokens: number;
@@ -369,93 +374,83 @@ api.get("/usage", async (c) => {
     }
     c.executionCtx.waitUntil(Promise.allSettled(cachePromises));
 
-    // 5. Merge: D1 archive (non-active) + fresh DO data → aggregate by hour
-    const map = new Map<
-      string,
-      {
-        hour: string;
-        request_count: number;
-        input_tokens: number;
-        cache_read_tokens: number;
-        cache_write_tokens: number;
-        output_tokens: number;
+    // 5. Merge: D1 archive (non-active) + fresh DO data → aggregate by hour|api_key_type
+    type MergedRow = {
+      hour: string;
+      api_key_type: string;
+      request_count: number;
+      input_tokens: number;
+      cache_read_tokens: number;
+      cache_write_tokens: number;
+      output_tokens: number;
+    };
+    const map = new Map<string, MergedRow>();
+
+    const mergeKey = (hour: string, apiKeyType: string) =>
+      `${hour}|${apiKeyType}`;
+
+    const addToMap = (
+      hour: string,
+      apiKeyType: string,
+      rc: number,
+      it: number,
+      crt: number,
+      cwt: number,
+      ot: number
+    ) => {
+      const key = mergeKey(hour, apiKeyType);
+      const existing = map.get(key);
+      if (existing) {
+        existing.request_count += rc;
+        existing.input_tokens += it;
+        existing.cache_read_tokens += crt;
+        existing.cache_write_tokens += cwt;
+        existing.output_tokens += ot;
+      } else {
+        map.set(key, {
+          hour,
+          api_key_type: apiKeyType,
+          request_count: rc,
+          input_tokens: it,
+          cache_read_tokens: crt,
+          cache_write_tokens: cwt,
+          output_tokens: ot
+        });
       }
-    >();
+    };
 
     for (const row of archivedResults) {
-      map.set(row.hour, { ...row });
+      addToMap(
+        row.hour,
+        row.api_key_type || "unknown",
+        row.request_count || 0,
+        row.input_tokens || 0,
+        row.cache_read_tokens || 0,
+        row.cache_write_tokens || 0,
+        row.output_tokens || 0
+      );
     }
 
     for (const result of activeResults) {
       if (result.status !== "fulfilled") continue;
       for (const row of result.value.rows) {
         if (row.hour < start || row.hour > end) continue;
-        const existing = map.get(row.hour);
-        if (existing) {
-          existing.request_count += row.request_count || 0;
-          existing.input_tokens += row.input_tokens || 0;
-          existing.cache_read_tokens += row.cache_read_tokens || 0;
-          existing.cache_write_tokens += row.cache_write_tokens || 0;
-          existing.output_tokens += row.output_tokens || 0;
-        } else {
-          map.set(row.hour, {
-            hour: row.hour,
-            request_count: row.request_count || 0,
-            input_tokens: row.input_tokens || 0,
-            cache_read_tokens: row.cache_read_tokens || 0,
-            cache_write_tokens: row.cache_write_tokens || 0,
-            output_tokens: row.output_tokens || 0
-          });
-        }
+        addToMap(
+          row.hour,
+          (row as UsageRow).api_key_type || "unknown",
+          row.request_count || 0,
+          row.input_tokens || 0,
+          row.cache_read_tokens || 0,
+          row.cache_write_tokens || 0,
+          row.output_tokens || 0
+        );
       }
     }
 
-    // 6. Add device_messages usage
-    const deviceUsage = await c.env.DB.prepare(
-      `SELECT
-        strftime('%Y-%m-%dT%H', created_at) as hour,
-        COUNT(*) as request_count,
-        SUM(json_extract(message, '$.metadata.usage.inputTokens')) as input_tokens,
-        SUM(json_extract(message, '$.metadata.usage.cacheReadTokens')) as cache_read_tokens,
-        SUM(json_extract(message, '$.metadata.usage.cacheWriteTokens')) as cache_write_tokens,
-        SUM(json_extract(message, '$.metadata.usage.outputTokens')) as output_tokens
-      FROM device_messages
-      WHERE user_id = ? AND strftime('%Y-%m-%dT%H', created_at) >= ? AND strftime('%Y-%m-%dT%H', created_at) <= ?
-        AND json_extract(message, '$.metadata.usage') IS NOT NULL
-      GROUP BY hour`
-    )
-      .bind(userId, start, end)
-      .all<UsageRow>();
-
-    console.log(`[usage] device_messages: ${deviceUsage.results.length} rows`);
-    Sentry.addBreadcrumb({
-      category: "usage",
-      message: `device_messages: ${deviceUsage.results.length} rows`,
-      level: "info"
-    });
-
-    for (const row of deviceUsage.results) {
-      const existing = map.get(row.hour);
-      if (existing) {
-        existing.request_count += row.request_count || 0;
-        existing.input_tokens += row.input_tokens || 0;
-        existing.cache_read_tokens += row.cache_read_tokens || 0;
-        existing.cache_write_tokens += row.cache_write_tokens || 0;
-        existing.output_tokens += row.output_tokens || 0;
-      } else {
-        map.set(row.hour, {
-          hour: row.hour,
-          request_count: row.request_count || 0,
-          input_tokens: row.input_tokens || 0,
-          cache_read_tokens: row.cache_read_tokens || 0,
-          cache_write_tokens: row.cache_write_tokens || 0,
-          output_tokens: row.output_tokens || 0
-        });
-      }
-    }
-
-    const merged = [...map.values()].sort((a, b) =>
-      a.hour.localeCompare(b.hour)
+    const merged = [...map.values()].sort(
+      (a, b) =>
+        a.hour.localeCompare(b.hour) ||
+        a.api_key_type.localeCompare(b.api_key_type)
     );
 
     console.log(
@@ -473,6 +468,72 @@ api.get("/usage", async (c) => {
     Sentry.captureException(e);
     return c.json({ error: String(e) }, 500);
   }
+});
+
+// GET /quota — current user's builtin usage vs limits
+api.get("/quota", async (c) => {
+  const userId = c.get("userId");
+  const now = new Date();
+  const currentHour = now.toISOString().slice(0, 13);
+  const todayStart = now.toISOString().slice(0, 10) + "T00";
+
+  const row = await c.env.DB.prepare(
+    `SELECT
+      SUM(CASE WHEN hour = ? THEN request_count ELSE 0 END) as hourly_reqs,
+      SUM(CASE WHEN hour = ? THEN input_tokens + output_tokens ELSE 0 END) as hourly_tokens,
+      SUM(request_count) as daily_reqs,
+      SUM(input_tokens + output_tokens) as daily_tokens
+    FROM usage_archive
+    WHERE user_id = ? AND api_key_type = 'builtin' AND hour >= ?`
+  )
+    .bind(currentHour, currentHour, userId, todayStart)
+    .first<{
+      hourly_reqs: number;
+      hourly_tokens: number;
+      daily_reqs: number;
+      daily_tokens: number;
+    }>();
+
+  const userRow = await c.env.DB.prepare(
+    `SELECT builtin_quota_exceeded_at FROM users WHERE id = ?`
+  )
+    .bind(userId)
+    .first<{ builtin_quota_exceeded_at: string | null }>();
+
+  return c.json({
+    exceeded: !!userRow?.builtin_quota_exceeded_at,
+    exceededAt: userRow?.builtin_quota_exceeded_at || null,
+    hourly: {
+      requests: row?.hourly_reqs || 0,
+      tokens: row?.hourly_tokens || 0,
+      requestLimit: QUOTA_LIMITS.HOURLY_REQUEST_LIMIT,
+      tokenLimit: QUOTA_LIMITS.HOURLY_TOKEN_LIMIT
+    },
+    daily: {
+      requests: row?.daily_reqs || 0,
+      tokens: row?.daily_tokens || 0,
+      requestLimit: QUOTA_LIMITS.DAILY_REQUEST_LIMIT,
+      tokenLimit: QUOTA_LIMITS.DAILY_TOKEN_LIMIT
+    }
+  });
+});
+
+// POST /admin/reenable-user — clear builtin_quota_exceeded_at (protected by ADMIN_SECRET)
+api.post("/admin/reenable-user", async (c) => {
+  const secret = c.req.header("x-admin-secret");
+  if (!secret || secret !== c.env.ADMIN_SECRET) {
+    return c.json({ error: "Unauthorized" }, 401);
+  }
+  const { user_id } = await c.req.json<{ user_id: string }>();
+  if (!user_id) {
+    return c.json({ error: "user_id is required" }, 400);
+  }
+  await c.env.DB.prepare(
+    `UPDATE users SET builtin_quota_exceeded_at = NULL WHERE id = ?`
+  )
+    .bind(user_id)
+    .run();
+  return c.json({ ok: true });
 });
 
 // POST /device/approve — web user approves a device code
@@ -513,23 +574,66 @@ api.post("/device/approve", async (c) => {
 // POST /proxy/v1/chat/completions — OpenAI-compatible LLM proxy
 api.post("/proxy/v1/chat/completions", async (c) => {
   const userId = c.get("userId");
+
+  // Resolve LLM config: prefer user's custom config over builtin
+  const llmRow = await c.env.DB.prepare(
+    "SELECT content FROM files WHERE user_id = ? AND path = ?"
+  )
+    .bind(userId, "/etc/llm.json")
+    .first<{ content: ArrayBuffer | null }>();
+
+  let upstreamBaseURL = c.env.BUILTIN_LLM_BASE_URL;
+  let upstreamApiKey = c.env.BUILTIN_LLM_API_KEY;
+  let upstreamModel = c.env.BUILTIN_LLM_MODEL;
+  let apiKeyType = "builtin";
+
+  if (llmRow?.content) {
+    try {
+      const cfg = JSON.parse(new TextDecoder().decode(llmRow.content));
+      if (cfg.base_url && cfg.api_key) {
+        upstreamBaseURL = cfg.base_url;
+        upstreamApiKey = cfg.api_key;
+        upstreamModel = cfg.model || upstreamModel;
+        apiKeyType = "custom";
+      }
+    } catch {}
+  }
+
+  // Quota check only for builtin key
+  if (apiKeyType === "builtin") {
+    const quotaRow = await c.env.DB.prepare(
+      `SELECT builtin_quota_exceeded_at FROM users WHERE id = ?`
+    )
+      .bind(userId)
+      .first<{ builtin_quota_exceeded_at: string | null }>();
+    if (quotaRow?.builtin_quota_exceeded_at) {
+      return c.json(
+        {
+          error: {
+            message:
+              "Builtin API key usage quota exceeded. Please configure your own API key in Settings.",
+            type: "quota_exceeded"
+          }
+        },
+        429
+      );
+    }
+  }
+
   const body = await c.req.json();
 
-  // Forward to upstream LLM
-  const upstreamRes = await fetch(
-    `${c.env.BUILTIN_LLM_BASE_URL}/chat/completions`,
-    {
-      method: "POST",
-      headers: {
-        "Content-Type": "application/json",
-        Authorization: `Bearer ${c.env.BUILTIN_LLM_API_KEY}`
-      },
-      body: JSON.stringify({
-        ...body,
-        model: body.model || c.env.BUILTIN_LLM_MODEL
-      })
-    }
-  );
+  // Forward to resolved upstream LLM
+  const upstreamRes = await fetch(`${upstreamBaseURL}/chat/completions`, {
+    method: "POST",
+    headers: {
+      "Content-Type": "application/json",
+      Authorization: `Bearer ${upstreamApiKey}`
+    },
+    body: JSON.stringify({
+      ...body,
+      model: body.model || upstreamModel
+    })
+  });
 
   if (!upstreamRes.ok) {
     const errText = await upstreamRes.text();
@@ -548,58 +652,77 @@ api.post("/proxy/v1/chat/completions", async (c) => {
     };
   };
 
-  // Fire-and-forget: store assistant message with usage in D1
+  // Fire-and-forget: write to usage_archive for quota enforcement
   const choice = responseBody.choices?.[0]?.message;
   if (choice) {
-    const assistantMsg = {
-      role: "assistant",
-      content: choice.content,
-      tool_calls: choice.tool_calls,
-      metadata: {
-        usage: {
-          inputTokens: responseBody.usage?.prompt_tokens || 0,
-          outputTokens: responseBody.usage?.completion_tokens || 0,
-          cacheReadTokens:
-            responseBody.usage?.prompt_tokens_details?.cached_tokens || 0,
-          cacheWriteTokens: 0
-        }
-      }
-    };
+    const inputTokens = responseBody.usage?.prompt_tokens || 0;
+    const outputTokens = responseBody.usage?.completion_tokens || 0;
+    const cacheReadTokens =
+      responseBody.usage?.prompt_tokens_details?.cached_tokens || 0;
+
+    const proxyHour = new Date().toISOString().slice(0, 13);
     c.executionCtx.waitUntil(
       c.env.DB.prepare(
-        "INSERT INTO device_messages (id, user_id, message) VALUES (?, ?, ?)"
+        `INSERT INTO usage_archive (user_id, session_id, hour, api_key_type, request_count, input_tokens, cache_read_tokens, cache_write_tokens, output_tokens)
+         VALUES (?, '__proxy__', ?, ?, 1, ?, ?, 0, ?)
+         ON CONFLICT(user_id, session_id, hour, api_key_type) DO UPDATE SET
+           request_count = request_count + 1,
+           input_tokens = input_tokens + excluded.input_tokens,
+           cache_read_tokens = cache_read_tokens + excluded.cache_read_tokens,
+           output_tokens = output_tokens + excluded.output_tokens`
       )
-        .bind(crypto.randomUUID(), userId, JSON.stringify(assistantMsg))
+        .bind(
+          userId,
+          proxyHour,
+          apiKeyType,
+          inputTokens,
+          cacheReadTokens,
+          outputTokens
+        )
         .run()
+        .catch((e: unknown) =>
+          console.error("proxy usage_archive write failed:", e)
+        )
     );
   }
 
   return Response.json(responseBody);
 });
 
-// GET /device/ws — WebSocket upgrade, forwarded to DeviceHub DO
-api.get("/device/ws", async (c) => {
-  const userId = c.get("userId");
-  const id = c.env.DeviceHub.idFromName(userId);
-  const stub = c.env.DeviceHub.get(id);
-  const url = new URL(c.req.url);
-  url.pathname = "/connect";
-  return stub.fetch(
-    new Request(url.toString(), {
-      method: c.req.method,
-      headers: c.req.raw.headers,
-      body: c.req.raw.body
-    })
-  );
-});
-
-// GET /devices — list online devices for the current user
+// GET /devices — list online devices for the current user (checks DO liveness)
 api.get("/devices", async (c) => {
   const userId = c.get("userId");
-  const id = c.env.DeviceHub.idFromName(userId);
-  const stub = c.env.DeviceHub.get(id);
-  const res = await stub.fetch(new Request("http://hub/devices"));
-  return new Response(res.body, { status: res.status, headers: res.headers });
+  const rows = await c.env.DB.prepare(
+    "SELECT id, title FROM sessions WHERE user_id = ? AND id LIKE 'device-%'"
+  )
+    .bind(userId)
+    .all<{ id: string; title: string }>();
+
+  // Check each device DO for actual WebSocket liveness
+  const results = await Promise.allSettled(
+    rows.results.map(async (s) => {
+      const stub = c.env.ChatAgent.get(
+        c.env.ChatAgent.idFromName(encodeURIComponent(`${userId}:${s.id}`))
+      );
+      const res = await stub.fetch(new Request("http://agent/status"));
+      const body = (await res.json()) as { online: boolean };
+      return { ...s, online: body.online };
+    })
+  );
+
+  const online = results
+    .map((r, i) =>
+      r.status === "fulfilled" ? r.value : { ...rows.results[i], online: false }
+    )
+    .filter((r) => r.online);
+
+  return c.json(
+    online.map((r) => ({
+      deviceName: r.id.replace("device-", ""),
+      sessionId: r.id,
+      title: r.title
+    }))
+  );
 });
 
 // File Manager routes — delegate to existing handler
