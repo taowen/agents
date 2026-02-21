@@ -69,7 +69,7 @@ export async function listSessions(
 ): Promise<Session[]> {
   const result = await db
     .prepare(
-      "SELECT * FROM sessions WHERE user_id = ? ORDER BY updated_at DESC"
+      "SELECT * FROM sessions WHERE user_id = ? AND id NOT LIKE 'device-%' ORDER BY updated_at DESC"
     )
     .bind(userId)
     .all<Session>();
