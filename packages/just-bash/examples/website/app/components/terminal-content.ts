@@ -331,7 +331,7 @@ pnpm shell --no-network
 
 ### Network Commands
 
-\`curl\`, \`html-to-markdown\`
+\`curl\`
 
 All commands support \`--help\` for usage information.
 
@@ -440,9 +440,6 @@ The allow-list enforces:
 \`\`\`bash
 # Fetch and process data
 curl -s https://api.example.com/data | grep pattern
-
-# Download and convert HTML to Markdown
-curl -s https://example.com | html-to-markdown
 
 # POST JSON data
 curl -X POST -H "Content-Type: application/json" \\
@@ -787,7 +784,7 @@ const result = await bash.exec("cat input.txt | grep pattern");
 
 **File operations**: \`basename\`, \`chmod\`, \`cp\`, \`dirname\`, \`du\`, \`file\`, \`find\`, \`ln\`, \`ls\`, \`mkdir\`, \`mv\`, \`od\`, \`pwd\`, \`readlink\`, \`rm\`, \`rmdir\`, \`split\`, \`stat\`, \`touch\`, \`tree\`
 
-**Utilities**: \`alias\`, \`base64\`, \`bash\`, \`clear\`, \`curl\`, \`date\`, \`diff\`, \`echo\`, \`env\`, \`expr\`, \`false\`, \`gzip\`, \`gunzip\`, \`help\`, \`history\`, \`hostname\`, \`html-to-markdown\`, \`md5sum\`, \`printenv\`, \`printf\`, \`seq\`, \`sh\`, \`sha1sum\`, \`sha256sum\`, \`sleep\`, \`tar\`, \`tee\`, \`time\`, \`timeout\`, \`true\`, \`unalias\`, \`which\`, \`whoami\`, \`zcat\`
+**Utilities**: \`alias\`, \`base64\`, \`bash\`, \`clear\`, \`curl\`, \`date\`, \`diff\`, \`echo\`, \`env\`, \`expr\`, \`false\`, \`gzip\`, \`gunzip\`, \`help\`, \`history\`, \`hostname\`, \`md5sum\`, \`printenv\`, \`printf\`, \`seq\`, \`sh\`, \`sha1sum\`, \`sha256sum\`, \`sleep\`, \`tar\`, \`tee\`, \`time\`, \`timeout\`, \`true\`, \`unalias\`, \`which\`, \`whoami\`, \`zcat\`
 
 All commands support \`--help\` for usage details.
 
@@ -885,16 +882,6 @@ yq '.database.host' config.ini
 
 # Convert INI to JSON
 yq -p ini -o json '.' config.ini
-\`\`\`
-
-### HTML - \`html-to-markdown\`
-
-\`\`\`bash
-# Convert HTML to markdown
-html-to-markdown page.html
-
-# From stdin
-echo '<h1>Title</h1><p>Text</p>' | html-to-markdown
 \`\`\`
 
 ### Format Conversion with yq

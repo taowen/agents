@@ -186,7 +186,7 @@ See the [bash-tool documentation](https://github.com/vercel-labs/bash-tool) for 
 
 ### Network Commands
 
-`curl`, `html-to-markdown`
+`curl`
 
 All commands support `--help` for usage information.
 
@@ -261,9 +261,6 @@ The allow-list enforces:
 ```bash
 # Fetch and process data
 curl -s https://api.example.com/data | grep pattern
-
-# Download and convert HTML to Markdown
-curl -s https://example.com | html-to-markdown
 
 # POST JSON data
 curl -X POST -H "Content-Type: application/json" \

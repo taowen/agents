@@ -20,7 +20,6 @@ export function buildSystemPrompt(): string {
       "Utils: date, sleep, timeout, time, basename, dirname, env, printenv, alias, unalias, history, " +
       "uname, id, uptime, hostname, whoami, clear, pwd, bash, sh.\n" +
       "Network: curl (use this to fetch URLs).\n" +
-      "HTML: html-to-markdown.\n" +
       "Custom: mount, umount, git, sessions, help.\n" +
       "NOT available: apt, npm, pip, python, node, tar, gzip, ssh, wget, docker, sudo, rclone, " +
       "and any package managers, compilers, or tools not listed above.",

@@ -80,7 +80,6 @@ export type CommandName =
   | "sha1sum"
   | "sha256sum"
   | "file"
-  | "html-to-markdown"
   | "help"
   | "which"
   | "tac"
@@ -403,14 +402,6 @@ const commandLoaders: LazyCommandDef<CommandName>[] = [
   {
     name: "file",
     load: async () => (await import("./file/file.js")).fileCommand
-  },
-
-  // HTML processing
-  {
-    name: "html-to-markdown",
-    load: async () =>
-      (await import("./html-to-markdown/html-to-markdown.js"))
-        .htmlToMarkdownCommand
   },
 
   // Help

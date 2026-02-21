@@ -76,7 +76,7 @@ const result = await bash.exec("cat input.txt | grep pattern");
 
 **File operations**: `basename`, `chmod`, `cp`, `df`, `dirname`, `du`, `file`, `find`, `ln`, `ls`, `mkdir`, `mv`, `od`, `pwd`, `readlink`, `rm`, `rmdir`, `split`, `stat`, `touch`, `tree`
 
-**Utilities**: `alias`, `base64`, `bash`, `clear`, `curl`, `date`, `diff`, `echo`, `env`, `expr`, `false`, `help`, `history`, `hostname`, `html-to-markdown`, `id`, `md5sum`, `printenv`, `printf`, `seq`, `sh`, `sha1sum`, `sha256sum`, `sleep`, `tee`, `time`, `timeout`, `true`, `uname`, `unalias`, `uptime`, `which`, `whoami`
+**Utilities**: `alias`, `base64`, `bash`, `clear`, `curl`, `date`, `diff`, `echo`, `env`, `expr`, `false`, `help`, `history`, `hostname`, `id`, `md5sum`, `printenv`, `printf`, `seq`, `sh`, `sha1sum`, `sha256sum`, `sleep`, `tee`, `time`, `timeout`, `true`, `uname`, `unalias`, `uptime`, `which`, `whoami`
 
 All commands support `--help` for usage details.
 
@@ -96,16 +96,6 @@ jq '[.items[] | {id, name}]' data.json
 
 # From stdin
 echo '{"x":1}' | jq '.x'
-```
-
-### HTML - `html-to-markdown`
-
-```bash
-# Convert HTML to markdown
-html-to-markdown page.html
-
-# From stdin
-echo '<h1>Title</h1><p>Text</p>' | html-to-markdown
 ```
 
 ## Common Patterns

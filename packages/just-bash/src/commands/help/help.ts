@@ -46,7 +46,7 @@ const CATEGORIES = new Map<string, string[]>([
     ]
   ],
   ["Data processing", ["xargs", "jq", "base64", "date"]],
-  ["Network", ["curl", "html-to-markdown"]]
+  ["Network", ["curl"]]
 ]);
 
 function formatHelp(commands: string[]): string {
