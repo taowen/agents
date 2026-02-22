@@ -16,6 +16,7 @@ target_include_directories(jsi PUBLIC ${JSI_DIR})
 add_library(hermesruntime SHARED
     hermes_runtime.cpp
     tools_app.cpp
+    tools_browser.cpp
 )
 
 find_package(hermes-engine REQUIRED CONFIG)

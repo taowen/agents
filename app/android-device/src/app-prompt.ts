@@ -9,7 +9,7 @@ export const SYSTEM_PROMPT =
   agentSignatures +
   "\n```\n\n" +
   "Tips:\n" +
-  "- Execute a SHORT sequence of actions (5-10 operations max), then return the result\n" +
+  "- Execute a SHORT sequence of actions (5-10 operations max). The last expression's value is the result — do NOT use `return` (code runs in global scope, not a function)\n" +
   "- Do NOT write for/while loops that call get_screen() or scroll() repeatedly\n" +
   "- get_screen() is limited to 5 calls per execute_js\n" +
   "- Use globalThis to store state between calls\n" +

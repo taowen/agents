@@ -20,10 +20,14 @@ public class TaskReceiver extends BroadcastReceiver {
 
         Log.d(TAG, "[TASK] Received broadcast task: " + task);
 
-        // Route to server via WebSocket
-        DeviceConnection conn = DeviceConnection.getInstance();
+        // Route to server via WebSocket (default to "app" agent)
+        String agentType = intent.getStringExtra("agent");
+        if (agentType == null || agentType.isEmpty()) {
+            agentType = "app";
+        }
+        DeviceConnection conn = DeviceConnection.getInstance(agentType);
         if (!conn.isConnected()) {
-            Log.e(TAG, "[ERROR] Cannot send task - not connected to server");
+            Log.e(TAG, "[ERROR] Cannot send task - " + agentType + " agent not connected to server");
             return;
         }
         conn.sendUserTask(task);

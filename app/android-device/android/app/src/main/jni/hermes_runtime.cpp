@@ -10,6 +10,7 @@
 
 #include "hermes_runtime.h"
 #include "tools_app.h"
+#include "tools_browser.h"
 
 using namespace facebook::jsi;
 using namespace facebook::hermes;
@@ -166,6 +167,7 @@ Java_ai_connct_1screen_rn_HermesRuntime_nativeCreateRuntime(JNIEnv* env, jclass,
     if (!g_caches_resolved) {
         resolveCommonJniCache(env);
         resolveAppJniCache(env);
+        resolveBrowserJniCache(env);
         g_caches_resolved = true;
     }
 
@@ -185,8 +187,9 @@ Java_ai_connct_1screen_rn_HermesRuntime_nativeCreateRuntime(JNIEnv* env, jclass,
     // Register agent-specific tools
     if (agentType == "app") {
         registerAppTools(rt);
+    } else if (agentType == "browser") {
+        registerBrowserTools(rt);
     }
-    // Future: else if (agentType == "browser") { registerBrowserTools(rt); }
 
     RuntimeEntry entry;
     entry.runtime = std::move(runtime);

@@ -3,6 +3,8 @@ package ai.connct_screen.rn;
 import android.content.Context;
 import android.content.Intent;
 import android.content.SharedPreferences;
+import android.content.res.Configuration;
+import android.graphics.Bitmap;
 import android.os.Build;
 import android.os.Bundle;
 import android.os.Handler;
@@ -10,10 +12,19 @@ import android.os.Looper;
 import android.provider.Settings;
 import android.util.Log;
 import android.view.View;
+import android.view.ViewGroup;
+import android.webkit.WebResourceRequest;
+import android.webkit.WebSettings;
+import android.webkit.WebView;
+import android.webkit.WebViewClient;
+import android.widget.AdapterView;
+import android.widget.ArrayAdapter;
 import android.widget.Button;
 import android.widget.EditText;
 import android.widget.ScrollView;
+import android.widget.Spinner;
 import android.widget.TextView;
+import android.view.inputmethod.EditorInfo;
 import android.widget.ViewFlipper;
 
 import androidx.appcompat.app.AppCompatActivity;
@@ -52,12 +63,15 @@ public class MainActivity extends AppCompatActivity implements DeviceConnection.
     private View retryLoginBtn;
 
     // Task screen views
-    private View cloudDot;
-    private TextView cloudLabel;
-    private View serviceDot;
-    private TextView serviceLabel;
+    private View headerRow;
+    private View taskInputRow;
+    private Spinner agentSpinner;
     private EditText taskInput;
     private Button sendBtn;
+    private WebView browserWebView;
+    private View browserBar;
+    private EditText browserUrlInput;
+    private Button browserBackBtn, browserFwdBtn, browserGoBtn;
     private ScrollView logScroll;
     private TextView logText;
 
@@ -69,12 +83,26 @@ public class MainActivity extends AppCompatActivity implements DeviceConnection.
     private String currentDeviceCode;
     private Runnable pollRunnable;
     private boolean isRunning;
-    private boolean cloudConnected;
+    private boolean serviceRunning;
+
+    // Per-agent connection status
+    private boolean appConnected;
+    private boolean browserConnected;
+
+    // Spinner items: "App - Connected", "App - Offline", "Browser - Connected", "Browser - Offline"
+    private String[] spinnerItems;
+    private ArrayAdapter<String> spinnerAdapter;
+    private String currentAgentType = "app"; // selected agent type
+    private boolean spinnerInitialized = false;
 
     @Override
     protected void onCreate(Bundle savedInstanceState) {
         super.onCreate(savedInstanceState);
         setContentView(R.layout.activity_main);
+
+        // Light status bar: dark icons on light background
+        getWindow().setStatusBarColor(0xFFF5F5F5);
+        getWindow().getDecorView().setSystemUiVisibility(View.SYSTEM_UI_FLAG_LIGHT_STATUS_BAR);
 
         viewFlipper = findViewById(R.id.viewFlipper);
 
@@ -87,12 +115,17 @@ public class MainActivity extends AppCompatActivity implements DeviceConnection.
         retryLoginBtn = findViewById(R.id.retryLoginBtn);
 
         // Task screen
-        cloudDot = findViewById(R.id.cloudDot);
-        cloudLabel = findViewById(R.id.cloudLabel);
-        serviceDot = findViewById(R.id.serviceDot);
-        serviceLabel = findViewById(R.id.serviceLabel);
+        headerRow = findViewById(R.id.headerRow);
+        taskInputRow = findViewById(R.id.taskInputRow);
+        agentSpinner = findViewById(R.id.agentSpinner);
         taskInput = findViewById(R.id.taskInput);
         sendBtn = findViewById(R.id.sendBtn);
+        browserWebView = findViewById(R.id.browserWebView);
+        browserBar = findViewById(R.id.browserBar);
+        browserUrlInput = findViewById(R.id.browserUrlInput);
+        browserBackBtn = findViewById(R.id.browserBackBtn);
+        browserFwdBtn = findViewById(R.id.browserFwdBtn);
+        browserGoBtn = findViewById(R.id.browserGoBtn);
         logScroll = findViewById(R.id.logScroll);
         logText = findViewById(R.id.logText);
 
@@ -101,22 +134,68 @@ public class MainActivity extends AppCompatActivity implements DeviceConnection.
         cancelLoginBtn.setOnClickListener(v -> cancelDeviceLogin());
         retryLoginBtn.setOnClickListener(v -> startDeviceLogin());
 
-        // Task screen handlers
-        findViewById(R.id.accessibilityBtn).setOnClickListener(v -> {
-            Intent intent = new Intent(Settings.ACTION_ACCESSIBILITY_SETTINGS);
-            startActivity(intent);
-        });
-        findViewById(R.id.refreshBtn).setOnClickListener(v -> checkService());
-        sendBtn.setOnClickListener(v -> handleSend());
-
-        // Cloud status tappable for reconnect
-        View cloudArea = cloudDot;
-        cloudArea.setOnClickListener(v -> {
-            if (!cloudConnected) {
-                appendLog("[CLOUD] Reconnecting...");
-                DeviceConnection.getInstance().reconnect();
+        // Send button: handles both "No A11y" → open settings, and normal send
+        sendBtn.setOnClickListener(v -> {
+            if (!serviceRunning) {
+                startActivity(new Intent(Settings.ACTION_ACCESSIBILITY_SETTINGS));
+            } else {
+                handleSend();
             }
         });
+
+        // Browser bar handlers
+        browserBackBtn.setOnClickListener(v -> {
+            if (browserWebView.canGoBack()) browserWebView.goBack();
+        });
+        browserFwdBtn.setOnClickListener(v -> {
+            if (browserWebView.canGoForward()) browserWebView.goForward();
+        });
+        browserGoBtn.setOnClickListener(v -> navigateBrowserUrl());
+        browserUrlInput.setOnEditorActionListener((v, actionId, event) -> {
+            if (actionId == EditorInfo.IME_ACTION_GO || actionId == EditorInfo.IME_ACTION_DONE) {
+                navigateBrowserUrl();
+                return true;
+            }
+            return false;
+        });
+
+        // Set up agent spinner
+        spinnerItems = new String[] {
+            "App - Offline \u25BE",
+            "Browser - Offline \u25BE"
+        };
+        spinnerAdapter = new ArrayAdapter<>(this,
+                R.layout.spinner_item, spinnerItems);
+        spinnerAdapter.setDropDownViewResource(R.layout.spinner_dropdown_item);
+        agentSpinner.setAdapter(spinnerAdapter);
+        agentSpinner.setOnItemSelectedListener(new AdapterView.OnItemSelectedListener() {
+            @Override
+            public void onItemSelected(AdapterView<?> parent, View view, int position, long id) {
+                if (!spinnerInitialized) {
+                    spinnerInitialized = true;
+                    return;
+                }
+                if (position == 0) {
+                    currentAgentType = "app";
+                    browserWebView.setVisibility(View.GONE);
+                    browserBar.setVisibility(View.GONE);
+                    logScroll.setVisibility(View.VISIBLE);
+                } else {
+                    currentAgentType = "browser";
+                    browserWebView.setVisibility(View.VISIBLE);
+                    browserBar.setVisibility(View.VISIBLE);
+                    logScroll.setVisibility(View.GONE);
+                }
+                updateBrowserChrome();
+                updateSendButton();
+            }
+
+            @Override
+            public void onNothingSelected(AdapterView<?> parent) {}
+        });
+
+        // Set up WebView
+        setupWebView();
 
         // Check if already logged in
         SharedPreferences prefs = getSharedPreferences(PREFS_NAME, Context.MODE_PRIVATE);
@@ -126,6 +205,49 @@ public class MainActivity extends AppCompatActivity implements DeviceConnection.
             connectCloud();
         }
         // else stay on login screen (screen 0)
+    }
+
+    private void setupWebView() {
+        WebSettings settings = browserWebView.getSettings();
+        settings.setJavaScriptEnabled(true);
+        settings.setDomStorageEnabled(true);
+        settings.setLoadWithOverviewMode(true);
+        settings.setUseWideViewPort(true);
+
+        browserWebView.setWebViewClient(new WebViewClient() {
+            @Override
+            public boolean shouldOverrideUrlLoading(WebView view, WebResourceRequest request) {
+                String scheme = request.getUrl().getScheme();
+                // Block non-http(s) schemes (e.g. baiduboxapp://) — they can't load in WebView
+                if (scheme != null && !scheme.equals("https") && !scheme.equals("http")) {
+                    return true;
+                }
+                return false;
+            }
+
+            @Override
+            public void onPageStarted(WebView view, String url, Bitmap favicon) {
+                BrowserToolsHost.onPageStarted();
+            }
+
+            @Override
+            public void onPageFinished(WebView view, String url) {
+                BrowserToolsHost.onPageFinished();
+                browserUrlInput.setText(view.getUrl());
+            }
+        });
+
+        // Initialize BrowserToolsHost with this activity and webview
+        BrowserToolsHost.init(this, browserWebView);
+
+        // Load a default page
+        browserWebView.loadUrl("https://www.google.com");
+    }
+
+    @Override
+    public void onConfigurationChanged(Configuration newConfig) {
+        super.onConfigurationChanged(newConfig);
+        updateBrowserChrome();
     }
 
     @Override
@@ -138,7 +260,8 @@ public class MainActivity extends AppCompatActivity implements DeviceConnection.
     protected void onDestroy() {
         super.onDestroy();
         stopDevicePoll();
-        DeviceConnection.getInstance().setListener(null);
+        DeviceConnection.getInstance("app").setListener(null);
+        DeviceConnection.getInstance("browser").setListener(null);
     }
 
     // --- Login flow ---
@@ -190,7 +313,6 @@ public class MainActivity extends AppCompatActivity implements DeviceConnection.
                 httpClient.newCall(request).enqueue(new Callback() {
                     @Override
                     public void onFailure(Call call, IOException e) {
-                        // Keep polling
                         handler.postDelayed(pollRunnable, DEVICE_POLL_INTERVAL);
                     }
 
@@ -271,54 +393,90 @@ public class MainActivity extends AppCompatActivity implements DeviceConnection.
 
         String name = Build.MANUFACTURER + " " + Build.MODEL;
         try {
-            String wsUrl = "wss://ai.connect-screen.com/agents/chat-agent/device-"
-                    + URLEncoder.encode(name, "UTF-8")
-                    + "/device-connect?token="
-                    + URLEncoder.encode(apiKey, "UTF-8");
+            String encodedName = URLEncoder.encode(name, "UTF-8");
+            String encodedToken = URLEncoder.encode(apiKey, "UTF-8");
 
-            DeviceConnection conn = DeviceConnection.getInstance();
-            conn.setListener(this);
-            conn.connect(wsUrl, name);
+            // App agent connection
+            String appUrl = "wss://ai.connect-screen.com/agents/chat-agent/device-"
+                    + encodedName + "-app"
+                    + "/device-connect?token=" + encodedToken;
+
+            // Browser agent connection
+            String browserUrl = "wss://ai.connect-screen.com/agents/chat-agent/device-"
+                    + encodedName + "-browser"
+                    + "/device-connect?token=" + encodedToken;
+
+            DeviceConnection appConn = DeviceConnection.getInstance("app");
+            appConn.setListener(this);
+            appConn.connect(appUrl, name);
+
+            DeviceConnection browserConn = DeviceConnection.getInstance("browser");
+            browserConn.setListener(this);
+            browserConn.connect(browserUrl, name);
         } catch (Exception e) {
             Log.e(TAG, "Failed to connect cloud", e);
         }
     }
 
-    private void checkService() {
-        boolean running = SelectToSpeakService.getInstance() != null;
-        if (running) {
-            serviceDot.setBackgroundColor(0xFF4CAF50);
-            serviceLabel.setText("Service");
-        } else {
-            serviceDot.setBackgroundColor(0xFFF44336);
-            serviceLabel.setText("No Svc");
+    /** Hide header/task rows in landscape when browser is active */
+    private void updateBrowserChrome() {
+        boolean landscape = getResources().getConfiguration().orientation == Configuration.ORIENTATION_LANDSCAPE;
+        boolean browserMode = "browser".equals(currentAgentType);
+        int vis = (landscape && browserMode) ? View.GONE : View.VISIBLE;
+        headerRow.setVisibility(vis);
+        taskInputRow.setVisibility(vis);
+    }
+
+    private void navigateBrowserUrl() {
+        String input = browserUrlInput.getText().toString().trim();
+        if (input.isEmpty()) return;
+        if (!input.contains("://")) {
+            input = "https://" + input;
         }
+        browserWebView.loadUrl(input);
+    }
+
+    private void checkService() {
+        serviceRunning = SelectToSpeakService.getInstance() != null;
+        updateSendButton();
     }
 
     private void handleSend() {
         String text = taskInput.getText().toString().trim();
-        if (text.isEmpty() || isRunning || !cloudConnected) return;
+        boolean currentConnected = "app".equals(currentAgentType) ? appConnected : browserConnected;
+        if (text.isEmpty() || isRunning || !currentConnected) return;
 
         logText.setText("");
         taskInput.setText("");
         isRunning = true;
         updateSendButton();
 
-        appendLog("[TASK] Sending to server: " + text);
-        DeviceConnection.getInstance().sendUserTask(text);
+        appendLog("[TASK] Sending to server (" + currentAgentType + "): " + text);
+        DeviceConnection.getInstance(currentAgentType).sendUserTask(text);
+    }
+
+    private void updateSpinnerItems() {
+        spinnerItems[0] = (appConnected ? "App - Connected" : "App - Offline") + " \u25BE";
+        spinnerItems[1] = (browserConnected ? "Browser - Connected" : "Browser - Offline") + " \u25BE";
+        spinnerAdapter.notifyDataSetChanged();
     }
 
     private void updateSendButton() {
-        if (isRunning) {
+        if (!serviceRunning) {
+            sendBtn.setText("No A11y");
+            sendBtn.setEnabled(true);
+            sendBtn.setBackgroundColor(0xFFC62828);
+            taskInput.setEnabled(false);
+        } else if (isRunning) {
             sendBtn.setText("Running");
             sendBtn.setEnabled(false);
             sendBtn.setBackgroundColor(0xFF666666);
             taskInput.setEnabled(false);
         } else {
-            boolean canSend = cloudConnected;
-            sendBtn.setText(canSend ? "Send" : "Offline");
-            sendBtn.setEnabled(canSend);
-            sendBtn.setBackgroundColor(canSend ? 0xFFE94560 : 0x66E94560);
+            boolean currentConnected = "app".equals(currentAgentType) ? appConnected : browserConnected;
+            sendBtn.setText(currentConnected ? "Send" : "Offline");
+            sendBtn.setEnabled(currentConnected);
+            sendBtn.setBackgroundColor(currentConnected ? 0xFF1976D2 : 0x661976D2);
             taskInput.setEnabled(true);
         }
     }
@@ -338,24 +496,22 @@ public class MainActivity extends AppCompatActivity implements DeviceConnection.
     // --- DeviceConnection.Listener ---
 
     @Override
-    public void onConnectionStatusChanged(boolean connected) {
+    public void onConnectionStatusChanged(String agentType, boolean connected) {
         handler.post(() -> {
-            cloudConnected = connected;
-            if (connected) {
-                cloudDot.setBackgroundColor(0xFF2196F3);
-                cloudLabel.setText("Cloud");
-            } else {
-                cloudDot.setBackgroundColor(0xFF666666);
-                cloudLabel.setText("Offline");
+            if ("app".equals(agentType)) {
+                appConnected = connected;
+            } else if ("browser".equals(agentType)) {
+                browserConnected = connected;
             }
+            updateSpinnerItems();
             updateSendButton();
         });
     }
 
     @Override
-    public void onTaskDone(String result) {
+    public void onTaskDone(String agentType, String result) {
         handler.post(() -> {
-            appendLog("[DONE] " + result);
+            appendLog("[DONE] (" + agentType + ") " + result);
             isRunning = false;
             updateSendButton();
         });

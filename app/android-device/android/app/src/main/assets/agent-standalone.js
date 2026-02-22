@@ -166,12 +166,12 @@
       .join("\n");
   }
 
-  // src/prompt.ts
+  // src/app-prompt.ts
   var agentSignatures = generateSignatures((fn) => fn.agentVisible);
   var SYSTEM_PROMPT =
     "You are a mobile automation assistant controlling a phone via Android Accessibility Service.\nYou can see the screen's accessibility tree where each node shows: class type, text, content description (desc), bounds coordinates, and properties.\n\nYou operate by writing JavaScript code using the execute_js tool. All calls are synchronous. Available global functions:\n```typescript\n" +
     agentSignatures +
-    '\n```\n\nTips:\n- Execute a SHORT sequence of actions (5-10 operations max), then return the result\n- Do NOT write for/while loops that call get_screen() or scroll() repeatedly\n- get_screen() is limited to 5 calls per execute_js\n- Use globalThis to store state between calls\n- click("text") matches BOTH text and desc attributes. Use click({desc:"X"}) for desc-only match\n- Bounds format: [left,top][right,bottom]. Center: x=(left+right)/2, y=(top+bottom)/2\n- After actions, call sleep(500) then get_screen() to verify results\n- If elements (especially ImageView) have no text or desc, call take_screenshot() to see actual pixels\n- take_screenshot() returns a placeholder; the actual image is automatically sent to you as a vision input\n- If click by text fails, calculate coordinates from bounds and use click({x, y})\n- To open an app, prefer launch_app("AppName") over navigating the home screen\n- For NumberPicker/time selectors, use scroll_element("\u5F53\u524D\u503C", "up"/"down") to change values\n- When you encounter ambiguity (e.g. multiple matches) or need user action (e.g. password input), call ask_user("your question") to pause and let the user act, then continue after they tap Continue\n- IMPORTANT: ALWAYS use execute_js to interact with the phone. Never describe or narrate planned actions \u2014 execute them directly.\n- When the task is complete, respond with a text summary (no tool call)';
+    '\n```\n\nTips:\n- Execute a SHORT sequence of actions (5-10 operations max). The last expression\'s value is the result \u2014 do NOT use `return` (code runs in global scope, not a function)\n- Do NOT write for/while loops that call get_screen() or scroll() repeatedly\n- get_screen() is limited to 5 calls per execute_js\n- Use globalThis to store state between calls\n- click("text") matches BOTH text and desc attributes. Use click({desc:"X"}) for desc-only match\n- Bounds format: [left,top][right,bottom]. Center: x=(left+right)/2, y=(top+bottom)/2\n- After actions, call sleep(500) then get_screen() to verify results\n- If elements (especially ImageView) have no text or desc, call take_screenshot() to see actual pixels\n- take_screenshot() returns a placeholder; the actual image is automatically sent to you as a vision input\n- If click by text fails, calculate coordinates from bounds and use click({x, y})\n- To open an app, prefer launch_app("AppName") over navigating the home screen\n- For NumberPicker/time selectors, use scroll_element("\u5F53\u524D\u503C", "up"/"down") to change values\n- When you encounter ambiguity (e.g. multiple matches) or need user action (e.g. password input), call ask_user("your question") to pause and let the user act, then continue after they tap Continue\n- IMPORTANT: ALWAYS use execute_js to interact with the phone. Never describe or narrate planned actions \u2014 execute them directly.\n- When the task is complete, respond with a text summary (no tool call)';
   var toolSignatures = generateSignatures((fn) => fn.agentVisible);
   var TOOLS = [
     {
@@ -337,6 +337,13 @@
       };
     } catch (e) {
       const msg = e instanceof Error ? e.message : String(e);
+      if (msg.includes("'return' not in a function")) {
+        return {
+          result:
+            "[JS Error] Top-level 'return' is not allowed. The code runs in global scope \u2014 use the last expression as the result instead of 'return'.",
+          screenshots: capturedScreenshots
+        };
+      }
       return {
         result: "[JS Error] " + msg,
         screenshots: capturedScreenshots

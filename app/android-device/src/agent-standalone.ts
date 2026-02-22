@@ -10,7 +10,7 @@
  * exposed via `__DEVICE_PROMPT__` for the server handshake.
  */
 
-import "./prompt"; // side-effect: sets globalThis.__DEVICE_PROMPT__
+import "./app-prompt"; // side-effect: sets globalThis.__DEVICE_PROMPT__
 
 // Declare globals provided by C++ host functions (for TypeScript only)
 declare global {
@@ -217,6 +217,13 @@ function executeCodeForServer(code: string): {
     };
   } catch (e: unknown) {
     const msg = e instanceof Error ? e.message : String(e);
+    if (msg.includes("'return' not in a function")) {
+      return {
+        result:
+          "[JS Error] Top-level 'return' is not allowed. The code runs in global scope — use the last expression as the result instead of 'return'.",
+        screenshots: capturedScreenshots
+      };
+    }
     return {
       result: "[JS Error] " + msg,
       screenshots: capturedScreenshots

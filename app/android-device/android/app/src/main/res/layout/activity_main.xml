@@ -5,7 +5,7 @@
     android:layout_width="match_parent"
     android:layout_height="match_parent"
     android:fitsSystemWindows="true"
-    android:background="#1a1a2e">
+    android:background="#f5f5f5">
 
     <!-- Screen 0: Login -->
     <LinearLayout
@@ -19,7 +19,7 @@
             android:layout_width="wrap_content"
             android:layout_height="wrap_content"
             android:text="RN Agent"
-            android:textColor="#eeeeee"
+            android:textColor="#212121"
             android:textSize="32sp"
             android:textStyle="bold"
             android:layout_marginBottom="40dp" />
@@ -32,7 +32,7 @@
             android:textColor="#ffffff"
             android:textSize="18sp"
             android:textStyle="bold"
-            android:background="#e94560"
+            android:background="#1976D2"
             android:paddingHorizontal="40dp"
             android:paddingVertical="14dp" />
 
@@ -43,7 +43,7 @@
             android:layout_height="wrap_content"
             android:orientation="vertical"
             android:gravity="center"
-            android:background="#16213e"
+            android:background="#ffffff"
             android:padding="12dp"
             android:layout_marginTop="16dp"
             android:visibility="gone">
@@ -53,7 +53,7 @@
                 android:layout_width="wrap_content"
                 android:layout_height="wrap_content"
                 android:text="Open ai.connect-screen.com/device and enter:"
-                android:textColor="#cccccc"
+                android:textColor="#666666"
                 android:textSize="12sp"
                 android:layout_marginBottom="8dp"
                 android:gravity="center" />
@@ -62,7 +62,7 @@
                 android:id="@+id/deviceCodeText"
                 android:layout_width="wrap_content"
                 android:layout_height="wrap_content"
-                android:textColor="#ffffff"
+                android:textColor="#212121"
                 android:textSize="28sp"
                 android:textStyle="bold"
                 android:fontFamily="monospace"
@@ -83,7 +83,7 @@
                 android:layout_width="wrap_content"
                 android:layout_height="wrap_content"
                 android:text="Cancel"
-                android:textColor="#e94560"
+                android:textColor="#D32F2F"
                 android:textSize="13sp"
                 android:layout_marginTop="4dp" />
         </LinearLayout>
@@ -95,7 +95,7 @@
             android:layout_height="wrap_content"
             android:orientation="vertical"
             android:gravity="center"
-            android:background="#16213e"
+            android:background="#ffffff"
             android:padding="12dp"
             android:layout_marginTop="16dp"
             android:visibility="gone">
@@ -104,7 +104,7 @@
                 android:layout_width="wrap_content"
                 android:layout_height="wrap_content"
                 android:text="Code expired or failed. Try again."
-                android:textColor="#F44336"
+                android:textColor="#D32F2F"
                 android:textSize="13sp"
                 android:layout_marginBottom="4dp" />
 
@@ -113,7 +113,7 @@
                 android:layout_width="wrap_content"
                 android:layout_height="wrap_content"
                 android:text="Retry"
-                android:textColor="#e94560"
+                android:textColor="#1976D2"
                 android:textSize="13sp"
                 android:textStyle="bold" />
         </LinearLayout>
@@ -128,6 +128,7 @@
 
         <!-- Header row -->
         <LinearLayout
+            android:id="@+id/headerRow"
             android:layout_width="match_parent"
             android:layout_height="wrap_content"
             android:orientation="horizontal"
@@ -139,79 +140,24 @@
                 android:layout_height="wrap_content"
                 android:layout_weight="1"
                 android:text="RN Agent"
-                android:textColor="#eeeeee"
+                android:textColor="#212121"
                 android:textSize="20sp"
                 android:textStyle="bold" />
 
-            <!-- Cloud status -->
-            <View
-                android:id="@+id/cloudDot"
-                android:layout_width="10dp"
-                android:layout_height="10dp"
-                android:background="#666666"
-                android:layout_marginEnd="6dp" />
-
-            <TextView
-                android:id="@+id/cloudLabel"
+            <!-- Agent mode selector -->
+            <Spinner
+                android:id="@+id/agentSpinner"
                 android:layout_width="wrap_content"
-                android:layout_height="wrap_content"
-                android:text="Offline"
-                android:textColor="#cccccc"
-                android:textSize="13sp" />
-
-            <!-- Service status -->
-            <View
-                android:id="@+id/serviceDot"
-                android:layout_width="10dp"
-                android:layout_height="10dp"
-                android:background="#F44336"
-                android:layout_marginStart="8dp"
-                android:layout_marginEnd="6dp" />
-
-            <TextView
-                android:id="@+id/serviceLabel"
-                android:layout_width="wrap_content"
-                android:layout_height="wrap_content"
-                android:text="No Svc"
-                android:textColor="#cccccc"
-                android:textSize="13sp" />
-        </LinearLayout>
-
-        <!-- Buttons row -->
-        <LinearLayout
-            android:layout_width="match_parent"
-            android:layout_height="wrap_content"
-            android:orientation="horizontal"
-            android:layout_marginBottom="8dp">
-
-            <Button
-                android:id="@+id/accessibilityBtn"
-                android:layout_width="wrap_content"
-                android:layout_height="wrap_content"
-                android:text="Accessibility"
-                android:textColor="#e0e0e0"
-                android:textSize="13sp"
-                android:background="#16213e"
-                android:paddingHorizontal="12dp"
-                android:paddingVertical="6dp"
-                android:layout_marginEnd="8dp"
-                android:textAllCaps="false" />
-
-            <Button
-                android:id="@+id/refreshBtn"
-                android:layout_width="wrap_content"
-                android:layout_height="wrap_content"
-                android:text="Refresh"
-                android:textColor="#e0e0e0"
-                android:textSize="13sp"
-                android:background="#16213e"
-                android:paddingHorizontal="12dp"
-                android:paddingVertical="6dp"
-                android:textAllCaps="false" />
+                android:layout_height="36dp"
+                android:background="#e0e0e0"
+                android:popupBackground="#ffffff"
+                android:paddingHorizontal="10dp"
+                android:gravity="center_vertical" />
         </LinearLayout>
 
         <!-- Task input row -->
         <LinearLayout
+            android:id="@+id/taskInputRow"
             android:layout_width="match_parent"
             android:layout_height="wrap_content"
             android:orientation="horizontal"
@@ -224,8 +170,8 @@
                 android:layout_weight="1"
                 android:hint="Enter task..."
                 android:textColorHint="#999999"
-                android:textColor="#eeeeee"
-                android:background="#16213e"
+                android:textColor="#212121"
+                android:background="#ffffff"
                 android:padding="10dp"
                 android:textSize="14sp"
                 android:maxHeight="80dp"
@@ -240,25 +186,89 @@
                 android:textColor="#ffffff"
                 android:textStyle="bold"
                 android:textSize="15sp"
-                android:background="#e94560"
+                android:background="#1976D2"
                 android:paddingHorizontal="16dp"
                 android:textAllCaps="false" />
         </LinearLayout>
 
-        <!-- Logs -->
+        <!-- Browser WebView (hidden by default) -->
+        <android.webkit.WebView
+            android:id="@+id/browserWebView"
+            android:layout_width="match_parent"
+            android:layout_height="0dp"
+            android:layout_weight="1"
+            android:visibility="gone" />
+
+        <!-- Browser bottom bar (hidden by default) -->
+        <LinearLayout
+            android:id="@+id/browserBar"
+            android:layout_width="match_parent"
+            android:layout_height="wrap_content"
+            android:orientation="horizontal"
+            android:gravity="center_vertical"
+            android:background="#ffffff"
+            android:padding="4dp"
+            android:visibility="gone">
+
+            <Button
+                android:id="@+id/browserBackBtn"
+                android:layout_width="40dp"
+                android:layout_height="40dp"
+                android:text="\u2190"
+                android:textSize="18sp"
+                android:background="?android:attr/selectableItemBackground"
+                android:padding="0dp" />
+
+            <Button
+                android:id="@+id/browserFwdBtn"
+                android:layout_width="40dp"
+                android:layout_height="40dp"
+                android:text="\u2192"
+                android:textSize="18sp"
+                android:background="?android:attr/selectableItemBackground"
+                android:padding="0dp" />
+
+            <EditText
+                android:id="@+id/browserUrlInput"
+                android:layout_width="0dp"
+                android:layout_height="36dp"
+                android:layout_weight="1"
+                android:singleLine="true"
+                android:inputType="textUri"
+                android:hint="Search or URL"
+                android:textSize="13sp"
+                android:textColor="#212121"
+                android:textColorHint="#999999"
+                android:background="#f0f0f0"
+                android:paddingHorizontal="8dp"
+                android:layout_marginHorizontal="4dp" />
+
+            <Button
+                android:id="@+id/browserGoBtn"
+                android:layout_width="wrap_content"
+                android:layout_height="36dp"
+                android:text="Go"
+                android:textSize="14sp"
+                android:textColor="#ffffff"
+                android:background="#1976D2"
+                android:paddingHorizontal="12dp"
+                android:textAllCaps="false" />
+        </LinearLayout>
+
+        <!-- Logs (visible by default) -->
         <ScrollView
             android:id="@+id/logScroll"
             android:layout_width="match_parent"
             android:layout_height="0dp"
             android:layout_weight="1"
-            android:background="#0a0a1a"
+            android:background="#ffffff"
             android:padding="8dp">
 
             <TextView
                 android:id="@+id/logText"
                 android:layout_width="match_parent"
                 android:layout_height="wrap_content"
-                android:textColor="#b0b0b0"
+                android:textColor="#424242"
                 android:fontFamily="monospace"
                 android:textSize="11sp"
                 android:lineSpacingExtra="4dp"

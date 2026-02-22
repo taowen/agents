@@ -6,6 +6,8 @@ import android.util.Log;
 
 import org.json.JSONObject;
 
+import java.util.HashMap;
+import java.util.Map;
 import java.util.concurrent.ExecutorService;
 import java.util.concurrent.Executors;
 import java.util.concurrent.TimeUnit;
@@ -19,15 +21,10 @@ import okhttp3.WebSocket;
 import okhttp3.WebSocketListener;
 
 /**
- * Singleton that manages a Java-level OkHttp WebSocket connection to the cloud ChatAgent.
+ * Per-agent-type WebSocket connection to the cloud ChatAgent.
  *
- * Responsibilities:
- * - Maintains persistent WebSocket to the device's ChatAgent session
- *   (wss://ai.connect-screen.com/agents/chat-agent/device-{name}/device-connect)
- * - Executes JS code from server exec_js requests in a persistent Hermes runtime
- * - Receives task dispatches and notifies the Listener
- * - Handles ping/pong keepalive
- * - Sends task results back to the ChatAgent
+ * Each agent type ("app", "browser") gets its own DeviceConnection instance,
+ * with its own WebSocket, OkHttpClient, reconnect state, and Hermes runtime.
  */
 public class DeviceConnection {
 
@@ -37,12 +34,13 @@ public class DeviceConnection {
     private static final long RECONNECT_MAX_MS = 60000;
 
     public interface Listener {
-        void onConnectionStatusChanged(boolean connected);
-        void onTaskDone(String result);
+        void onConnectionStatusChanged(String agentType, boolean connected);
+        void onTaskDone(String agentType, String result);
     }
 
-    private static DeviceConnection instance;
+    private static final Map<String, DeviceConnection> instances = new HashMap<>();
 
+    private final String agentType;
     private OkHttpClient client;
     private WebSocket ws;
     private boolean connected = false;
@@ -57,21 +55,23 @@ public class DeviceConnection {
     private long reconnectDelayMs = RECONNECT_BASE_MS;
     private Runnable pendingReconnect = null;
 
-    // Persistent Hermes runtime for exec_js — initialized on first exec_js, reused across calls
+    // Persistent Hermes runtime for exec_js
     private boolean hermesInitialized = false;
 
-    private DeviceConnection() {
+    private DeviceConnection(String agentType) {
+        this.agentType = agentType;
         client = new OkHttpClient.Builder()
-                .readTimeout(0, TimeUnit.MILLISECONDS) // no read timeout for WS
-                .pingInterval(20, TimeUnit.SECONDS)    // WebSocket protocol-level ping frames
+                .readTimeout(0, TimeUnit.MILLISECONDS)
+                .pingInterval(20, TimeUnit.SECONDS)
                 .build();
     }
 
-    public static synchronized DeviceConnection getInstance() {
-        if (instance == null) {
-            instance = new DeviceConnection();
-        }
-        return instance;
+    public static synchronized DeviceConnection getInstance(String agentType) {
+        return instances.computeIfAbsent(agentType, k -> new DeviceConnection(k));
+    }
+
+    public String getAgentType() {
+        return agentType;
     }
 
     public void setListener(Listener listener) {
@@ -95,7 +95,7 @@ public class DeviceConnection {
         ws = client.newWebSocket(request, new WebSocketListener() {
             @Override
             public void onOpen(WebSocket webSocket, Response response) {
-                Log.i(TAG, "WebSocket connected at " + System.currentTimeMillis());
+                Log.i(TAG, "[" + agentType + "] WebSocket connected at " + System.currentTimeMillis());
                 connected = true;
                 reconnectDelayMs = RECONNECT_BASE_MS;
                 lastPingTime = System.currentTimeMillis();
@@ -106,8 +106,6 @@ public class DeviceConnection {
                     ready.put("type", "ready");
                     ready.put("deviceName", deviceName);
                     ready.put("deviceId", deviceName);
-                    // Include system prompt and tool definitions from prompt.ts
-                    // so server can use them in streamText
                     String promptInfo = getDevicePromptInfo();
                     if (promptInfo != null) {
                         JSONObject promptData = new JSONObject(promptInfo);
@@ -120,7 +118,7 @@ public class DeviceConnection {
                     }
                     webSocket.send(ready.toString());
                 } catch (Exception e) {
-                    Log.e(TAG, "Failed to send ready", e);
+                    Log.e(TAG, "[" + agentType + "] Failed to send ready", e);
                 }
             }
 
@@ -134,13 +132,13 @@ public class DeviceConnection {
                         case "exec_js": {
                             String execId = data.getString("execId");
                             String code = data.getString("code");
-                            Log.i(TAG, "Received exec_js: " + execId + " code length=" + code.length());
+                            Log.i(TAG, "[" + agentType + "] Received exec_js: " + execId + " code length=" + code.length());
                             handleExecJs(webSocket, execId, code);
                             break;
                         }
                         case "task_done": {
                             String result = data.optString("result", "");
-                            Log.i(TAG, "Received task_done: " + result.substring(0, Math.min(100, result.length())));
+                            Log.i(TAG, "[" + agentType + "] Received task_done: " + result.substring(0, Math.min(100, result.length())));
                             HermesRuntime.nativeHideOverlay();
                             notifyTaskDone(result);
                             break;
@@ -155,26 +153,26 @@ public class DeviceConnection {
                             break;
                         }
                         default:
-                            Log.d(TAG, "Unknown message type: " + type);
+                            Log.d(TAG, "[" + agentType + "] Unknown message type: " + type);
                     }
                 } catch (Exception e) {
-                    Log.e(TAG, "Failed to parse message: " + text, e);
+                    Log.e(TAG, "[" + agentType + "] Failed to parse message: " + text, e);
                 }
             }
 
             @Override
             public void onClosing(WebSocket webSocket, int code, String reason) {
-                if (webSocket != ws) return; // stale connection
-                Log.i(TAG, "WebSocket closing: " + code + " " + reason);
+                if (webSocket != ws) return;
+                Log.i(TAG, "[" + agentType + "] WebSocket closing: " + code + " " + reason);
                 webSocket.close(1000, null);
             }
 
             @Override
             public void onClosed(WebSocket webSocket, int code, String reason) {
-                if (webSocket != ws) return; // stale connection
+                if (webSocket != ws) return;
                 long secsSincePing = lastPingTime > 0
                         ? (System.currentTimeMillis() - lastPingTime) / 1000 : -1;
-                Log.i(TAG, "WebSocket closed: code=" + code + " reason=" + reason
+                Log.i(TAG, "[" + agentType + "] WebSocket closed: code=" + code + " reason=" + reason
                         + " secsSinceLastPing=" + secsSincePing);
                 connected = false;
                 notifyConnectionStatus(false);
@@ -183,10 +181,10 @@ public class DeviceConnection {
 
             @Override
             public void onFailure(WebSocket webSocket, Throwable t, Response response) {
-                if (webSocket != ws) return; // stale connection
+                if (webSocket != ws) return;
                 long secsSincePing = lastPingTime > 0
                         ? (System.currentTimeMillis() - lastPingTime) / 1000 : -1;
-                Log.e(TAG, "WebSocket failure: " + t.getClass().getSimpleName()
+                Log.e(TAG, "[" + agentType + "] WebSocket failure: " + t.getClass().getSimpleName()
                         + ": " + t.getMessage()
                         + " secsSinceLastPing=" + secsSincePing, t);
                 connected = false;
@@ -202,9 +200,8 @@ public class DeviceConnection {
             ws = null;
         }
         connected = false;
-        // Clean up Hermes runtime
         if (hermesInitialized) {
-            try { HermesRuntime.nativeDestroyRuntime("app"); } catch (Exception ignored) {}
+            try { HermesRuntime.nativeDestroyRuntime(agentType); } catch (Exception ignored) {}
             hermesInitialized = false;
             cachedPromptInfo = null;
         }
@@ -213,7 +210,7 @@ public class DeviceConnection {
     private void scheduleReconnect() {
         if (lastUrl == null) return;
         long delay = reconnectDelayMs;
-        Log.i(TAG, "Scheduling auto-reconnect in " + delay + "ms");
+        Log.i(TAG, "[" + agentType + "] Scheduling auto-reconnect in " + delay + "ms");
         pendingReconnect = () -> connect(lastUrl, lastDeviceName);
         mainHandler.postDelayed(pendingReconnect, delay);
         reconnectDelayMs = Math.min(reconnectDelayMs * 2, RECONNECT_MAX_MS);
@@ -228,7 +225,7 @@ public class DeviceConnection {
      */
     public void sendUserTask(String text) {
         if (!connected || ws == null) {
-            Log.w(TAG, "Cannot send user_task - not connected");
+            Log.w(TAG, "[" + agentType + "] Cannot send user_task - not connected");
             return;
         }
         try {
@@ -237,22 +234,21 @@ public class DeviceConnection {
             msg.put("text", text);
             ws.send(msg.toString());
         } catch (Exception e) {
-            Log.e(TAG, "Failed to send user_task", e);
+            Log.e(TAG, "[" + agentType + "] Failed to send user_task", e);
         }
     }
 
     public synchronized void reconnect() {
         if (lastUrl != null) {
-            Log.i(TAG, "Manual reconnect");
+            Log.i(TAG, "[" + agentType + "] Manual reconnect");
             connect(lastUrl, lastDeviceName);
         } else {
-            Log.w(TAG, "Cannot reconnect - no previous connection params");
+            Log.w(TAG, "[" + agentType + "] Cannot reconnect - no previous connection params");
         }
     }
 
     /**
      * Execute JS code in a persistent Hermes runtime and send the result back.
-     * Runs on a single-thread executor to serialize access to the Hermes runtime.
      */
     private void handleExecJs(WebSocket webSocket, String execId, String code) {
         execExecutor.execute(() -> {
@@ -260,10 +256,8 @@ public class DeviceConnection {
             JSONArray screenshots = new JSONArray();
             try {
                 initHermesRuntime();
-                // Execute the code. The executeCodeInHermes function returns JSON
-                // with { result, screenshots? }
                 String rawResult = HermesRuntime.nativeEvaluateJS(
-                        "app",
+                        agentType,
                         "JSON.stringify(executeCodeForServer(" + escapeJsString(code) + "))",
                         "exec_js"
                 );
@@ -273,15 +267,13 @@ public class DeviceConnection {
                     JSONArray ss = parsed.optJSONArray("screenshots");
                     if (ss != null) screenshots = ss;
                 } catch (Exception e) {
-                    // If not JSON, use raw result
                     result = rawResult;
                 }
             } catch (Exception e) {
-                Log.e(TAG, "exec_js failed", e);
+                Log.e(TAG, "[" + agentType + "] exec_js failed", e);
                 result = "Error: " + e.getMessage();
             }
 
-            // Send result back
             try {
                 JSONObject msg = new JSONObject();
                 msg.put("type", "exec_result");
@@ -292,39 +284,36 @@ public class DeviceConnection {
                 }
                 webSocket.send(msg.toString());
             } catch (Exception e) {
-                Log.e(TAG, "Failed to send exec_result", e);
+                Log.e(TAG, "[" + agentType + "] Failed to send exec_result", e);
             }
         });
     }
 
-    /**
-     * Initialize the persistent Hermes runtime, load the agent bundle, and set up
-     * the executeCodeForServer helper. Also reads and caches __DEVICE_PROMPT__.
-     * Must only be called from the execExecutor thread (Hermes is not thread-safe).
-     */
     private String cachedPromptInfo = null;
 
     private void initHermesRuntime() {
         if (hermesInitialized) return;
 
-        HermesRuntime.nativeCreateRuntime("app");
+        HermesRuntime.nativeCreateRuntime(agentType);
 
-        // Load the agent JS bundle which defines all host function wrappers
+        // Load the appropriate JS bundle
+        String assetName = "app".equals(agentType) ? "agent-standalone.js" : "browser-standalone.js";
+
         com.google.android.accessibility.selecttospeak.SelectToSpeakService service =
                 com.google.android.accessibility.selecttospeak.SelectToSpeakService.getInstance();
         if (service != null) {
-            String agentJs = HermesRuntime.loadAsset(service, "agent-standalone.js");
-            if (agentJs != null) {
-                HermesRuntime.nativeEvaluateJS("app", agentJs, "agent-standalone.js");
+            String bundleJs = HermesRuntime.loadAsset(service, assetName);
+            if (bundleJs != null) {
+                HermesRuntime.nativeEvaluateJS(agentType, bundleJs, assetName);
             } else {
-                Log.e(TAG, "Failed to load agent-standalone.js");
+                Log.e(TAG, "[" + agentType + "] Failed to load " + assetName);
             }
         }
 
-        // Read __DEVICE_PROMPT__ (set by prompt.ts) before defining helpers
+        // Read __DEVICE_PROMPT__ (set by prompt.ts / browser-prompt.ts)
         try {
             String result = HermesRuntime.nativeEvaluateJS(
-                    "app",
+                    agentType,
                     "JSON.stringify(__DEVICE_PROMPT__)",
                     "get-prompt-info"
             );
@@ -332,20 +321,13 @@ public class DeviceConnection {
                 cachedPromptInfo = result;
             }
         } catch (Exception e) {
-            Log.w(TAG, "Failed to read __DEVICE_PROMPT__", e);
+            Log.w(TAG, "[" + agentType + "] Failed to read __DEVICE_PROMPT__", e);
         }
 
-        // executeCodeForServer is now defined in agent-standalone.ts
-        // (loaded above), sharing the same host function wrappers with update_status.
-
         hermesInitialized = true;
-        Log.i(TAG, "Hermes runtime initialized for exec_js");
+        Log.i(TAG, "[" + agentType + "] Hermes runtime initialized for exec_js");
     }
 
-    /**
-     * Get the device prompt info (systemPrompt + tools).
-     * Initializes the Hermes runtime on the execExecutor thread (Hermes is not thread-safe).
-     */
     private String getDevicePromptInfo() {
         try {
             return execExecutor.submit(() -> {
@@ -353,7 +335,7 @@ public class DeviceConnection {
                 return cachedPromptInfo;
             }).get(10, TimeUnit.SECONDS);
         } catch (Exception e) {
-            Log.e(TAG, "Failed to get prompt info", e);
+            Log.e(TAG, "[" + agentType + "] Failed to get prompt info", e);
             return null;
         }
     }
@@ -365,14 +347,14 @@ public class DeviceConnection {
     private void notifyConnectionStatus(boolean status) {
         Listener l = listener;
         if (l != null) {
-            l.onConnectionStatusChanged(status);
+            l.onConnectionStatusChanged(agentType, status);
         }
     }
 
     private void notifyTaskDone(String result) {
         Listener l = listener;
         if (l != null) {
-            l.onTaskDone(result);
+            l.onTaskDone(agentType, result);
         }
     }
 }
