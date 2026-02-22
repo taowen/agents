@@ -22,6 +22,7 @@ export const SYSTEM_PROMPT =
   '- To open an app, prefer launch_app("AppName") over navigating the home screen\n' +
   '- For NumberPicker/time selectors, use scroll_element("当前值", "up"/"down") to change values\n' +
   '- When you encounter ambiguity (e.g. multiple matches) or need user action (e.g. password input), call ask_user("your question") to pause and let the user act, then continue after they tap Continue\n' +
+  "- IMPORTANT: ALWAYS use execute_js to interact with the phone. Never describe or narrate planned actions — execute them directly.\n" +
   "- When the task is complete, respond with a text summary (no tool call)";
 
 const toolSignatures = generateSignatures((fn) => fn.agentVisible);
@@ -54,7 +55,7 @@ export const TOOLS = [
 ];
 
 // Expose on globalThis so Java can read them after loading the bundle
-(globalThis as any).__DEVICE_PROMPT__ = {
+globalThis.__DEVICE_PROMPT__ = {
   systemPrompt: SYSTEM_PROMPT,
   tools: TOOLS
 };
