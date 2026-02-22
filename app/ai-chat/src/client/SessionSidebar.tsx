@@ -9,7 +9,8 @@ import {
   ChatCircleIcon,
   SignOutIcon,
   PencilSimpleIcon,
-  DeviceMobileIcon
+  DeviceMobileIcon,
+  DownloadSimpleIcon
 } from "@phosphor-icons/react";
 import { Button, Text } from "@cloudflare/kumo";
 import { SessionListSkeleton } from "./Skeleton";
@@ -155,39 +156,46 @@ export function SessionSidebar({
       </div>
 
       {/* Devices */}
-      {devices.length > 0 && (
-        <div className="px-2 pb-2">
-          <div className="px-3 py-1.5 text-xs font-medium text-kumo-inactive uppercase tracking-wide">
-            Devices
-          </div>
-          <div className="space-y-0.5">
-            {devices.map((device) => {
-              const deviceSessionId = device.sessionId;
-              const isActive = deviceSessionId === activeSessionId;
-              return (
-                <div
-                  key={device.sessionId}
-                  className={`flex items-center gap-2 px-3 py-2 rounded-lg cursor-pointer text-sm transition-colors ${
-                    isActive
-                      ? "bg-kumo-elevated text-kumo-default"
-                      : "text-kumo-secondary hover:bg-kumo-elevated/50 hover:text-kumo-default"
-                  }`}
-                  onClick={() => onSelectSession(deviceSessionId)}
-                >
-                  <DeviceMobileIcon
-                    size={14}
-                    className="shrink-0 text-kumo-inactive"
-                  />
-                  <span className="flex-1 min-w-0 truncate">
-                    {device.deviceName}
-                  </span>
-                  <span className="shrink-0 w-2 h-2 rounded-full bg-green-500" />
-                </div>
-              );
-            })}
-          </div>
+      <div className="px-2 pb-2">
+        <div className="px-3 py-1.5 text-xs font-medium text-kumo-inactive uppercase tracking-wide">
+          Devices
         </div>
-      )}
+        <div className="space-y-0.5">
+          {devices.map((device) => {
+            const deviceSessionId = device.sessionId;
+            const isActive = deviceSessionId === activeSessionId;
+            return (
+              <div
+                key={device.sessionId}
+                className={`flex items-center gap-2 px-3 py-2 rounded-lg cursor-pointer text-sm transition-colors ${
+                  isActive
+                    ? "bg-kumo-elevated text-kumo-default"
+                    : "text-kumo-secondary hover:bg-kumo-elevated/50 hover:text-kumo-default"
+                }`}
+                onClick={() => onSelectSession(deviceSessionId)}
+              >
+                <DeviceMobileIcon
+                  size={14}
+                  className="shrink-0 text-kumo-inactive"
+                />
+                <span className="flex-1 min-w-0 truncate">
+                  {device.deviceName}
+                </span>
+                <span className="shrink-0 w-2 h-2 rounded-full bg-green-500" />
+              </div>
+            );
+          })}
+          <a
+            href="/download"
+            target="_blank"
+            rel="noopener noreferrer"
+            className="flex items-center gap-2 px-3 py-2 rounded-lg text-sm text-kumo-tertiary hover:bg-kumo-elevated/50 hover:text-kumo-default transition-colors"
+          >
+            <DownloadSimpleIcon size={14} className="shrink-0" />
+            <span>Add device</span>
+          </a>
+        </div>
+      </div>
 
       {/* Bottom section */}
       <div className="border-t border-kumo-line p-3 space-y-2">

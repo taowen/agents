@@ -5,7 +5,7 @@ import { useAgentChat } from "@cloudflare/ai-chat/react";
 import { isToolUIPart } from "ai";
 import type { UIMessage, FileUIPart } from "ai";
 import { Button, Badge, InputArea, Empty, Text } from "@cloudflare/kumo";
-import { useQuotaStatus, useInitialMessages } from "./api";
+import { useQuotaStatus, useInitialMessages, useDevices } from "./api";
 import type { AuthLayoutContext } from "./AuthLayout";
 import {
   ConnectionIndicator,
@@ -18,7 +18,9 @@ import {
   CloudSunIcon,
   ListIcon,
   FolderIcon,
-  BugIcon
+  BugIcon,
+  DeviceMobileIcon,
+  PlusIcon
 } from "@phosphor-icons/react";
 import ReactMarkdown from "react-markdown";
 import remarkGfm from "remark-gfm";
@@ -169,8 +171,21 @@ function ChatInner({
   const inputRef = useRef(input);
   inputRef.current = input;
   const [fileManagerOpen, setFileManagerOpen] = useState(false);
+  const [selectedDevice, setSelectedDevice] = useState<string | null>(null);
   const messagesEndRef = useRef<HTMLDivElement>(null);
   const firstMessageSent = useRef(false);
+
+  const { devices } = useDevices();
+
+  // Reset selected device if it disappears from the list
+  useEffect(() => {
+    if (
+      selectedDevice &&
+      !devices.some((d) => d.deviceName === selectedDevice)
+    ) {
+      setSelectedDevice(null);
+    }
+  }, [devices, selectedDevice]);
 
   const agent = useAgent({
     agent: "ChatAgent",
@@ -203,15 +218,24 @@ function ChatInner({
     messagesEndRef.current?.scrollIntoView({ behavior: "smooth" });
   }, [messages]);
 
+  const selectedDeviceRef = useRef(selectedDevice);
+  selectedDeviceRef.current = selectedDevice;
+
   const send = useCallback(async () => {
     const text = inputRef.current.trim();
     if (!text) return;
     inputRef.current = "";
     setInput("");
 
+    // Prepend device context if a device is selected
+    const devicePrefix = selectedDeviceRef.current
+      ? `[Use device: ${selectedDeviceRef.current}]\n`
+      : "";
+    const finalText = devicePrefix + text;
+
     // Collect file parts from @references in text
     const refPaths: string[] = [];
-    for (const m of text.matchAll(AT_REF_REGEX)) {
+    for (const m of finalText.matchAll(AT_REF_REGEX)) {
       refPaths.push(m[1]);
     }
     const refResults = await Promise.all(
@@ -220,7 +244,7 @@ function ChatInner({
     const fileParts = refResults.filter(Boolean) as FileUIPart[];
 
     const parts: Array<{ type: "text"; text: string } | FileUIPart> = [
-      { type: "text", text }
+      { type: "text", text: finalText }
     ];
     for (const fp of fileParts) parts.push(fp);
 
@@ -231,7 +255,7 @@ function ChatInner({
     sendMessage({ role: "user", parts });
     if (!firstMessageSent.current) {
       firstMessageSent.current = true;
-      onFirstMessage(text);
+      onFirstMessage(finalText);
     }
   }, [isStreaming, sendMessage, stop, onFirstMessage]);
 
@@ -397,6 +421,60 @@ function ChatInner({
           }}
           className="max-w-3xl mx-auto px-4 md:px-5 py-3 md:py-4"
         >
+          {/* Device selector (only in normal chat sessions) */}
+          {!isDeviceSession && (
+            <div className="flex items-center gap-2 mb-2 min-h-[28px] flex-wrap">
+              <DeviceMobileIcon
+                size={14}
+                className="shrink-0 text-kumo-inactive"
+              />
+              {devices.length === 0 ? (
+                <span className="text-xs text-kumo-tertiary">
+                  No devices linked
+                  {" · "}
+                  <a
+                    href="/download"
+                    target="_blank"
+                    rel="noopener noreferrer"
+                    className="text-kumo-brand hover:underline"
+                  >
+                    Add device
+                  </a>
+                </span>
+              ) : (
+                <>
+                  {devices.map((device) => (
+                    <button
+                      key={device.deviceName}
+                      type="button"
+                      onClick={() =>
+                        setSelectedDevice((prev) =>
+                          prev === device.deviceName ? null : device.deviceName
+                        )
+                      }
+                      className={`inline-flex items-center gap-1.5 px-2.5 py-1 rounded-full text-xs font-medium transition-colors ${
+                        selectedDevice === device.deviceName
+                          ? "bg-kumo-brand text-white"
+                          : "bg-kumo-elevated text-kumo-secondary hover:bg-kumo-line hover:text-kumo-default"
+                      }`}
+                    >
+                      <span className="w-1.5 h-1.5 rounded-full bg-green-500" />
+                      {device.deviceName}
+                    </button>
+                  ))}
+                  <a
+                    href="/download"
+                    target="_blank"
+                    rel="noopener noreferrer"
+                    className="inline-flex items-center gap-1 text-xs text-kumo-tertiary hover:text-kumo-brand transition-colors"
+                  >
+                    <PlusIcon size={12} />
+                    Add device
+                  </a>
+                </>
+              )}
+            </div>
+          )}
           <div className="flex items-end gap-3 rounded-xl border border-kumo-line bg-kumo-base p-3 shadow-sm focus-within:ring-2 focus-within:ring-kumo-ring focus-within:border-transparent transition-shadow">
             <InputArea
               value={input}
