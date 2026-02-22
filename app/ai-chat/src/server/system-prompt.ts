@@ -81,6 +81,12 @@ export function buildSystemPrompt(): string {
       "echo '- fact' >> /home/user/.memory/preferences.md (or profile.md/entities.md). " +
       "These memory files are automatically loaded into your context at the start of each session.",
 
+    // Device dispatch
+    "The user may have a mobile device (phone) connected. " +
+      "Use the send_to_device tool to dispatch tasks to the device — for example opening apps, " +
+      "tapping buttons, reading screen content, or any on-device automation. " +
+      "When the user mentions their phone, device, or wants something done on a mobile screen, use send_to_device.",
+
     // Image attachments
     "Users can share images with you by attaching them to their messages. " +
       "When the user attaches an image, you will be able to see and analyze it directly.",

@@ -1,4 +1,4 @@
-# RN Agent
+# Android Device Agent
 
 Android Accessibility Service agent with plain Java UI + standalone Hermes.
 
@@ -50,7 +50,7 @@ Agent JS is bundled via esbuild into `assets/agent-standalone.js` (no Metro/RN b
 ### Debug build (local testing)
 
 ```sh
-cd app/rn/android && ./gradlew assembleDebug
+cd app/android-device/android && ./gradlew assembleDebug
 adb install -r app/build/outputs/apk/debug/app-debug.apk
 adb shell am start -n ai.connct_screen.rn/.MainActivity
 ```
@@ -60,7 +60,7 @@ adb shell am start -n ai.connct_screen.rn/.MainActivity
 Builds a release APK, uploads it to R2, and updates the download link in `app/ai-chat`:
 
 ```sh
-npm run publish:apk -w app/rn
+npm run publish:apk -w app/android-device
 # Then deploy ai-chat for the download page to serve the new APK:
 npm run deploy -w app/ai-chat
 ```

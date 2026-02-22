@@ -70,6 +70,130 @@ export function createDeviceExecTool(
   };
 }
 
+// ---- Device tools (for normal sessions to discover and send tasks to devices) ----
+
+/** Shared helper: query D1 for device sessions and check DO liveness. */
+async function findDevices(
+  env: Env,
+  userId: string
+): Promise<
+  {
+    name: string;
+    sessionId: string;
+    online: boolean;
+    stub: DurableObjectStub;
+  }[]
+> {
+  const rows = await env.DB.prepare(
+    "SELECT id FROM sessions WHERE user_id = ? AND id LIKE 'device-%'"
+  )
+    .bind(userId)
+    .all<{ id: string }>();
+
+  if (rows.results.length === 0) return [];
+
+  const checks = await Promise.allSettled(
+    rows.results.map(async (s) => {
+      const stub = env.ChatAgent.get(
+        env.ChatAgent.idFromName(encodeURIComponent(`${userId}:${s.id}`))
+      );
+      const res = await stub.fetch(new Request("http://agent/status"));
+      const body = (await res.json()) as { online: boolean };
+      const name = s.id.replace("device-", "");
+      return { name, sessionId: s.id, online: body.online, stub };
+    })
+  );
+
+  return checks
+    .filter(
+      (
+        r
+      ): r is PromiseFulfilledResult<{
+        name: string;
+        sessionId: string;
+        online: boolean;
+        stub: DurableObjectStub;
+      }> => r.status === "fulfilled"
+    )
+    .map((r) => r.value);
+}
+
+export function createDeviceTools(env: Env, userId: string): ToolSet {
+  return {
+    list_devices: tool({
+      description:
+        "List the user's linked mobile devices and their online/offline status. " +
+        "Call this first to discover available device names before sending tasks.",
+      inputSchema: z.object({}),
+      execute: async () => {
+        const devices = await findDevices(env, userId);
+        if (devices.length === 0) {
+          return { devices: [], message: "No linked devices found." };
+        }
+        return {
+          devices: devices.map((d) => ({ name: d.name, online: d.online }))
+        };
+      }
+    }),
+
+    send_to_device: tool({
+      description:
+        "Send a task to a connected mobile device for execution. " +
+        "Use list_devices first to find available device names. " +
+        "If device_name is omitted, the first online device is used.",
+      inputSchema: z.object({
+        task: z
+          .string()
+          .describe(
+            "The task description to send to the device, in natural language"
+          ),
+        device_name: z
+          .string()
+          .optional()
+          .describe(
+            "Target device name (from list_devices). If omitted, uses the first online device."
+          )
+      }),
+      execute: async ({ task, device_name }) => {
+        const devices = await findDevices(env, userId);
+
+        if (devices.length === 0) {
+          return { error: "No linked devices found." };
+        }
+
+        let target;
+        if (device_name) {
+          target = devices.find((d) => d.name === device_name && d.online);
+          if (!target) {
+            const exists = devices.find((d) => d.name === device_name);
+            if (exists) {
+              return { error: `Device "${device_name}" is offline.` };
+            }
+            return {
+              error: `Device "${device_name}" not found. Available: ${devices.map((d) => d.name).join(", ")}`
+            };
+          }
+        } else {
+          target = devices.find((d) => d.online);
+          if (!target) {
+            return { error: "No device is currently online." };
+          }
+        }
+
+        const res = await target.stub.fetch(
+          new Request("http://agent/dispatch-task", {
+            method: "POST",
+            headers: { "Content-Type": "application/json" },
+            body: JSON.stringify({ text: task })
+          })
+        );
+        const result = (await res.json()) as { result: string };
+        return { device: target.name, result: result.result };
+      }
+    })
+  };
+}
+
 export interface SchedulePayload {
   description: string;
   prompt: string;

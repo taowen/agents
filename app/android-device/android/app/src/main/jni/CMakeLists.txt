@@ -8,7 +8,7 @@ project(hermesagent)
 
 # Build libjsi.so from source (replaces the copy from react-android).
 # The prebuilt libhermesvm.so dynamically links against libjsi.so at runtime.
-set(JSI_DIR "${CMAKE_SOURCE_DIR}/../../../../../../../node_modules/react-native/ReactCommon/jsi")
+set(JSI_DIR "${CMAKE_SOURCE_DIR}/jsi")
 
 add_library(jsi SHARED ${JSI_DIR}/jsi/jsi.cpp)
 target_include_directories(jsi PUBLIC ${JSI_DIR})

@@ -4,7 +4,7 @@ import { dirname, resolve } from "path";
 import { fileURLToPath } from "url";
 
 const __dirname = dirname(fileURLToPath(import.meta.url));
-const rnRoot = resolve(__dirname, "..");
+const projectRoot = resolve(__dirname, "..");
 const aiChatIndex = resolve(__dirname, "../../ai-chat/src/server/index.ts");
 
 // 1. Get short git commit hash
@@ -17,13 +17,13 @@ console.log(`Building APK: ${apkName}`);
 // 2. Build release APK
 console.log("Running assembleRelease...");
 execSync("./gradlew assembleRelease --quiet", {
-  cwd: resolve(rnRoot, "android"),
+  cwd: resolve(projectRoot, "android"),
   stdio: "inherit"
 });
 
 // 3. Verify APK exists
 const apkPath = resolve(
-  rnRoot,
+  projectRoot,
   "android/app/build/outputs/apk/release/app-release.apk"
 );
 if (!existsSync(apkPath)) {

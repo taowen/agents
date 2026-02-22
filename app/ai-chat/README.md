@@ -42,7 +42,7 @@ Browser                                 Cloudflare Worker
                                           |  +- bash tool (just-bash)
                                           |  +- device_agent tool
                                           |
-RN Agent (Android)                        |
+Android Agent                              |
   DeviceConnection.java                   |
     +- OkHttp WS -- /device-connect ---->-+
     |  (ping/pong keepalive)
@@ -53,11 +53,11 @@ RN Agent (Android)                        |
 
 ### Device connection flow
 
-1. The RN agent authenticates via the Device Authorization flow (`POST /auth/device/start` → 6-char code → user approves on web)
+1. The Android agent authenticates via the Device Authorization flow (`POST /auth/device/start` → 6-char code → user approves on web)
 2. Once authorized, the agent opens a WebSocket directly to the user's ChatAgent Durable Object at `/agents/chat-agent/{session}/device-connect`
 3. The ChatAgent tags this WebSocket as `["device"]` and starts a heartbeat alarm
 4. The web user can dispatch tasks to the device via the `device_agent` tool in chat — the ChatAgent forwards these over the device WebSocket
-5. The RN agent executes tasks locally (via Hermes + accessibility APIs) and sends results back
+5. The Android agent executes tasks locally (via Hermes + accessibility APIs) and sends results back
 
 ## Storage architecture
 
@@ -197,7 +197,7 @@ Note: `recent_messages` comes from D1 (`files` table, `/.chat/` prefix) — this
 
 ## Self-testing API endpoints
 
-The app has a device auth flow (similar to OAuth2 Device Authorization) designed for the companion React Native agent (`app/rn/`) to link with a user's account. The self-test script reuses this flow to obtain a Bearer token and call authenticated API endpoints directly.
+The app has a device auth flow (similar to OAuth2 Device Authorization) designed for the companion Android device agent (`app/android-device/`) to link with a user's account. The self-test script reuses this flow to obtain a Bearer token and call authenticated API endpoints directly.
 
 ### Run the self-test script
 
@@ -254,10 +254,10 @@ npm run deploy        # builds + deploys to Cloudflare
 npm run dev           # local development
 ```
 
-### RN Agent (Android)
+### Android Device Agent
 
 ```bash
-cd app/rn/android
+cd app/android-device/android
 ./gradlew assembleDebug
 adb install -r app/build/outputs/apk/debug/app-debug.apk
 adb shell am start -n ai.connct_screen.rn/.MainActivity

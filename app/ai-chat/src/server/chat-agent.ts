@@ -28,7 +28,12 @@ import {
 } from "./llm-config";
 import { handleFileRequest } from "./file-api";
 import { writeChatHistory, readMemoryBlock } from "./chat-history";
-import { createBashTool, createTools, createDeviceExecTool } from "./tools";
+import {
+  createBashTool,
+  createTools,
+  createDeviceExecTool,
+  createDeviceTools
+} from "./tools";
 import { DeviceHub, isDeviceSession } from "./device-hub";
 import {
   queryUsageData,
@@ -204,6 +209,13 @@ class ChatAgentBase extends AIChatAgent {
     // Device WebSocket — custom protocol, bypasses agents framework
     if (url.pathname.endsWith("/device-connect")) {
       return this.deviceHub.handleConnect(request);
+    }
+
+    // Dispatch a task to this device session (called by send_to_device tool)
+    if (url.pathname.endsWith("/dispatch-task") && request.method === "POST") {
+      const { text } = await request.json<{ text: string }>();
+      const result = await this.handleDeviceInitiatedTask(text);
+      return Response.json({ result });
     }
 
     const response = await super.fetch(request);
@@ -546,6 +558,7 @@ class ChatAgentBase extends AIChatAgent {
             cancelSchedule: (id) => this.cancelSchedule(id),
             getTimezone: () => this.getTimezone()
           }),
+          ...createDeviceTools(this.env, this.userId!),
           ...mcpTools
         } as ToolSet;
       }
@@ -620,7 +633,7 @@ class ChatAgentBase extends AIChatAgent {
 
   // ---- Device-initiated task (from device WebSocket) ----
 
-  private async handleDeviceInitiatedTask(text: string): Promise<void> {
+  private async handleDeviceInitiatedTask(text: string): Promise<string> {
     return Sentry.startSpan(
       { name: "handleDeviceInitiatedTask", op: "device_task" },
       async () => {
@@ -653,11 +666,13 @@ class ChatAgentBase extends AIChatAgent {
             }
           }
           this.deviceHub.sendTaskDone(resultText || "done");
+          return resultText || "done";
         } catch (e) {
           console.error("handleDeviceInitiatedTask failed:", e);
           Sentry.captureException(e);
           const errMsg = e instanceof Error ? e.message : String(e);
           this.deviceHub.sendTaskDone("Error: " + errMsg);
+          return "Error: " + errMsg;
         }
       }
     );
