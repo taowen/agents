@@ -8,7 +8,8 @@ import {
   convertToModelMessages,
   pruneMessages,
   stepCountIs,
-  type ToolSet
+  type ToolSet,
+  type UIMessage
 } from "ai";
 import type { Bash } from "just-bash";
 import type { MountableFs } from "just-bash";
@@ -617,6 +618,51 @@ class ChatAgentBase extends AIChatAgent {
     return this.toStreamResponse(result, apiKeyType);
   }
 
+  // ---- Device-initiated task (from device WebSocket) ----
+
+  private async handleDeviceInitiatedTask(text: string): Promise<void> {
+    return Sentry.startSpan(
+      { name: "handleDeviceInitiatedTask", op: "device_task" },
+      async () => {
+        try {
+          if (!this.userId) {
+            const uid = await this.getUserId();
+            this.doInitBash(uid);
+          }
+          if (!this.sessionUuid) {
+            await this.getSessionUuid();
+          }
+          this.applySentryTags();
+
+          const userMsg: UIMessage = {
+            id: crypto.randomUUID(),
+            role: "user",
+            parts: [{ type: "text", text }]
+          };
+
+          // Reuse the same path as web-initiated messages:
+          // saveMessages → onChatMessage → handleDeviceChatMessage → streamText → _reply
+          await this.saveMessages([...this.messages, userMsg]);
+
+          // Extract final text from the last assistant message for task_done
+          const lastMsg = this.messages[this.messages.length - 1];
+          let resultText = "";
+          if (lastMsg?.role === "assistant") {
+            for (const part of lastMsg.parts) {
+              if (part.type === "text") resultText += part.text;
+            }
+          }
+          this.deviceHub.sendTaskDone(resultText || "done");
+        } catch (e) {
+          console.error("handleDeviceInitiatedTask failed:", e);
+          Sentry.captureException(e);
+          const errMsg = e instanceof Error ? e.message : String(e);
+          this.deviceHub.sendTaskDone("Error: " + errMsg);
+        }
+      }
+    );
+  }
+
   // ---- Device WebSocket handling (Hibernatable API) ----
 
   async webSocketMessage(ws: WebSocket, message: string | ArrayBuffer) {
@@ -625,6 +671,9 @@ class ChatAgentBase extends AIChatAgent {
       return this.deviceHub.handleMessage(ws, message, {
         getUserId: () => this.getUserId(),
         getSessionUuid: () => this.getSessionUuid(),
+        onUserTask: (text) => {
+          this.handleDeviceInitiatedTask(text);
+        },
         env: this.env
       });
     }
