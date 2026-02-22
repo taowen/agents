@@ -1,0 +1,8 @@
+{
+  "name": "ai.connctscreen.win-device",
+  "version": "0.0.1",
+  "private": true,
+  "scripts": {
+    "publish:zip": "tsx publish.ts"
+  }
+}

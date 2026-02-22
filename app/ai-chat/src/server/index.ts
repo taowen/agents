@@ -19,7 +19,10 @@ app.all("/auth/*", (c) => handleAuthRoutes(c.req.raw, c.env));
 app.get("/download", (c) => {
   const apkUrl =
     "https://ai.connect-screen.com/api/public/connect-screen-0aa8c27.apk";
-  const qrUrl = `https://api.qrserver.com/v1/create-qr-code/?data=${encodeURIComponent(apkUrl)}&size=200x200`;
+  const winZipUrl =
+    "https://ai.connect-screen.com/api/public/connect-screen-win-572d4ce.zip";
+  const apkQrUrl = `https://api.qrserver.com/v1/create-qr-code/?data=${encodeURIComponent(apkUrl)}&size=200x200`;
+  const winQrUrl = `https://api.qrserver.com/v1/create-qr-code/?data=${encodeURIComponent(winZipUrl)}&size=200x200`;
   const html = `<!DOCTYPE html>
 <html lang="en">
 <head>
@@ -29,23 +32,40 @@ app.get("/download", (c) => {
 <style>
 *{margin:0;padding:0;box-sizing:border-box}
 body{font-family:-apple-system,BlinkMacSystemFont,"Segoe UI",Roboto,sans-serif;display:flex;align-items:center;justify-content:center;min-height:100vh;background:#f5f5f5;color:#333}
-.card{background:#fff;border-radius:16px;padding:48px 40px;text-align:center;box-shadow:0 2px 16px rgba(0,0,0,.08);max-width:400px;width:90%}
-h1{font-size:24px;margin-bottom:8px}
-p.sub{color:#666;margin-bottom:32px;font-size:14px}
-img{border-radius:8px;margin-bottom:24px}
-a.btn{display:inline-block;background:#2563eb;color:#fff;text-decoration:none;padding:12px 32px;border-radius:8px;font-size:16px;font-weight:500;transition:background .15s}
-a.btn:hover{background:#1d4ed8}
-p.hint{margin-top:24px;font-size:12px;color:#999}
+.container{display:flex;gap:32px;flex-wrap:wrap;justify-content:center;padding:32px}
+.card{background:#fff;border-radius:16px;padding:40px 36px;text-align:center;box-shadow:0 2px 16px rgba(0,0,0,.08);max-width:360px;width:100%}
+h1{font-size:22px;margin-bottom:6px}
+p.sub{color:#666;margin-bottom:24px;font-size:14px}
+img.qr{border-radius:8px;margin-bottom:20px}
+a.btn{display:inline-block;color:#fff;text-decoration:none;padding:12px 28px;border-radius:8px;font-size:15px;font-weight:500;transition:background .15s}
+a.btn.android{background:#2563eb}
+a.btn.android:hover{background:#1d4ed8}
+a.btn.windows{background:#0078d4}
+a.btn.windows:hover{background:#006abc}
+p.hint{margin-top:20px;font-size:12px;color:#999}
+.icon{font-size:36px;margin-bottom:12px}
 </style>
 </head>
 <body>
+<div class="container">
 <div class="card">
-<h1>Connect Screen</h1>
-<p class="sub">Scan the QR code or tap the button below to download the Android app.</p>
-<img src="${qrUrl}" width="200" height="200" alt="QR Code">
+<div class="icon">&#x1f4f1;</div>
+<h1>Android</h1>
+<p class="sub">Scan the QR code or tap below to download the APK.</p>
+<img class="qr" src="${apkQrUrl}" width="200" height="200" alt="Android QR Code">
 <br>
-<a class="btn" href="${apkUrl}">Download APK</a>
-<p class="hint">Requires Android 8.0+. You may need to allow installs from unknown sources.</p>
+<a class="btn android" href="${apkUrl}">Download APK</a>
+<p class="hint">Requires Android 8.0+. Allow installs from unknown sources.</p>
+</div>
+<div class="card">
+<div class="icon">&#x1f5a5;</div>
+<h1>Windows</h1>
+<p class="sub">Scan the QR code or tap below to download the PowerShell agent.</p>
+<img class="qr" src="${winQrUrl}" width="200" height="200" alt="Windows QR Code">
+<br>
+<a class="btn windows" href="${winZipUrl}">Download ZIP</a>
+<p class="hint">Requires Windows 10/11 with PowerShell 5.1+. Extract and run connect.ps1.</p>
+</div>
 </div>
 </body>
 </html>`;
@@ -61,6 +81,9 @@ app.get("/api/public/:key", async (c) => {
   headers.set("etag", object.httpEtag);
   if (key.endsWith(".apk")) {
     headers.set("content-type", "application/vnd.android.package-archive");
+    headers.set("content-disposition", `attachment; filename="${key}"`);
+  } else if (key.endsWith(".zip")) {
+    headers.set("content-type", "application/zip");
     headers.set("content-disposition", `attachment; filename="${key}"`);
   }
   return new Response(object.body, { headers });
