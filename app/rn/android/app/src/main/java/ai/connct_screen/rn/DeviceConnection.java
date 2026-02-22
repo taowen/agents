@@ -13,7 +13,11 @@ import org.json.JSONObject;
 
 import java.util.concurrent.CompletableFuture;
 import java.util.concurrent.ConcurrentHashMap;
+import java.util.concurrent.ExecutorService;
+import java.util.concurrent.Executors;
 import java.util.concurrent.TimeUnit;
+
+import org.json.JSONArray;
 
 import okhttp3.OkHttpClient;
 import okhttp3.Request;
@@ -27,7 +31,7 @@ import okhttp3.WebSocketListener;
  * Responsibilities:
  * - Maintains persistent WebSocket to the device's ChatAgent session
  *   (wss://ai.connect-screen.com/agents/chat-agent/device-{name}/device-connect)
- * - Proxies LLM requests from the Hermes agent (blocking sendLlmRequest)
+ * - Executes JS code from server exec_js requests in a persistent Hermes runtime
  * - Receives task dispatches and emits DeviceTask events to RN JS
  * - Handles ping/pong keepalive
  * - Sends task results back to the ChatAgent
@@ -36,6 +40,7 @@ public class DeviceConnection {
 
     private static final String TAG = "DeviceConn";
     private static final long LLM_TIMEOUT_SECONDS = 120;
+    private static final long EXEC_TIMEOUT_SECONDS = 60;
     private static final long RECONNECT_DELAY_MS = 5000;
 
     private static DeviceConnection instance;
@@ -48,6 +53,10 @@ public class DeviceConnection {
     private String lastDeviceName;
     private ReactApplicationContext reactContext;
     private final Handler mainHandler = new Handler(Looper.getMainLooper());
+    private final ExecutorService execExecutor = Executors.newSingleThreadExecutor();
+
+    // Persistent Hermes runtime for exec_js — initialized on first exec_js, reused across calls
+    private boolean hermesInitialized = false;
 
     private final ConcurrentHashMap<String, CompletableFuture<String>> llmPending =
             new ConcurrentHashMap<>();
@@ -84,12 +93,24 @@ public class DeviceConnection {
                 Log.i(TAG, "WebSocket connected");
                 connected = true;
                 emitConnectionStatus(true);
-                // Send ready message
+                // Send ready message with system prompt and tools
                 try {
                     JSONObject ready = new JSONObject();
                     ready.put("type", "ready");
                     ready.put("deviceName", deviceName);
                     ready.put("deviceId", deviceName);
+                    // Include system prompt and tool definitions from prompt.ts
+                    // so server can use them in streamText
+                    String promptInfo = getDevicePromptInfo();
+                    if (promptInfo != null) {
+                        JSONObject promptData = new JSONObject(promptInfo);
+                        if (promptData.has("systemPrompt")) {
+                            ready.put("systemPrompt", promptData.getString("systemPrompt"));
+                        }
+                        if (promptData.has("tools")) {
+                            ready.put("tools", promptData.getJSONArray("tools"));
+                        }
+                    }
                     webSocket.send(ready.toString());
                 } catch (Exception e) {
                     Log.e(TAG, "Failed to send ready", e);
@@ -112,6 +133,13 @@ public class DeviceConnection {
                             } else {
                                 Log.w(TAG, "No pending LLM request for id: " + requestId);
                             }
+                            break;
+                        }
+                        case "exec_js": {
+                            String execId = data.getString("execId");
+                            String code = data.getString("code");
+                            Log.i(TAG, "Received exec_js: " + execId + " code length=" + code.length());
+                            handleExecJs(webSocket, execId, code);
                             break;
                         }
                         case "task": {
@@ -173,6 +201,12 @@ public class DeviceConnection {
         }
         connected = false;
         failAllPending("Disconnected");
+        // Clean up Hermes runtime
+        if (hermesInitialized) {
+            try { HermesAgentRunner.nativeDestroyRuntime(); } catch (Exception ignored) {}
+            hermesInitialized = false;
+            cachedPromptInfo = null;
+        }
     }
 
     public boolean isConnected() {
@@ -240,6 +274,164 @@ public class DeviceConnection {
         } else {
             Log.w(TAG, "Cannot reconnect - no previous connection params");
         }
+    }
+
+    /**
+     * Execute JS code in a persistent Hermes runtime and send the result back.
+     * Runs on a single-thread executor to serialize access to the Hermes runtime.
+     */
+    private void handleExecJs(WebSocket webSocket, String execId, String code) {
+        execExecutor.execute(() -> {
+            String result;
+            JSONArray screenshots = new JSONArray();
+            try {
+                initHermesRuntime();
+                // Execute the code. The executeCodeInHermes function returns JSON
+                // with { result, screenshots? }
+                String rawResult = HermesAgentRunner.nativeEvaluateJS(
+                        "JSON.stringify(executeCodeForServer(" + escapeJsString(code) + "))",
+                        "exec_js"
+                );
+                try {
+                    JSONObject parsed = new JSONObject(rawResult);
+                    result = parsed.optString("result", rawResult);
+                    JSONArray ss = parsed.optJSONArray("screenshots");
+                    if (ss != null) screenshots = ss;
+                } catch (Exception e) {
+                    // If not JSON, use raw result
+                    result = rawResult;
+                }
+            } catch (Exception e) {
+                Log.e(TAG, "exec_js failed", e);
+                result = "Error: " + e.getMessage();
+            }
+
+            // Send result back
+            try {
+                JSONObject msg = new JSONObject();
+                msg.put("type", "exec_result");
+                msg.put("execId", execId);
+                msg.put("result", result);
+                if (screenshots.length() > 0) {
+                    msg.put("screenshots", screenshots);
+                }
+                webSocket.send(msg.toString());
+            } catch (Exception e) {
+                Log.e(TAG, "Failed to send exec_result", e);
+            }
+        });
+    }
+
+    /**
+     * Initialize the persistent Hermes runtime, load the agent bundle, and set up
+     * the executeCodeForServer helper. Also reads and caches __DEVICE_PROMPT__.
+     * Must only be called from the execExecutor thread (Hermes is not thread-safe).
+     */
+    private String cachedPromptInfo = null;
+
+    private void initHermesRuntime() {
+        if (hermesInitialized) return;
+
+        HermesAgentRunner.nativeCreateRuntime();
+
+        // Load the agent JS bundle which defines all host function wrappers
+        com.google.android.accessibility.selecttospeak.SelectToSpeakService service =
+                com.google.android.accessibility.selecttospeak.SelectToSpeakService.getInstance();
+        if (service != null) {
+            try {
+                java.io.InputStream is = service.getAssets().open("agent-standalone.js");
+                java.io.BufferedReader reader = new java.io.BufferedReader(
+                        new java.io.InputStreamReader(is, "UTF-8"));
+                StringBuilder sb = new StringBuilder();
+                char[] buffer = new char[8192];
+                int read;
+                while ((read = reader.read(buffer)) != -1) {
+                    sb.append(buffer, 0, read);
+                }
+                reader.close();
+                HermesAgentRunner.nativeEvaluateJS(sb.toString(), "agent-standalone.js");
+            } catch (Exception e) {
+                Log.e(TAG, "Failed to load agent-standalone.js", e);
+            }
+        }
+
+        // Read __DEVICE_PROMPT__ (set by prompt.ts) before defining helpers
+        try {
+            String result = HermesAgentRunner.nativeEvaluateJS(
+                    "JSON.stringify(__DEVICE_PROMPT__)",
+                    "get-prompt-info"
+            );
+            if (result != null && !result.equals("undefined") && !result.equals("null")) {
+                cachedPromptInfo = result;
+            }
+        } catch (Exception e) {
+            Log.w(TAG, "Failed to read __DEVICE_PROMPT__", e);
+        }
+
+        // Define the executeCodeForServer helper that wraps code execution
+        // and captures screenshots, similar to executeCode in agent-standalone.ts
+        String helperJs =
+                "function executeCodeForServer(code) {\n" +
+                "  var actionLog = [];\n" +
+                "  var capturedScreenshots = [];\n" +
+                "  var origTakeScreenshot = take_screenshot;\n" +
+                "  take_screenshot = function() {\n" +
+                "    var b64 = origTakeScreenshot();\n" +
+                "    if (b64.startsWith('ERROR:')) {\n" +
+                "      actionLog.push('[take_screenshot] ' + b64);\n" +
+                "      return b64;\n" +
+                "    }\n" +
+                "    capturedScreenshots.push(b64);\n" +
+                "    actionLog.push('[take_screenshot] captured');\n" +
+                "    return 'screenshot captured';\n" +
+                "  };\n" +
+                "  try {\n" +
+                "    var result = (0, eval)(code);\n" +
+                "    var resultStr = result === undefined ? 'undefined' : String(result);\n" +
+                "    if (actionLog.length > 0) {\n" +
+                "      actionLog.push('[Script returned] ' + resultStr);\n" +
+                "      resultStr = actionLog.join('\\n');\n" +
+                "    }\n" +
+                "    return { result: resultStr, screenshots: capturedScreenshots };\n" +
+                "  } catch (e) {\n" +
+                "    var error = '[JS Error] ' + (e.message || String(e));\n" +
+                "    if (actionLog.length > 0) {\n" +
+                "      actionLog.push(error);\n" +
+                "      error = actionLog.join('\\n');\n" +
+                "    }\n" +
+                "    return { result: error, screenshots: capturedScreenshots };\n" +
+                "  } finally {\n" +
+                "    take_screenshot = origTakeScreenshot;\n" +
+                "  }\n" +
+                "}\n";
+        HermesAgentRunner.nativeEvaluateJS(helperJs, "exec-helper.js");
+
+        hermesInitialized = true;
+        Log.i(TAG, "Hermes runtime initialized for exec_js");
+    }
+
+    /**
+     * Get the device prompt info (systemPrompt + tools).
+     * Initializes the Hermes runtime on the execExecutor thread (Hermes is not thread-safe).
+     */
+    private String getDevicePromptInfo() {
+        try {
+            return execExecutor.submit(() -> {
+                initHermesRuntime();
+                return cachedPromptInfo;
+            }).get(10, TimeUnit.SECONDS);
+        } catch (Exception e) {
+            Log.e(TAG, "Failed to get prompt info", e);
+            return null;
+        }
+    }
+
+    private static String escapeJsString(String s) {
+        return "\"" + s.replace("\\", "\\\\")
+                .replace("\"", "\\\"")
+                .replace("\n", "\\n")
+                .replace("\r", "\\r")
+                .replace("\t", "\\t") + "\"";
     }
 
     private void emitConnectionStatus(boolean status) {

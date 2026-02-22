@@ -2,6 +2,7 @@ import * as Sentry from "@sentry/cloudflare";
 import { tool, type ToolSet } from "ai";
 import { z } from "zod";
 import type { Bash } from "just-bash";
+import type { DeviceHub } from "./device-hub";
 
 export function createBashTool(bash: Bash, ensureMounted: () => Promise<void>) {
   return tool({
@@ -26,6 +27,47 @@ export function createBashTool(bash: Bash, ensureMounted: () => Promise<void>) {
       );
     }
   });
+}
+
+// ---- Device exec tool (for device sessions using streamText) ----
+
+/**
+ * Create the execute_js tool that sends JS code to the connected device.
+ * The tool description is dynamically built from the device-reported prompt.
+ */
+export function createDeviceExecTool(
+  deviceHub: DeviceHub,
+  toolDescription?: string
+): ToolSet {
+  return {
+    execute_js: tool({
+      description:
+        toolDescription ||
+        "Execute JavaScript code on the connected Android device. " +
+          "The code runs in a Hermes runtime with access to accessibility APIs.",
+      inputSchema: z.object({
+        code: z
+          .string()
+          .describe(
+            "JavaScript code to execute. All screen automation functions are available as globals."
+          )
+      }),
+      execute: async ({ code }) => {
+        const { result, screenshots } = await deviceHub.execOnDevice(code);
+        return { result, screenshots };
+      },
+      toModelOutput: ({ output }) => {
+        const parts: Array<
+          | { type: "text"; text: string }
+          | { type: "file-data"; data: string; mediaType: string }
+        > = [{ type: "text", text: output.result }];
+        for (const s of output.screenshots ?? []) {
+          parts.push({ type: "file-data", data: s, mediaType: "image/jpeg" });
+        }
+        return { type: "content", value: parts };
+      }
+    })
+  };
 }
 
 // ---- Device tools ----

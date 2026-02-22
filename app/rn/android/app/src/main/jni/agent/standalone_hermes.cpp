@@ -78,6 +78,9 @@ struct JniCache {
     jmethodID httpPost;
     jmethodID llmChat;
     jmethodID appendLog;
+    jmethodID updateStatus;
+    jmethodID askUser;
+    jmethodID hideOverlay;
 };
 
 static JniCache g_cache = {};
@@ -106,6 +109,9 @@ static void resolveJniCache(JNIEnv* env) {
     g_cache.httpPost         = env->GetStaticMethodID(cls, "nativeHttpPost",         "(Ljava/lang/String;Ljava/lang/String;Ljava/lang/String;)Ljava/lang/String;");
     g_cache.llmChat          = env->GetStaticMethodID(cls, "nativeLlmChat",          "(Ljava/lang/String;)Ljava/lang/String;");
     g_cache.appendLog        = env->GetStaticMethodID(cls, "nativeAppendLog",        "(Ljava/lang/String;)V");
+    g_cache.updateStatus     = env->GetStaticMethodID(cls, "nativeUpdateStatus",     "(Ljava/lang/String;)V");
+    g_cache.askUser          = env->GetStaticMethodID(cls, "nativeAskUser",          "(Ljava/lang/String;)V");
+    g_cache.hideOverlay      = env->GetStaticMethodID(cls, "nativeHideOverlay",      "()V");
     env->DeleteLocalRef(cls);
 }
 
@@ -341,6 +347,41 @@ static void registerHostFunctions(Runtime& rt) {
                 env->DeleteLocalRef(jbody);
                 if (result) env->DeleteLocalRef(result);
                 return String::createFromUtf8(rt, str);
+            }));
+
+    // update_status(text) -> undefined  (overlay status, not visible to LLM)
+    rt.global().setProperty(rt, "update_status",
+        Function::createFromHostFunction(rt, PropNameID::forAscii(rt, "update_status"), 1,
+            [](Runtime& rt, const Value&, const Value* args, size_t count) -> Value {
+                if (count < 1) return Value::undefined();
+                JNIEnv* env = getEnv();
+                std::string text = args[0].asString(rt).utf8(rt);
+                jstring jtext = env->NewStringUTF(text.c_str());
+                env->CallStaticVoidMethod(g_cache.clazz, g_cache.updateStatus, jtext);
+                env->DeleteLocalRef(jtext);
+                return Value::undefined();
+            }));
+
+    // ask_user(question) -> undefined  (blocks until user taps Continue)
+    rt.global().setProperty(rt, "ask_user",
+        Function::createFromHostFunction(rt, PropNameID::forAscii(rt, "ask_user"), 1,
+            [](Runtime& rt, const Value&, const Value* args, size_t count) -> Value {
+                if (count < 1) return Value::undefined();
+                JNIEnv* env = getEnv();
+                std::string question = args[0].asString(rt).utf8(rt);
+                jstring jquestion = env->NewStringUTF(question.c_str());
+                env->CallStaticVoidMethod(g_cache.clazz, g_cache.askUser, jquestion);
+                env->DeleteLocalRef(jquestion);
+                return Value::undefined();
+            }));
+
+    // hide_overlay() -> undefined
+    rt.global().setProperty(rt, "hide_overlay",
+        Function::createFromHostFunction(rt, PropNameID::forAscii(rt, "hide_overlay"), 0,
+            [](Runtime& rt, const Value&, const Value*, size_t) -> Value {
+                JNIEnv* env = getEnv();
+                env->CallStaticVoidMethod(g_cache.clazz, g_cache.hideOverlay);
+                return Value::undefined();
             }));
 }
 

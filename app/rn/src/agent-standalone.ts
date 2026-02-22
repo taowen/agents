@@ -31,6 +31,9 @@ declare function launch_app(name: string): string;
 declare function list_apps(): string;
 declare function sleep(ms: number): void;
 declare function log(msg: string): void;
+declare function update_status(text: string): void;
+declare function ask_user(question: string): void;
+declare function hide_overlay(): void;
 
 const MAX_STEPS = 30;
 const MAX_GET_SCREEN_PER_EXEC = 5;
@@ -134,6 +137,7 @@ function runAgent(task: string, configJson: string): string {
   const config: LlmConfig = JSON.parse(configJson);
 
   agentLog("[TASK] Received task: " + task);
+  update_status("\u4efb\u52a1\u5f00\u59cb"); // "任务开始"
 
   if (!conversationMessages) {
     conversationMessages = [{ role: "system", content: SYSTEM_PROMPT }];
@@ -144,6 +148,13 @@ function runAgent(task: string, configJson: string): string {
   const messages = conversationMessages;
 
   for (let step = 1; step <= MAX_STEPS; step++) {
+    update_status(
+      "\u6b65\u9aa4 " +
+        step +
+        "/" +
+        MAX_STEPS +
+        ": \u6b63\u5728\u601d\u8003\u2026"
+    ); // "步骤 N/30: 正在思考…"
     agentLog("[STEP " + step + "] Calling LLM...");
     trimMessages(messages);
 
@@ -151,6 +162,7 @@ function runAgent(task: string, configJson: string): string {
     try {
       response = callLLM(messages, TOOLS, config);
     } catch (e: any) {
+      update_status("\u9519\u8bef: " + e.message); // "错误: ..."
       agentLog("[ERROR] LLM call failed: " + e.message);
       return "Error: " + e.message;
     }
@@ -167,6 +179,9 @@ function runAgent(task: string, configJson: string): string {
         .map((tc: ToolCall) => tc.function.name)
         .join(", ");
       agentLog("[STEP " + step + "] LLM returned tool_calls: " + toolNames);
+      update_status(
+        "\u6b65\u9aa4 " + step + "/" + MAX_STEPS + ": \u6267\u884c\u4e2d\u2026"
+      ); // "步骤 N/30: 执行中…"
 
       for (const toolCall of response.toolCalls) {
         let resultText: string;
@@ -218,6 +233,7 @@ function runAgent(task: string, configJson: string): string {
     }
   }
 
+  update_status("\u5df2\u8fbe\u5230\u6700\u5927\u6b65\u6570\u9650\u5236"); // "已达到最大步数限制"
   agentLog(
     "[ERROR] Reached max steps (" + MAX_STEPS + ") without completing task"
   );

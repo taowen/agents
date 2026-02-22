@@ -27,8 +27,13 @@ import {
 } from "./llm-config";
 import { handleFileRequest } from "./file-api";
 import { writeChatHistory, readMemoryBlock } from "./chat-history";
-import { createBashTool, createTools, createDeviceTools } from "./tools";
-import { DeviceHub, isDeviceSession, type LlmProxyConfig } from "./device-hub";
+import {
+  createBashTool,
+  createTools,
+  createDeviceTools,
+  createDeviceExecTool
+} from "./tools";
+import { DeviceHub, isDeviceSession } from "./device-hub";
 import {
   queryUsageData,
   logUsageDiagnostics,
@@ -336,9 +341,9 @@ class ChatAgentBase extends AIChatAgent {
       }
       this.applySentryTags();
 
-      // Device sessions are pure relays — no LLM, no bash, no tools
+      // Device sessions use streamText with device-reported prompt + execute_js tool
       if (isDeviceSession(this.sessionUuid)) {
-        return this.deviceHub.relay(this.messages);
+        return this.handleDeviceChatMessage();
       }
 
       // Ensure /etc and fstab mounts are ready before any filesystem access
@@ -540,6 +545,98 @@ class ChatAgentBase extends AIChatAgent {
     });
   }
 
+  // ---- Device session streamText handler ----
+
+  private async handleDeviceChatMessage(): Promise<Response> {
+    // userId and bash are guaranteed by onChatMessage caller
+    await this.ensureMounted();
+
+    // Resolve LLM model
+    const { data: llmConfig, cache } = await getCachedLlmConfig(
+      this.mountableFs,
+      this.cachedLlmConfig
+    );
+    this.cachedLlmConfig = cache;
+    const isBuiltinKey = llmConfig === null;
+
+    if (isBuiltinKey) {
+      this.quotaCheckCache = await checkQuota(
+        this.env.DB,
+        this.userId!,
+        this.quotaCheckCache
+      );
+      if (this.quotaCheckCache.exceeded) {
+        throw new Error(
+          "You have exceeded the builtin API key usage quota. " +
+            "Please configure your own API key in Settings to continue using the service."
+        );
+      }
+    }
+
+    const llmModel = getLlmModel(this.env, llmConfig);
+
+    // Read device-reported system prompt and tool description from storage
+    const deviceSystemPrompt =
+      (await this.ctx.storage.get<string>("deviceSystemPrompt")) ||
+      "You are a mobile automation assistant.";
+    const deviceTools = await this.ctx.storage.get<any[]>("deviceTools");
+
+    // Build tool description from device-reported tools (for execute_js description)
+    let toolDesc: string | undefined;
+    if (deviceTools && deviceTools.length > 0) {
+      const fn = deviceTools[0]?.function;
+      if (fn?.description) {
+        toolDesc = fn.description;
+      }
+    }
+
+    const tools = createDeviceExecTool(this.deviceHub, toolDesc);
+
+    const messages = await pruneMessages({
+      messages: await convertToModelMessages(this.messages),
+      toolCalls: "before-last-2-messages",
+      reasoning: "before-last-message"
+    });
+
+    const apiKeyType = isBuiltinKey ? "builtin" : "custom";
+    const sessionId = this.sessionUuid;
+    const userId = this.userId!;
+    const env = this.env;
+    const doStorage = this.ctx.storage;
+
+    const result = streamText({
+      model: llmModel,
+      system: deviceSystemPrompt,
+      messages,
+      tools,
+      stopWhen: stepCountIs(30),
+      onFinish: async () => {
+        try {
+          await archiveSessionUsage(env.DB, doStorage.sql, userId, sessionId);
+        } catch (e) {
+          console.error("onFinish usage_archive write failed:", e);
+        }
+      }
+    });
+
+    return result.toUIMessageStreamResponse({
+      messageMetadata: ({ part }) => {
+        if (part.type === "finish") {
+          return {
+            usage: {
+              inputTokens: part.totalUsage.inputTokens,
+              outputTokens: part.totalUsage.outputTokens,
+              cacheReadTokens:
+                part.totalUsage.inputTokenDetails?.cacheReadTokens
+            },
+            apiKeyType
+          };
+        }
+        return undefined;
+      }
+    });
+  }
+
   // ---- Device WebSocket handling (Hibernatable API) ----
 
   async webSocketMessage(ws: WebSocket, message: string | ArrayBuffer) {
@@ -548,8 +645,6 @@ class ChatAgentBase extends AIChatAgent {
       return this.deviceHub.handleMessage(ws, message, {
         getUserId: () => this.getUserId(),
         getSessionUuid: () => this.getSessionUuid(),
-        getLlmProxyConfig: () => this.getLlmProxyConfig(),
-        ensureMounted: () => this.ensureMounted(),
         env: this.env
       });
     }
@@ -578,37 +673,6 @@ class ChatAgentBase extends AIChatAgent {
       return;
     }
     return super.webSocketError(ws, error);
-  }
-
-  /**
-   * Build LlmProxyConfig from ChatAgent's own config (for device LLM requests).
-   */
-  private async getLlmProxyConfig(): Promise<LlmProxyConfig> {
-    if (!this.userId) {
-      const uid = await this.getUserId();
-      this.doInitBash(uid);
-    }
-
-    const { data: llmConfig, cache } = await getCachedLlmConfig(
-      this.mountableFs,
-      this.cachedLlmConfig
-    );
-    this.cachedLlmConfig = cache;
-
-    if (llmConfig) {
-      return {
-        baseUrl: llmConfig.base_url,
-        apiKey: llmConfig.api_key,
-        model: llmConfig.model || this.env.BUILTIN_LLM_MODEL,
-        apiKeyType: "custom"
-      };
-    }
-    return {
-      baseUrl: this.env.BUILTIN_LLM_BASE_URL,
-      apiKey: this.env.BUILTIN_LLM_API_KEY,
-      model: this.env.BUILTIN_LLM_MODEL,
-      apiKeyType: "builtin"
-    };
   }
 }
 

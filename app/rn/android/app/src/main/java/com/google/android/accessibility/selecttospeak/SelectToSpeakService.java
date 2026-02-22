@@ -32,6 +32,7 @@ public class SelectToSpeakService extends AccessibilityService {
     private static SelectToSpeakService instance;
     private GestureExecutor gestureExecutor;
     private AppLauncher appLauncher;
+    private AgentOverlay agentOverlay;
 
     private static final List<String> logEntries =
             Collections.synchronizedList(new ArrayList<String>());
@@ -85,6 +86,7 @@ public class SelectToSpeakService extends AccessibilityService {
         instance = this;
         gestureExecutor = new GestureExecutor(this);
         appLauncher = new AppLauncher(this);
+        agentOverlay = new AgentOverlay(this);
         Log.d(TAG, "SelectToSpeakService connected");
         Log.d(AGENT_TAG, "SelectToSpeakService connected - agent ready");
     }
@@ -92,6 +94,10 @@ public class SelectToSpeakService extends AccessibilityService {
     @Override
     public void onDestroy() {
         super.onDestroy();
+        if (agentOverlay != null) {
+            agentOverlay.hide();
+            agentOverlay = null;
+        }
         instance = null;
         gestureExecutor = null;
         appLauncher = null;
@@ -214,5 +220,19 @@ public class SelectToSpeakService extends AccessibilityService {
 
     public String launchApp(String name) {
         return appLauncher.launchApp(name);
+    }
+
+    // ========== Agent Overlay ==========
+
+    public void updateOverlayStatus(String text) {
+        if (agentOverlay != null) agentOverlay.updateStatus(text);
+    }
+
+    public void askUser(String question) {
+        if (agentOverlay != null) agentOverlay.askUser(question);
+    }
+
+    public void hideOverlay() {
+        if (agentOverlay != null) agentOverlay.hide();
     }
 }

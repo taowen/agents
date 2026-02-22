@@ -124,6 +124,28 @@
       agentVisible: true
     },
     {
+      name: "ask_user",
+      params: [{ name: "question", type: "string" }],
+      returns: "void",
+      description:
+        "show a question overlay and block until user taps Continue. Use when you encounter ambiguity or need user action (e.g. password input)",
+      agentVisible: true
+    },
+    {
+      name: "update_status",
+      params: [{ name: "text", type: "string" }],
+      returns: "void",
+      description: "update overlay status text",
+      agentVisible: false
+    },
+    {
+      name: "hide_overlay",
+      params: [],
+      returns: "void",
+      description: "hide the overlay",
+      agentVisible: false
+    },
+    {
       name: "http_post",
       params: [
         { name: "url", type: "string" },
@@ -149,7 +171,7 @@
   var SYSTEM_PROMPT =
     "You are a mobile automation assistant controlling a phone via Android Accessibility Service.\nYou can see the screen's accessibility tree where each node shows: class type, text, content description (desc), bounds coordinates, and properties.\n\nYou operate by writing JavaScript code using the execute_js tool. All calls are synchronous. Available global functions:\n```typescript\n" +
     agentSignatures +
-    '\n```\n\nTips:\n- Execute a SHORT sequence of actions (5-10 operations max), then return the result\n- Do NOT write for/while loops that call get_screen() or scroll() repeatedly\n- get_screen() is limited to 5 calls per execute_js\n- Use globalThis to store state between calls\n- click("text") matches BOTH text and desc attributes. Use click({desc:"X"}) for desc-only match\n- Bounds format: [left,top][right,bottom]. Center: x=(left+right)/2, y=(top+bottom)/2\n- After actions, call sleep(500) then get_screen() to verify results\n- If elements (especially ImageView) have no text or desc, call take_screenshot() to see actual pixels\n- take_screenshot() returns a placeholder; the actual image is automatically sent to you as a vision input\n- If click by text fails, calculate coordinates from bounds and use click({x, y})\n- To open an app, prefer launch_app("AppName") over navigating the home screen\n- For NumberPicker/time selectors, use scroll_element("\u5F53\u524D\u503C", "up"/"down") to change values\n- When the task is complete, respond with a text summary (no tool call)';
+    '\n```\n\nTips:\n- Execute a SHORT sequence of actions (5-10 operations max), then return the result\n- Do NOT write for/while loops that call get_screen() or scroll() repeatedly\n- get_screen() is limited to 5 calls per execute_js\n- Use globalThis to store state between calls\n- click("text") matches BOTH text and desc attributes. Use click({desc:"X"}) for desc-only match\n- Bounds format: [left,top][right,bottom]. Center: x=(left+right)/2, y=(top+bottom)/2\n- After actions, call sleep(500) then get_screen() to verify results\n- If elements (especially ImageView) have no text or desc, call take_screenshot() to see actual pixels\n- take_screenshot() returns a placeholder; the actual image is automatically sent to you as a vision input\n- If click by text fails, calculate coordinates from bounds and use click({x, y})\n- To open an app, prefer launch_app("AppName") over navigating the home screen\n- For NumberPicker/time selectors, use scroll_element("\u5F53\u524D\u503C", "up"/"down") to change values\n- When you encounter ambiguity (e.g. multiple matches) or need user action (e.g. password input), call ask_user("your question") to pause and let the user act, then continue after they tap Continue\n- When the task is complete, respond with a text summary (no tool call)';
   var toolSignatures = generateSignatures((fn) => fn.agentVisible);
   var TOOLS = [
     {
@@ -174,6 +196,7 @@
       }
     }
   ];
+  globalThis.__DEVICE_PROMPT__ = { systemPrompt: SYSTEM_PROMPT, tools: TOOLS };
 
   // src/llm-client.ts
   var MAX_RETRIES = 2;
@@ -466,6 +489,7 @@
   function runAgent(task, configJson) {
     const config = JSON.parse(configJson);
     agentLog("[TASK] Received task: " + task);
+    update_status("\u4EFB\u52A1\u5F00\u59CB");
     if (!conversationMessages) {
       conversationMessages = [{ role: "system", content: SYSTEM_PROMPT }];
     }
@@ -473,12 +497,20 @@
     compactConversation(conversationMessages, config, agentLog);
     const messages = conversationMessages;
     for (let step = 1; step <= MAX_STEPS; step++) {
+      update_status(
+        "\u6B65\u9AA4 " +
+          step +
+          "/" +
+          MAX_STEPS +
+          ": \u6B63\u5728\u601D\u8003\u2026"
+      );
       agentLog("[STEP " + step + "] Calling LLM...");
       trimMessages(messages);
       let response;
       try {
         response = callLLM(messages, TOOLS, config);
       } catch (e) {
+        update_status("\u9519\u8BEF: " + e.message);
         agentLog("[ERROR] LLM call failed: " + e.message);
         return "Error: " + e.message;
       }
@@ -493,6 +525,13 @@
           .map((tc) => tc.function.name)
           .join(", ");
         agentLog("[STEP " + step + "] LLM returned tool_calls: " + toolNames);
+        update_status(
+          "\u6B65\u9AA4 " +
+            step +
+            "/" +
+            MAX_STEPS +
+            ": \u6267\u884C\u4E2D\u2026"
+        );
         for (const toolCall of response.toolCalls) {
           let resultText;
           let screenshot;
@@ -538,6 +577,7 @@
         return finalContent;
       }
     }
+    update_status("\u5DF2\u8FBE\u5230\u6700\u5927\u6B65\u6570\u9650\u5236");
     agentLog(
       "[ERROR] Reached max steps (" + MAX_STEPS + ") without completing task"
     );

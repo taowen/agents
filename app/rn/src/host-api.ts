@@ -130,6 +130,28 @@ export const HOST_FUNCTIONS: HostFunctionDef[] = [
     agentVisible: true
   },
   {
+    name: "ask_user",
+    params: [{ name: "question", type: "string" }],
+    returns: "void",
+    description:
+      "show a question overlay and block until user taps Continue. Use when you encounter ambiguity or need user action (e.g. password input)",
+    agentVisible: true
+  },
+  {
+    name: "update_status",
+    params: [{ name: "text", type: "string" }],
+    returns: "void",
+    description: "update overlay status text",
+    agentVisible: false
+  },
+  {
+    name: "hide_overlay",
+    params: [],
+    returns: "void",
+    description: "hide the overlay",
+    agentVisible: false
+  },
+  {
     name: "http_post",
     params: [
       { name: "url", type: "string" },

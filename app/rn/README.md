@@ -9,7 +9,9 @@ LLM generates JavaScript code, which is `eval()`'d in a standalone Hermes runtim
 ```
 agent-standalone.ts  ──>  runAgent(task, configJson)
                            │
-                           ├── callLLM()  ──>  http_post() [sync C++ host fn]
+                           ├── llm-client.ts: callLLM()  ──>  http_post() [sync C++ host fn]
+                           │
+                           ├── conversation-manager.ts: trimMessages() / compactHistory()
                            │
                            └── executeCode(code)  [eval() in Hermes]
                                  │
@@ -30,7 +32,9 @@ Key files:
 
 | File | Role |
 |------|------|
-| `src/agent-standalone.ts` | Self-contained agent loop (runs in standalone Hermes) — LLM calls, tool dispatch, message management |
+| `src/agent-standalone.ts` | Agent loop entry point (runs in standalone Hermes) — tool dispatch, code execution |
+| `src/llm-client.ts` | LLM API client with retry logic (`callLLM`, `http_post` host fn) |
+| `src/conversation-manager.ts` | Conversation history trimming, compaction (summarization), state persistence |
 | `src/host-api.ts` | Host function definitions and metadata |
 | `src/prompt.ts` | System prompt and tool definitions for the LLM |
 | `src/App.tsx` | RN UI: device login, task input, log viewer, WebSocket cloud connection |

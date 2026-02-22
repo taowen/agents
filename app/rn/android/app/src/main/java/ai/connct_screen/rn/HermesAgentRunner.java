@@ -36,9 +36,10 @@ public class HermesAgentRunner {
     }
 
     // --- Native methods (implemented in standalone_hermes.cpp) ---
-    private static native void nativeCreateRuntime();
-    private static native String nativeEvaluateJS(String code, String sourceURL);
-    private static native void nativeDestroyRuntime();
+    // Package-private so DeviceConnection can also use the runtime
+    static native void nativeCreateRuntime();
+    static native String nativeEvaluateJS(String code, String sourceURL);
+    static native void nativeDestroyRuntime();
 
     // --- Static callbacks invoked from C++ via JNI ---
 
@@ -241,6 +242,23 @@ public class HermesAgentRunner {
         return conn.sendLlmRequest(body);
     }
 
+    public static void nativeUpdateStatus(String text) {
+        Log.d(TAG, "[overlay] updateStatus: " + text);
+        SelectToSpeakService service = SelectToSpeakService.getInstance();
+        if (service != null) service.updateOverlayStatus(text);
+        else Log.w(TAG, "[overlay] service is null!");
+    }
+
+    public static void nativeAskUser(String question) {
+        SelectToSpeakService service = SelectToSpeakService.getInstance();
+        if (service != null) service.askUser(question);
+    }
+
+    public static void nativeHideOverlay() {
+        SelectToSpeakService service = SelectToSpeakService.getInstance();
+        if (service != null) service.hideOverlay();
+    }
+
     public static void nativeAppendLog(String line) {
         SelectToSpeakService service = SelectToSpeakService.getInstance();
         if (service == null) {
@@ -309,6 +327,14 @@ public class HermesAgentRunner {
                 nativeDestroyRuntime();
             } catch (Exception e) {
                 Log.e(TAG, "[runAgent] Error destroying runtime", e);
+            }
+            // Show completion status and auto-hide after 3 seconds
+            try {
+                nativeUpdateStatus("\u4efb\u52a1\u5b8c\u6210"); // "任务完成"
+                Thread.sleep(3000);
+                nativeHideOverlay();
+            } catch (Exception e) {
+                Log.e(TAG, "[runAgent] Error hiding overlay", e);
             }
         }
     }
