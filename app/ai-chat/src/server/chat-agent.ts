@@ -411,7 +411,7 @@ class ChatAgentBase extends AIChatAgent {
 
   async onChatMessage(
     _onFinish?: unknown,
-    options?: { body?: Record<string, unknown> }
+    options?: { abortSignal?: AbortSignal; body?: Record<string, unknown> }
   ) {
     return Sentry.startSpan({ name: "onChatMessage", op: "chat" }, async () => {
       // Ensure we have userId + sessionUuid (may need recovery after hibernation)
@@ -431,7 +431,7 @@ class ChatAgentBase extends AIChatAgent {
 
       // Device sessions use streamText with device-reported prompt + execute_js tool
       if (isDeviceSession(this.sessionUuid)) {
-        return this.handleDeviceChatMessage();
+        return this.handleDeviceChatMessage(options?.abortSignal);
       }
 
       // Ensure /etc and fstab mounts are ready before any filesystem access
@@ -581,7 +581,8 @@ class ChatAgentBase extends AIChatAgent {
         messages,
         tools: this.cachedTools!,
         stopWhen: stepCountIs(10),
-        onFinish: this.createOnFinish()
+        onFinish: this.createOnFinish(),
+        abortSignal: options?.abortSignal
       });
 
       return this.toStreamResponse(result, apiKeyType);
@@ -590,7 +591,9 @@ class ChatAgentBase extends AIChatAgent {
 
   // ---- Device session streamText handler ----
 
-  private async handleDeviceChatMessage(): Promise<Response> {
+  private async handleDeviceChatMessage(
+    abortSignal?: AbortSignal
+  ): Promise<Response> {
     // userId and bash are guaranteed by onChatMessage caller
     await this.ensureMounted();
 
@@ -628,7 +631,8 @@ class ChatAgentBase extends AIChatAgent {
       onFinish: async () => {
         await this.createOnFinish()();
         this.deviceHub.sendTaskDone("done");
-      }
+      },
+      abortSignal
     });
 
     return this.toStreamResponse(result, apiKeyType);

@@ -107,9 +107,15 @@ export class WebSocketChatTransport<
     // Track this request so the onAgentMessage handler skips it
     this.activeRequestIds?.add(requestId);
 
+    // Will hold a reference to the ReadableStream controller so the abort
+    // handler can close the stream even after the message listener is removed.
+    let streamController: ReadableStreamDefaultController<UIMessageChunk> | null =
+      null;
+
     // Handle abort from the caller (only if the stream has not already completed)
     options.abortSignal?.addEventListener("abort", () => {
       if (completed) return;
+      completed = true;
       this.agent.send(
         JSON.stringify({
           id: requestId,
@@ -121,6 +127,10 @@ export class WebSocketChatTransport<
       // Without this, chunks arriving between cancel and server acknowledgment
       // would be processed as broadcast messages, making the stream appear
       // to continue after stop().
+      activeIds?.delete(requestId);
+      try {
+        streamController?.close();
+      } catch {}
       abortController.abort();
     });
 
@@ -130,6 +140,7 @@ export class WebSocketChatTransport<
     const activeIds = this.activeRequestIds;
     const stream = new ReadableStream<UIMessageChunk>({
       start(controller) {
+        streamController = controller;
         const onMessage = (event: MessageEvent) => {
           try {
             const data = JSON.parse(

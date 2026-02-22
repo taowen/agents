@@ -42,8 +42,8 @@ execSync(
 // 5. Update apkUrl in ai-chat server
 const indexSrc = readFileSync(aiChatIndex, "utf-8");
 const updated = indexSrc.replace(
-  /const apkUrl = "https:\/\/ai\.connect-screen\.com\/api\/public\/connect-screen[^"]*\.apk"/,
-  `const apkUrl = "https://ai.connect-screen.com/api/public/${apkName}"`
+  /const apkUrl\s*=\s*\n?\s*"https:\/\/ai\.connect-screen\.com\/api\/public\/connect-screen[^"]*\.apk"/,
+  `const apkUrl =\n    "https://ai.connect-screen.com/api/public/${apkName}"`
 );
 if (updated === indexSrc) {
   console.error(
