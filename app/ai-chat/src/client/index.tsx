@@ -83,3 +83,7 @@ root.render(
     </ThemeProvider>
   </Sentry.ErrorBoundary>
 );
+
+if ("serviceWorker" in navigator) {
+  navigator.serviceWorker.register("/sw.js");
+}
