@@ -1,8 +1,11 @@
 /**
  * Google OAuth + session cookie authentication.
  *
- * Session cookie format: base64({userId,exp}).hmac_hex
+ * Session cookie format: base64({userId,iat,exp}).hmac_hex
  * HMAC-SHA256 signed with AUTH_SECRET env var.
+ *
+ * Revocation: on logout, a per-user timestamp is written to KV
+ * (`auth-revoke:{userId}`). Any token with iat < that timestamp is rejected.
  */
 
 import { findOrCreateUser, getUser, getUserByEmail } from "./db";
@@ -12,7 +15,11 @@ const COOKIE_MAX_AGE = 30 * 24 * 60 * 60; // 30 days in seconds
 const EMAIL_DOMAIN = "connect-screen.com";
 const EMAIL_TOKEN_TTL = 5 * 60; // 5 minutes in seconds
 const DEVICE_CODE_TTL = 10 * 60; // 10 minutes in seconds
+const DEVICE_TOKEN_MAX_AGE = 90 * 24 * 60 * 60 * 1000; // 90 days in ms
+const REVOKE_KV_TTL = Math.ceil(DEVICE_TOKEN_MAX_AGE / 1000); // 90 days (matches longest token)
 const DEVICE_CODE_CHARS = "ABCDEFGHJKLMNPQRSTUVWXYZ23456789"; // no 0/O/1/I
+
+type TokenPayload = { userId: string; iat: number };
 
 // ---- HMAC helpers ----
 
@@ -64,8 +71,9 @@ async function createSessionCookie(
   userId: string,
   secret: string
 ): Promise<string> {
-  const exp = Date.now() + COOKIE_MAX_AGE * 1000;
-  const payloadB64 = btoa(JSON.stringify({ userId, exp }));
+  const iat = Date.now();
+  const exp = iat + COOKIE_MAX_AGE * 1000;
+  const payloadB64 = btoa(JSON.stringify({ userId, iat, exp }));
   const sig = await hmacSign(payloadB64, secret);
   const value = `${payloadB64}.${sig}`;
   return `${COOKIE_NAME}=${value}; Path=/; HttpOnly; SameSite=Lax; Max-Age=${COOKIE_MAX_AGE}; Secure`;
@@ -74,7 +82,7 @@ async function createSessionCookie(
 async function validateSessionCookie(
   request: Request,
   secret: string
-): Promise<string | null> {
+): Promise<TokenPayload | null> {
   const cookieHeader = request.headers.get("Cookie");
   if (!cookieHeader) return null;
 
@@ -96,10 +104,12 @@ async function validateSessionCookie(
   try {
     const payload = JSON.parse(atob(payloadB64)) as {
       userId: string;
+      iat: number;
       exp: number;
     };
     if (Date.now() > payload.exp) return null;
-    return payload.userId;
+    if (!payload.iat) return null;
+    return { userId: payload.userId, iat: payload.iat };
   } catch {
     return null;
   }
@@ -143,7 +153,13 @@ export async function createDeviceToken(
   userId: string,
   secret: string
 ): Promise<string> {
-  const payloadB64 = btoa(JSON.stringify({ userId, iat: Date.now() }));
+  const payloadB64 = btoa(
+    JSON.stringify({
+      userId,
+      iat: Date.now(),
+      exp: Date.now() + DEVICE_TOKEN_MAX_AGE
+    })
+  );
   const sig = await hmacSign(payloadB64, secret);
   return `device.${payloadB64}.${sig}`;
 }
@@ -151,7 +167,7 @@ export async function createDeviceToken(
 export async function validateDeviceToken(
   token: string,
   secret: string
-): Promise<string | null> {
+): Promise<TokenPayload | null> {
   if (!token.startsWith("device.")) return null;
   const rest = token.slice(7); // strip "device."
   const dotIdx = rest.indexOf(".");
@@ -161,8 +177,14 @@ export async function validateDeviceToken(
   const valid = await hmacVerify(payloadB64, sigHex, secret);
   if (!valid) return null;
   try {
-    const payload = JSON.parse(atob(payloadB64)) as { userId: string };
-    return payload.userId;
+    const payload = JSON.parse(atob(payloadB64)) as {
+      userId: string;
+      iat: number;
+      exp: number;
+    };
+    if (!payload.exp || Date.now() > payload.exp) return null;
+    if (!payload.iat) return null;
+    return { userId: payload.userId, iat: payload.iat };
   } catch {
     return null;
   }
@@ -173,6 +195,18 @@ function generateDeviceCode(): string {
   return Array.from(bytes)
     .map((b) => DEVICE_CODE_CHARS[b % DEVICE_CODE_CHARS.length])
     .join("");
+}
+
+// ---- Token revocation ----
+
+async function isTokenRevoked(
+  kv: KVNamespace,
+  userId: string,
+  iat: number
+): Promise<boolean> {
+  const raw = await kv.get(`auth-revoke:${userId}`);
+  if (!raw) return false;
+  return iat < Number(raw);
 }
 
 // ---- Public API ----
@@ -282,8 +316,17 @@ export async function handleAuthRoutes(
     });
   }
 
-  // GET /auth/logout — clear cookie
+  // GET /auth/logout — revoke all tokens, clear cookie
   if (url.pathname === "/auth/logout" && request.method === "GET") {
+    // Extract userId before clearing — no revocation check here (we're about to revoke)
+    const payload = await validateSessionCookie(request, env.AUTH_SECRET);
+    if (payload) {
+      await env.OTP_KV.put(
+        `auth-revoke:${payload.userId}`,
+        String(Date.now()),
+        { expirationTtl: REVOKE_KV_TTL }
+      );
+    }
     return new Response(null, {
       status: 302,
       headers: {
@@ -295,11 +338,14 @@ export async function handleAuthRoutes(
 
   // GET /auth/status — check authentication
   if (url.pathname === "/auth/status" && request.method === "GET") {
-    const userId = await validateSessionCookie(request, env.AUTH_SECRET);
-    if (!userId) {
+    const payload = await validateSessionCookie(request, env.AUTH_SECRET);
+    if (!payload) {
       return Response.json({ authenticated: false });
     }
-    const user = await getUser(env.DB, userId);
+    if (await isTokenRevoked(env.OTP_KV, payload.userId, payload.iat)) {
+      return Response.json({ authenticated: false });
+    }
+    const user = await getUser(env.DB, payload.userId);
     if (!user) {
       return Response.json({ authenticated: false });
     }
@@ -623,23 +669,38 @@ export async function requireAuth(
   env: Env
 ): Promise<string | Response> {
   // Try session cookie first
-  const cookieUserId = await validateSessionCookie(request, env.AUTH_SECRET);
-  if (cookieUserId) return cookieUserId;
+  const cookiePayload = await validateSessionCookie(request, env.AUTH_SECRET);
+  if (
+    cookiePayload &&
+    !(await isTokenRevoked(env.OTP_KV, cookiePayload.userId, cookiePayload.iat))
+  ) {
+    return cookiePayload.userId;
+  }
 
   // Try Bearer token
   const authHeader = request.headers.get("Authorization");
   if (authHeader?.startsWith("Bearer ")) {
     const token = authHeader.slice(7);
-    const tokenUserId = await validateDeviceToken(token, env.AUTH_SECRET);
-    if (tokenUserId) return tokenUserId;
+    const tokenPayload = await validateDeviceToken(token, env.AUTH_SECRET);
+    if (
+      tokenPayload &&
+      !(await isTokenRevoked(env.OTP_KV, tokenPayload.userId, tokenPayload.iat))
+    ) {
+      return tokenPayload.userId;
+    }
   }
 
   // Try ?token= query param (needed for WebSocket connections from devices)
   const url = new URL(request.url);
   const queryToken = url.searchParams.get("token");
   if (queryToken) {
-    const tokenUserId = await validateDeviceToken(queryToken, env.AUTH_SECRET);
-    if (tokenUserId) return tokenUserId;
+    const tokenPayload = await validateDeviceToken(queryToken, env.AUTH_SECRET);
+    if (
+      tokenPayload &&
+      !(await isTokenRevoked(env.OTP_KV, tokenPayload.userId, tokenPayload.iat))
+    ) {
+      return tokenPayload.userId;
+    }
   }
 
   return new Response(JSON.stringify({ error: "Unauthorized" }), {
