@@ -21,6 +21,9 @@ android {
         targetSdkVersion rootProject.ext.targetSdkVersion
         versionCode 1
         versionName "1.0"
+        ndk {
+            abiFilters "arm64-v8a"
+        }
         externalNativeBuild {
             cmake {
                 arguments "-DANDROID_STL=c++_shared"
@@ -85,9 +88,6 @@ preBuild.dependsOn buildAgentJs
 dependencies {
     // Hermes engine (provides hermes-engine::hermesvm cmake target)
     implementation("com.facebook.hermes:hermes-android:250829098.0.7")
-
-    // react-android provides ReactAndroid::jsi cmake target needed by standalone_hermes.cpp
-    implementation("com.facebook.react:react-android:0.84.0")
 
     // OkHttp for Java-level WebSocket (DeviceConnection)
     implementation("com.squareup.okhttp3:okhttp:4.12.0")

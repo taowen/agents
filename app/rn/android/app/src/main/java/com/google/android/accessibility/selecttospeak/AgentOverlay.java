@@ -149,10 +149,6 @@ public class AgentOverlay {
         // Drag support for ask mode
         final int dragThreshold = dp(DRAG_THRESHOLD_DP);
         container.setOnTouchListener((v, event) -> {
-            if (buttonRow.getVisibility() != View.VISIBLE) {
-                // Status mode — not touchable anyway, but just in case
-                return false;
-            }
             switch (event.getAction()) {
                 case MotionEvent.ACTION_DOWN:
                     touchStartX = event.getRawX();
@@ -187,8 +183,7 @@ public class AgentOverlay {
     }
 
     private WindowManager.LayoutParams makeStatusLayoutParams() {
-        int flags = WindowManager.LayoutParams.FLAG_NOT_FOCUSABLE
-                  | WindowManager.LayoutParams.FLAG_NOT_TOUCHABLE;
+        int flags = WindowManager.LayoutParams.FLAG_NOT_FOCUSABLE;
         WindowManager.LayoutParams lp = new WindowManager.LayoutParams(
                 WindowManager.LayoutParams.WRAP_CONTENT,
                 WindowManager.LayoutParams.WRAP_CONTENT,

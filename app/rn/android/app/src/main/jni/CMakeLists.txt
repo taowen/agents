@@ -6,13 +6,19 @@ project(hermesagent)
 # for running the agent loop inside the AccessibilityService process,
 # free from Android's background-app JS thread restrictions.
 
+# Build libjsi.so from source (replaces the copy from react-android).
+# The prebuilt libhermesvm.so dynamically links against libjsi.so at runtime.
+set(JSI_DIR "${CMAKE_SOURCE_DIR}/../../../../../../../node_modules/react-native/ReactCommon/jsi")
+
+add_library(jsi SHARED ${JSI_DIR}/jsi/jsi.cpp)
+target_include_directories(jsi PUBLIC ${JSI_DIR})
+
 add_library(hermesagent SHARED agent/standalone_hermes.cpp)
 
 find_package(hermes-engine REQUIRED CONFIG)
-find_package(ReactAndroid REQUIRED CONFIG)
 
 target_link_libraries(hermesagent
     hermes-engine::hermesvm   # Hermes runtime (makeHermesRuntime)
-    ReactAndroid::jsi         # JSI API (jsi::Runtime, HostFunction, etc.)
+    jsi                       # JSI API (jsi::Runtime, HostFunction, etc.)
     log                       # Android __android_log_print
 )

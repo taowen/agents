@@ -141,6 +141,7 @@ public class DeviceConnection {
                         case "task_done": {
                             String result = data.optString("result", "");
                             Log.i(TAG, "Received task_done: " + result.substring(0, Math.min(100, result.length())));
+                            HermesAgentRunner.nativeHideOverlay();
                             notifyTaskDone(result);
                             break;
                         }
@@ -163,12 +164,14 @@ public class DeviceConnection {
 
             @Override
             public void onClosing(WebSocket webSocket, int code, String reason) {
+                if (webSocket != ws) return; // stale connection
                 Log.i(TAG, "WebSocket closing: " + code + " " + reason);
                 webSocket.close(1000, null);
             }
 
             @Override
             public void onClosed(WebSocket webSocket, int code, String reason) {
+                if (webSocket != ws) return; // stale connection
                 long secsSincePing = lastPingTime > 0
                         ? (System.currentTimeMillis() - lastPingTime) / 1000 : -1;
                 Log.i(TAG, "WebSocket closed: code=" + code + " reason=" + reason
@@ -180,6 +183,7 @@ public class DeviceConnection {
 
             @Override
             public void onFailure(WebSocket webSocket, Throwable t, Response response) {
+                if (webSocket != ws) return; // stale connection
                 long secsSincePing = lastPingTime > 0
                         ? (System.currentTimeMillis() - lastPingTime) / 1000 : -1;
                 Log.e(TAG, "WebSocket failure: " + t.getClass().getSimpleName()
