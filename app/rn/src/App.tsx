@@ -80,46 +80,7 @@ function App(): React.JSX.Element {
     const wsUrl = `wss://ai.connect-screen.com/agents/chat-agent/device-${encodeURIComponent(name)}/device-connect?token=${encodeURIComponent(config.apiKey)}`;
     AccessibilityBridge.connectCloud(wsUrl, name);
 
-    // Listen for task events pushed from Java DeviceConnection
-    const sub = DeviceEventEmitter.addListener("DeviceTask", async (data) => {
-      if (isRunningRef.current) {
-        AccessibilityBridge.sendTaskResult(data.taskId, "Device busy", false);
-        return;
-      }
-      setLogs((prev) => [
-        ...prev,
-        `[${formatTime()}] [CLOUD] Task: ${data.description}`
-      ]);
-      setIsRunning(true);
-      isRunningRef.current = true;
-      try {
-        const configJson = JSON.stringify(config);
-        const agentResult = await AccessibilityBridge.runAgentTask(
-          data.description,
-          configJson
-        );
-        AccessibilityBridge.sendTaskResult(
-          data.taskId,
-          agentResult || "done",
-          true
-        );
-        setLogs((prev) => [...prev, `[${formatTime()}] [CLOUD] Done`]);
-      } catch (e: unknown) {
-        const msg = e instanceof Error ? e.message : String(e);
-        AccessibilityBridge.sendTaskResult(
-          data.taskId,
-          msg || "Task failed",
-          false
-        );
-        setLogs((prev) => [...prev, `[${formatTime()}] [CLOUD] Error: ${msg}`]);
-      } finally {
-        setIsRunning(false);
-        isRunningRef.current = false;
-      }
-    });
-
     return () => {
-      sub.remove();
       AccessibilityBridge.disconnectCloud();
       setCloudConnected(false);
     };
@@ -132,6 +93,19 @@ function App(): React.JSX.Element {
       "DeviceConnectionStatus",
       (data: { connected: boolean }) => {
         setCloudConnected(data.connected);
+      }
+    );
+    return () => sub.remove();
+  }, []);
+
+  // Listen for task completion from server
+  useEffect(() => {
+    const sub = DeviceEventEmitter.addListener(
+      "DeviceTaskDone",
+      (data: { result: string }) => {
+        setLogs((prev) => [...prev, `[${formatTime()}] [DONE] ${data.result}`]);
+        setIsRunning(false);
+        isRunningRef.current = false;
       }
     );
     return () => sub.remove();
@@ -207,7 +181,7 @@ function App(): React.JSX.Element {
 
   const handleSend = useCallback(async () => {
     const trimmed = task.trim();
-    if (!trimmed || !configLoaded || isRunning) return;
+    if (!trimmed || !configLoaded || isRunning || !cloudConnected) return;
 
     setLogs([]);
     AccessibilityBridge.clearLogFile();
@@ -215,19 +189,16 @@ function App(): React.JSX.Element {
     setIsRunning(true);
     isRunningRef.current = true;
 
+    addLog(`[${formatTime()}] [TASK] Sending to server: ${trimmed}`);
     try {
-      const configJson = JSON.stringify(config);
-      addLog(`[${formatTime()}] [TASK] Starting: ${trimmed}`);
-      await AccessibilityBridge.runAgentTask(trimmed, configJson);
-      addLog(`[${formatTime()}] [DONE] Agent finished`);
+      await AccessibilityBridge.sendUserTask(trimmed);
     } catch (e: unknown) {
       const msg = e instanceof Error ? e.message : String(e);
       addLog(`[${formatTime()}] [ERROR] ${msg}`);
-    } finally {
       setIsRunning(false);
       isRunningRef.current = false;
     }
-  }, [task, config, configLoaded, isRunning, addLog]);
+  }, [task, configLoaded, isRunning, cloudConnected, addLog]);
 
   if (!configLoaded) {
     // Login screen
@@ -347,11 +318,16 @@ function App(): React.JSX.Element {
           </TouchableOpacity>
         ) : (
           <TouchableOpacity
-            style={[styles.sendBtn, !task.trim() && styles.disabledBtn]}
+            style={[
+              styles.sendBtn,
+              (!task.trim() || !cloudConnected) && styles.disabledBtn
+            ]}
             onPress={handleSend}
-            disabled={!task.trim()}
+            disabled={!task.trim() || !cloudConnected}
           >
-            <Text style={styles.sendBtnText}>Send</Text>
+            <Text style={styles.sendBtnText}>
+              {cloudConnected ? "Send" : "Offline"}
+            </Text>
           </TouchableOpacity>
         )}
       </View>

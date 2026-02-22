@@ -138,11 +138,10 @@ public class DeviceConnection {
                             handleExecJs(webSocket, execId, code);
                             break;
                         }
-                        case "task": {
-                            String taskId = data.getString("taskId");
-                            String description = data.getString("description");
-                            Log.i(TAG, "Received task: " + taskId + " - " + description);
-                            emitTaskEvent(taskId, description);
+                        case "task_done": {
+                            String result = data.optString("result", "");
+                            Log.i(TAG, "Received task_done: " + result.substring(0, Math.min(100, result.length())));
+                            emitTaskDone(result);
                             break;
                         }
                         case "ping": {
@@ -221,22 +220,20 @@ public class DeviceConnection {
     }
 
     /**
-     * Send a task result back to the DeviceHub.
+     * Send a user-initiated task to the server for processing.
      */
-    public void sendTaskResult(String taskId, String result, boolean success) {
+    public void sendUserTask(String text) {
         if (!connected || ws == null) {
-            Log.w(TAG, "Cannot send task result - not connected");
+            Log.w(TAG, "Cannot send user_task - not connected");
             return;
         }
         try {
             JSONObject msg = new JSONObject();
-            msg.put("type", "result");
-            msg.put("taskId", taskId);
-            msg.put("result", result);
-            msg.put("success", success);
+            msg.put("type", "user_task");
+            msg.put("text", text);
             ws.send(msg.toString());
         } catch (Exception e) {
-            Log.e(TAG, "Failed to send task result", e);
+            Log.e(TAG, "Failed to send user_task", e);
         }
     }
 
@@ -373,19 +370,18 @@ public class DeviceConnection {
         }
     }
 
-    private void emitTaskEvent(String taskId, String description) {
+    private void emitTaskDone(String result) {
         if (reactContext == null || !reactContext.hasActiveReactInstance()) {
-            Log.w(TAG, "No React context for task event");
+            Log.w(TAG, "No React context for task_done event");
             return;
         }
         try {
             WritableMap params = Arguments.createMap();
-            params.putString("taskId", taskId);
-            params.putString("description", description);
+            params.putString("result", result);
             reactContext.getJSModule(DeviceEventManagerModule.RCTDeviceEventEmitter.class)
-                    .emit("DeviceTask", params);
+                    .emit("DeviceTaskDone", params);
         } catch (Exception e) {
-            Log.e(TAG, "Failed to emit DeviceTask event", e);
+            Log.e(TAG, "Failed to emit DeviceTaskDone event", e);
         }
     }
 }

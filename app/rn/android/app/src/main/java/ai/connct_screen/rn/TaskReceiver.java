@@ -3,7 +3,6 @@ package ai.connct_screen.rn;
 import android.content.BroadcastReceiver;
 import android.content.Context;
 import android.content.Intent;
-import android.content.SharedPreferences;
 import android.util.Log;
 
 
@@ -19,46 +18,14 @@ public class TaskReceiver extends BroadcastReceiver {
             return;
         }
 
-        Log.d(TAG, "[TASK] Received task: " + task);
+        Log.d(TAG, "[TASK] Received broadcast task: " + task);
 
-        // Read LLM config from SharedPreferences (written by RN app after device login)
-        String configJson = readConfig(context);
-        if (configJson == null) {
-            Log.e(TAG, "[ERROR] No LLM config found");
+        // Route to server via WebSocket
+        DeviceConnection conn = DeviceConnection.getInstance();
+        if (!conn.isConnected()) {
+            Log.e(TAG, "[ERROR] Cannot send task - not connected to server");
             return;
         }
-
-        // Run agent on a background thread (HermesAgentRunner.runAgent blocks)
-        final String finalConfig = configJson;
-        final String finalTask = task;
-        new Thread(() -> {
-            try {
-                HermesAgentRunner.runAgent(finalTask, finalConfig);
-            } catch (Exception e) {
-                Log.e(TAG, "[ERROR] Agent failed", e);
-            }
-        }, "hermes-agent").start();
-    }
-
-    private String readConfig(Context context) {
-        try {
-            SharedPreferences prefs = context.getSharedPreferences("llm_config", Context.MODE_PRIVATE);
-            String baseURL = prefs.getString("baseURL", null);
-            String apiKey = prefs.getString("apiKey", null);
-            String model = prefs.getString("model", null);
-            if (baseURL != null && apiKey != null && model != null) {
-                return "{\"baseURL\":\"" + escapeJson(baseURL) +
-                       "\",\"apiKey\":\"" + escapeJson(apiKey) +
-                       "\",\"model\":\"" + escapeJson(model) + "\"}";
-            }
-        } catch (Exception e) {
-            Log.w(TAG, "[readConfig] SharedPreferences failed", e);
-        }
-
-        return null;
-    }
-
-    private static String escapeJson(String s) {
-        return JsStringUtils.escapeForJS(s);
+        conn.sendUserTask(task);
     }
 }

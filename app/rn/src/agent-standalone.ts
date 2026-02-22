@@ -1,15 +1,16 @@
 /**
  * agent-standalone.ts
  *
- * Self-contained agent loop that runs in a standalone Hermes runtime
- * (inside the AccessibilityService process). Host function metadata lives
- * in host-api.ts; prompt & tool definitions are generated in prompt.ts.
+ * JS executor that runs in a standalone Hermes runtime (inside the
+ * AccessibilityService process). The server-side agent loop sends
+ * exec_js requests; this file provides `executeCodeForServer()` which
+ * wraps host functions with safety limits and status updates.
+ *
+ * Prompt & tool definitions are still generated in prompt.ts and
+ * exposed via `__DEVICE_PROMPT__` for the server handshake.
  */
 
-import { SYSTEM_PROMPT, TOOLS } from "./prompt";
-import type { ChatMessage, LlmConfig, ToolCall } from "./types";
-import { callLLM } from "./llm-client";
-import { trimMessages, compactConversation } from "./conversation-manager";
+import "./prompt"; // side-effect: sets globalThis.__DEVICE_PROMPT__
 
 // Declare globals provided by C++ host functions (for TypeScript only)
 declare global {
@@ -35,7 +36,6 @@ declare global {
   var update_status: (text: string) => void;
   var ask_user: (question: string) => string;
   var hide_overlay: () => void;
-  var runAgent: (task: string, configJson: string) => string;
   var executeCodeForServer: (code: string) => {
     result: string;
     screenshots?: string[];
@@ -43,22 +43,8 @@ declare global {
   var __DEVICE_PROMPT__: { systemPrompt: string; tools: unknown[] };
 }
 
-const MAX_STEPS = 30;
 const MAX_GET_SCREEN_PER_EXEC = 5;
 const EXEC_TIMEOUT_MS = 30_000;
-
-function formatTime(): string {
-  const d = new Date();
-  const pad = (n: number) => (n < 10 ? "0" : "") + n;
-  return (
-    pad(d.getHours()) + ":" + pad(d.getMinutes()) + ":" + pad(d.getSeconds())
-  );
-}
-
-function agentLog(msg: string): void {
-  const line = "[" + formatTime() + "] " + msg;
-  log(line);
-}
 
 /**
  * Save and wrap all host functions with update_status + safety limits.
@@ -198,45 +184,6 @@ function wrapHostFunctions(opts: {
   };
 }
 
-function executeCode(
-  code: string,
-  thinking?: string
-): { text: string; screenshot?: string } {
-  if (thinking) {
-    agentLog("[THINK] " + thinking);
-  }
-  agentLog("[CODE] " + code);
-
-  let lastGetScreenResult: string | null = null;
-  let capturedScreenshot: string | undefined;
-
-  const wrapped = wrapHostFunctions({
-    deadline: Date.now() + EXEC_TIMEOUT_MS,
-    maxGetScreen: MAX_GET_SCREEN_PER_EXEC,
-    onGetScreen(tree) {
-      lastGetScreenResult = tree;
-    },
-    onScreenshot(b64) {
-      capturedScreenshot = b64;
-    }
-  });
-
-  try {
-    let result = (0, eval)(code);
-    if (result === undefined && lastGetScreenResult !== null) {
-      result = lastGetScreenResult;
-    }
-    const text = result === undefined ? "undefined" : String(result);
-    return { text, screenshot: capturedScreenshot };
-  } catch (e: unknown) {
-    const msg = e instanceof Error ? e.message : String(e);
-    const text = "[JS Error] " + msg;
-    return { text, screenshot: capturedScreenshot };
-  } finally {
-    wrapped.restore();
-  }
-}
-
 /**
  * executeCodeForServer — called from DeviceConnection.java for cloud exec_js.
  * Same host function wrapping (with update_status) but returns { result, screenshots[] }.
@@ -280,111 +227,3 @@ function executeCodeForServer(code: string): {
 }
 
 globalThis.executeCodeForServer = executeCodeForServer;
-
-// Global conversation buffer — persists across runAgent calls
-let conversationMessages: ChatMessage[] | null = null;
-
-// Main entry point — called from Java via nativeEvaluateJS
-function runAgent(task: string, configJson: string): string {
-  const config: LlmConfig = JSON.parse(configJson);
-
-  agentLog("[TASK] Received task: " + task);
-  update_status("task started");
-
-  if (!conversationMessages) {
-    conversationMessages = [{ role: "system", content: SYSTEM_PROMPT }];
-  }
-  conversationMessages.push({ role: "user", content: task });
-  compactConversation(conversationMessages, config, agentLog);
-
-  const messages = conversationMessages;
-
-  for (let step = 1; step <= MAX_STEPS; step++) {
-    update_status("step " + step + "/" + MAX_STEPS + ": thinking…");
-    agentLog("[STEP " + step + "] Calling LLM...");
-    trimMessages(messages);
-
-    let response: { content: string | null; toolCalls: ToolCall[] | null };
-    try {
-      response = callLLM(messages, TOOLS, config);
-    } catch (e: unknown) {
-      const msg = e instanceof Error ? e.message : String(e);
-      update_status("error: " + msg);
-      agentLog("[ERROR] LLM call failed: " + msg);
-      return "Error: " + msg;
-    }
-
-    if (response.toolCalls) {
-      const assistantMsg: ChatMessage = {
-        role: "assistant",
-        content: response.content,
-        tool_calls: response.toolCalls
-      };
-      messages.push(assistantMsg);
-
-      const toolNames = response.toolCalls
-        .map((tc: ToolCall) => tc.function.name)
-        .join(", ");
-      agentLog("[STEP " + step + "] LLM returned tool_calls: " + toolNames);
-
-      update_status("step " + step + "/" + MAX_STEPS + ": executing…");
-
-      for (const toolCall of response.toolCalls) {
-        let resultText: string;
-        let screenshot: string | undefined;
-        if (toolCall.function.name === "execute_js") {
-          const args = JSON.parse(toolCall.function.arguments);
-          const execResult = executeCode(
-            args.code,
-            response.content ?? undefined
-          );
-          resultText = execResult.text;
-          screenshot = execResult.screenshot;
-        } else {
-          resultText = "Unknown tool: " + toolCall.function.name;
-        }
-
-        const logResult =
-          resultText.length > 200
-            ? resultText.substring(0, 200) +
-              "... (" +
-              resultText.length +
-              " chars)"
-            : resultText;
-        agentLog("[TOOL] " + toolCall.function.name + " -> " + logResult);
-
-        messages.push({
-          role: "tool",
-          tool_call_id: toolCall.id,
-          content: resultText
-        });
-
-        // Inject screenshot as a user vision message
-        if (screenshot) {
-          messages.push({
-            role: "user",
-            content: [
-              {
-                type: "image_url",
-                image_url: { url: "data:image/jpeg;base64," + screenshot }
-              }
-            ]
-          });
-        }
-      }
-    } else {
-      const finalContent = response.content || "(no response)";
-      agentLog("[DONE] Task completed: " + finalContent);
-      return finalContent;
-    }
-  }
-
-  update_status("max steps reached");
-  agentLog(
-    "[ERROR] Reached max steps (" + MAX_STEPS + ") without completing task"
-  );
-  return "Error: reached max steps";
-}
-
-// Expose runAgent on globalThis so it can be called from Java
-globalThis.runAgent = runAgent;

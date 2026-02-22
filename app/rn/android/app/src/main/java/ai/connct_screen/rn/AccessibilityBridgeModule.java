@@ -106,12 +106,6 @@ public class AccessibilityBridgeModule extends ReactContextBaseJavaModule {
         promise.resolve(null);
     }
 
-    @ReactMethod
-    public void sendTaskResult(String taskId, String result, boolean success, Promise promise) {
-        DeviceConnection.getInstance().sendTaskResult(taskId, result, success);
-        promise.resolve(null);
-    }
-
     /**
      * Save LLM config to SharedPreferences so that TaskReceiver (broadcast path)
      * can also read it without going through React Native.
@@ -133,19 +127,12 @@ public class AccessibilityBridgeModule extends ReactContextBaseJavaModule {
     }
 
     /**
-     * Run agent task via standalone Hermes (HermesAgentRunner).
-     * Runs on a background thread; resolves when the agent completes.
+     * Send a task to the server for execution via the device WebSocket.
+     * Resolves immediately — the result arrives async via DeviceTaskDone event.
      */
     @ReactMethod
-    public void runAgentTask(String task, String configJson, Promise promise) {
-        new Thread(() -> {
-            try {
-                String result = HermesAgentRunner.runAgent(task, configJson);
-                promise.resolve(result != null ? result : "done");
-            } catch (Exception e) {
-                Log.e(TAG, "[runAgentTask] failed", e);
-                promise.reject("AGENT_ERROR", e.getMessage(), e);
-            }
-        }, "hermes-agent").start();
+    public void sendUserTask(String text, Promise promise) {
+        DeviceConnection.getInstance().sendUserTask(text);
+        promise.resolve(null);
     }
 }

@@ -120,12 +120,26 @@ export class DeviceHub {
 
   // --- Device WebSocket message handling ---
 
+  /**
+   * Send a task_done message to the device after server-side agent completes.
+   */
+  sendTaskDone(result: string): void {
+    const deviceWs = this.getWs();
+    if (!deviceWs) return;
+    try {
+      deviceWs.send(JSON.stringify({ type: "task_done", result }));
+    } catch {
+      // Dead socket — ignore
+    }
+  }
+
   async handleMessage(
     ws: WebSocket,
     message: string | ArrayBuffer,
     callbacks: {
       getUserId: () => Promise<string>;
       getSessionUuid: () => Promise<string | null>;
+      onUserTask?: (text: string) => void;
       env: Env;
     }
   ): Promise<void> {
@@ -165,6 +179,13 @@ export class DeviceHub {
           }
         } catch (e) {
           console.error("Failed to update device_online on ready:", e);
+        }
+        return;
+      }
+
+      if (data.type === "user_task") {
+        if (data.text && callbacks.onUserTask) {
+          callbacks.onUserTask(data.text);
         }
         return;
       }
