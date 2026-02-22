@@ -230,18 +230,6 @@ public class HermesAgentRunner {
         }
     }
 
-    /**
-     * Route LLM requests through the DeviceConnection WebSocket.
-     * Called from C++ host function (llm_chat). Blocks until response arrives.
-     */
-    public static String nativeLlmChat(String body) {
-        DeviceConnection conn = DeviceConnection.getInstance();
-        if (conn == null || !conn.isConnected()) {
-            return "{\"error\":{\"message\":\"Not connected to cloud\"}}";
-        }
-        return conn.sendLlmRequest(body);
-    }
-
     public static void nativeUpdateStatus(String text) {
         Log.d(TAG, "[overlay] updateStatus: " + text);
         SelectToSpeakService service = SelectToSpeakService.getInstance();
@@ -249,9 +237,11 @@ public class HermesAgentRunner {
         else Log.w(TAG, "[overlay] service is null!");
     }
 
-    public static void nativeAskUser(String question) {
+    public static String nativeAskUser(String question) {
         SelectToSpeakService service = SelectToSpeakService.getInstance();
-        if (service != null) service.askUser(question);
+        if (service == null) return "abandoned";
+        boolean continued = service.askUser(question);
+        return continued ? "continue" : "abandoned";
     }
 
     public static void nativeHideOverlay() {

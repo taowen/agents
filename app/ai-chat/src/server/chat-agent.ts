@@ -27,12 +27,7 @@ import {
 } from "./llm-config";
 import { handleFileRequest } from "./file-api";
 import { writeChatHistory, readMemoryBlock } from "./chat-history";
-import {
-  createBashTool,
-  createTools,
-  createDeviceTools,
-  createDeviceExecTool
-} from "./tools";
+import { createBashTool, createTools, createDeviceExecTool } from "./tools";
 import { DeviceHub, isDeviceSession } from "./device-hub";
 import {
   queryUsageData,
@@ -203,11 +198,6 @@ class ChatAgentBase extends AIChatAgent {
     // Device WebSocket — custom protocol, bypasses agents framework
     if (url.pathname.endsWith("/device-connect")) {
       return this.deviceHub.handleConnect(request);
-    }
-
-    // Task dispatch endpoint — used by device_agent tool
-    if (url.pathname.endsWith("/dispatch")) {
-      return this.deviceHub.handleDispatch(request, () => this.getUserId());
     }
 
     const response = await super.fetch(request);
@@ -488,7 +478,6 @@ class ChatAgentBase extends AIChatAgent {
             cancelSchedule: (id) => this.cancelSchedule(id),
             getTimezone: () => this.getTimezone()
           }),
-          ...createDeviceTools(this.env, this.userId!),
           ...mcpTools
         } as ToolSet;
       }

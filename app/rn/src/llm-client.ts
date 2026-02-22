@@ -12,7 +12,6 @@ declare function http_post(
   headersJson: string,
   body: string
 ): string;
-declare function llm_chat(body: string): string;
 declare function sleep(ms: number): void;
 
 const MAX_RETRIES = 2;
@@ -37,11 +36,13 @@ export function callLLM(
   }
   const body = JSON.stringify(payload);
 
-  // Use llm_chat (WebSocket via DeviceConnection) when available,
-  // falling back to http_post for local/direct LLM calls
-  const useLlmChat =
-    typeof llm_chat === "function" &&
-    (!config.baseURL || config.baseURL.includes("connect-screen.com"));
+  let apiUrl = config.baseURL;
+  if (apiUrl.endsWith("/")) apiUrl = apiUrl.slice(0, -1);
+  apiUrl += "/chat/completions";
+  const headers = JSON.stringify({
+    Authorization: "Bearer " + config.apiKey,
+    "Content-Type": "application/json"
+  });
 
   let lastError = "";
 
@@ -50,19 +51,7 @@ export function callLLM(
       sleep(RETRY_DELAY_MS);
     }
 
-    let responseStr: string;
-    if (useLlmChat) {
-      responseStr = llm_chat(body);
-    } else {
-      let apiUrl = config.baseURL;
-      if (apiUrl.endsWith("/")) apiUrl = apiUrl.slice(0, -1);
-      apiUrl += "/chat/completions";
-      const headers = JSON.stringify({
-        Authorization: "Bearer " + config.apiKey,
-        "Content-Type": "application/json"
-      });
-      responseStr = http_post(apiUrl, headers, body);
-    }
+    const responseStr = http_post(apiUrl, headers, body);
 
     let data: any;
     try {

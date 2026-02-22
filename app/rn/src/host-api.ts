@@ -132,9 +132,9 @@ export const HOST_FUNCTIONS: HostFunctionDef[] = [
   {
     name: "ask_user",
     params: [{ name: "question", type: "string" }],
-    returns: "void",
+    returns: "string",
     description:
-      "show a question overlay and block until user taps Continue. Use when you encounter ambiguity or need user action (e.g. password input)",
+      'show a question overlay and block until user responds. Returns "continue" or "abandoned". Use when you encounter ambiguity or need user action (e.g. password input)',
     agentVisible: true
   },
   {

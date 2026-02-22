@@ -126,9 +126,9 @@
     {
       name: "ask_user",
       params: [{ name: "question", type: "string" }],
-      returns: "void",
+      returns: "string",
       description:
-        "show a question overlay and block until user taps Continue. Use when you encounter ambiguity or need user action (e.g. password input)",
+        'show a question overlay and block until user responds. Returns "continue" or "abandoned". Use when you encounter ambiguity or need user action (e.g. password input)',
       agentVisible: true
     },
     {
@@ -196,7 +196,10 @@
       }
     }
   ];
-  globalThis.__DEVICE_PROMPT__ = { systemPrompt: SYSTEM_PROMPT, tools: TOOLS };
+  globalThis.__DEVICE_PROMPT__ = {
+    systemPrompt: SYSTEM_PROMPT,
+    tools: TOOLS
+  };
 
   // src/llm-client.ts
   var MAX_RETRIES = 2;
@@ -210,27 +213,19 @@
       payload.tools = tools;
     }
     const body = JSON.stringify(payload);
-    const useLlmChat =
-      typeof llm_chat === "function" &&
-      (!config.baseURL || config.baseURL.includes("connect-screen.com"));
+    let apiUrl = config.baseURL;
+    if (apiUrl.endsWith("/")) apiUrl = apiUrl.slice(0, -1);
+    apiUrl += "/chat/completions";
+    const headers = JSON.stringify({
+      Authorization: "Bearer " + config.apiKey,
+      "Content-Type": "application/json"
+    });
     let lastError = "";
     for (let attempt = 0; attempt <= MAX_RETRIES; attempt++) {
       if (attempt > 0) {
         sleep(RETRY_DELAY_MS);
       }
-      let responseStr;
-      if (useLlmChat) {
-        responseStr = llm_chat(body);
-      } else {
-        let apiUrl = config.baseURL;
-        if (apiUrl.endsWith("/")) apiUrl = apiUrl.slice(0, -1);
-        apiUrl += "/chat/completions";
-        const headers = JSON.stringify({
-          Authorization: "Bearer " + config.apiKey,
-          "Content-Type": "application/json"
-        });
-        responseStr = http_post(apiUrl, headers, body);
-      }
+      const responseStr = http_post(apiUrl, headers, body);
       let data;
       try {
         data = JSON.parse(responseStr);
@@ -424,8 +419,8 @@
       agentLog("[THINK] " + thinking);
     }
     agentLog("[CODE] " + code);
-    const actionLog = [];
     let getScreenCount = 0;
+    let lastGetScreenResult = null;
     let capturedScreenshot;
     const deadline = Date.now() + EXEC_TIMEOUT_MS;
     const origGetScreen = get_screen;
@@ -442,7 +437,7 @@
         );
       }
       const tree = origGetScreen();
-      actionLog.push("[get_screen] (" + tree.length + " chars)");
+      lastGetScreenResult = tree;
       return tree;
     };
     const origTakeScreenshot = take_screenshot;
@@ -450,35 +445,20 @@
       if (Date.now() > deadline) throw new Error("Script execution timeout");
       const b64 = origTakeScreenshot();
       if (b64.startsWith("ERROR:")) {
-        actionLog.push("[take_screenshot] " + b64);
         return b64;
       }
       capturedScreenshot = b64;
-      actionLog.push(
-        "[take_screenshot] captured (" + b64.length + " chars base64)"
-      );
       return "screenshot captured - image will be sent to you";
     };
     try {
-      const result = (0, eval)(code);
-      const resultStr = result === void 0 ? "undefined" : String(result);
-      let text;
-      if (actionLog.length > 0) {
-        actionLog.push("[Script returned] " + resultStr);
-        text = actionLog.join("\n");
-      } else {
-        text = resultStr;
+      let result = (0, eval)(code);
+      if (result === void 0 && lastGetScreenResult !== null) {
+        result = lastGetScreenResult;
       }
+      const text = result === void 0 ? "undefined" : String(result);
       return { text, screenshot: capturedScreenshot };
     } catch (e) {
-      const error = "[JS Error] " + (e.message || String(e));
-      let text;
-      if (actionLog.length > 0) {
-        actionLog.push(error);
-        text = actionLog.join("\n");
-      } else {
-        text = error;
-      }
+      const text = "[JS Error] " + (e.message || String(e));
       return { text, screenshot: capturedScreenshot };
     } finally {
       globalThis.get_screen = origGetScreen;
@@ -525,12 +505,16 @@
           .map((tc) => tc.function.name)
           .join(", ");
         agentLog("[STEP " + step + "] LLM returned tool_calls: " + toolNames);
+        let intent = "\u6267\u884C\u4E2D";
+        if (response.content) {
+          const firstLine = response.content.split("\n")[0].trim();
+          intent =
+            firstLine.length > 20
+              ? firstLine.substring(0, 20) + "\u2026"
+              : firstLine;
+        }
         update_status(
-          "\u6B65\u9AA4 " +
-            step +
-            "/" +
-            MAX_STEPS +
-            ": \u6267\u884C\u4E2D\u2026"
+          "\u6B65\u9AA4 " + step + "/" + MAX_STEPS + ": " + intent + "\u2026"
         );
         for (const toolCall of response.toolCalls) {
           let resultText;

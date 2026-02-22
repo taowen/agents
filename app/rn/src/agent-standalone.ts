@@ -32,7 +32,7 @@ declare function list_apps(): string;
 declare function sleep(ms: number): void;
 declare function log(msg: string): void;
 declare function update_status(text: string): void;
-declare function ask_user(question: string): void;
+declare function ask_user(question: string): string;
 declare function hide_overlay(): void;
 
 const MAX_STEPS = 30;
@@ -61,12 +61,12 @@ function executeCode(
   }
   agentLog("[CODE] " + code);
 
-  const actionLog: string[] = [];
   let getScreenCount = 0;
+  let lastGetScreenResult: string | null = null;
   let capturedScreenshot: string | undefined;
   const deadline = Date.now() + EXEC_TIMEOUT_MS;
 
-  // Wrap host functions with logging and limits
+  // Wrap host functions with limits
   const origGetScreen = get_screen;
   (globalThis as any).get_screen = function (): string {
     if (Date.now() > deadline) throw new Error("Script execution timeout");
@@ -81,7 +81,7 @@ function executeCode(
       );
     }
     const tree = origGetScreen();
-    actionLog.push("[get_screen] (" + tree.length + " chars)");
+    lastGetScreenResult = tree;
     return tree;
   };
 
@@ -90,37 +90,22 @@ function executeCode(
     if (Date.now() > deadline) throw new Error("Script execution timeout");
     const b64 = origTakeScreenshot();
     if (b64.startsWith("ERROR:")) {
-      actionLog.push("[take_screenshot] " + b64);
       return b64;
     }
     capturedScreenshot = b64;
-    actionLog.push(
-      "[take_screenshot] captured (" + b64.length + " chars base64)"
-    );
     return "screenshot captured - image will be sent to you";
   };
 
   try {
     // Use indirect eval to run in global scope
-    const result = (0, eval)(code);
-    const resultStr = result === undefined ? "undefined" : String(result);
-    let text: string;
-    if (actionLog.length > 0) {
-      actionLog.push("[Script returned] " + resultStr);
-      text = actionLog.join("\n");
-    } else {
-      text = resultStr;
+    let result = (0, eval)(code);
+    if (result === undefined && lastGetScreenResult !== null) {
+      result = lastGetScreenResult;
     }
+    const text = result === undefined ? "undefined" : String(result);
     return { text, screenshot: capturedScreenshot };
   } catch (e: any) {
-    const error = "[JS Error] " + (e.message || String(e));
-    let text: string;
-    if (actionLog.length > 0) {
-      actionLog.push(error);
-      text = actionLog.join("\n");
-    } else {
-      text = error;
-    }
+    const text = "[JS Error] " + (e.message || String(e));
     return { text, screenshot: capturedScreenshot };
   } finally {
     // Restore originals
@@ -179,9 +164,19 @@ function runAgent(task: string, configJson: string): string {
         .map((tc: ToolCall) => tc.function.name)
         .join(", ");
       agentLog("[STEP " + step + "] LLM returned tool_calls: " + toolNames);
+
+      // Extract first line of LLM content as intent (max 20 chars)
+      let intent = "\u6267\u884c\u4e2d"; // "执行中"
+      if (response.content) {
+        const firstLine = response.content.split("\n")[0].trim();
+        intent =
+          firstLine.length > 20
+            ? firstLine.substring(0, 20) + "\u2026"
+            : firstLine;
+      }
       update_status(
-        "\u6b65\u9aa4 " + step + "/" + MAX_STEPS + ": \u6267\u884c\u4e2d\u2026"
-      ); // "步骤 N/30: 执行中…"
+        "\u6b65\u9aa4 " + step + "/" + MAX_STEPS + ": " + intent + "\u2026"
+      );
 
       for (const toolCall of response.toolCalls) {
         let resultText: string;

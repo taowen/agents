@@ -5,12 +5,6 @@ interface DeviceInfo {
   connectedAt: number;
 }
 
-interface PendingTask {
-  resolve: (value: { result: string; success: boolean }) => void;
-  reject: (reason: Error) => void;
-  timer: ReturnType<typeof setTimeout>;
-}
-
 interface PendingExec {
   resolve: (value: { result: string; screenshots: string[] }) => void;
   reject: (reason: Error) => void;
@@ -26,7 +20,6 @@ export function getDeviceName(sessionUuid: string): string {
 }
 
 export class DeviceHub {
-  private pendingTasks = new Map<string, PendingTask>();
   private pendingExecs = new Map<string, PendingExec>();
 
   constructor(private ctx: DurableObjectState) {}
@@ -89,61 +82,6 @@ export class DeviceHub {
     }
 
     return new Response(null, { status: 101, webSocket: pair[0] });
-  }
-
-  async handleDispatch(
-    request: Request,
-    getUserId: () => Promise<string>
-  ): Promise<Response> {
-    // Ensure userId is available
-    const uid = request.headers.get("x-user-id");
-    if (uid) {
-      await this.ctx.storage.put("userId", uid);
-    }
-
-    const body = (await request.json()) as {
-      task: string;
-      timeoutMs?: number;
-    };
-    const { task, timeoutMs = 5 * 60 * 1000 } = body;
-
-    const deviceWs = this.getWs();
-    if (!deviceWs) {
-      return Response.json({ error: "No device connected" }, { status: 404 });
-    }
-
-    const taskId = crypto.randomUUID();
-
-    try {
-      deviceWs.send(
-        JSON.stringify({ type: "task", taskId, description: task })
-      );
-    } catch (e) {
-      return Response.json(
-        { error: "Failed to send to device" },
-        { status: 502 }
-      );
-    }
-
-    const resultPromise = new Promise<{ result: string; success: boolean }>(
-      (resolve, reject) => {
-        const timer = setTimeout(() => {
-          this.pendingTasks.delete(taskId);
-          reject(new Error("Task timed out"));
-        }, timeoutMs);
-        this.pendingTasks.set(taskId, { resolve, reject, timer });
-      }
-    );
-
-    try {
-      const { result, success } = await resultPromise;
-      return Response.json({ taskId, result, success });
-    } catch (e) {
-      return Response.json(
-        { error: e instanceof Error ? e.message : "Unknown error" },
-        { status: 504 }
-      );
-    }
   }
 
   // --- Execute JS on device ---
@@ -244,19 +182,6 @@ export class DeviceHub {
         return;
       }
 
-      if (data.type === "result") {
-        const pending = this.pendingTasks.get(data.taskId);
-        if (pending) {
-          clearTimeout(pending.timer);
-          this.pendingTasks.delete(data.taskId);
-          pending.resolve({
-            result: data.result || "",
-            success: data.success !== false
-          });
-        }
-        return;
-      }
-
       // pong — no action needed
     } catch {
       // ignore malformed messages
@@ -266,13 +191,6 @@ export class DeviceHub {
   // --- Device WebSocket close/error ---
 
   handleClose(): void {
-    // Reject all pending tasks
-    for (const [taskId, pending] of this.pendingTasks) {
-      clearTimeout(pending.timer);
-      this.pendingTasks.delete(taskId);
-      pending.reject(new Error("Device disconnected"));
-    }
-
     // Reject all pending execs
     for (const [execId, pending] of this.pendingExecs) {
       clearTimeout(pending.timer);

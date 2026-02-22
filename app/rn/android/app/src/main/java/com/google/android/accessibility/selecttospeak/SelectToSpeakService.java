@@ -228,8 +228,9 @@ public class SelectToSpeakService extends AccessibilityService {
         if (agentOverlay != null) agentOverlay.updateStatus(text);
     }
 
-    public void askUser(String question) {
-        if (agentOverlay != null) agentOverlay.askUser(question);
+    public boolean askUser(String question) {
+        if (agentOverlay != null) return agentOverlay.askUser(question);
+        return false;
     }
 
     public void hideOverlay() {

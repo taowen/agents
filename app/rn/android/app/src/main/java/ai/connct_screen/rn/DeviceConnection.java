@@ -11,8 +11,6 @@ import com.facebook.react.modules.core.DeviceEventManagerModule;
 
 import org.json.JSONObject;
 
-import java.util.concurrent.CompletableFuture;
-import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.ExecutorService;
 import java.util.concurrent.Executors;
 import java.util.concurrent.TimeUnit;
@@ -39,7 +37,6 @@ import okhttp3.WebSocketListener;
 public class DeviceConnection {
 
     private static final String TAG = "DeviceConn";
-    private static final long LLM_TIMEOUT_SECONDS = 120;
     private static final long EXEC_TIMEOUT_SECONDS = 60;
     private static final long RECONNECT_DELAY_MS = 5000;
 
@@ -57,9 +54,6 @@ public class DeviceConnection {
 
     // Persistent Hermes runtime for exec_js — initialized on first exec_js, reused across calls
     private boolean hermesInitialized = false;
-
-    private final ConcurrentHashMap<String, CompletableFuture<String>> llmPending =
-            new ConcurrentHashMap<>();
 
     private DeviceConnection() {
         client = new OkHttpClient.Builder()
@@ -124,17 +118,6 @@ public class DeviceConnection {
                     String type = data.optString("type", "");
 
                     switch (type) {
-                        case "llm_response": {
-                            String requestId = data.getString("requestId");
-                            String body = data.getString("body");
-                            CompletableFuture<String> future = llmPending.remove(requestId);
-                            if (future != null) {
-                                future.complete(body);
-                            } else {
-                                Log.w(TAG, "No pending LLM request for id: " + requestId);
-                            }
-                            break;
-                        }
                         case "exec_js": {
                             String execId = data.getString("execId");
                             String code = data.getString("code");
@@ -176,7 +159,6 @@ public class DeviceConnection {
                 Log.i(TAG, "WebSocket closed: " + code + " " + reason);
                 connected = false;
                 emitConnectionStatus(false);
-                failAllPending("WebSocket closed");
             }
 
             @Override
@@ -184,7 +166,6 @@ public class DeviceConnection {
                 Log.e(TAG, "WebSocket failure", t);
                 connected = false;
                 emitConnectionStatus(false);
-                failAllPending("WebSocket failure: " + t.getMessage());
                 // Auto-reconnect after delay
                 if (lastUrl != null) {
                     Log.i(TAG, "Scheduling auto-reconnect in " + RECONNECT_DELAY_MS + "ms");
@@ -200,7 +181,6 @@ public class DeviceConnection {
             ws = null;
         }
         connected = false;
-        failAllPending("Disconnected");
         // Clean up Hermes runtime
         if (hermesInitialized) {
             try { HermesAgentRunner.nativeDestroyRuntime(); } catch (Exception ignored) {}
@@ -211,40 +191,6 @@ public class DeviceConnection {
 
     public boolean isConnected() {
         return connected;
-    }
-
-    /**
-     * Send an LLM request through the WebSocket and block until the response arrives.
-     * Called from the Hermes agent thread (via JNI → nativeLlmChat).
-     */
-    public String sendLlmRequest(String body) {
-        if (!connected || ws == null) {
-            return "{\"error\":{\"message\":\"Not connected to cloud\"}}";
-        }
-
-        String requestId = java.util.UUID.randomUUID().toString();
-        CompletableFuture<String> future = new CompletableFuture<>();
-        llmPending.put(requestId, future);
-
-        try {
-            JSONObject msg = new JSONObject();
-            msg.put("type", "llm_request");
-            msg.put("requestId", requestId);
-            msg.put("body", new JSONObject(body));
-            ws.send(msg.toString());
-        } catch (Exception e) {
-            llmPending.remove(requestId);
-            Log.e(TAG, "Failed to send llm_request", e);
-            return "{\"error\":{\"message\":\"Failed to send: " + e.getMessage().replace("\"", "\\\"") + "\"}}";
-        }
-
-        try {
-            return future.get(LLM_TIMEOUT_SECONDS, TimeUnit.SECONDS);
-        } catch (Exception e) {
-            llmPending.remove(requestId);
-            Log.e(TAG, "LLM request timed out or failed", e);
-            return "{\"error\":{\"message\":\"LLM request failed: " + e.getMessage().replace("\"", "\\\"") + "\"}}";
-        }
     }
 
     /**
@@ -372,35 +318,42 @@ public class DeviceConnection {
         // and captures screenshots, similar to executeCode in agent-standalone.ts
         String helperJs =
                 "function executeCodeForServer(code) {\n" +
-                "  var actionLog = [];\n" +
                 "  var capturedScreenshots = [];\n" +
+                "  var origGetScreen = get_screen;\n" +
                 "  var origTakeScreenshot = take_screenshot;\n" +
+                "  var getScreenCount = 0;\n" +
+                "  var lastGetScreenResult = null;\n" +
+                "  get_screen = function() {\n" +
+                "    getScreenCount++;\n" +
+                "    if (getScreenCount > 5) {\n" +
+                "      throw new Error('get_screen() called ' + getScreenCount + ' times. Max is 5.');\n" +
+                "    }\n" +
+                "    var tree = origGetScreen();\n" +
+                "    lastGetScreenResult = tree;\n" +
+                "    return tree;\n" +
+                "  };\n" +
                 "  take_screenshot = function() {\n" +
                 "    var b64 = origTakeScreenshot();\n" +
-                "    if (b64.startsWith('ERROR:')) {\n" +
-                "      actionLog.push('[take_screenshot] ' + b64);\n" +
-                "      return b64;\n" +
-                "    }\n" +
+                "    if (b64.startsWith('ERROR:')) return b64;\n" +
                 "    capturedScreenshots.push(b64);\n" +
-                "    actionLog.push('[take_screenshot] captured');\n" +
-                "    return 'screenshot captured';\n" +
+                "    return 'screenshot captured - image will be sent to you';\n" +
                 "  };\n" +
                 "  try {\n" +
                 "    var result = (0, eval)(code);\n" +
-                "    var resultStr = result === undefined ? 'undefined' : String(result);\n" +
-                "    if (actionLog.length > 0) {\n" +
-                "      actionLog.push('[Script returned] ' + resultStr);\n" +
-                "      resultStr = actionLog.join('\\n');\n" +
+                "    if (result === undefined && lastGetScreenResult !== null) {\n" +
+                "      result = lastGetScreenResult;\n" +
                 "    }\n" +
-                "    return { result: resultStr, screenshots: capturedScreenshots };\n" +
+                "    return {\n" +
+                "      result: result === undefined ? 'undefined' : String(result),\n" +
+                "      screenshots: capturedScreenshots\n" +
+                "    };\n" +
                 "  } catch (e) {\n" +
-                "    var error = '[JS Error] ' + (e.message || String(e));\n" +
-                "    if (actionLog.length > 0) {\n" +
-                "      actionLog.push(error);\n" +
-                "      error = actionLog.join('\\n');\n" +
-                "    }\n" +
-                "    return { result: error, screenshots: capturedScreenshots };\n" +
+                "    return {\n" +
+                "      result: '[JS Error] ' + (e.message || String(e)),\n" +
+                "      screenshots: capturedScreenshots\n" +
+                "    };\n" +
                 "  } finally {\n" +
+                "    get_screen = origGetScreen;\n" +
                 "    take_screenshot = origTakeScreenshot;\n" +
                 "  }\n" +
                 "}\n";
@@ -446,13 +399,6 @@ public class DeviceConnection {
         } catch (Exception e) {
             Log.e(TAG, "Failed to emit DeviceConnectionStatus", e);
         }
-    }
-
-    private void failAllPending(String reason) {
-        for (CompletableFuture<String> future : llmPending.values()) {
-            future.completeExceptionally(new RuntimeException(reason));
-        }
-        llmPending.clear();
     }
 
     private void emitTaskEvent(String taskId, String description) {
