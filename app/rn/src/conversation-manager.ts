@@ -4,18 +4,12 @@
  * Extracted from agent-standalone.ts.
  */
 
-import type { ChatMessage, ToolCall, LlmConfig } from "./types";
+import type { ChatMessage, ContentPart, ToolCall, LlmConfig } from "./types";
 import { callLLM } from "./llm-client";
 
 const KEEP_RECENT_TOOL_RESULTS = 3;
 const COMPACT_THRESHOLD = 100;
 const COMPACT_KEEP_RECENT = 10;
-
-interface ContentPart {
-  type: string;
-  text?: string;
-  image_url?: { url: string };
-}
 
 /**
  * Trim older tool results and remove duplicate screenshots in-place.
@@ -88,8 +82,8 @@ function buildDigest(messages: ChatMessage[]): string {
     if (role === "tool" && text.length > 200) {
       text = text.substring(0, 200) + "...(truncated)";
     }
-    if (role === "assistant" && (msg as any).tool_calls) {
-      const calls = ((msg as any).tool_calls as ToolCall[])
+    if (role === "assistant" && msg.tool_calls) {
+      const calls = msg.tool_calls
         .map(
           (tc) =>
             tc.function.name +
@@ -151,11 +145,10 @@ export function compactConversation(
       config
     );
     summary = result.content || "(empty summary)";
-  } catch (e: any) {
+  } catch (e: unknown) {
+    const msg = e instanceof Error ? e.message : String(e);
     agentLog(
-      "[COMPACT] Summarization failed: " +
-        e.message +
-        " — falling back to truncation"
+      "[COMPACT] Summarization failed: " + msg + " — falling back to truncation"
     );
     const system = messages[0];
     const recent = messages.slice(cutPoint);

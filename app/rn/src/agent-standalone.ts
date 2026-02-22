@@ -12,28 +12,36 @@ import { callLLM } from "./llm-client";
 import { trimMessages, compactConversation } from "./conversation-manager";
 
 // Declare globals provided by C++ host functions (for TypeScript only)
-declare function get_screen(): string;
-declare function take_screenshot(): string;
-declare function click(
-  target: string | { desc?: string; x?: number; y?: number }
-): boolean;
-declare function long_click(
-  target: string | { desc?: string; x?: number; y?: number }
-): boolean;
-declare function scroll(direction: string): boolean;
-declare function scroll_element(text: string, direction: string): string;
-declare function type_text(text: string): boolean;
-declare function press_home(): boolean;
-declare function press_back(): boolean;
-declare function press_recents(): boolean;
-declare function show_notifications(): boolean;
-declare function launch_app(name: string): string;
-declare function list_apps(): string;
-declare function sleep(ms: number): void;
-declare function log(msg: string): void;
-declare function update_status(text: string): void;
-declare function ask_user(question: string): string;
-declare function hide_overlay(): void;
+declare global {
+  var get_screen: () => string;
+  var take_screenshot: () => string;
+  var click: (
+    target: string | { desc?: string; x?: number; y?: number }
+  ) => boolean;
+  var long_click: (
+    target: string | { desc?: string; x?: number; y?: number }
+  ) => boolean;
+  var scroll: (direction: string) => boolean;
+  var scroll_element: (text: string, direction: string) => string;
+  var type_text: (text: string) => boolean;
+  var press_home: () => boolean;
+  var press_back: () => boolean;
+  var press_recents: () => boolean;
+  var show_notifications: () => boolean;
+  var launch_app: (name: string) => string;
+  var list_apps: () => string;
+  var sleep: (ms: number) => void;
+  var log: (msg: string) => void;
+  var update_status: (text: string) => void;
+  var ask_user: (question: string) => string;
+  var hide_overlay: () => void;
+  var runAgent: (task: string, configJson: string) => string;
+  var executeCodeForServer: (code: string) => {
+    result: string;
+    screenshots?: string[];
+  };
+  var __DEVICE_PROMPT__: { systemPrompt: string; tools: unknown[] };
+}
 
 const MAX_STEPS = 30;
 const MAX_GET_SCREEN_PER_EXEC = 5;
@@ -52,6 +60,144 @@ function agentLog(msg: string): void {
   log(line);
 }
 
+/**
+ * Save and wrap all host functions with update_status + safety limits.
+ * Returns a cleanup function that restores originals.
+ */
+function wrapHostFunctions(opts: {
+  deadline: number;
+  maxGetScreen: number;
+  onGetScreen?: (tree: string) => void;
+  onScreenshot: (b64: string) => void;
+}): { getScreenCount: () => number; restore: () => void } {
+  let getScreenCount = 0;
+
+  const origGetScreen = get_screen;
+  const origTakeScreenshot = take_screenshot;
+  const origClick = click;
+  const origLongClick = long_click;
+  const origTypeText = type_text;
+  const origLaunchApp = launch_app;
+  const origScroll = scroll;
+  const origScrollElement = scroll_element;
+  const origPressHome = press_home;
+  const origPressBack = press_back;
+  const origPressRecents = press_recents;
+  const origShowNotifications = show_notifications;
+
+  globalThis.get_screen = function (): string {
+    if (Date.now() > opts.deadline) throw new Error("Script execution timeout");
+    getScreenCount++;
+    if (getScreenCount > opts.maxGetScreen) {
+      throw new Error(
+        "get_screen() called " +
+          getScreenCount +
+          " times. Max is " +
+          opts.maxGetScreen +
+          ". Return and plan next actions in a new execute_js call."
+      );
+    }
+    update_status("read screen");
+    const tree = origGetScreen();
+    if (opts.onGetScreen) opts.onGetScreen(tree);
+    return tree;
+  };
+
+  globalThis.take_screenshot = function (): string {
+    if (Date.now() > opts.deadline) throw new Error("Script execution timeout");
+    update_status("take screenshot");
+    const b64 = origTakeScreenshot();
+    if (b64.startsWith("ERROR:")) {
+      return b64;
+    }
+    opts.onScreenshot(b64);
+    return "screenshot captured - image will be sent to you";
+  };
+
+  globalThis.click = function (
+    target: string | { desc?: string; x?: number; y?: number }
+  ): boolean {
+    const desc =
+      typeof target === "string"
+        ? target
+        : target.desc || "(" + target.x + "," + target.y + ")";
+    update_status("click " + desc);
+    return origClick(target);
+  };
+
+  globalThis.long_click = function (
+    target: string | { desc?: string; x?: number; y?: number }
+  ): boolean {
+    const desc =
+      typeof target === "string"
+        ? target
+        : target.desc || "(" + target.x + "," + target.y + ")";
+    update_status("long click " + desc);
+    return origLongClick(target);
+  };
+
+  globalThis.type_text = function (text: string): boolean {
+    update_status("type " + text.substring(0, 15));
+    return origTypeText(text);
+  };
+
+  globalThis.launch_app = function (name: string): string {
+    update_status("launch " + name);
+    return origLaunchApp(name);
+  };
+
+  globalThis.scroll = function (direction: string): boolean {
+    update_status("scroll " + direction);
+    return origScroll(direction);
+  };
+
+  globalThis.scroll_element = function (
+    text: string,
+    direction: string
+  ): string {
+    update_status("scroll " + text + " " + direction);
+    return origScrollElement(text, direction);
+  };
+
+  globalThis.press_home = function (): boolean {
+    update_status("press home");
+    return origPressHome();
+  };
+
+  globalThis.press_back = function (): boolean {
+    update_status("press back");
+    return origPressBack();
+  };
+
+  globalThis.press_recents = function (): boolean {
+    update_status("press recents");
+    return origPressRecents();
+  };
+
+  globalThis.show_notifications = function (): boolean {
+    update_status("show notifications");
+    return origShowNotifications();
+  };
+
+  return {
+    getScreenCount: () => getScreenCount,
+    restore() {
+      globalThis.get_screen = origGetScreen;
+      globalThis.take_screenshot = origTakeScreenshot;
+      globalThis.click = origClick;
+      globalThis.long_click = origLongClick;
+      globalThis.type_text = origTypeText;
+      globalThis.launch_app = origLaunchApp;
+      globalThis.scroll = origScroll;
+      globalThis.scroll_element = origScrollElement;
+      globalThis.press_home = origPressHome;
+      globalThis.press_back = origPressBack;
+      globalThis.press_recents = origPressRecents;
+      globalThis.show_notifications = origShowNotifications;
+    }
+  };
+}
+
 function executeCode(
   code: string,
   thinking?: string
@@ -61,58 +207,79 @@ function executeCode(
   }
   agentLog("[CODE] " + code);
 
-  let getScreenCount = 0;
   let lastGetScreenResult: string | null = null;
   let capturedScreenshot: string | undefined;
-  const deadline = Date.now() + EXEC_TIMEOUT_MS;
 
-  // Wrap host functions with limits
-  const origGetScreen = get_screen;
-  (globalThis as any).get_screen = function (): string {
-    if (Date.now() > deadline) throw new Error("Script execution timeout");
-    getScreenCount++;
-    if (getScreenCount > MAX_GET_SCREEN_PER_EXEC) {
-      throw new Error(
-        "get_screen() called " +
-          getScreenCount +
-          " times. Max is " +
-          MAX_GET_SCREEN_PER_EXEC +
-          ". Return and plan next actions in a new execute_js call."
-      );
+  const wrapped = wrapHostFunctions({
+    deadline: Date.now() + EXEC_TIMEOUT_MS,
+    maxGetScreen: MAX_GET_SCREEN_PER_EXEC,
+    onGetScreen(tree) {
+      lastGetScreenResult = tree;
+    },
+    onScreenshot(b64) {
+      capturedScreenshot = b64;
     }
-    const tree = origGetScreen();
-    lastGetScreenResult = tree;
-    return tree;
-  };
-
-  const origTakeScreenshot = take_screenshot;
-  (globalThis as any).take_screenshot = function (): string {
-    if (Date.now() > deadline) throw new Error("Script execution timeout");
-    const b64 = origTakeScreenshot();
-    if (b64.startsWith("ERROR:")) {
-      return b64;
-    }
-    capturedScreenshot = b64;
-    return "screenshot captured - image will be sent to you";
-  };
+  });
 
   try {
-    // Use indirect eval to run in global scope
     let result = (0, eval)(code);
     if (result === undefined && lastGetScreenResult !== null) {
       result = lastGetScreenResult;
     }
     const text = result === undefined ? "undefined" : String(result);
     return { text, screenshot: capturedScreenshot };
-  } catch (e: any) {
-    const text = "[JS Error] " + (e.message || String(e));
+  } catch (e: unknown) {
+    const msg = e instanceof Error ? e.message : String(e);
+    const text = "[JS Error] " + msg;
     return { text, screenshot: capturedScreenshot };
   } finally {
-    // Restore originals
-    (globalThis as any).get_screen = origGetScreen;
-    (globalThis as any).take_screenshot = origTakeScreenshot;
+    wrapped.restore();
   }
 }
+
+/**
+ * executeCodeForServer — called from DeviceConnection.java for cloud exec_js.
+ * Same host function wrapping (with update_status) but returns { result, screenshots[] }.
+ */
+function executeCodeForServer(code: string): {
+  result: string;
+  screenshots: string[];
+} {
+  const capturedScreenshots: string[] = [];
+  let lastGetScreenResult: string | null = null;
+
+  const wrapped = wrapHostFunctions({
+    deadline: Date.now() + EXEC_TIMEOUT_MS,
+    maxGetScreen: MAX_GET_SCREEN_PER_EXEC,
+    onGetScreen(tree) {
+      lastGetScreenResult = tree;
+    },
+    onScreenshot(b64) {
+      capturedScreenshots.push(b64);
+    }
+  });
+
+  try {
+    let result = (0, eval)(code);
+    if (result === undefined && lastGetScreenResult !== null) {
+      result = lastGetScreenResult;
+    }
+    return {
+      result: result === undefined ? "undefined" : String(result),
+      screenshots: capturedScreenshots
+    };
+  } catch (e: unknown) {
+    const msg = e instanceof Error ? e.message : String(e);
+    return {
+      result: "[JS Error] " + msg,
+      screenshots: capturedScreenshots
+    };
+  } finally {
+    wrapped.restore();
+  }
+}
+
+globalThis.executeCodeForServer = executeCodeForServer;
 
 // Global conversation buffer — persists across runAgent calls
 let conversationMessages: ChatMessage[] | null = null;
@@ -122,7 +289,7 @@ function runAgent(task: string, configJson: string): string {
   const config: LlmConfig = JSON.parse(configJson);
 
   agentLog("[TASK] Received task: " + task);
-  update_status("\u4efb\u52a1\u5f00\u59cb"); // "任务开始"
+  update_status("task started");
 
   if (!conversationMessages) {
     conversationMessages = [{ role: "system", content: SYSTEM_PROMPT }];
@@ -133,23 +300,18 @@ function runAgent(task: string, configJson: string): string {
   const messages = conversationMessages;
 
   for (let step = 1; step <= MAX_STEPS; step++) {
-    update_status(
-      "\u6b65\u9aa4 " +
-        step +
-        "/" +
-        MAX_STEPS +
-        ": \u6b63\u5728\u601d\u8003\u2026"
-    ); // "步骤 N/30: 正在思考…"
+    update_status("step " + step + "/" + MAX_STEPS + ": thinking…");
     agentLog("[STEP " + step + "] Calling LLM...");
     trimMessages(messages);
 
     let response: { content: string | null; toolCalls: ToolCall[] | null };
     try {
       response = callLLM(messages, TOOLS, config);
-    } catch (e: any) {
-      update_status("\u9519\u8bef: " + e.message); // "错误: ..."
-      agentLog("[ERROR] LLM call failed: " + e.message);
-      return "Error: " + e.message;
+    } catch (e: unknown) {
+      const msg = e instanceof Error ? e.message : String(e);
+      update_status("error: " + msg);
+      agentLog("[ERROR] LLM call failed: " + msg);
+      return "Error: " + msg;
     }
 
     if (response.toolCalls) {
@@ -165,18 +327,7 @@ function runAgent(task: string, configJson: string): string {
         .join(", ");
       agentLog("[STEP " + step + "] LLM returned tool_calls: " + toolNames);
 
-      // Extract first line of LLM content as intent (max 20 chars)
-      let intent = "\u6267\u884c\u4e2d"; // "执行中"
-      if (response.content) {
-        const firstLine = response.content.split("\n")[0].trim();
-        intent =
-          firstLine.length > 20
-            ? firstLine.substring(0, 20) + "\u2026"
-            : firstLine;
-      }
-      update_status(
-        "\u6b65\u9aa4 " + step + "/" + MAX_STEPS + ": " + intent + "\u2026"
-      );
+      update_status("step " + step + "/" + MAX_STEPS + ": executing…");
 
       for (const toolCall of response.toolCalls) {
         let resultText: string;
@@ -218,7 +369,7 @@ function runAgent(task: string, configJson: string): string {
                 image_url: { url: "data:image/jpeg;base64," + screenshot }
               }
             ]
-          } as any);
+          });
         }
       }
     } else {
@@ -228,7 +379,7 @@ function runAgent(task: string, configJson: string): string {
     }
   }
 
-  update_status("\u5df2\u8fbe\u5230\u6700\u5927\u6b65\u6570\u9650\u5236"); // "已达到最大步数限制"
+  update_status("max steps reached");
   agentLog(
     "[ERROR] Reached max steps (" + MAX_STEPS + ") without completing task"
   );
@@ -236,4 +387,4 @@ function runAgent(task: string, configJson: string): string {
 }
 
 // Expose runAgent on globalThis so it can be called from Java
-(globalThis as any).runAgent = runAgent;
+globalThis.runAgent = runAgent;

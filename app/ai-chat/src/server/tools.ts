@@ -70,17 +70,23 @@ export function createDeviceExecTool(
   };
 }
 
+export interface SchedulePayload {
+  description: string;
+  prompt: string;
+  timezone?: string;
+}
+
 export interface CreateToolsDeps {
   bashTool: ReturnType<typeof createBashTool>;
   schedule: (
     when: Date | number | string,
-    method: any,
-    payload: any
+    method: string,
+    payload: SchedulePayload
   ) => Promise<{ id: string; time: number }>;
   getSchedules: () => Array<{
     id: string;
     type: string;
-    payload: any;
+    payload: string | SchedulePayload;
     time: number;
     cron?: string;
   }>;
@@ -129,7 +135,7 @@ export function createTools(deps: CreateToolsDeps): ToolSet {
           return { error: "Provide either delaySeconds or scheduledAt" };
         }
         const tz = await deps.getTimezone();
-        const s = await deps.schedule(when, "executeScheduledTask" as any, {
+        const s = await deps.schedule(when, "executeScheduledTask", {
           description,
           prompt,
           timezone: tz
@@ -163,7 +169,7 @@ export function createTools(deps: CreateToolsDeps): ToolSet {
       }),
       execute: async ({ description, prompt, cron }) => {
         const tz = await deps.getTimezone();
-        const s = await deps.schedule(cron, "executeScheduledTask" as any, {
+        const s = await deps.schedule(cron, "executeScheduledTask", {
           description,
           prompt,
           timezone: tz
@@ -203,7 +209,7 @@ export function createTools(deps: CreateToolsDeps): ToolSet {
               type: s.type,
               description,
               nextRun: new Date(s.time * 1000).toISOString(),
-              ...(s.type === "cron" ? { cron: (s as any).cron } : {})
+              ...(s.type === "cron" ? { cron: s.cron } : {})
             };
           });
         }

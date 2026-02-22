@@ -132,38 +132,3 @@ export async function archiveSessionUsage(
       );
   }
 }
-
-/**
- * Write usage for a single LLM proxy request (device → upstream) to D1.
- */
-export function archiveLlmRequestUsage(
-  db: D1Database,
-  userId: string,
-  sessionId: string | null,
-  apiKeyType: string,
-  usage: Record<string, number>
-): void {
-  const proxyHour = new Date().toISOString().slice(0, 13);
-  db.prepare(
-    `INSERT INTO usage_archive (user_id, session_id, hour, api_key_type, request_count, input_tokens, cache_read_tokens, cache_write_tokens, output_tokens)
-     VALUES (?, ?, ?, ?, 1, ?, ?, 0, ?)
-     ON CONFLICT(user_id, session_id, hour, api_key_type) DO UPDATE SET
-       request_count = request_count + 1,
-       input_tokens = input_tokens + excluded.input_tokens,
-       cache_read_tokens = cache_read_tokens + excluded.cache_read_tokens,
-       output_tokens = output_tokens + excluded.output_tokens`
-  )
-    .bind(
-      userId,
-      sessionId,
-      proxyHour,
-      apiKeyType,
-      usage.prompt_tokens || 0,
-      (usage as any).prompt_tokens_details?.cached_tokens || 0,
-      usage.completion_tokens || 0
-    )
-    .run()
-    .catch((e: unknown) =>
-      console.error("LLM request usage_archive write failed:", e)
-    );
-}

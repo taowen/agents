@@ -15,7 +15,6 @@ import AccessibilityBridge from "./NativeAccessibilityBridge";
 import type { LlmConfig } from "./types";
 
 const STORAGE_KEY = "llm_config";
-const LOG_POLL_INTERVAL = 1000;
 const SERVER_URL = "https://ai.connect-screen.com";
 const DEVICE_POLL_INTERVAL = 2000;
 
@@ -38,7 +37,6 @@ function App(): React.JSX.Element {
   const [cloudConnected, setCloudConnected] = useState(false);
 
   const scrollRef = useRef<ScrollView>(null);
-  const logPollRef = useRef<ReturnType<typeof setInterval> | null>(null);
   const devicePollRef = useRef<ReturnType<typeof setInterval> | null>(null);
   const isRunningRef = useRef(false);
 
@@ -106,16 +104,14 @@ function App(): React.JSX.Element {
           true
         );
         setLogs((prev) => [...prev, `[${formatTime()}] [CLOUD] Done`]);
-      } catch (e: any) {
+      } catch (e: unknown) {
+        const msg = e instanceof Error ? e.message : String(e);
         AccessibilityBridge.sendTaskResult(
           data.taskId,
-          e.message || "Task failed",
+          msg || "Task failed",
           false
         );
-        setLogs((prev) => [
-          ...prev,
-          `[${formatTime()}] [CLOUD] Error: ${e.message}`
-        ]);
+        setLogs((prev) => [...prev, `[${formatTime()}] [CLOUD] Error: ${msg}`]);
       } finally {
         setIsRunning(false);
         isRunningRef.current = false;
@@ -219,29 +215,17 @@ function App(): React.JSX.Element {
     setIsRunning(true);
     isRunningRef.current = true;
 
-    // Start polling the log file for updates (agent writes to it from native)
-    const knownLines = new Set<string>();
-    logPollRef.current = setInterval(async () => {
-      try {
-        // Read the log file via fetch from the app's files dir
-        // We use appendLogLine/clearLogFile, so we read via a simple polling approach
-      } catch {}
-    }, LOG_POLL_INTERVAL);
-
     try {
       const configJson = JSON.stringify(config);
       addLog(`[${formatTime()}] [TASK] Starting: ${trimmed}`);
       await AccessibilityBridge.runAgentTask(trimmed, configJson);
       addLog(`[${formatTime()}] [DONE] Agent finished`);
-    } catch (e: any) {
-      addLog(`[${formatTime()}] [ERROR] ${e.message}`);
+    } catch (e: unknown) {
+      const msg = e instanceof Error ? e.message : String(e);
+      addLog(`[${formatTime()}] [ERROR] ${msg}`);
     } finally {
       setIsRunning(false);
       isRunningRef.current = false;
-      if (logPollRef.current) {
-        clearInterval(logPollRef.current);
-        logPollRef.current = null;
-      }
     }
   }, [task, config, configLoaded, isRunning, addLog]);
 

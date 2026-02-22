@@ -24,10 +24,10 @@ import {
 } from "./usage-aggregator";
 import {
   resolveLlmConfig,
-  checkProxyQuota,
   callUpstreamLlm,
   archiveProxyUsage
 } from "./llm-proxy";
+import { checkQuota } from "./usage-tracker";
 
 type ApiEnv = { Bindings: Env; Variables: { userId: string } };
 
@@ -331,7 +331,7 @@ api.post("/proxy/v1/chat/completions", async (c) => {
 
   // Quota check only for builtin key
   if (config.apiKeyType === "builtin") {
-    const { exceeded } = await checkProxyQuota(c.env.DB, userId);
+    const { exceeded } = await checkQuota(c.env.DB, userId, null);
     if (exceeded) {
       return c.json(
         {

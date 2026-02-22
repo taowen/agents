@@ -42,8 +42,8 @@ export function DevicePage() {
         throw new Error(data.error || `HTTP ${res.status}`);
       }
       setStep("done");
-    } catch (e: any) {
-      setError(e.message || "Approval failed");
+    } catch (e: unknown) {
+      setError(e instanceof Error ? e.message : String(e));
       setStep("error");
     }
   }

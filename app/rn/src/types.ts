@@ -4,9 +4,15 @@ export interface LlmConfig {
   model: string;
 }
 
+export interface ContentPart {
+  type: string;
+  text?: string;
+  image_url?: { url: string };
+}
+
 export interface ChatMessage {
   role: "system" | "user" | "assistant" | "tool";
-  content: string | null;
+  content: string | ContentPart[] | null;
   tool_calls?: ToolCall[];
   tool_call_id?: string;
 }

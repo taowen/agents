@@ -42,7 +42,7 @@ function formatSize(bytes: number): string {
   return `${(bytes / (1024 * 1024)).toFixed(1)} MB`;
 }
 
-const fileFetcher = async <T = any>(url: string): Promise<T> => {
+const fileFetcher = async <T = unknown>(url: string): Promise<T> => {
   const res = await fetch(url);
   if (!res.ok) {
     const data = (await res.json()) as { error?: string };

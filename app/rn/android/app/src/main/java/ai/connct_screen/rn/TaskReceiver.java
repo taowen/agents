@@ -59,6 +59,6 @@ public class TaskReceiver extends BroadcastReceiver {
     }
 
     private static String escapeJson(String s) {
-        return s.replace("\\", "\\\\").replace("\"", "\\\"");
+        return JsStringUtils.escapeForJS(s);
     }
 }

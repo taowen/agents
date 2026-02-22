@@ -320,7 +320,7 @@ public class HermesAgentRunner {
             }
             // Show completion status and auto-hide after 3 seconds
             try {
-                nativeUpdateStatus("\u4efb\u52a1\u5b8c\u6210"); // "任务完成"
+                nativeUpdateStatus("task completed");
                 Thread.sleep(3000);
                 nativeHideOverlay();
             } catch (Exception e) {
@@ -329,7 +329,7 @@ public class HermesAgentRunner {
         }
     }
 
-    private static String loadAsset(Context context, String filename) {
+    public static String loadAsset(Context context, String filename) {
         try {
             InputStream is = context.getAssets().open(filename);
             BufferedReader reader = new BufferedReader(new InputStreamReader(is, "UTF-8"));
@@ -348,10 +348,6 @@ public class HermesAgentRunner {
     }
 
     private static String escapeForJS(String s) {
-        return s.replace("\\", "\\\\")
-                .replace("\"", "\\\"")
-                .replace("\n", "\\n")
-                .replace("\r", "\\r")
-                .replace("\t", "\\t");
+        return JsStringUtils.escapeForJS(s);
     }
 }

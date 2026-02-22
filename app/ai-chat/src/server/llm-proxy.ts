@@ -49,20 +49,6 @@ export async function resolveLlmConfig(
   };
 }
 
-/**
- * Check if a user's builtin quota is exceeded. Returns error response or null.
- */
-export async function checkProxyQuota(
-  db: D1Database,
-  userId: string
-): Promise<{ exceeded: boolean }> {
-  const quotaRow = await db
-    .prepare(`SELECT builtin_quota_exceeded_at FROM users WHERE id = ?`)
-    .bind(userId)
-    .first<{ builtin_quota_exceeded_at: string | null }>();
-  return { exceeded: !!quotaRow?.builtin_quota_exceeded_at };
-}
-
 type UpstreamResponseBody = {
   choices?: { message?: { content?: string; tool_calls?: unknown } }[];
   usage?: {

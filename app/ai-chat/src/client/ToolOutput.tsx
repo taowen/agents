@@ -117,7 +117,8 @@ function ToolApproval({
   }) => void;
 }) {
   const toolName = getToolName(part);
-  const approvalId = ((part as any).approval as { id?: string })?.id;
+  const approvalId =
+    "approval" in part ? (part.approval as { id?: string })?.id : undefined;
 
   return (
     <div className="flex justify-start">

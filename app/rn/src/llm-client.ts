@@ -14,6 +14,13 @@ declare function http_post(
 ): string;
 declare function sleep(ms: number): void;
 
+interface LlmApiResponse {
+  error?: { message?: string; status?: number; code?: number };
+  choices?: Array<{
+    message: { content: string | null; tool_calls?: ToolCall[] };
+  }>;
+}
+
 const MAX_RETRIES = 2;
 const RETRY_DELAY_MS = 2000;
 
@@ -53,9 +60,9 @@ export function callLLM(
 
     const responseStr = http_post(apiUrl, headers, body);
 
-    let data: any;
+    let data: LlmApiResponse;
     try {
-      data = JSON.parse(responseStr);
+      data = JSON.parse(responseStr) as LlmApiResponse;
     } catch {
       lastError =
         "Failed to parse LLM response: " + responseStr.substring(0, 200);

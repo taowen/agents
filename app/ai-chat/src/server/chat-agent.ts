@@ -38,6 +38,10 @@ import {
 } from "./usage-tracker";
 import { runScheduledTask } from "./scheduled-tasks";
 
+interface DeviceTool {
+  function?: { name?: string; description?: string };
+}
+
 /**
  * AI Chat Agent with sandboxed bash tool via just-bash.
  * Filesystem is backed by D1, scoped to the authenticated user.
@@ -68,6 +72,7 @@ class ChatAgentBase extends AIChatAgent {
     super(ctx, env);
     this.deviceHub = new DeviceHub(ctx);
     const parentAlarm = this.alarm.bind(this);
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any -- framework workaround: alarm() not exposed on AIChatAgent type
     (this as any).alarm = async () => {
       await this.deviceHub.sendHeartbeats();
       await parentAlarm();
@@ -311,6 +316,86 @@ class ChatAgentBase extends AIChatAgent {
     );
   }
 
+  /**
+   * Resolve LLM config and enforce quota for builtin key users.
+   * Shared by onChatMessage and handleDeviceChatMessage.
+   */
+  private async resolveQuotaAndModel(): Promise<{
+    llmModel: ReturnType<typeof getLlmModel>;
+    apiKeyType: "builtin" | "custom";
+    isBuiltinKey: boolean;
+  }> {
+    const { data: llmConfig, cache } = await getCachedLlmConfig(
+      this.mountableFs,
+      this.cachedLlmConfig
+    );
+    this.cachedLlmConfig = cache;
+    const isBuiltinKey = llmConfig === null;
+
+    if (isBuiltinKey) {
+      this.quotaCheckCache = await checkQuota(
+        this.env.DB,
+        this.userId!,
+        this.quotaCheckCache
+      );
+      if (this.quotaCheckCache.exceeded) {
+        throw new Error(
+          "You have exceeded the builtin API key usage quota. " +
+            "Please configure your own API key in Settings to continue using the service."
+        );
+      }
+    }
+
+    const llmModel = getLlmModel(this.env, llmConfig);
+    return {
+      llmModel,
+      apiKeyType: isBuiltinKey ? "builtin" : "custom",
+      isBuiltinKey
+    };
+  }
+
+  /**
+   * Create the onFinish callback for archiving session usage.
+   */
+  private createOnFinish(): () => Promise<void> {
+    const { DB } = this.env;
+    const sql = this.ctx.storage.sql;
+    const userId = this.userId!;
+    const sessionId = this.sessionUuid;
+    return async () => {
+      try {
+        await archiveSessionUsage(DB, sql, userId, sessionId);
+      } catch (e) {
+        console.error("onFinish usage_archive write failed:", e);
+      }
+    };
+  }
+
+  /**
+   * Wrap a streamText result into a UI message stream response with usage metadata.
+   */
+  private toStreamResponse(
+    result: ReturnType<typeof streamText>,
+    apiKeyType: string
+  ): Response {
+    return result.toUIMessageStreamResponse({
+      messageMetadata: ({ part }) => {
+        if (part.type === "finish") {
+          return {
+            usage: {
+              inputTokens: part.totalUsage.inputTokens,
+              outputTokens: part.totalUsage.outputTokens,
+              cacheReadTokens:
+                part.totalUsage.inputTokenDetails?.cacheReadTokens
+            },
+            apiKeyType
+          };
+        }
+        return undefined;
+      }
+    });
+  }
+
   async onChatMessage(
     _onFinish?: unknown,
     options?: { body?: Record<string, unknown> }
@@ -388,26 +473,8 @@ class ChatAgentBase extends AIChatAgent {
         }
       }
 
-      // Determine if this session uses the builtin key (no /etc/llm.json)
-      const { data: llmConfigForKeyCheck, cache: keyCheckCache } =
-        await getCachedLlmConfig(this.mountableFs, this.cachedLlmConfig);
-      this.cachedLlmConfig = keyCheckCache;
-      const isBuiltinKey = llmConfigForKeyCheck === null;
-
-      // Quota gate: if builtin key and user is over quota, reject
-      if (isBuiltinKey) {
-        this.quotaCheckCache = await checkQuota(
-          this.env.DB,
-          this.userId!,
-          this.quotaCheckCache
-        );
-        if (this.quotaCheckCache.exceeded) {
-          throw new Error(
-            "You have exceeded the builtin API key usage quota. " +
-              "Please configure your own API key in Settings to continue using the service."
-          );
-        }
-      }
+      // Quota gate + LLM config resolution
+      const { apiKeyType, isBuiltinKey } = await this.resolveQuotaAndModel();
 
       // Compute system prompt, dynamic context, LLM model, and tools once per session.
       // Invalidate when this is the first message or after clear history (messages.length <= 1).
@@ -473,7 +540,7 @@ class ChatAgentBase extends AIChatAgent {
           ...createTools({
             bashTool: createBashTool(this.bash, () => this.ensureMounted()),
             schedule: (when, method, payload) =>
-              this.schedule(when, method, payload),
+              this.schedule(when, method as keyof typeof this, payload),
             getSchedules: () => this.getSchedules(),
             cancelSchedule: (id) => this.cancelSchedule(id),
             getTimezone: () => this.getTimezone()
@@ -494,43 +561,16 @@ class ChatAgentBase extends AIChatAgent {
 
       messages.unshift({ role: "system", content: this.cachedDynamicContext! });
 
-      const apiKeyType = isBuiltinKey ? "builtin" : "custom";
-      const sessionId = this.sessionUuid;
-      const userId = this.userId!;
-      const env = this.env;
-      const doStorage = this.ctx.storage;
-
       const result = streamText({
         model: this.cachedLlmModel!,
         system: this.cachedSystemPrompt!,
         messages,
         tools: this.cachedTools!,
         stopWhen: stepCountIs(10),
-        onFinish: async () => {
-          try {
-            await archiveSessionUsage(env.DB, doStorage.sql, userId, sessionId);
-          } catch (e) {
-            console.error("onFinish usage_archive write failed:", e);
-          }
-        }
+        onFinish: this.createOnFinish()
       });
 
-      return result.toUIMessageStreamResponse({
-        messageMetadata: ({ part }) => {
-          if (part.type === "finish") {
-            return {
-              usage: {
-                inputTokens: part.totalUsage.inputTokens,
-                outputTokens: part.totalUsage.outputTokens,
-                cacheReadTokens:
-                  part.totalUsage.inputTokenDetails?.cacheReadTokens
-              },
-              apiKeyType
-            };
-          }
-          return undefined;
-        }
-      });
+      return this.toStreamResponse(result, apiKeyType);
     });
   }
 
@@ -540,35 +580,13 @@ class ChatAgentBase extends AIChatAgent {
     // userId and bash are guaranteed by onChatMessage caller
     await this.ensureMounted();
 
-    // Resolve LLM model
-    const { data: llmConfig, cache } = await getCachedLlmConfig(
-      this.mountableFs,
-      this.cachedLlmConfig
-    );
-    this.cachedLlmConfig = cache;
-    const isBuiltinKey = llmConfig === null;
-
-    if (isBuiltinKey) {
-      this.quotaCheckCache = await checkQuota(
-        this.env.DB,
-        this.userId!,
-        this.quotaCheckCache
-      );
-      if (this.quotaCheckCache.exceeded) {
-        throw new Error(
-          "You have exceeded the builtin API key usage quota. " +
-            "Please configure your own API key in Settings to continue using the service."
-        );
-      }
-    }
-
-    const llmModel = getLlmModel(this.env, llmConfig);
+    const { llmModel, apiKeyType } = await this.resolveQuotaAndModel();
 
     // Read device-reported system prompt and tool description from storage
     const deviceSystemPrompt =
       (await this.ctx.storage.get<string>("deviceSystemPrompt")) ||
       "You are a mobile automation assistant.";
-    const deviceTools = await this.ctx.storage.get<any[]>("deviceTools");
+    const deviceTools = await this.ctx.storage.get<DeviceTool[]>("deviceTools");
 
     // Build tool description from device-reported tools (for execute_js description)
     let toolDesc: string | undefined;
@@ -587,43 +605,16 @@ class ChatAgentBase extends AIChatAgent {
       reasoning: "before-last-message"
     });
 
-    const apiKeyType = isBuiltinKey ? "builtin" : "custom";
-    const sessionId = this.sessionUuid;
-    const userId = this.userId!;
-    const env = this.env;
-    const doStorage = this.ctx.storage;
-
     const result = streamText({
       model: llmModel,
       system: deviceSystemPrompt,
       messages,
       tools,
       stopWhen: stepCountIs(30),
-      onFinish: async () => {
-        try {
-          await archiveSessionUsage(env.DB, doStorage.sql, userId, sessionId);
-        } catch (e) {
-          console.error("onFinish usage_archive write failed:", e);
-        }
-      }
+      onFinish: this.createOnFinish()
     });
 
-    return result.toUIMessageStreamResponse({
-      messageMetadata: ({ part }) => {
-        if (part.type === "finish") {
-          return {
-            usage: {
-              inputTokens: part.totalUsage.inputTokens,
-              outputTokens: part.totalUsage.outputTokens,
-              cacheReadTokens:
-                part.totalUsage.inputTokenDetails?.cacheReadTokens
-            },
-            apiKeyType
-          };
-        }
-        return undefined;
-      }
-    });
+    return this.toStreamResponse(result, apiKeyType);
   }
 
   // ---- Device WebSocket handling (Hibernatable API) ----

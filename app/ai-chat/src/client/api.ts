@@ -9,7 +9,7 @@ export interface UserInfo {
   picture: string | null;
 }
 
-const fetcher = async <T = any>(url: string): Promise<T> => {
+const fetcher = async <T = unknown>(url: string): Promise<T> => {
   const res = await fetch(url);
   return res.json() as Promise<T>;
 };

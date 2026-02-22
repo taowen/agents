@@ -29,6 +29,15 @@ import {
   MIME_TYPES,
   getExtension
 } from "../shared/file-utils";
+interface ChatMessageMetadata {
+  usage?: {
+    inputTokens?: number;
+    outputTokens?: number;
+    cacheReadTokens?: number;
+  };
+  apiKeyType?: string;
+}
+
 const AT_REF_REGEX = /@(\/[\w./-]+\.\w+)/g;
 
 async function fetchImageAsFileUIPart(
@@ -338,9 +347,10 @@ function ChatInner({
                 )}
 
                 {!isUser &&
-                  (message as any).metadata?.usage &&
+                  (message as UIMessage<ChatMessageMetadata>).metadata?.usage &&
                   (() => {
-                    const u = (message as any).metadata.usage;
+                    const u = (message as UIMessage<ChatMessageMetadata>)
+                      .metadata!.usage!;
                     const cached = u.cacheReadTokens || 0;
                     const uncached = (u.inputTokens || 0) - cached;
                     const output = u.outputTokens || 0;

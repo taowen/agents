@@ -284,20 +284,11 @@ public class DeviceConnection {
         com.google.android.accessibility.selecttospeak.SelectToSpeakService service =
                 com.google.android.accessibility.selecttospeak.SelectToSpeakService.getInstance();
         if (service != null) {
-            try {
-                java.io.InputStream is = service.getAssets().open("agent-standalone.js");
-                java.io.BufferedReader reader = new java.io.BufferedReader(
-                        new java.io.InputStreamReader(is, "UTF-8"));
-                StringBuilder sb = new StringBuilder();
-                char[] buffer = new char[8192];
-                int read;
-                while ((read = reader.read(buffer)) != -1) {
-                    sb.append(buffer, 0, read);
-                }
-                reader.close();
-                HermesAgentRunner.nativeEvaluateJS(sb.toString(), "agent-standalone.js");
-            } catch (Exception e) {
-                Log.e(TAG, "Failed to load agent-standalone.js", e);
+            String agentJs = HermesAgentRunner.loadAsset(service, "agent-standalone.js");
+            if (agentJs != null) {
+                HermesAgentRunner.nativeEvaluateJS(agentJs, "agent-standalone.js");
+            } else {
+                Log.e(TAG, "Failed to load agent-standalone.js");
             }
         }
 
@@ -314,50 +305,8 @@ public class DeviceConnection {
             Log.w(TAG, "Failed to read __DEVICE_PROMPT__", e);
         }
 
-        // Define the executeCodeForServer helper that wraps code execution
-        // and captures screenshots, similar to executeCode in agent-standalone.ts
-        String helperJs =
-                "function executeCodeForServer(code) {\n" +
-                "  var capturedScreenshots = [];\n" +
-                "  var origGetScreen = get_screen;\n" +
-                "  var origTakeScreenshot = take_screenshot;\n" +
-                "  var getScreenCount = 0;\n" +
-                "  var lastGetScreenResult = null;\n" +
-                "  get_screen = function() {\n" +
-                "    getScreenCount++;\n" +
-                "    if (getScreenCount > 5) {\n" +
-                "      throw new Error('get_screen() called ' + getScreenCount + ' times. Max is 5.');\n" +
-                "    }\n" +
-                "    var tree = origGetScreen();\n" +
-                "    lastGetScreenResult = tree;\n" +
-                "    return tree;\n" +
-                "  };\n" +
-                "  take_screenshot = function() {\n" +
-                "    var b64 = origTakeScreenshot();\n" +
-                "    if (b64.startsWith('ERROR:')) return b64;\n" +
-                "    capturedScreenshots.push(b64);\n" +
-                "    return 'screenshot captured - image will be sent to you';\n" +
-                "  };\n" +
-                "  try {\n" +
-                "    var result = (0, eval)(code);\n" +
-                "    if (result === undefined && lastGetScreenResult !== null) {\n" +
-                "      result = lastGetScreenResult;\n" +
-                "    }\n" +
-                "    return {\n" +
-                "      result: result === undefined ? 'undefined' : String(result),\n" +
-                "      screenshots: capturedScreenshots\n" +
-                "    };\n" +
-                "  } catch (e) {\n" +
-                "    return {\n" +
-                "      result: '[JS Error] ' + (e.message || String(e)),\n" +
-                "      screenshots: capturedScreenshots\n" +
-                "    };\n" +
-                "  } finally {\n" +
-                "    get_screen = origGetScreen;\n" +
-                "    take_screenshot = origTakeScreenshot;\n" +
-                "  }\n" +
-                "}\n";
-        HermesAgentRunner.nativeEvaluateJS(helperJs, "exec-helper.js");
+        // executeCodeForServer is now defined in agent-standalone.ts
+        // (loaded above), sharing the same host function wrappers with update_status.
 
         hermesInitialized = true;
         Log.i(TAG, "Hermes runtime initialized for exec_js");
@@ -380,11 +329,7 @@ public class DeviceConnection {
     }
 
     private static String escapeJsString(String s) {
-        return "\"" + s.replace("\\", "\\\\")
-                .replace("\"", "\\\"")
-                .replace("\n", "\\n")
-                .replace("\r", "\\r")
-                .replace("\t", "\\t") + "\"";
+        return JsStringUtils.quoteForJS(s);
     }
 
     private void emitConnectionStatus(boolean status) {
