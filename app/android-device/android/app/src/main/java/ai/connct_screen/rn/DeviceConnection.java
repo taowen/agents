@@ -141,7 +141,7 @@ public class DeviceConnection {
                         case "task_done": {
                             String result = data.optString("result", "");
                             Log.i(TAG, "Received task_done: " + result.substring(0, Math.min(100, result.length())));
-                            HermesAgentRunner.nativeHideOverlay();
+                            HermesRuntime.nativeHideOverlay();
                             notifyTaskDone(result);
                             break;
                         }
@@ -204,7 +204,7 @@ public class DeviceConnection {
         connected = false;
         // Clean up Hermes runtime
         if (hermesInitialized) {
-            try { HermesAgentRunner.nativeDestroyRuntime(); } catch (Exception ignored) {}
+            try { HermesRuntime.nativeDestroyRuntime("app"); } catch (Exception ignored) {}
             hermesInitialized = false;
             cachedPromptInfo = null;
         }
@@ -262,7 +262,8 @@ public class DeviceConnection {
                 initHermesRuntime();
                 // Execute the code. The executeCodeInHermes function returns JSON
                 // with { result, screenshots? }
-                String rawResult = HermesAgentRunner.nativeEvaluateJS(
+                String rawResult = HermesRuntime.nativeEvaluateJS(
+                        "app",
                         "JSON.stringify(executeCodeForServer(" + escapeJsString(code) + "))",
                         "exec_js"
                 );
@@ -306,15 +307,15 @@ public class DeviceConnection {
     private void initHermesRuntime() {
         if (hermesInitialized) return;
 
-        HermesAgentRunner.nativeCreateRuntime();
+        HermesRuntime.nativeCreateRuntime("app");
 
         // Load the agent JS bundle which defines all host function wrappers
         com.google.android.accessibility.selecttospeak.SelectToSpeakService service =
                 com.google.android.accessibility.selecttospeak.SelectToSpeakService.getInstance();
         if (service != null) {
-            String agentJs = HermesAgentRunner.loadAsset(service, "agent-standalone.js");
+            String agentJs = HermesRuntime.loadAsset(service, "agent-standalone.js");
             if (agentJs != null) {
-                HermesAgentRunner.nativeEvaluateJS(agentJs, "agent-standalone.js");
+                HermesRuntime.nativeEvaluateJS("app", agentJs, "agent-standalone.js");
             } else {
                 Log.e(TAG, "Failed to load agent-standalone.js");
             }
@@ -322,7 +323,8 @@ public class DeviceConnection {
 
         // Read __DEVICE_PROMPT__ (set by prompt.ts) before defining helpers
         try {
-            String result = HermesAgentRunner.nativeEvaluateJS(
+            String result = HermesRuntime.nativeEvaluateJS(
+                    "app",
                     "JSON.stringify(__DEVICE_PROMPT__)",
                     "get-prompt-info"
             );

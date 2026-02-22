@@ -183,7 +183,8 @@ public class AgentOverlay {
     }
 
     private WindowManager.LayoutParams makeStatusLayoutParams() {
-        int flags = WindowManager.LayoutParams.FLAG_NOT_FOCUSABLE;
+        int flags = WindowManager.LayoutParams.FLAG_NOT_FOCUSABLE
+                | WindowManager.LayoutParams.FLAG_NOT_TOUCHABLE;
         WindowManager.LayoutParams lp = new WindowManager.LayoutParams(
                 WindowManager.LayoutParams.WRAP_CONTENT,
                 WindowManager.LayoutParams.WRAP_CONTENT,

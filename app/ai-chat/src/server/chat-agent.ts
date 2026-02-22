@@ -625,7 +625,10 @@ class ChatAgentBase extends AIChatAgent {
       messages,
       tools,
       stopWhen: stepCountIs(30),
-      onFinish: this.createOnFinish()
+      onFinish: async () => {
+        await this.createOnFinish()();
+        this.deviceHub.sendTaskDone("done");
+      }
     });
 
     return this.toStreamResponse(result, apiKeyType);
@@ -657,7 +660,7 @@ class ChatAgentBase extends AIChatAgent {
           // saveMessages → onChatMessage → handleDeviceChatMessage → streamText → _reply
           await this.saveMessages([...this.messages, userMsg]);
 
-          // Extract final text from the last assistant message for task_done
+          // task_done is now sent by handleDeviceChatMessage's onFinish
           const lastMsg = this.messages[this.messages.length - 1];
           let resultText = "";
           if (lastMsg?.role === "assistant") {
@@ -665,7 +668,6 @@ class ChatAgentBase extends AIChatAgent {
               if (part.type === "text") resultText += part.text;
             }
           }
-          this.deviceHub.sendTaskDone(resultText || "done");
           return resultText || "done";
         } catch (e) {
           console.error("handleDeviceInitiatedTask failed:", e);

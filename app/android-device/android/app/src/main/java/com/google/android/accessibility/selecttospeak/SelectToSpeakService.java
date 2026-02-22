@@ -179,7 +179,7 @@ public class SelectToSpeakService extends AccessibilityService {
         return resultHolder[0];
     }
 
-    // ========== Delegated methods (maintain API for HermesAgentRunner) ==========
+    // ========== Delegated methods (maintain API for AppToolsHost) ==========
 
     public String getAccessibilityTree() {
         return A11yTreeScanner.buildTree(getRootInActiveWindow());
