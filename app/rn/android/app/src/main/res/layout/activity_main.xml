@@ -1,0 +1,268 @@
+<?xml version="1.0" encoding="utf-8"?>
+<ViewFlipper
+    xmlns:android="http://schemas.android.com/apk/res/android"
+    android:id="@+id/viewFlipper"
+    android:layout_width="match_parent"
+    android:layout_height="match_parent"
+    android:fitsSystemWindows="true"
+    android:background="#1a1a2e">
+
+    <!-- Screen 0: Login -->
+    <LinearLayout
+        android:layout_width="match_parent"
+        android:layout_height="match_parent"
+        android:orientation="vertical"
+        android:gravity="center"
+        android:padding="24dp">
+
+        <TextView
+            android:layout_width="wrap_content"
+            android:layout_height="wrap_content"
+            android:text="RN Agent"
+            android:textColor="#eeeeee"
+            android:textSize="32sp"
+            android:textStyle="bold"
+            android:layout_marginBottom="40dp" />
+
+        <Button
+            android:id="@+id/loginBtn"
+            android:layout_width="wrap_content"
+            android:layout_height="wrap_content"
+            android:text="Login"
+            android:textColor="#ffffff"
+            android:textSize="18sp"
+            android:textStyle="bold"
+            android:background="#e94560"
+            android:paddingHorizontal="40dp"
+            android:paddingVertical="14dp" />
+
+        <!-- Device code panel (initially hidden) -->
+        <LinearLayout
+            android:id="@+id/deviceCodePanel"
+            android:layout_width="wrap_content"
+            android:layout_height="wrap_content"
+            android:orientation="vertical"
+            android:gravity="center"
+            android:background="#16213e"
+            android:padding="12dp"
+            android:layout_marginTop="16dp"
+            android:visibility="gone">
+
+            <TextView
+                android:id="@+id/deviceCodeLabel"
+                android:layout_width="wrap_content"
+                android:layout_height="wrap_content"
+                android:text="Open ai.connect-screen.com/device and enter:"
+                android:textColor="#cccccc"
+                android:textSize="12sp"
+                android:layout_marginBottom="8dp"
+                android:gravity="center" />
+
+            <TextView
+                android:id="@+id/deviceCodeText"
+                android:layout_width="wrap_content"
+                android:layout_height="wrap_content"
+                android:textColor="#ffffff"
+                android:textSize="28sp"
+                android:textStyle="bold"
+                android:fontFamily="monospace"
+                android:letterSpacing="0.3"
+                android:layout_marginBottom="8dp" />
+
+            <TextView
+                android:id="@+id/deviceCodeHint"
+                android:layout_width="wrap_content"
+                android:layout_height="wrap_content"
+                android:text="Waiting for approval..."
+                android:textColor="#999999"
+                android:textSize="12sp"
+                android:layout_marginBottom="4dp" />
+
+            <TextView
+                android:id="@+id/cancelLoginBtn"
+                android:layout_width="wrap_content"
+                android:layout_height="wrap_content"
+                android:text="Cancel"
+                android:textColor="#e94560"
+                android:textSize="13sp"
+                android:layout_marginTop="4dp" />
+        </LinearLayout>
+
+        <!-- Error panel (initially hidden) -->
+        <LinearLayout
+            android:id="@+id/loginErrorPanel"
+            android:layout_width="wrap_content"
+            android:layout_height="wrap_content"
+            android:orientation="vertical"
+            android:gravity="center"
+            android:background="#16213e"
+            android:padding="12dp"
+            android:layout_marginTop="16dp"
+            android:visibility="gone">
+
+            <TextView
+                android:layout_width="wrap_content"
+                android:layout_height="wrap_content"
+                android:text="Code expired or failed. Try again."
+                android:textColor="#F44336"
+                android:textSize="13sp"
+                android:layout_marginBottom="4dp" />
+
+            <TextView
+                android:id="@+id/retryLoginBtn"
+                android:layout_width="wrap_content"
+                android:layout_height="wrap_content"
+                android:text="Retry"
+                android:textColor="#e94560"
+                android:textSize="13sp"
+                android:textStyle="bold" />
+        </LinearLayout>
+    </LinearLayout>
+
+    <!-- Screen 1: Task -->
+    <LinearLayout
+        android:layout_width="match_parent"
+        android:layout_height="match_parent"
+        android:orientation="vertical"
+        android:padding="12dp">
+
+        <!-- Header row -->
+        <LinearLayout
+            android:layout_width="match_parent"
+            android:layout_height="wrap_content"
+            android:orientation="horizontal"
+            android:gravity="center_vertical"
+            android:layout_marginBottom="8dp">
+
+            <TextView
+                android:layout_width="0dp"
+                android:layout_height="wrap_content"
+                android:layout_weight="1"
+                android:text="RN Agent"
+                android:textColor="#eeeeee"
+                android:textSize="20sp"
+                android:textStyle="bold" />
+
+            <!-- Cloud status -->
+            <View
+                android:id="@+id/cloudDot"
+                android:layout_width="10dp"
+                android:layout_height="10dp"
+                android:background="#666666"
+                android:layout_marginEnd="6dp" />
+
+            <TextView
+                android:id="@+id/cloudLabel"
+                android:layout_width="wrap_content"
+                android:layout_height="wrap_content"
+                android:text="Offline"
+                android:textColor="#cccccc"
+                android:textSize="13sp" />
+
+            <!-- Service status -->
+            <View
+                android:id="@+id/serviceDot"
+                android:layout_width="10dp"
+                android:layout_height="10dp"
+                android:background="#F44336"
+                android:layout_marginStart="8dp"
+                android:layout_marginEnd="6dp" />
+
+            <TextView
+                android:id="@+id/serviceLabel"
+                android:layout_width="wrap_content"
+                android:layout_height="wrap_content"
+                android:text="No Svc"
+                android:textColor="#cccccc"
+                android:textSize="13sp" />
+        </LinearLayout>
+
+        <!-- Buttons row -->
+        <LinearLayout
+            android:layout_width="match_parent"
+            android:layout_height="wrap_content"
+            android:orientation="horizontal"
+            android:layout_marginBottom="8dp">
+
+            <Button
+                android:id="@+id/accessibilityBtn"
+                android:layout_width="wrap_content"
+                android:layout_height="wrap_content"
+                android:text="Accessibility"
+                android:textColor="#e0e0e0"
+                android:textSize="13sp"
+                android:background="#16213e"
+                android:paddingHorizontal="12dp"
+                android:paddingVertical="6dp"
+                android:layout_marginEnd="8dp"
+                android:textAllCaps="false" />
+
+            <Button
+                android:id="@+id/refreshBtn"
+                android:layout_width="wrap_content"
+                android:layout_height="wrap_content"
+                android:text="Refresh"
+                android:textColor="#e0e0e0"
+                android:textSize="13sp"
+                android:background="#16213e"
+                android:paddingHorizontal="12dp"
+                android:paddingVertical="6dp"
+                android:textAllCaps="false" />
+        </LinearLayout>
+
+        <!-- Task input row -->
+        <LinearLayout
+            android:layout_width="match_parent"
+            android:layout_height="wrap_content"
+            android:orientation="horizontal"
+            android:layout_marginBottom="8dp">
+
+            <EditText
+                android:id="@+id/taskInput"
+                android:layout_width="0dp"
+                android:layout_height="wrap_content"
+                android:layout_weight="1"
+                android:hint="Enter task..."
+                android:textColorHint="#999999"
+                android:textColor="#eeeeee"
+                android:background="#16213e"
+                android:padding="10dp"
+                android:textSize="14sp"
+                android:maxHeight="80dp"
+                android:inputType="textMultiLine"
+                android:layout_marginEnd="8dp" />
+
+            <Button
+                android:id="@+id/sendBtn"
+                android:layout_width="wrap_content"
+                android:layout_height="wrap_content"
+                android:text="Send"
+                android:textColor="#ffffff"
+                android:textStyle="bold"
+                android:textSize="15sp"
+                android:background="#e94560"
+                android:paddingHorizontal="16dp"
+                android:textAllCaps="false" />
+        </LinearLayout>
+
+        <!-- Logs -->
+        <ScrollView
+            android:id="@+id/logScroll"
+            android:layout_width="match_parent"
+            android:layout_height="0dp"
+            android:layout_weight="1"
+            android:background="#0a0a1a"
+            android:padding="8dp">
+
+            <TextView
+                android:id="@+id/logText"
+                android:layout_width="match_parent"
+                android:layout_height="wrap_content"
+                android:textColor="#b0b0b0"
+                android:fontFamily="monospace"
+                android:textSize="11sp"
+                android:lineSpacingExtra="4dp"
+                android:text="Enter a task and tap Send" />
+        </ScrollView>
+    </LinearLayout>
+</ViewFlipper>

@@ -1,6 +1,6 @@
 # RN Agent
 
-Android Accessibility Service agent powered by React Native + standalone Hermes.
+Android Accessibility Service agent with plain Java UI + standalone Hermes.
 
 LLM generates JavaScript code, which is `eval()`'d in a standalone Hermes runtime inside the AccessibilityService process. The JS code calls synchronous C++ host functions to interact with the accessibility tree.
 
@@ -37,17 +37,15 @@ Key files:
 | `src/conversation-manager.ts` | Conversation history trimming, compaction (summarization), state persistence |
 | `src/host-api.ts` | Host function definitions and metadata |
 | `src/prompt.ts` | System prompt and tool definitions for the LLM |
-| `src/App.tsx` | RN UI: device login, task input, log viewer, WebSocket cloud connection |
-| `src/NativeAccessibilityBridge.ts` | TurboModule spec for JS↔Java bridge |
-| `src/types.ts` | Shared TypeScript types |
-| `AccessibilityBridgeModule.java` | Sync native methods bridging to SelectToSpeakService |
+| `MainActivity.java` | Plain Java Activity: device login, task input, log viewer, cloud status |
+| `DeviceConnection.java` | OkHttp WebSocket connection to cloud ChatAgent, Hermes exec_js |
 | `SelectToSpeakService.java` | Core accessibility service (reads UI tree, performs clicks/scrolls, takes screenshots) |
 | `HermesAgentRunner.java` | Standalone Hermes runtime that loads `agent-standalone.js` |
-| `TaskReceiver.java` | BroadcastReceiver that emits `onTaskReceived` event to RN |
+| `TaskReceiver.java` | BroadcastReceiver for task dispatch via `adb shell am broadcast` |
 
 ## Build & Deploy
 
-JS is bundled into the APK (no Metro dev server needed — `debuggableVariants = []` in build.gradle).
+Agent JS is bundled via esbuild into `assets/agent-standalone.js` (no Metro/RN bundler).
 
 ### Debug build (local testing)
 
@@ -77,13 +75,13 @@ Config is obtained via device auth flow — no local config file needed:
 2. A device code is shown (e.g. `A1B2C3`)
 3. Go to `ai.connect-screen.com/device` in a browser and enter the code
 4. Once approved, the app receives its API token and LLM config via the server
-5. Config is persisted in AsyncStorage
+5. Config is persisted in SharedPreferences
 
 After login, the app connects to the cloud via WebSocket to receive dispatched tasks.
 
 ## Trigger task via broadcast
 
-The broadcast sends the task string directly to JS via `DeviceEventEmitter`:
+The broadcast sends the task to the server via the WebSocket connection:
 
 ```sh
 adb shell "am broadcast -a ai.connct_screen.rn.EXECUTE_TASK -p ai.connct_screen.rn --es task 'open calculator'"
@@ -112,25 +110,11 @@ adb shell "run-as ai.connct_screen.rn cat files/screens/screen_001.txt"
 ```sh
 # Filter by tag
 adb logcat -s A11yAgent
-adb logcat -s ReactNativeJS
+adb logcat -s DeviceConn
 
 # Filter by app PID
 adb logcat --pid=$(adb shell pidof ai.connct_screen.rn)
 ```
-
-### Common errors
-
-**Red screen: "TurboModule system assumes returnType == void iff the method is synchronous"**
-
-Sync native methods (`isBlockingSynchronousMethod = true`) must have a non-void return type. The TurboModule interop layer uses return type to distinguish sync vs async:
-- `void` return = async (must use `Promise` parameter)
-- non-void return (`boolean`, `String`, `double`, etc.) = sync
-
-If you need a sync method that logically returns nothing, return `boolean` (e.g. `return true`).
-
-**Red screen: "Packager does not seem to be running"**
-
-This happens if `debuggableVariants` in `build.gradle` includes `"debug"` (the default). With `debuggableVariants = []`, JS is bundled into the APK and Metro is not needed.
 
 ## Screenshot (`take_screenshot()`)
 

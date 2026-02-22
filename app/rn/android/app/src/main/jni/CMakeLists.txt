@@ -1,9 +1,5 @@
 cmake_minimum_required(VERSION 3.13)
-project(appmodules)
-
-# Include the standard React Native application build setup.
-# This creates the "appmodules" shared library with RN's OnLoad.cpp (or our custom one).
-include(${REACT_ANDROID_DIR}/cmake-utils/ReactNative-application.cmake)
+project(hermesagent)
 
 # --- Standalone Hermes Agent library ---
 # A separate shared library that embeds an independent Hermes runtime
@@ -13,6 +9,7 @@ include(${REACT_ANDROID_DIR}/cmake-utils/ReactNative-application.cmake)
 add_library(hermesagent SHARED agent/standalone_hermes.cpp)
 
 find_package(hermes-engine REQUIRED CONFIG)
+find_package(ReactAndroid REQUIRED CONFIG)
 
 target_link_libraries(hermesagent
     hermes-engine::hermesvm   # Hermes runtime (makeHermesRuntime)

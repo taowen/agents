@@ -4,11 +4,6 @@ import android.os.Handler;
 import android.os.Looper;
 import android.util.Log;
 
-import com.facebook.react.bridge.Arguments;
-import com.facebook.react.bridge.ReactApplicationContext;
-import com.facebook.react.bridge.WritableMap;
-import com.facebook.react.modules.core.DeviceEventManagerModule;
-
 import org.json.JSONObject;
 
 import java.util.concurrent.ExecutorService;
@@ -30,7 +25,7 @@ import okhttp3.WebSocketListener;
  * - Maintains persistent WebSocket to the device's ChatAgent session
  *   (wss://ai.connect-screen.com/agents/chat-agent/device-{name}/device-connect)
  * - Executes JS code from server exec_js requests in a persistent Hermes runtime
- * - Receives task dispatches and emits DeviceTask events to RN JS
+ * - Receives task dispatches and notifies the Listener
  * - Handles ping/pong keepalive
  * - Sends task results back to the ChatAgent
  */
@@ -41,6 +36,11 @@ public class DeviceConnection {
     private static final long RECONNECT_BASE_MS = 5000;
     private static final long RECONNECT_MAX_MS = 60000;
 
+    public interface Listener {
+        void onConnectionStatusChanged(boolean connected);
+        void onTaskDone(String result);
+    }
+
     private static DeviceConnection instance;
 
     private OkHttpClient client;
@@ -49,7 +49,7 @@ public class DeviceConnection {
     private String deviceName;
     private String lastUrl;
     private String lastDeviceName;
-    private ReactApplicationContext reactContext;
+    private Listener listener;
     private final Handler mainHandler = new Handler(Looper.getMainLooper());
     private final ExecutorService execExecutor = Executors.newSingleThreadExecutor();
 
@@ -74,8 +74,8 @@ public class DeviceConnection {
         return instance;
     }
 
-    public void setReactContext(ReactApplicationContext ctx) {
-        this.reactContext = ctx;
+    public void setListener(Listener listener) {
+        this.listener = listener;
     }
 
     public synchronized void connect(String url, String name) {
@@ -99,7 +99,7 @@ public class DeviceConnection {
                 connected = true;
                 reconnectDelayMs = RECONNECT_BASE_MS;
                 lastPingTime = System.currentTimeMillis();
-                emitConnectionStatus(true);
+                notifyConnectionStatus(true);
                 // Send ready message with system prompt and tools
                 try {
                     JSONObject ready = new JSONObject();
@@ -141,7 +141,7 @@ public class DeviceConnection {
                         case "task_done": {
                             String result = data.optString("result", "");
                             Log.i(TAG, "Received task_done: " + result.substring(0, Math.min(100, result.length())));
-                            emitTaskDone(result);
+                            notifyTaskDone(result);
                             break;
                         }
                         case "ping": {
@@ -174,7 +174,7 @@ public class DeviceConnection {
                 Log.i(TAG, "WebSocket closed: code=" + code + " reason=" + reason
                         + " secsSinceLastPing=" + secsSincePing);
                 connected = false;
-                emitConnectionStatus(false);
+                notifyConnectionStatus(false);
                 scheduleReconnect();
             }
 
@@ -186,7 +186,7 @@ public class DeviceConnection {
                         + ": " + t.getMessage()
                         + " secsSinceLastPing=" + secsSincePing, t);
                 connected = false;
-                emitConnectionStatus(false);
+                notifyConnectionStatus(false);
                 scheduleReconnect();
             }
         });
@@ -356,32 +356,17 @@ public class DeviceConnection {
         return JsStringUtils.quoteForJS(s);
     }
 
-    private void emitConnectionStatus(boolean status) {
-        if (reactContext == null || !reactContext.hasActiveReactInstance()) {
-            return;
-        }
-        try {
-            WritableMap params = Arguments.createMap();
-            params.putBoolean("connected", status);
-            reactContext.getJSModule(DeviceEventManagerModule.RCTDeviceEventEmitter.class)
-                    .emit("DeviceConnectionStatus", params);
-        } catch (Exception e) {
-            Log.e(TAG, "Failed to emit DeviceConnectionStatus", e);
+    private void notifyConnectionStatus(boolean status) {
+        Listener l = listener;
+        if (l != null) {
+            l.onConnectionStatusChanged(status);
         }
     }
 
-    private void emitTaskDone(String result) {
-        if (reactContext == null || !reactContext.hasActiveReactInstance()) {
-            Log.w(TAG, "No React context for task_done event");
-            return;
-        }
-        try {
-            WritableMap params = Arguments.createMap();
-            params.putString("result", result);
-            reactContext.getJSModule(DeviceEventManagerModule.RCTDeviceEventEmitter.class)
-                    .emit("DeviceTaskDone", params);
-        } catch (Exception e) {
-            Log.e(TAG, "Failed to emit DeviceTaskDone event", e);
+    private void notifyTaskDone(String result) {
+        Listener l = listener;
+        if (l != null) {
+            l.onTaskDone(result);
         }
     }
 }
