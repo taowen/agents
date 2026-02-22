@@ -1,9 +1,11 @@
 package com.google.android.accessibility.selecttospeak;
 
 import android.accessibilityservice.AccessibilityService;
+import android.content.Context;
 import android.graphics.Bitmap;
 import android.graphics.Rect;
 import android.hardware.HardwareBuffer;
+import android.net.wifi.WifiManager;
 import android.os.Build;
 import android.util.Base64;
 import android.util.Log;
@@ -33,6 +35,7 @@ public class SelectToSpeakService extends AccessibilityService {
     private GestureExecutor gestureExecutor;
     private AppLauncher appLauncher;
     private AgentOverlay agentOverlay;
+    private WifiManager.WifiLock wifiLock;
 
     private static final List<String> logEntries =
             Collections.synchronizedList(new ArrayList<String>());
@@ -87,13 +90,21 @@ public class SelectToSpeakService extends AccessibilityService {
         gestureExecutor = new GestureExecutor(this);
         appLauncher = new AppLauncher(this);
         agentOverlay = new AgentOverlay(this);
-        Log.d(TAG, "SelectToSpeakService connected");
+        // Acquire WiFi lock to keep network alive during Doze mode
+        WifiManager wm = (WifiManager) getApplicationContext().getSystemService(Context.WIFI_SERVICE);
+        wifiLock = wm.createWifiLock(WifiManager.WIFI_MODE_FULL_HIGH_PERF, "RNAgent:ws");
+        wifiLock.acquire();
+        Log.d(TAG, "SelectToSpeakService connected, WiFi lock acquired");
         Log.d(AGENT_TAG, "SelectToSpeakService connected - agent ready");
     }
 
     @Override
     public void onDestroy() {
         super.onDestroy();
+        if (wifiLock != null && wifiLock.isHeld()) {
+            wifiLock.release();
+            wifiLock = null;
+        }
         if (agentOverlay != null) {
             agentOverlay.hide();
             agentOverlay = null;

@@ -38,7 +38,8 @@ public class DeviceConnection {
 
     private static final String TAG = "DeviceConn";
     private static final long EXEC_TIMEOUT_SECONDS = 60;
-    private static final long RECONNECT_DELAY_MS = 5000;
+    private static final long RECONNECT_BASE_MS = 5000;
+    private static final long RECONNECT_MAX_MS = 60000;
 
     private static DeviceConnection instance;
 
@@ -52,12 +53,17 @@ public class DeviceConnection {
     private final Handler mainHandler = new Handler(Looper.getMainLooper());
     private final ExecutorService execExecutor = Executors.newSingleThreadExecutor();
 
+    private long lastPingTime = 0;
+    private long reconnectDelayMs = RECONNECT_BASE_MS;
+    private Runnable pendingReconnect = null;
+
     // Persistent Hermes runtime for exec_js — initialized on first exec_js, reused across calls
     private boolean hermesInitialized = false;
 
     private DeviceConnection() {
         client = new OkHttpClient.Builder()
                 .readTimeout(0, TimeUnit.MILLISECONDS) // no read timeout for WS
+                .pingInterval(20, TimeUnit.SECONDS)    // WebSocket protocol-level ping frames
                 .build();
     }
 
@@ -76,6 +82,11 @@ public class DeviceConnection {
         this.deviceName = name;
         this.lastUrl = url;
         this.lastDeviceName = name;
+        // Cancel any pending reconnect to avoid duplicates
+        if (pendingReconnect != null) {
+            mainHandler.removeCallbacks(pendingReconnect);
+            pendingReconnect = null;
+        }
         if (ws != null) {
             try { ws.close(1000, "reconnecting"); } catch (Exception ignored) {}
         }
@@ -84,8 +95,10 @@ public class DeviceConnection {
         ws = client.newWebSocket(request, new WebSocketListener() {
             @Override
             public void onOpen(WebSocket webSocket, Response response) {
-                Log.i(TAG, "WebSocket connected");
+                Log.i(TAG, "WebSocket connected at " + System.currentTimeMillis());
                 connected = true;
+                reconnectDelayMs = RECONNECT_BASE_MS;
+                lastPingTime = System.currentTimeMillis();
                 emitConnectionStatus(true);
                 // Send ready message with system prompt and tools
                 try {
@@ -133,6 +146,7 @@ public class DeviceConnection {
                             break;
                         }
                         case "ping": {
+                            lastPingTime = System.currentTimeMillis();
                             try {
                                 JSONObject pong = new JSONObject();
                                 pong.put("type", "pong");
@@ -156,21 +170,25 @@ public class DeviceConnection {
 
             @Override
             public void onClosed(WebSocket webSocket, int code, String reason) {
-                Log.i(TAG, "WebSocket closed: " + code + " " + reason);
+                long secsSincePing = lastPingTime > 0
+                        ? (System.currentTimeMillis() - lastPingTime) / 1000 : -1;
+                Log.i(TAG, "WebSocket closed: code=" + code + " reason=" + reason
+                        + " secsSinceLastPing=" + secsSincePing);
                 connected = false;
                 emitConnectionStatus(false);
+                scheduleReconnect();
             }
 
             @Override
             public void onFailure(WebSocket webSocket, Throwable t, Response response) {
-                Log.e(TAG, "WebSocket failure", t);
+                long secsSincePing = lastPingTime > 0
+                        ? (System.currentTimeMillis() - lastPingTime) / 1000 : -1;
+                Log.e(TAG, "WebSocket failure: " + t.getClass().getSimpleName()
+                        + ": " + t.getMessage()
+                        + " secsSinceLastPing=" + secsSincePing, t);
                 connected = false;
                 emitConnectionStatus(false);
-                // Auto-reconnect after delay
-                if (lastUrl != null) {
-                    Log.i(TAG, "Scheduling auto-reconnect in " + RECONNECT_DELAY_MS + "ms");
-                    mainHandler.postDelayed(() -> connect(lastUrl, lastDeviceName), RECONNECT_DELAY_MS);
-                }
+                scheduleReconnect();
             }
         });
     }
@@ -187,6 +205,15 @@ public class DeviceConnection {
             hermesInitialized = false;
             cachedPromptInfo = null;
         }
+    }
+
+    private void scheduleReconnect() {
+        if (lastUrl == null) return;
+        long delay = reconnectDelayMs;
+        Log.i(TAG, "Scheduling auto-reconnect in " + delay + "ms");
+        pendingReconnect = () -> connect(lastUrl, lastDeviceName);
+        mainHandler.postDelayed(pendingReconnect, delay);
+        reconnectDelayMs = Math.min(reconnectDelayMs * 2, RECONNECT_MAX_MS);
     }
 
     public boolean isConnected() {
