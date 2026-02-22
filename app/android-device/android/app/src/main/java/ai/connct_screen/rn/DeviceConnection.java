@@ -254,6 +254,7 @@ public class DeviceConnection {
         execExecutor.execute(() -> {
             String result;
             JSONArray screenshots = new JSONArray();
+            JSONArray executionLog = null;
             try {
                 initHermesRuntime();
                 String rawResult = HermesRuntime.nativeEvaluateJS(
@@ -266,6 +267,8 @@ public class DeviceConnection {
                     result = parsed.optString("result", rawResult);
                     JSONArray ss = parsed.optJSONArray("screenshots");
                     if (ss != null) screenshots = ss;
+                    JSONArray el = parsed.optJSONArray("executionLog");
+                    if (el != null && el.length() > 0) executionLog = el;
                 } catch (Exception e) {
                     result = rawResult;
                 }
@@ -281,6 +284,9 @@ public class DeviceConnection {
                 msg.put("result", result);
                 if (screenshots.length() > 0) {
                     msg.put("screenshots", screenshots);
+                }
+                if (executionLog != null) {
+                    msg.put("executionLog", executionLog);
                 }
                 webSocket.send(msg.toString());
             } catch (Exception e) {

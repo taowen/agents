@@ -74,6 +74,11 @@ class ChatAgentBase extends AIChatAgent {
   // Quota check cache — avoid per-message D1 queries
   private quotaCheckCache: QuotaCache | null = null;
 
+  // Deferred promise for dispatch-task: resolved by handleDeviceChatMessage's onFinish
+  private deviceTaskDeferred: {
+    resolve: (text: string) => void;
+  } | null = null;
+
   constructor(ctx: DurableObjectState, env: Env) {
     super(ctx, env);
     this.deviceHub = new DeviceHub(ctx);
@@ -605,16 +610,16 @@ class ChatAgentBase extends AIChatAgent {
       "You are a mobile automation assistant.";
     const deviceTools = await this.ctx.storage.get<DeviceTool[]>("deviceTools");
 
-    // Build tool description from device-reported tools (for execute_js description)
+    // Build tool name and description from device-reported tools
     let toolDesc: string | undefined;
+    let toolName: string | undefined;
     if (deviceTools && deviceTools.length > 0) {
       const fn = deviceTools[0]?.function;
-      if (fn?.description) {
-        toolDesc = fn.description;
-      }
+      toolName = fn?.name;
+      toolDesc = fn?.description;
     }
 
-    const tools = createDeviceExecTool(this.deviceHub, toolDesc);
+    const tools = createDeviceExecTool(this.deviceHub, toolDesc, toolName);
 
     const messages = await pruneMessages({
       messages: await convertToModelMessages(this.messages),
@@ -630,6 +635,18 @@ class ChatAgentBase extends AIChatAgent {
       stopWhen: stepCountIs(30),
       onFinish: async () => {
         await this.createOnFinish()();
+        // Resolve the deferred so handleDeviceInitiatedTask can return the result
+        if (this.deviceTaskDeferred) {
+          const lastMsg = this.messages[this.messages.length - 1];
+          let resultText = "";
+          if (lastMsg?.role === "assistant") {
+            for (const part of lastMsg.parts) {
+              if (part.type === "text") resultText += part.text;
+            }
+          }
+          this.deviceTaskDeferred.resolve(resultText);
+          this.deviceTaskDeferred = null;
+        }
         this.deviceHub.sendTaskDone("done");
       },
       abortSignal
@@ -660,18 +677,17 @@ class ChatAgentBase extends AIChatAgent {
             parts: [{ type: "text", text }]
           };
 
+          // Set up a deferred promise that onFinish in handleDeviceChatMessage will resolve
+          const resultPromise = new Promise<string>((resolve) => {
+            this.deviceTaskDeferred = { resolve };
+          });
+
           // Reuse the same path as web-initiated messages:
           // saveMessages → onChatMessage → handleDeviceChatMessage → streamText → _reply
           await this.saveMessages([...this.messages, userMsg]);
 
-          // task_done is now sent by handleDeviceChatMessage's onFinish
-          const lastMsg = this.messages[this.messages.length - 1];
-          let resultText = "";
-          if (lastMsg?.role === "assistant") {
-            for (const part of lastMsg.parts) {
-              if (part.type === "text") resultText += part.text;
-            }
-          }
+          // Wait for the stream to fully complete (resolved by onFinish)
+          const resultText = await resultPromise;
           return resultText || "done";
         } catch (e) {
           console.error("handleDeviceInitiatedTask failed:", e);

@@ -5,8 +5,20 @@ interface DeviceInfo {
   connectedAt: number;
 }
 
+export interface ExecLogEntry {
+  fn: string;
+  args: string;
+  result: string;
+}
+
+export interface ExecResult {
+  result: string;
+  screenshots: string[];
+  executionLog?: ExecLogEntry[];
+}
+
 interface PendingExec {
-  resolve: (value: { result: string; screenshots: string[] }) => void;
+  resolve: (value: ExecResult) => void;
   reject: (reason: Error) => void;
   timer: ReturnType<typeof setTimeout>;
 }
@@ -84,38 +96,35 @@ export class DeviceHub {
     return new Response(null, { status: 101, webSocket: pair[0] });
   }
 
-  // --- Execute JS on device ---
+  // --- Execute code on device ---
 
   /**
-   * Send JavaScript code to the device for execution and wait for the result.
-   * Uses exec_js/exec_result message pair over the device WebSocket.
+   * Send code to the device for execution and wait for the result.
+   * Uses the device-reported exec type (defaults to "exec_js" for Android).
    */
-  async execOnDevice(
-    code: string,
-    timeoutMs = 60_000
-  ): Promise<{ result: string; screenshots: string[] }> {
+  async execOnDevice(code: string, timeoutMs = 60_000): Promise<ExecResult> {
     const deviceWs = this.getWs();
     if (!deviceWs) {
       throw new Error("Device not connected");
     }
 
+    const execType =
+      (await this.ctx.storage.get<string>("execType")) || "exec_js";
     const execId = crypto.randomUUID();
 
     try {
-      deviceWs.send(JSON.stringify({ type: "exec_js", execId, code }));
+      deviceWs.send(JSON.stringify({ type: execType, execId, code }));
     } catch {
-      throw new Error("Failed to send exec_js to device");
+      throw new Error(`Failed to send ${execType} to device`);
     }
 
-    return new Promise<{ result: string; screenshots: string[] }>(
-      (resolve, reject) => {
-        const timer = setTimeout(() => {
-          this.pendingExecs.delete(execId);
-          reject(new Error("exec_js timed out"));
-        }, timeoutMs);
-        this.pendingExecs.set(execId, { resolve, reject, timer });
-      }
-    );
+    return new Promise<ExecResult>((resolve, reject) => {
+      const timer = setTimeout(() => {
+        this.pendingExecs.delete(execId);
+        reject(new Error(`${execType} timed out`));
+      }, timeoutMs);
+      this.pendingExecs.set(execId, { resolve, reject, timer });
+    });
   }
 
   // --- Device WebSocket message handling ---
@@ -157,12 +166,15 @@ export class DeviceHub {
         };
         ws.serializeAttachment(info);
 
-        // Store device system prompt and tools if provided
+        // Store device system prompt, tools, and exec type if provided
         if (data.systemPrompt) {
           await this.ctx.storage.put("deviceSystemPrompt", data.systemPrompt);
         }
         if (data.tools) {
           await this.ctx.storage.put("deviceTools", data.tools);
+        }
+        if (data.execType) {
+          await this.ctx.storage.put("execType", data.execType);
         }
 
         // Mark device online in D1
@@ -197,7 +209,8 @@ export class DeviceHub {
           this.pendingExecs.delete(data.execId);
           pending.resolve({
             result: data.result || "",
-            screenshots: data.screenshots || []
+            screenshots: data.screenshots || [],
+            executionLog: data.executionLog
           });
         }
         return;

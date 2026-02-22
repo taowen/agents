@@ -39,6 +39,7 @@ declare global {
   var executeCodeForServer: (code: string) => {
     result: string;
     screenshots?: string[];
+    executionLog?: Array<{ fn: string; args: string; result: string }>;
   };
   var __DEVICE_PROMPT__: { systemPrompt: string; tools: unknown[] };
 }
@@ -55,6 +56,7 @@ function wrapHostFunctions(opts: {
   maxGetScreen: number;
   onGetScreen?: (tree: string) => void;
   onScreenshot: (b64: string) => void;
+  onAction?: (entry: { fn: string; args: string; result: string }) => void;
 }): { getScreenCount: () => number; restore: () => void } {
   let getScreenCount = 0;
 
@@ -83,20 +85,25 @@ function wrapHostFunctions(opts: {
           ". Return and plan next actions in a new execute_js call."
       );
     }
-    update_status("read screen");
     const tree = origGetScreen();
+    opts.onAction?.({
+      fn: "get_screen",
+      args: "",
+      result: tree.length + " chars"
+    });
     if (opts.onGetScreen) opts.onGetScreen(tree);
     return tree;
   };
 
   globalThis.take_screenshot = function (): string {
     if (Date.now() > opts.deadline) throw new Error("Script execution timeout");
-    update_status("take screenshot");
     const b64 = origTakeScreenshot();
     if (b64.startsWith("ERROR:")) {
+      opts.onAction?.({ fn: "take_screenshot", args: "", result: b64 });
       return b64;
     }
     opts.onScreenshot(b64);
+    opts.onAction?.({ fn: "take_screenshot", args: "", result: "captured" });
     return "screenshot captured - image will be sent to you";
   };
 
@@ -107,8 +114,9 @@ function wrapHostFunctions(opts: {
       typeof target === "string"
         ? target
         : target.desc || "(" + target.x + "," + target.y + ")";
-    update_status("click " + desc);
-    return origClick(target);
+    const r = origClick(target);
+    opts.onAction?.({ fn: "click", args: desc, result: String(r) });
+    return r;
   };
 
   globalThis.long_click = function (
@@ -118,51 +126,64 @@ function wrapHostFunctions(opts: {
       typeof target === "string"
         ? target
         : target.desc || "(" + target.x + "," + target.y + ")";
-    update_status("long click " + desc);
-    return origLongClick(target);
+    const r = origLongClick(target);
+    opts.onAction?.({ fn: "long_click", args: desc, result: String(r) });
+    return r;
   };
 
   globalThis.type_text = function (text: string): boolean {
-    update_status("type " + text.substring(0, 15));
-    return origTypeText(text);
+    const r = origTypeText(text);
+    opts.onAction?.({ fn: "type_text", args: text, result: String(r) });
+    return r;
   };
 
   globalThis.launch_app = function (name: string): string {
-    update_status("launch " + name);
-    return origLaunchApp(name);
+    const r = origLaunchApp(name);
+    opts.onAction?.({ fn: "launch_app", args: name, result: String(r) });
+    return r;
   };
 
   globalThis.scroll = function (direction: string): boolean {
-    update_status("scroll " + direction);
-    return origScroll(direction);
+    const r = origScroll(direction);
+    opts.onAction?.({ fn: "scroll", args: direction, result: String(r) });
+    return r;
   };
 
   globalThis.scroll_element = function (
     text: string,
     direction: string
   ): string {
-    update_status("scroll " + text + " " + direction);
-    return origScrollElement(text, direction);
+    const r = origScrollElement(text, direction);
+    opts.onAction?.({
+      fn: "scroll_element",
+      args: text + " " + direction,
+      result: String(r)
+    });
+    return r;
   };
 
   globalThis.press_home = function (): boolean {
-    update_status("press home");
-    return origPressHome();
+    const r = origPressHome();
+    opts.onAction?.({ fn: "press_home", args: "", result: String(r) });
+    return r;
   };
 
   globalThis.press_back = function (): boolean {
-    update_status("press back");
-    return origPressBack();
+    const r = origPressBack();
+    opts.onAction?.({ fn: "press_back", args: "", result: String(r) });
+    return r;
   };
 
   globalThis.press_recents = function (): boolean {
-    update_status("press recents");
-    return origPressRecents();
+    const r = origPressRecents();
+    opts.onAction?.({ fn: "press_recents", args: "", result: String(r) });
+    return r;
   };
 
   globalThis.show_notifications = function (): boolean {
-    update_status("show notifications");
-    return origShowNotifications();
+    const r = origShowNotifications();
+    opts.onAction?.({ fn: "show_notifications", args: "", result: String(r) });
+    return r;
   };
 
   return {
@@ -191,8 +212,10 @@ function wrapHostFunctions(opts: {
 function executeCodeForServer(code: string): {
   result: string;
   screenshots: string[];
+  executionLog: Array<{ fn: string; args: string; result: string }>;
 } {
   const capturedScreenshots: string[] = [];
+  const logEntries: Array<{ fn: string; args: string; result: string }> = [];
   let lastGetScreenResult: string | null = null;
 
   const wrapped = wrapHostFunctions({
@@ -203,6 +226,10 @@ function executeCodeForServer(code: string): {
     },
     onScreenshot(b64) {
       capturedScreenshots.push(b64);
+    },
+    onAction(entry) {
+      logEntries.push(entry);
+      update_status(entry.fn + " " + entry.args);
     }
   });
 
@@ -213,7 +240,8 @@ function executeCodeForServer(code: string): {
     }
     return {
       result: result === undefined ? "undefined" : String(result),
-      screenshots: capturedScreenshots
+      screenshots: capturedScreenshots,
+      executionLog: logEntries
     };
   } catch (e: unknown) {
     const msg = e instanceof Error ? e.message : String(e);
@@ -221,12 +249,14 @@ function executeCodeForServer(code: string): {
       return {
         result:
           "[JS Error] Top-level 'return' is not allowed. The code runs in global scope — use the last expression as the result instead of 'return'.",
-        screenshots: capturedScreenshots
+        screenshots: capturedScreenshots,
+        executionLog: logEntries
       };
     }
     return {
       result: "[JS Error] " + msg,
-      screenshots: capturedScreenshots
+      screenshots: capturedScreenshots,
+      executionLog: logEntries
     };
   } finally {
     wrapped.restore();

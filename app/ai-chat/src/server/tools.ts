@@ -2,7 +2,7 @@ import * as Sentry from "@sentry/cloudflare";
 import { tool, type ToolSet } from "ai";
 import { z } from "zod";
 import type { Bash } from "just-bash";
-import type { DeviceHub } from "./device-hub";
+import type { DeviceHub, ExecLogEntry } from "./device-hub";
 
 export function createBashTool(bash: Bash, ensureMounted: () => Promise<void>) {
   return tool({
@@ -37,10 +37,12 @@ export function createBashTool(bash: Bash, ensureMounted: () => Promise<void>) {
  */
 export function createDeviceExecTool(
   deviceHub: DeviceHub,
-  toolDescription?: string
+  toolDescription?: string,
+  toolName?: string
 ): ToolSet {
+  const name = toolName || "execute_js";
   return {
-    execute_js: tool({
+    [name]: tool({
       description:
         toolDescription ||
         "Execute JavaScript code on the connected Android device. " +
@@ -53,14 +55,26 @@ export function createDeviceExecTool(
           )
       }),
       execute: async ({ code }) => {
-        const { result, screenshots } = await deviceHub.execOnDevice(code);
-        return { result, screenshots };
+        const { result, screenshots, executionLog } =
+          await deviceHub.execOnDevice(code);
+        return { result, screenshots, executionLog };
       },
       toModelOutput: ({ output }) => {
+        let text = "";
+        if (output.executionLog && output.executionLog.length > 0) {
+          const summary = (output.executionLog as ExecLogEntry[])
+            .map((e) => {
+              const argsStr = e.args ? ' "' + e.args + '"' : "";
+              return e.fn + argsStr + " \u2192 " + e.result;
+            })
+            .join(", ");
+          text += "[actions: " + summary + "]\n";
+        }
+        text += output.result;
         const parts: Array<
           | { type: "text"; text: string }
           | { type: "file-data"; data: string; mediaType: string }
-        > = [{ type: "text", text: output.result }];
+        > = [{ type: "text", text }];
         for (const s of output.screenshots ?? []) {
           parts.push({ type: "file-data", data: s, mediaType: "image/jpeg" });
         }

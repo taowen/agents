@@ -231,20 +231,25 @@
             ". Return and plan next actions in a new execute_js call."
         );
       }
-      update_status("read screen");
       const tree = origGetScreen();
+      opts.onAction?.({
+        fn: "get_screen",
+        args: "",
+        result: tree.length + " chars"
+      });
       if (opts.onGetScreen) opts.onGetScreen(tree);
       return tree;
     };
     globalThis.take_screenshot = function () {
       if (Date.now() > opts.deadline)
         throw new Error("Script execution timeout");
-      update_status("take screenshot");
       const b64 = origTakeScreenshot();
       if (b64.startsWith("ERROR:")) {
+        opts.onAction?.({ fn: "take_screenshot", args: "", result: b64 });
         return b64;
       }
       opts.onScreenshot(b64);
+      opts.onAction?.({ fn: "take_screenshot", args: "", result: "captured" });
       return "screenshot captured - image will be sent to you";
     };
     globalThis.click = function (target) {
@@ -252,48 +257,66 @@
         typeof target === "string"
           ? target
           : target.desc || "(" + target.x + "," + target.y + ")";
-      update_status("click " + desc);
-      return origClick(target);
+      const r = origClick(target);
+      opts.onAction?.({ fn: "click", args: desc, result: String(r) });
+      return r;
     };
     globalThis.long_click = function (target) {
       const desc =
         typeof target === "string"
           ? target
           : target.desc || "(" + target.x + "," + target.y + ")";
-      update_status("long click " + desc);
-      return origLongClick(target);
+      const r = origLongClick(target);
+      opts.onAction?.({ fn: "long_click", args: desc, result: String(r) });
+      return r;
     };
     globalThis.type_text = function (text) {
-      update_status("type " + text.substring(0, 15));
-      return origTypeText(text);
+      const r = origTypeText(text);
+      opts.onAction?.({ fn: "type_text", args: text, result: String(r) });
+      return r;
     };
     globalThis.launch_app = function (name) {
-      update_status("launch " + name);
-      return origLaunchApp(name);
+      const r = origLaunchApp(name);
+      opts.onAction?.({ fn: "launch_app", args: name, result: String(r) });
+      return r;
     };
     globalThis.scroll = function (direction) {
-      update_status("scroll " + direction);
-      return origScroll(direction);
+      const r = origScroll(direction);
+      opts.onAction?.({ fn: "scroll", args: direction, result: String(r) });
+      return r;
     };
     globalThis.scroll_element = function (text, direction) {
-      update_status("scroll " + text + " " + direction);
-      return origScrollElement(text, direction);
+      const r = origScrollElement(text, direction);
+      opts.onAction?.({
+        fn: "scroll_element",
+        args: text + " " + direction,
+        result: String(r)
+      });
+      return r;
     };
     globalThis.press_home = function () {
-      update_status("press home");
-      return origPressHome();
+      const r = origPressHome();
+      opts.onAction?.({ fn: "press_home", args: "", result: String(r) });
+      return r;
     };
     globalThis.press_back = function () {
-      update_status("press back");
-      return origPressBack();
+      const r = origPressBack();
+      opts.onAction?.({ fn: "press_back", args: "", result: String(r) });
+      return r;
     };
     globalThis.press_recents = function () {
-      update_status("press recents");
-      return origPressRecents();
+      const r = origPressRecents();
+      opts.onAction?.({ fn: "press_recents", args: "", result: String(r) });
+      return r;
     };
     globalThis.show_notifications = function () {
-      update_status("show notifications");
-      return origShowNotifications();
+      const r = origShowNotifications();
+      opts.onAction?.({
+        fn: "show_notifications",
+        args: "",
+        result: String(r)
+      });
+      return r;
     };
     return {
       getScreenCount: () => getScreenCount,
@@ -315,6 +338,7 @@
   }
   function executeCodeForServer(code) {
     const capturedScreenshots = [];
+    const logEntries = [];
     let lastGetScreenResult = null;
     const wrapped = wrapHostFunctions({
       deadline: Date.now() + EXEC_TIMEOUT_MS,
@@ -324,6 +348,10 @@
       },
       onScreenshot(b64) {
         capturedScreenshots.push(b64);
+      },
+      onAction(entry) {
+        logEntries.push(entry);
+        update_status(entry.fn + " " + entry.args);
       }
     });
     try {
@@ -333,7 +361,8 @@
       }
       return {
         result: result === void 0 ? "undefined" : String(result),
-        screenshots: capturedScreenshots
+        screenshots: capturedScreenshots,
+        executionLog: logEntries
       };
     } catch (e) {
       const msg = e instanceof Error ? e.message : String(e);
@@ -341,12 +370,14 @@
         return {
           result:
             "[JS Error] Top-level 'return' is not allowed. The code runs in global scope \u2014 use the last expression as the result instead of 'return'.",
-          screenshots: capturedScreenshots
+          screenshots: capturedScreenshots,
+          executionLog: logEntries
         };
       }
       return {
         result: "[JS Error] " + msg,
-        screenshots: capturedScreenshots
+        screenshots: capturedScreenshots,
+        executionLog: logEntries
       };
     } finally {
       wrapped.restore();
