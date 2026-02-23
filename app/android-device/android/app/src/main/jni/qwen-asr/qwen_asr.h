@@ -108,6 +108,10 @@ typedef struct {
     float *conv3_weight;       /* [480, 480, 3, 3] */
     float *conv3_bias;         /* [480] */
 
+    /* Q8_0 quantized conv weights for layers 2&3 (K=4320, multiple of 32) */
+    block_q8_0 *conv2_weight_q8;  /* [480, 4320/32=135 blocks] */
+    block_q8_0 *conv3_weight_q8;  /* [480, 4320/32=135 blocks] */
+
     /* Conv output projection - Q8_0 quantized */
     block_q8_0 *conv_out_weight_q8; /* [d_model, 7680/QK8_0 blocks] */
 
@@ -242,6 +246,13 @@ typedef struct {
     double perf_audio_ms;          /* input audio duration in milliseconds */
     double perf_encode_ms;         /* mel + encoder time in milliseconds */
     double perf_decode_ms;         /* decoder prefill + decode time in milliseconds */
+
+    /* Per-operation profiling for decode (accumulated across tokens, reset per run) */
+    double prof_dec_qkv_ms;
+    double prof_dec_attn_ms;
+    double prof_dec_mlp_ms;
+    double prof_dec_other_ms;
+    double prof_dec_argmax_ms;
 } qwen_ctx_t;
 
 /* ========================================================================

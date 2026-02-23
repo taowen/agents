@@ -18,6 +18,13 @@
 #include <stdlib.h>
 #include <string.h>
 #include <math.h>
+#include <sys/time.h>
+
+static double dec_get_time_ms(void) {
+    struct timeval tv;
+    gettimeofday(&tv, NULL);
+    return tv.tv_sec * 1000.0 + tv.tv_usec / 1000.0;
+}
 
 /* ========================================================================
  * Weight Loading
@@ -342,24 +349,33 @@ void qwen_decoder_prefill(qwen_ctx_t *ctx, const float *input_embeds, int seq_le
 
     float scale = 1.0f / sqrtf((float)head_dim);
 
+    /* Profiling accumulators */
+    double prof_qkv = 0, prof_attn = 0, prof_out_proj = 0;
+    double prof_mlp = 0, prof_norm_rope = 0;
+    double prof_t;
+
     for (int layer = 0; layer < cfg->dec_layers; layer++) {
         qwen_dec_layer_t *l = &dec->layers[layer];
 
         /* Input RMSNorm */
+        prof_t = dec_get_time_ms();
         qwen_rms_norm(x_norm, x, l->input_norm, seq_len, dim, eps);
+        prof_norm_rope += dec_get_time_ms() - prof_t;
 
         /* QKV projections (no bias, Q8_0) */
+        prof_t = dec_get_time_ms();
         qwen_linear_nobias_q8(q, x_norm, l->wq_weight_q8, seq_len, dim, q_dim);
         qwen_linear_nobias_q8(k, x_norm, l->wk_weight_q8, seq_len, dim, kv_dim);
         qwen_linear_nobias_q8(v, x_norm, l->wv_weight_q8, seq_len, dim, kv_dim);
+        prof_qkv += dec_get_time_ms() - prof_t;
 
-        /* Per-head Q/K RMSNorm */
+        /* Per-head Q/K RMSNorm + RoPE */
+        prof_t = dec_get_time_ms();
         qwen_rms_norm_per_head(q, l->q_norm_weight, seq_len, n_heads, head_dim, eps);
         qwen_rms_norm_per_head(k, l->k_norm_weight, seq_len, n_kv_heads, head_dim, eps);
-
-        /* Apply NeoX RoPE */
         qwen_apply_rope_neox(q, rope_cos, rope_sin, seq_len, n_heads, head_dim);
         qwen_apply_rope_neox(k, rope_cos, rope_sin, seq_len, n_kv_heads, head_dim);
+        prof_norm_rope += dec_get_time_ms() - prof_t;
 
         /* Store K, V in cache */
         for (int s = 0; s < seq_len; s++) {
@@ -370,30 +386,44 @@ void qwen_decoder_prefill(qwen_ctx_t *ctx, const float *input_embeds, int seq_le
         }
 
         /* Causal attention */
+        prof_t = dec_get_time_ms();
         int total_seq = start_pos + seq_len;
         float *full_k = kv_cache_k_at(ctx, layer, 0);
         float *full_v = kv_cache_v_at(ctx, layer, 0);
         qwen_causal_attention(attn_out, q, full_k, full_v,
                                seq_len, total_seq, n_heads, n_kv_heads,
                                head_dim, scale, start_pos);
+        prof_attn += dec_get_time_ms() - prof_t;
 
         /* Output projection + residual */
+        prof_t = dec_get_time_ms();
         qwen_linear_nobias_q8(proj_out, attn_out, l->wo_weight_q8,
                                seq_len, q_dim, dim);
+        prof_out_proj += dec_get_time_ms() - prof_t;
         qwen_add_inplace(x, proj_out, seq_len * dim);
 
         /* Post-attention RMSNorm */
+        prof_t = dec_get_time_ms();
         qwen_rms_norm(x_norm, x, l->post_attn_norm, seq_len, dim, eps);
+        prof_norm_rope += dec_get_time_ms() - prof_t;
 
         /* SwiGLU MLP */
+        prof_t = dec_get_time_ms();
         qwen_linear_nobias_q8(gate_up, x_norm, l->gate_up_fused_q8,
                                seq_len, dim, 2 * intermediate);
         qwen_swiglu_multiply(gate, gate_up, seq_len, intermediate);
         qwen_linear_nobias_q8(ffn_out, gate, l->down_weight_q8,
                                seq_len, intermediate, dim);
+        prof_mlp += dec_get_time_ms() - prof_t;
 
         qwen_add_inplace(x, ffn_out, seq_len * dim);
 
+    }
+
+    if (qwen_verbose >= 3) {
+        fprintf(stderr, "  Prefill breakdown: qkv=%.0f attn=%.0f out_proj=%.0f "
+                "mlp=%.0f norm_rope=%.0f ms\n",
+                prof_qkv, prof_attn, prof_out_proj, prof_mlp, prof_norm_rope);
     }
 
     ctx->kv_cache_len = start_pos + seq_len;
@@ -466,52 +496,54 @@ int qwen_decoder_forward(qwen_ctx_t *ctx, const float *input_embed) {
 
     float scale = 1.0f / sqrtf((float)head_dim);
 
+    double prof_t;
+
     for (int layer = 0; layer < cfg->dec_layers; layer++) {
         qwen_dec_layer_t *l = &dec->layers[layer];
 
+        prof_t = dec_get_time_ms();
         qwen_rms_norm(x_norm, x, l->input_norm, 1, dim, eps);
         qwen_linear_nobias_q8_qkv(q, k, v, x_norm,
                                    l->wq_weight_q8,
                                    l->wk_weight_q8,
                                    l->wv_weight_q8,
                                    dim, q_dim, kv_dim);
-
-        /* Per-head Q/K RMSNorm */
         qwen_rms_norm_per_head(q, l->q_norm_weight, 1, n_heads, head_dim, eps);
         qwen_rms_norm_per_head(k, l->k_norm_weight, 1, n_kv_heads, head_dim, eps);
-
-        /* Apply NeoX RoPE */
         qwen_apply_rope_neox(q, rope_cos, rope_sin, 1, n_heads, head_dim);
         qwen_apply_rope_neox(k, rope_cos, rope_sin, 1, n_kv_heads, head_dim);
+        ctx->prof_dec_qkv_ms += dec_get_time_ms() - prof_t;
 
         memcpy(kv_cache_k_at(ctx, layer, pos), k, kv_dim * sizeof(float));
         memcpy(kv_cache_v_at(ctx, layer, pos), v, kv_dim * sizeof(float));
 
+        prof_t = dec_get_time_ms();
         int total_seq = pos + 1;
         float *full_k = kv_cache_k_at(ctx, layer, 0);
         float *full_v = kv_cache_v_at(ctx, layer, 0);
-
         qwen_causal_attention(attn_out, q, full_k, full_v,
                                1, total_seq, n_heads, n_kv_heads,
                                head_dim, scale, pos);
+        ctx->prof_dec_attn_ms += dec_get_time_ms() - prof_t;
 
+        prof_t = dec_get_time_ms();
         qwen_linear_nobias_q8(proj_out, attn_out, l->wo_weight_q8, 1, q_dim, dim);
         qwen_add_inplace(x, proj_out, dim);
-
         qwen_rms_norm(x_norm, x, l->post_attn_norm, 1, dim, eps);
-
-        /* Fused gate+up matvec: one pass over x_norm, output interleaved [g0,u0,g1,u1,...] */
         qwen_linear_nobias_q8(gate_buf, x_norm, l->gate_up_fused_q8,
                                1, dim, 2 * intermediate);
-        /* In-place for seq=1: gate_buf[0:inter] receives SwiGLU output. */
         qwen_swiglu_multiply(gate_buf, gate_buf, 1, intermediate);
         qwen_linear_nobias_q8(ffn_out, gate_buf, l->down_weight_q8, 1, intermediate, dim);
         qwen_add_inplace(x, ffn_out, dim);
+        ctx->prof_dec_mlp_ms += dec_get_time_ms() - prof_t;
     }
 
     ctx->kv_cache_len = pos + 1;
 
     /* Final norm + streaming argmax (Q8_0, no logits buffer needed) */
+    prof_t = dec_get_time_ms();
     qwen_rms_norm(x, x, dec->norm, 1, dim, eps);
-    return qwen_argmax_matvec_q8(x, dec->tok_embeddings_q8, dim, cfg->vocab_size);
+    int token = qwen_argmax_matvec_q8(x, dec->tok_embeddings_q8, dim, cfg->vocab_size);
+    ctx->prof_dec_argmax_ms += dec_get_time_ms() - prof_t;
+    return token;
 }

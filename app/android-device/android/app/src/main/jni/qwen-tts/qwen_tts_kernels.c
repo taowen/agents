@@ -701,6 +701,26 @@ void kernel_mrope_apply(float *q, float *k, const float *cos, const float *sin,
 }
 
 /* ======================================================================== */
+/* NEON vectorized saxpy: dst[i] += alpha * src[i]                           */
+/* ======================================================================== */
+
+static inline void neon_saxpy_f32(float *dst, const float *src, float alpha, int n) {
+#if defined(__ARM_NEON) || defined(__aarch64__)
+    float32x4_t va = vdupq_n_f32(alpha);
+    int i = 0;
+    for (; i + 7 < n; i += 8) {
+        vst1q_f32(dst + i, vfmaq_f32(vld1q_f32(dst + i), vld1q_f32(src + i), va));
+        vst1q_f32(dst + i + 4, vfmaq_f32(vld1q_f32(dst + i + 4), vld1q_f32(src + i + 4), va));
+    }
+    for (; i + 3 < n; i += 4)
+        vst1q_f32(dst + i, vfmaq_f32(vld1q_f32(dst + i), vld1q_f32(src + i), va));
+    for (; i < n; i++) dst[i] += alpha * src[i];
+#else
+    for (int i = 0; i < n; i++) dst[i] += alpha * src[i];
+#endif
+}
+
+/* ======================================================================== */
 /* Convolution operations                                                    */
 /* ======================================================================== */
 
@@ -773,6 +793,90 @@ void kernel_causal_conv1d(float *out, const float *input, const float *weight,
             }
             return;
         }
+    }
+#endif
+
+    /*
+     * NEON fast path for k=7, groups=1 (vocoder hot path: dilation=1/3/9).
+     * Output-centric: compute 8 consecutive outputs at once with 7 FMA each.
+     * This eliminates the 7 separate saxpy passes over output, reducing
+     * memory write traffic by ~7x vs the saxpy approach.
+     */
+#if defined(__ARM_NEON) || defined(__aarch64__)
+    if (kernel_size == 7 && groups == 1) {
+        int pad7 = 6 * dilation;  /* (7-1) * dilation */
+
+#ifdef USE_OPENMP
+#pragma omp parallel for schedule(static)
+#endif
+        for (int oc = 0; oc < out_channels; oc++) {
+            float *out_ch = out + (size_t)oc * length;
+            float b = bias ? bias[oc] : 0.0f;
+
+            /* Init output to bias (NEON) */
+            {
+                float32x4_t vb = vdupq_n_f32(b);
+                int t = 0;
+                for (; t + 3 < length; t += 4) vst1q_f32(out_ch + t, vb);
+                for (; t < length; t++) out_ch[t] = b;
+            }
+
+            for (int ic = 0; ic < in_channels; ic++) {
+                const float *w = weight + ((size_t)oc * in_channels + ic) * 7;
+                const float *in_ch = input + (size_t)ic * length;
+                float w0 = w[0], w1 = w[1], w2 = w[2], w3 = w[3];
+                float w4 = w[4], w5 = w[5], w6 = w[6];
+                int dil = dilation;
+
+                /* Boundary: t < pad7 (some taps land in zero-padding) */
+                for (int t = 0; t < pad7 && t < length; t++) {
+                    float sum = 0;
+                    for (int k = 0; k < 7; k++) {
+                        int in_t = t - pad7 + k * dil;
+                        if (in_t >= 0) sum += w[k] * in_ch[in_t];
+                    }
+                    out_ch[t] += sum;
+                }
+
+                /* Steady state: NEON, 8 outputs at a time */
+                int t = pad7;
+                for (; t + 7 < length; t += 8) {
+                    float32x4_t acc0 = vdupq_n_f32(0);
+                    float32x4_t acc1 = vdupq_n_f32(0);
+                    int base = t - pad7;
+                    acc0 = vfmaq_n_f32(acc0, vld1q_f32(in_ch + base),             w0);
+                    acc1 = vfmaq_n_f32(acc1, vld1q_f32(in_ch + base + 4),         w0);
+                    acc0 = vfmaq_n_f32(acc0, vld1q_f32(in_ch + base + dil),       w1);
+                    acc1 = vfmaq_n_f32(acc1, vld1q_f32(in_ch + base + dil + 4),   w1);
+                    acc0 = vfmaq_n_f32(acc0, vld1q_f32(in_ch + base + 2*dil),     w2);
+                    acc1 = vfmaq_n_f32(acc1, vld1q_f32(in_ch + base + 2*dil + 4), w2);
+                    acc0 = vfmaq_n_f32(acc0, vld1q_f32(in_ch + base + 3*dil),     w3);
+                    acc1 = vfmaq_n_f32(acc1, vld1q_f32(in_ch + base + 3*dil + 4), w3);
+                    acc0 = vfmaq_n_f32(acc0, vld1q_f32(in_ch + base + 4*dil),     w4);
+                    acc1 = vfmaq_n_f32(acc1, vld1q_f32(in_ch + base + 4*dil + 4), w4);
+                    acc0 = vfmaq_n_f32(acc0, vld1q_f32(in_ch + base + 5*dil),     w5);
+                    acc1 = vfmaq_n_f32(acc1, vld1q_f32(in_ch + base + 5*dil + 4), w5);
+                    acc0 = vfmaq_n_f32(acc0, vld1q_f32(in_ch + base + 6*dil),     w6);
+                    acc1 = vfmaq_n_f32(acc1, vld1q_f32(in_ch + base + 6*dil + 4), w6);
+
+                    vst1q_f32(out_ch + t, vaddq_f32(vld1q_f32(out_ch + t), acc0));
+                    vst1q_f32(out_ch + t + 4, vaddq_f32(vld1q_f32(out_ch + t + 4), acc1));
+                }
+
+                /* Scalar tail */
+                for (; t < length; t++) {
+                    int base = t - pad7;
+                    out_ch[t] += w0 * in_ch[base]
+                               + w1 * in_ch[base + dil]
+                               + w2 * in_ch[base + 2*dil]
+                               + w3 * in_ch[base + 3*dil]
+                               + w4 * in_ch[base + 4*dil]
+                               + w5 * in_ch[base + 5*dil]
+                               + w6 * in_ch[base + 6*dil];
+                }
+            }
+        }
+        return;
     }
 #endif
 
@@ -865,9 +969,7 @@ void kernel_causal_conv1d(float *out, const float *input, const float *weight,
 #ifdef USE_BLAS
                     cblas_saxpy(n, wk, src, 1, dst, 1);
 #else
-                    for (int i = 0; i < n; i++) {
-                        dst[i] += wk * src[i];
-                    }
+                    neon_saxpy_f32(dst, src, wk, n);
 #endif
                 }
             }
@@ -907,11 +1009,7 @@ void kernel_causal_conv1d(float *out, const float *input, const float *weight,
 #ifdef USE_BLAS
                 cblas_saxpy(n, wk, in_ch + in_start, 1, out_ch + out_start, 1);
 #else
-                const float *src = in_ch + in_start;
-                float *dst = out_ch + out_start;
-                for (int i = 0; i < n; i++) {
-                    dst[i] += wk * src[i];
-                }
+                neon_saxpy_f32(out_ch + out_start, in_ch + in_start, wk, n);
 #endif
             }
         }
@@ -993,7 +1091,7 @@ void kernel_transposed_conv1d(float *out, const float *input, const float *weigh
     }
 #endif
 
-    /* Scalar fallback */
+    /* Scalar fallback (with NEON vectorized k-loop) */
 #ifdef USE_OPENMP
 #pragma omp parallel for schedule(static)
 #endif
@@ -1008,10 +1106,23 @@ void kernel_transposed_conv1d(float *out, const float *input, const float *weigh
             for (int t = 0; t < length; t++) {
                 float val = in_ch[t];
                 int base = t * stride;
-                for (int k = 0; k < kernel_size; k++) {
-                    int ot = base + k;
-                    if (ot < final_len) out_ch[ot] += val * w[k];
+                int k_max = kernel_size;
+                if (base + k_max > final_len) k_max = final_len - base;
+                if (k_max <= 0) continue;
+#if defined(__ARM_NEON) || defined(__aarch64__)
+                float32x4_t vval = vdupq_n_f32(val);
+                int k = 0;
+                for (; k + 3 < k_max; k += 4) {
+                    float32x4_t o = vld1q_f32(out_ch + base + k);
+                    float32x4_t wv = vld1q_f32(w + k);
+                    vst1q_f32(out_ch + base + k, vfmaq_f32(o, wv, vval));
                 }
+                for (; k < k_max; k++)
+                    out_ch[base + k] += val * w[k];
+#else
+                for (int k = 0; k < k_max; k++)
+                    out_ch[base + k] += val * w[k];
+#endif
             }
         }
     }

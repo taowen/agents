@@ -20,6 +20,13 @@
 #include <stdlib.h>
 #include <string.h>
 #include <math.h>
+#include <sys/time.h>
+
+static double enc_get_time_ms(void) {
+    struct timeval tv;
+    gettimeofday(&tv, NULL);
+    return tv.tv_sec * 1000.0 + tv.tv_usec / 1000.0;
+}
 
 /* ========================================================================
  * Weight Loading
@@ -80,6 +87,19 @@ int qwen_encoder_load(qwen_encoder_t *enc, multi_safetensors_t *ms,
     enc->conv3_bias = load_f32(ms, name);
 
     if (!enc->conv1_weight || !enc->conv2_weight || !enc->conv3_weight) return -1;
+
+    /* Quantize conv2/conv3 weights: [480, 4320] flat -> Q8_0 blocks */
+    {
+        int conv_k = QWEN_CONV_HIDDEN * QWEN_CONV_KERNEL * QWEN_CONV_KERNEL; /* 4320 */
+        int conv_n_elements = QWEN_CONV_HIDDEN * conv_k;  /* 480 * 4320 = 2073600 */
+        int conv_n_blocks = conv_n_elements / QK8_0;       /* 64800 */
+
+        enc->conv2_weight_q8 = (block_q8_0 *)malloc((size_t)conv_n_blocks * sizeof(block_q8_0));
+        quantize_f32_to_q8_0(enc->conv2_weight, enc->conv2_weight_q8, conv_n_elements);
+
+        enc->conv3_weight_q8 = (block_q8_0 *)malloc((size_t)conv_n_blocks * sizeof(block_q8_0));
+        quantize_f32_to_q8_0(enc->conv3_weight, enc->conv3_weight_q8, conv_n_elements);
+    }
 
     /* Conv output projection (bf16 -> Q8_0, no bias) */
     snprintf(name, sizeof(name), "%sconv_out.weight", ENC_PREFIX);
@@ -179,6 +199,11 @@ float *qwen_encoder_forward(qwen_ctx_t *ctx, const float *mel, int mel_frames,
     int n_window_infer = cfg->enc_n_window_infer;  /* 800 */
 
 
+    /* Profiling accumulators (qwen_verbose >= 3) */
+    double prof_conv = 0, prof_attn_proj = 0, prof_attn = 0;
+    double prof_ffn_proj = 0, prof_ffn_act = 0, prof_norm = 0, prof_proj = 0;
+    double prof_t;
+
     /* ---- Per-chunk Conv2D stem ---- */
     /* mel: [128, mel_frames] (already in Conv2D-friendly layout)
      * Process chunks of chunk_size frames, each producing tokens_per_chunk tokens */
@@ -215,6 +240,7 @@ float *qwen_encoder_forward(qwen_ctx_t *ctx, const float *mel, int mel_frames,
     int token_offset = 0;
 
     /* Process each chunk through Conv2D + reshape + project + sinusoidal PE */
+    prof_t = enc_get_time_ms();
     for (int c = 0; c < n_chunks; c++) {
         int start = c * chunk_size;
         int end = start + chunk_size;
@@ -237,21 +263,21 @@ float *qwen_encoder_forward(qwen_ctx_t *ctx, const float *mel, int mel_frames,
         qwen_gelu(c1, QWEN_CONV_HIDDEN * h1 * w1);
         free(chunk_mel);
 
-        /* Conv2D layer 2: [480, 64, w1] -> [480, 32, w2] */
+        /* Conv2D layer 2: [480, 64, w1] -> [480, 32, w2] (Q8_0 GEMM) */
         int h2 = (h1 + 2 - 3) / 2 + 1; /* 32 */
         int w2 = (w1 + 2 - 3) / 2 + 1;
         float *c2 = (float *)malloc(QWEN_CONV_HIDDEN * h2 * w2 * sizeof(float));
-        qwen_conv2d(c2, c1, enc->conv2_weight, enc->conv2_bias,
-                     QWEN_CONV_HIDDEN, QWEN_CONV_HIDDEN, h1, w1, 3, 3, 2, 1);
+        qwen_conv2d_q8(c2, c1, enc->conv2_weight_q8, enc->conv2_bias,
+                        QWEN_CONV_HIDDEN, QWEN_CONV_HIDDEN, h1, w1, 3, 3, 2, 1);
         qwen_gelu(c2, QWEN_CONV_HIDDEN * h2 * w2);
         free(c1);
 
-        /* Conv2D layer 3: [480, 32, w2] -> [480, 16, w3] */
+        /* Conv2D layer 3: [480, 32, w2] -> [480, 16, w3] (Q8_0 GEMM) */
         int h3 = (h2 + 2 - 3) / 2 + 1; /* 16 */
         int w3 = (w2 + 2 - 3) / 2 + 1;
         float *c3 = (float *)malloc(QWEN_CONV_HIDDEN * h3 * w3 * sizeof(float));
-        qwen_conv2d(c3, c2, enc->conv3_weight, enc->conv3_bias,
-                     QWEN_CONV_HIDDEN, QWEN_CONV_HIDDEN, h2, w2, 3, 3, 2, 1);
+        qwen_conv2d_q8(c3, c2, enc->conv3_weight_q8, enc->conv3_bias,
+                        QWEN_CONV_HIDDEN, QWEN_CONV_HIDDEN, h2, w2, 3, 3, 2, 1);
         qwen_gelu(c3, QWEN_CONV_HIDDEN * h3 * w3);
         free(c2);
 
@@ -282,6 +308,7 @@ float *qwen_encoder_forward(qwen_ctx_t *ctx, const float *mel, int mel_frames,
 
         token_offset += w3;
     }
+    prof_conv = enc_get_time_ms() - prof_t;
 
     /* ---- Build attention window boundaries ---- */
     /* Window size = tokens_per_chunk * (n_window_infer / chunk_size) */
@@ -310,43 +337,64 @@ float *qwen_encoder_forward(qwen_ctx_t *ctx, const float *mel, int mel_frames,
         qwen_enc_layer_t *l = &enc->layers[layer];
 
         /* ---- Self-attention ---- */
+        prof_t = enc_get_time_ms();
         qwen_layer_norm(x_norm, x, l->attn_norm_weight, l->attn_norm_bias,
                         total_tokens, d_model, 1e-5f);
+        prof_norm += enc_get_time_ms() - prof_t;
 
+        prof_t = enc_get_time_ms();
         qwen_linear_q8_qkv_batched(q, k, v, x_norm,
                                      l->wq_weight_q8, l->wq_bias,
                                      l->wk_weight_q8, l->wk_bias,
                                      l->wv_weight_q8, l->wv_bias,
                                      total_tokens, d_model, d_model, d_model);
+        prof_attn_proj += enc_get_time_ms() - prof_t;
 
+        prof_t = enc_get_time_ms();
         qwen_bidirectional_attention(attn_out, q, k, v,
                                       total_tokens, n_heads, head_dim, scale,
                                       window_starts, n_windows);
+        prof_attn += enc_get_time_ms() - prof_t;
 
         /* Output projection + residual */
+        prof_t = enc_get_time_ms();
         qwen_linear_q8(proj_out, attn_out, l->wo_weight_q8, l->wo_bias,
                         total_tokens, d_model, d_model);
+        prof_attn_proj += enc_get_time_ms() - prof_t;
         qwen_add_inplace(x, proj_out, total_tokens * d_model);
 
         /* ---- FFN ---- */
+        prof_t = enc_get_time_ms();
         qwen_layer_norm(x_norm, x, l->ffn_norm_weight, l->ffn_norm_bias,
                         total_tokens, d_model, 1e-5f);
+        prof_norm += enc_get_time_ms() - prof_t;
 
         /* GELU FFN: fc1 -> GELU -> fc2 */
+        prof_t = enc_get_time_ms();
         qwen_linear_q8(ffn_mid, x_norm, l->fc1_weight_q8, l->fc1_bias,
                         total_tokens, d_model, ffn_dim);
+        prof_ffn_proj += enc_get_time_ms() - prof_t;
+
+        prof_t = enc_get_time_ms();
         qwen_gelu(ffn_mid, total_tokens * ffn_dim);
+        prof_ffn_act += enc_get_time_ms() - prof_t;
+
+        prof_t = enc_get_time_ms();
         qwen_linear_q8(ffn_out, ffn_mid, l->fc2_weight_q8, l->fc2_bias,
                         total_tokens, ffn_dim, d_model);
+        prof_ffn_proj += enc_get_time_ms() - prof_t;
         qwen_add_inplace(x, ffn_out, total_tokens * d_model);
 
     }
 
     /* Final LayerNorm */
+    prof_t = enc_get_time_ms();
     qwen_layer_norm(x, x, enc->ln_post_weight, enc->ln_post_bias,
                     total_tokens, d_model, 1e-5f);
+    prof_norm += enc_get_time_ms() - prof_t;
 
     /* Projection: proj1 (GELU) -> proj2 (Q8_0) */
+    prof_t = enc_get_time_ms();
     float *proj_mid = (float *)malloc(total_tokens * d_model * sizeof(float));
     qwen_linear_q8(proj_mid, x, enc->proj1_weight_q8, enc->proj1_bias,
                     total_tokens, d_model, d_model);
@@ -356,6 +404,14 @@ float *qwen_encoder_forward(qwen_ctx_t *ctx, const float *mel, int mel_frames,
     qwen_linear_q8(enc_output, proj_mid, enc->proj2_weight_q8, enc->proj2_bias,
                     total_tokens, d_model, output_dim);
     free(proj_mid);
+    prof_proj = enc_get_time_ms() - prof_t;
+
+    if (qwen_verbose >= 3) {
+        fprintf(stderr, "  Encoder breakdown: conv=%.0f attn_proj=%.0f attn=%.0f "
+                "ffn_proj=%.0f ffn_act=%.0f norm=%.0f proj=%.0f ms\n",
+                prof_conv, prof_attn_proj, prof_attn,
+                prof_ffn_proj, prof_ffn_act, prof_norm, prof_proj);
+    }
 
     /* Clean up */
     free(x); free(x_norm); free(q); free(k); free(v);

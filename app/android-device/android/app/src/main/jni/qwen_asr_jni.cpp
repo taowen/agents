@@ -309,7 +309,7 @@ Java_ai_connct_1screen_rn_VoiceService_nativeTestWav(
     }
 
     // Enable verbose timing for per-phase profiling
-    qwen_verbose = 2;
+    qwen_verbose = 3;
     setup_stderr_redirect();
 
     LOGI("nativeTestWav: loading %s", path);
@@ -364,7 +364,7 @@ Java_ai_connct_1screen_rn_VoiceService_nativeTestWavStream(
         g_on_native_token = env->GetStaticMethodID(clazz, "onNativeToken", "(Ljava/lang/String;)V");
     }
 
-    qwen_verbose = 2;
+    qwen_verbose = 3;
     setup_stderr_redirect();
 
     LOGI("nativeTestWavStream: loading %s", path);

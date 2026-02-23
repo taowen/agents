@@ -259,6 +259,8 @@ void qwen_free(qwen_ctx_t *ctx) {
     FREE0(ctx->encoder.conv1_weight); FREE0(ctx->encoder.conv1_bias);
     FREE0(ctx->encoder.conv2_weight); FREE0(ctx->encoder.conv2_bias);
     FREE0(ctx->encoder.conv3_weight); FREE0(ctx->encoder.conv3_bias);
+    FREE0(ctx->encoder.conv2_weight_q8);
+    FREE0(ctx->encoder.conv3_weight_q8);
     FREE0(ctx->encoder.conv_out_weight_q8);
 
     /* Encoder layers (Q8_0 quantized weights, all allocated) */
@@ -722,6 +724,13 @@ static char *transcribe_segment(qwen_ctx_t *ctx, const float *samples,
         fprintf(stderr, "  Prefill: %d tokens (%.0f ms)\n", total_seq, prefill_ms);
 
     /* ---- Autoregressive decode ---- */
+    /* Reset per-token profiling accumulators */
+    ctx->prof_dec_qkv_ms = 0;
+    ctx->prof_dec_attn_ms = 0;
+    ctx->prof_dec_mlp_ms = 0;
+    ctx->prof_dec_other_ms = 0;
+    ctx->prof_dec_argmax_ms = 0;
+
     t0 = get_time_ms();
     int max_tokens = 2048;
     int n_generated = 0;
@@ -770,6 +779,12 @@ static char *transcribe_segment(qwen_ctx_t *ctx, const float *samples,
         fprintf(stderr, "  Decode: %d tokens (%.0f ms, %.1f ms/token)\n",
                 n_generated, decode_ms,
                 n_generated > 0 ? decode_ms / n_generated : 0);
+
+    if (qwen_verbose >= 3) {
+        fprintf(stderr, "  Decode breakdown: qkv=%.0f attn=%.0f mlp=%.0f argmax=%.0f ms\n",
+                ctx->prof_dec_qkv_ms, ctx->prof_dec_attn_ms,
+                ctx->prof_dec_mlp_ms, ctx->prof_dec_argmax_ms);
+    }
 
     free(tmp_embed);
 

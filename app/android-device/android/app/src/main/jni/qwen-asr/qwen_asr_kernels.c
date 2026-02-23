@@ -13,6 +13,9 @@
 #if (defined(__AVX512F__) || defined(__AVX2__)) && (defined(__x86_64__) || defined(__i386__) || defined(_M_X64) || defined(_M_IX86))
 #include <immintrin.h>
 #endif
+#if defined(__ARM_NEON) || defined(__aarch64__)
+#include <arm_neon.h>
+#endif
 #ifdef __APPLE__
 #include <sys/sysctl.h>
 #else
@@ -1154,6 +1157,61 @@ void qwen_conv2d(float *out, const float *in, const float *weight, const float *
             }
         }
     }
+}
+
+/*
+ * im2col_transposed: Unroll input patches into row-major [spatial_out, patch_size].
+ * This is the transposed layout vs im2col's [patch_size, spatial_out], suitable
+ * for feeding directly into qwen_linear_q8 as X[M, K].
+ */
+static void im2col_transposed(const float *in, float *cols_t,
+                               int c_in, int h_in, int w_in,
+                               int kh, int kw, int stride, int padding,
+                               int h_out, int w_out) {
+    int patch_size = c_in * kh * kw;
+    for (int oh = 0; oh < h_out; oh++) {
+        for (int ow = 0; ow < w_out; ow++) {
+            float *row = cols_t + (oh * w_out + ow) * patch_size;
+            for (int ic = 0; ic < c_in; ic++) {
+                for (int ki = 0; ki < kh; ki++) {
+                    int ih = oh * stride - padding + ki;
+                    for (int kj = 0; kj < kw; kj++) {
+                        int iw = ow * stride - padding + kj;
+                        int p = (ic * kh + ki) * kw + kj;
+                        if (ih >= 0 && ih < h_in && iw >= 0 && iw < w_in)
+                            row[p] = in[ic * h_in * w_in + ih * w_in + iw];
+                        else
+                            row[p] = 0.0f;
+                    }
+                }
+            }
+        }
+    }
+}
+
+void qwen_conv2d_q8(float *out, const float *in,
+                    const block_q8_0 *weight_q8, const float *bias,
+                    int c_in, int c_out, int h_in, int w_in,
+                    int kh, int kw, int stride, int padding) {
+    int h_out = (h_in + 2 * padding - kh) / stride + 1;
+    int w_out = (w_in + 2 * padding - kw) / stride + 1;
+    int patch_size = c_in * kh * kw;
+    int spatial_out = h_out * w_out;
+
+    /* 1. im2col transposed: [spatial_out, patch_size] */
+    float *cols_t = (float *)malloc((size_t)spatial_out * patch_size * sizeof(float));
+    im2col_transposed(in, cols_t, c_in, h_in, w_in, kh, kw, stride, padding, h_out, w_out);
+
+    /* 2. Q8_0 GEMM: out_t[spatial_out, c_out] = cols_t[spatial_out, patch_size] @ W_q8[c_out, patch_size]^T + bias */
+    float *out_t = (float *)malloc((size_t)spatial_out * c_out * sizeof(float));
+    qwen_linear_q8(out_t, cols_t, weight_q8, bias, spatial_out, patch_size, c_out);
+    free(cols_t);
+
+    /* 3. Transpose: out_t[spatial_out, c_out] -> out[c_out, spatial_out] */
+    for (int c = 0; c < c_out; c++)
+        for (int s = 0; s < spatial_out; s++)
+            out[c * spatial_out + s] = out_t[s * c_out + c];
+    free(out_t);
 }
 
 /* ========================================================================
