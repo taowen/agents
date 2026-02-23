@@ -2002,6 +2002,190 @@ void qwen_softmax(float *x, int rows, int cols) {
 }
 
 /* ========================================================================
+ * FP16 Conversion
+ * ======================================================================== */
+
+/* Scalar FP32→FP16 fallback using IEEE 754 bit manipulation */
+static inline uint16_t f32_to_f16_scalar(float v) {
+    union { float f; uint32_t u; } bits;
+    bits.f = v;
+    uint32_t w = bits.u;
+    uint32_t sign = (w >> 16) & 0x8000;
+    int exp = (int)((w >> 23) & 0xff) - 127 + 15;
+    uint32_t frac = (w >> 13) & 0x3ff;
+    if (exp <= 0) return (uint16_t)sign;
+    if (exp >= 31) return (uint16_t)(sign | 0x7c00);
+    return (uint16_t)(sign | ((uint32_t)exp << 10) | frac);
+}
+
+static inline float f16_to_f32_scalar(uint16_t h) {
+    uint32_t sign = ((uint32_t)h & 0x8000) << 16;
+    uint32_t exp = ((uint32_t)h >> 10) & 0x1f;
+    uint32_t frac = (uint32_t)h & 0x3ff;
+    if (exp == 0) {
+        if (frac == 0) { union { uint32_t u; float f; } r; r.u = sign; return r.f; }
+        /* denorm */
+        exp = 1;
+        while (!(frac & 0x400)) { frac <<= 1; exp--; }
+        frac &= 0x3ff;
+        exp = (127 - 15 + exp);
+    } else if (exp == 31) {
+        exp = 255;
+    } else {
+        exp = exp - 15 + 127;
+    }
+    union { uint32_t u; float f; } r;
+    r.u = sign | (exp << 23) | (frac << 13);
+    return r.f;
+}
+
+void qwen_f32_to_f16(uint16_t *dst, const float *src, int n) {
+#ifdef __ARM_NEON
+    int i = 0;
+    for (; i + 8 <= n; i += 8) {
+        float32x4_t lo = vld1q_f32(src + i);
+        float32x4_t hi = vld1q_f32(src + i + 4);
+        float16x4_t lo16 = vcvt_f16_f32(lo);
+        float16x4_t hi16 = vcvt_f16_f32(hi);
+        vst1_u16(dst + i, vreinterpret_u16_f16(lo16));
+        vst1_u16(dst + i + 4, vreinterpret_u16_f16(hi16));
+    }
+    for (; i + 4 <= n; i += 4) {
+        float32x4_t v = vld1q_f32(src + i);
+        float16x4_t v16 = vcvt_f16_f32(v);
+        vst1_u16(dst + i, vreinterpret_u16_f16(v16));
+    }
+    for (; i < n; i++) {
+        dst[i] = f32_to_f16_scalar(src[i]);
+    }
+#else
+    for (int i = 0; i < n; i++) {
+        dst[i] = f32_to_f16_scalar(src[i]);
+    }
+#endif
+}
+
+void qwen_f16_to_f32(float *dst, const uint16_t *src, int n) {
+#ifdef __ARM_NEON
+    int i = 0;
+    for (; i + 8 <= n; i += 8) {
+        float16x4_t lo16 = vreinterpret_f16_u16(vld1_u16(src + i));
+        float16x4_t hi16 = vreinterpret_f16_u16(vld1_u16(src + i + 4));
+        vst1q_f32(dst + i, vcvt_f32_f16(lo16));
+        vst1q_f32(dst + i + 4, vcvt_f32_f16(hi16));
+    }
+    for (; i + 4 <= n; i += 4) {
+        float16x4_t v16 = vreinterpret_f16_u16(vld1_u16(src + i));
+        vst1q_f32(dst + i, vcvt_f32_f16(v16));
+    }
+    for (; i < n; i++) {
+        dst[i] = f16_to_f32_scalar(src[i]);
+    }
+#else
+    for (int i = 0; i < n; i++) {
+        dst[i] = f16_to_f32_scalar(src[i]);
+    }
+#endif
+}
+
+/* Mixed-precision dot product: dot(fp32_a, fp16_b) with on-the-fly conversion */
+static inline float qwen_dot_f32_f16(const float *a, const uint16_t *b_fp16, int n) {
+#ifdef __ARM_NEON
+    float32x4_t acc0 = vdupq_n_f32(0.0f);
+    float32x4_t acc1 = vdupq_n_f32(0.0f);
+    int d = 0;
+    for (; d + 8 <= n; d += 8) {
+        float32x4_t a0 = vld1q_f32(a + d);
+        float32x4_t a1 = vld1q_f32(a + d + 4);
+        float16x4_t b16_0 = vreinterpret_f16_u16(vld1_u16(b_fp16 + d));
+        float16x4_t b16_1 = vreinterpret_f16_u16(vld1_u16(b_fp16 + d + 4));
+        float32x4_t b0 = vcvt_f32_f16(b16_0);
+        float32x4_t b1 = vcvt_f32_f16(b16_1);
+        acc0 = vfmaq_f32(acc0, a0, b0);
+        acc1 = vfmaq_f32(acc1, a1, b1);
+    }
+    for (; d + 4 <= n; d += 4) {
+        float32x4_t a0 = vld1q_f32(a + d);
+        float16x4_t b16 = vreinterpret_f16_u16(vld1_u16(b_fp16 + d));
+        acc0 = vfmaq_f32(acc0, a0, vcvt_f32_f16(b16));
+    }
+    float sum = vaddvq_f32(vaddq_f32(acc0, acc1));
+    for (; d < n; d++) {
+        sum += a[d] * f16_to_f32_scalar(b_fp16[d]);
+    }
+    return sum;
+#else
+    float sum = 0.0f;
+    for (int d = 0; d < n; d++) {
+        sum += a[d] * f16_to_f32_scalar(b_fp16[d]);
+    }
+    return sum;
+#endif
+}
+
+/* dst += alpha * src_fp16 (with on-the-fly FP16→FP32 conversion) */
+static inline void qwen_vec_axpy_f16_inplace(float *dst, const uint16_t *src_fp16,
+                                               float alpha, int n) {
+#ifdef __ARM_NEON
+    float32x4_t va = vdupq_n_f32(alpha);
+    int d = 0;
+    for (; d + 8 <= n; d += 8) {
+        float32x4_t d0 = vld1q_f32(dst + d);
+        float32x4_t d1 = vld1q_f32(dst + d + 4);
+        float16x4_t s16_0 = vreinterpret_f16_u16(vld1_u16(src_fp16 + d));
+        float16x4_t s16_1 = vreinterpret_f16_u16(vld1_u16(src_fp16 + d + 4));
+        float32x4_t s0 = vcvt_f32_f16(s16_0);
+        float32x4_t s1 = vcvt_f32_f16(s16_1);
+        vst1q_f32(dst + d, vfmaq_f32(d0, s0, va));
+        vst1q_f32(dst + d + 4, vfmaq_f32(d1, s1, va));
+    }
+    for (; d + 4 <= n; d += 4) {
+        float32x4_t d0 = vld1q_f32(dst + d);
+        float16x4_t s16 = vreinterpret_f16_u16(vld1_u16(src_fp16 + d));
+        vst1q_f32(dst + d, vfmaq_f32(d0, vcvt_f32_f16(s16), va));
+    }
+    for (; d < n; d++) {
+        dst[d] += alpha * f16_to_f32_scalar(src_fp16[d]);
+    }
+#else
+    for (int d = 0; d < n; d++) {
+        dst[d] += alpha * f16_to_f32_scalar(src_fp16[d]);
+    }
+#endif
+}
+
+/* dst = dst * correction + src_fp16 (scale-add with FP16 source) */
+static inline void qwen_vec_scale_add_f16(float *dst, const uint16_t *src_fp16,
+                                            float correction, int n) {
+#ifdef __ARM_NEON
+    float32x4_t vc = vdupq_n_f32(correction);
+    int d = 0;
+    for (; d + 8 <= n; d += 8) {
+        float32x4_t d0 = vld1q_f32(dst + d);
+        float32x4_t d1 = vld1q_f32(dst + d + 4);
+        float16x4_t s16_0 = vreinterpret_f16_u16(vld1_u16(src_fp16 + d));
+        float16x4_t s16_1 = vreinterpret_f16_u16(vld1_u16(src_fp16 + d + 4));
+        float32x4_t s0 = vcvt_f32_f16(s16_0);
+        float32x4_t s1 = vcvt_f32_f16(s16_1);
+        vst1q_f32(dst + d, vfmaq_f32(s0, d0, vc));
+        vst1q_f32(dst + d + 4, vfmaq_f32(s1, d1, vc));
+    }
+    for (; d + 4 <= n; d += 4) {
+        float32x4_t d0 = vld1q_f32(dst + d);
+        float16x4_t s16 = vreinterpret_f16_u16(vld1_u16(src_fp16 + d));
+        vst1q_f32(dst + d, vfmaq_f32(vcvt_f32_f16(s16), d0, vc));
+    }
+    for (; d < n; d++) {
+        dst[d] = dst[d] * correction + f16_to_f32_scalar(src_fp16[d]);
+    }
+#else
+    for (int d = 0; d < n; d++) {
+        dst[d] = dst[d] * correction + f16_to_f32_scalar(src_fp16[d]);
+    }
+#endif
+}
+
+/* ========================================================================
  * Attention Operations
  * ======================================================================== */
 
@@ -2024,6 +2208,9 @@ static inline void qwen_vec_scale_add(float *dst, const float *src, float correc
     qwen_vec_scale_add_impl(dst, src, correction, n);
 }
 
+/* Max scores buffer size for 2-pass attention (stack allocated) */
+#define ATTN_MAX_KEYS 2048
+
 static void qwen_bidirectional_attention_heads(float *out, const float *Q, const float *K,
                                                 const float *V, int n_heads, int head_dim,
                                                 float scale, const int *window_starts,
@@ -2038,33 +2225,49 @@ static void qwen_bidirectional_attention_heads(float *out, const float *Q, const
             for (int i = ws; i < we; i++) {
                 const float *q_row = Q + i * hidden + h * head_dim;
                 float *o_row = out + i * hidden + h * head_dim;
+                int n_keys = we - ws;
+                float scores[ATTN_MAX_KEYS];
 
-                /* Online softmax */
+                /* Pass 1: compute all scores and find max */
                 float max_score = -1e30f;
-                float sum_exp = 0.0f;
-                for (int d = 0; d < head_dim; d++) o_row[d] = 0.0f;
-
-                for (int j = ws; j < we; j++) {
-                    const float *k_row = K + j * hidden + h * head_dim;
-                    const float *v_row = V + j * hidden + h * head_dim;
-
-                    float score = qwen_dot_f32(q_row, k_row, head_dim) * scale;
-
-                    if (score > max_score) {
-                        float correction = expf(max_score - score);
-                        sum_exp = sum_exp * correction + 1.0f;
-                        qwen_vec_scale_add(o_row, v_row, correction, head_dim);
-                        max_score = score;
-                    } else {
-                        float wt = expf(score - max_score);
-                        sum_exp += wt;
-                        qwen_vec_axpy_inplace(o_row, v_row, wt, head_dim);
-                    }
+                for (int j = 0; j < n_keys; j++) {
+                    const float *k_row = K + (ws + j) * hidden + h * head_dim;
+                    scores[j] = qwen_dot_f32(q_row, k_row, head_dim) * scale;
+                    if (scores[j] > max_score) max_score = scores[j];
                 }
 
-                if (sum_exp > 0.0f) {
-                    float inv_sum = 1.0f / sum_exp;
-                    qwen_vec_scale_inplace(o_row, inv_sum, head_dim);
+                /* Pass 2: NEON batch exp and accumulate weights */
+                float sum_exp = 0.0f;
+#ifdef __ARM_NEON
+                {
+                    float32x4_t vmax = vdupq_n_f32(max_score);
+                    float32x4_t vsum = vdupq_n_f32(0.0f);
+                    int j = 0;
+                    for (; j + 4 <= n_keys; j += 4) {
+                        float32x4_t s = vld1q_f32(scores + j);
+                        float32x4_t e = neon_expf(vsubq_f32(s, vmax));
+                        vst1q_f32(scores + j, e);
+                        vsum = vaddq_f32(vsum, e);
+                    }
+                    sum_exp = vaddvq_f32(vsum);
+                    for (; j < n_keys; j++) {
+                        scores[j] = expf(scores[j] - max_score);
+                        sum_exp += scores[j];
+                    }
+                }
+#else
+                for (int j = 0; j < n_keys; j++) {
+                    scores[j] = expf(scores[j] - max_score);
+                    sum_exp += scores[j];
+                }
+#endif
+
+                /* Pass 3: weighted V sum */
+                float inv_sum = (sum_exp > 0.0f) ? 1.0f / sum_exp : 0.0f;
+                for (int d = 0; d < head_dim; d++) o_row[d] = 0.0f;
+                for (int j = 0; j < n_keys; j++) {
+                    const float *v_row = V + (ws + j) * hidden + h * head_dim;
+                    qwen_vec_axpy_inplace(o_row, v_row, scores[j] * inv_sum, head_dim);
                 }
             }
         }
@@ -2114,8 +2317,10 @@ void qwen_bidirectional_attention(float *out, const float *Q, const float *K,
                                         window_starts, n_windows, 0, n_heads);
 }
 
-static void qwen_causal_attention_heads(float *out, const float *Q, const float *K,
-                                        const float *V, int seq_q, int seq_k,
+static void qwen_causal_attention_heads(float *out, const float *Q,
+                                        const uint16_t *K_fp16,
+                                        const uint16_t *V_fp16,
+                                        int seq_q, int seq_k,
                                         int n_heads, int n_kv_heads, int head_dim,
                                         float scale, int q_offset,
                                         int head_start, int head_end) {
@@ -2133,31 +2338,48 @@ static void qwen_causal_attention_heads(float *out, const float *Q, const float 
             int k_end = global_pos + 1;
             if (k_end > seq_k) k_end = seq_k;
 
+            float scores[ATTN_MAX_KEYS];
+
+            /* Pass 1: compute all scores and find max */
             float max_score = -1e30f;
-            float sum_exp = 0.0f;
-            for (int d = 0; d < head_dim; d++) o_row[d] = 0.0f;
-
             for (int j = 0; j < k_end; j++) {
-                const float *k_row = K + j * kv_hidden + kv_h * head_dim;
-                const float *v_row = V + j * kv_hidden + kv_h * head_dim;
-
-                float score = qwen_dot_f32(q_row, k_row, head_dim) * scale;
-
-                if (score > max_score) {
-                    float correction = expf(max_score - score);
-                    sum_exp = sum_exp * correction + 1.0f;
-                    qwen_vec_scale_add(o_row, v_row, correction, head_dim);
-                    max_score = score;
-                } else {
-                    float wt = expf(score - max_score);
-                    sum_exp += wt;
-                    qwen_vec_axpy_inplace(o_row, v_row, wt, head_dim);
-                }
+                const uint16_t *k_row = K_fp16 + j * kv_hidden + kv_h * head_dim;
+                scores[j] = qwen_dot_f32_f16(q_row, k_row, head_dim) * scale;
+                if (scores[j] > max_score) max_score = scores[j];
             }
 
-            if (sum_exp > 0.0f) {
-                float inv_sum = 1.0f / sum_exp;
-                qwen_vec_scale_inplace(o_row, inv_sum, head_dim);
+            /* Pass 2: NEON batch exp and accumulate weights */
+            float sum_exp = 0.0f;
+#ifdef __ARM_NEON
+            {
+                float32x4_t vmax = vdupq_n_f32(max_score);
+                float32x4_t vsum = vdupq_n_f32(0.0f);
+                int j = 0;
+                for (; j + 4 <= k_end; j += 4) {
+                    float32x4_t s = vld1q_f32(scores + j);
+                    float32x4_t e = neon_expf(vsubq_f32(s, vmax));
+                    vst1q_f32(scores + j, e);
+                    vsum = vaddq_f32(vsum, e);
+                }
+                sum_exp = vaddvq_f32(vsum);
+                for (; j < k_end; j++) {
+                    scores[j] = expf(scores[j] - max_score);
+                    sum_exp += scores[j];
+                }
+            }
+#else
+            for (int j = 0; j < k_end; j++) {
+                scores[j] = expf(scores[j] - max_score);
+                sum_exp += scores[j];
+            }
+#endif
+
+            /* Pass 3: weighted V sum */
+            float inv_sum = (sum_exp > 0.0f) ? 1.0f / sum_exp : 0.0f;
+            for (int d = 0; d < head_dim; d++) o_row[d] = 0.0f;
+            for (int j = 0; j < k_end; j++) {
+                const uint16_t *v_row = V_fp16 + j * kv_hidden + kv_h * head_dim;
+                qwen_vec_axpy_f16_inplace(o_row, v_row, scores[j] * inv_sum, head_dim);
             }
         }
     }
@@ -2166,8 +2388,8 @@ static void qwen_causal_attention_heads(float *out, const float *Q, const float 
 typedef struct {
     float *out;
     const float *Q;
-    const float *K;
-    const float *V;
+    const uint16_t *K_fp16;
+    const uint16_t *V_fp16;
     int seq_q, seq_k;
     int n_heads, n_kv_heads;
     int head_dim;
@@ -2183,17 +2405,18 @@ static void causal_attn_worker(int tid, int n_threads, void *arg) {
     if (h1 > t->n_heads) h1 = t->n_heads;
     if (h0 >= h1) return;
 
-    qwen_causal_attention_heads(t->out, t->Q, t->K, t->V,
+    qwen_causal_attention_heads(t->out, t->Q, t->K_fp16, t->V_fp16,
                                 t->seq_q, t->seq_k, t->n_heads, t->n_kv_heads,
                                 t->head_dim, t->scale, t->q_offset, h0, h1);
 }
 
-void qwen_causal_attention(float *out, const float *Q, const float *K, const float *V,
+void qwen_causal_attention(float *out, const float *Q,
+                            const uint16_t *K_fp16, const uint16_t *V_fp16,
                             int seq_q, int seq_k, int n_heads, int n_kv_heads,
                             int head_dim, float scale, int q_offset) {
     if (tp.n_threads > 1 && n_heads >= 2 && (seq_q >= 2 || seq_k >= 128)) {
         causal_attn_task_t task = {
-            .out = out, .Q = Q, .K = K, .V = V,
+            .out = out, .Q = Q, .K_fp16 = K_fp16, .V_fp16 = V_fp16,
             .seq_q = seq_q, .seq_k = seq_k,
             .n_heads = n_heads, .n_kv_heads = n_kv_heads,
             .head_dim = head_dim, .scale = scale, .q_offset = q_offset
@@ -2202,7 +2425,7 @@ void qwen_causal_attention(float *out, const float *Q, const float *K, const flo
         return;
     }
 
-    qwen_causal_attention_heads(out, Q, K, V,
+    qwen_causal_attention_heads(out, Q, K_fp16, V_fp16,
                                 seq_q, seq_k, n_heads, n_kv_heads,
                                 head_dim, scale, q_offset, 0, n_heads);
 }
@@ -2294,6 +2517,26 @@ void qwen_apply_rope_neox(float *x, const float *cos_vals, const float *sin_vals
                 __m256 new2 = _mm256_fmadd_ps(x2, cc, _mm256_mul_ps(x1, ss));
                 _mm256_storeu_ps(vec + d, new1);
                 _mm256_storeu_ps(vec + half + d, new2);
+            }
+            for (; d < half; d++) {
+                float x1 = vec[d];
+                float x2 = vec[half + d];
+                vec[d]        = x1 * c[d]        + (-x2) * sn[d];
+                vec[half + d] = x2 * c[half + d] + x1 * sn[half + d];
+            }
+#elif defined(__ARM_NEON)
+            int d = 0;
+            for (; d + 4 <= half; d += 4) {
+                float32x4_t x1 = vld1q_f32(vec + d);
+                float32x4_t x2 = vld1q_f32(vec + half + d);
+                float32x4_t cc = vld1q_f32(c + d);
+                float32x4_t ss = vld1q_f32(sn + d);
+                float32x4_t cc2 = vld1q_f32(c + half + d);
+                float32x4_t ss2 = vld1q_f32(sn + half + d);
+                /* new1 = x1 * cos - x2 * sin */
+                vst1q_f32(vec + d, vsubq_f32(vmulq_f32(x1, cc), vmulq_f32(x2, ss)));
+                /* new2 = x2 * cos2 + x1 * sin2 */
+                vst1q_f32(vec + half + d, vfmaq_f32(vmulq_f32(x2, cc2), x1, ss2));
             }
             for (; d < half; d++) {
                 float x1 = vec[d];

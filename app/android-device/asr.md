@@ -373,16 +373,96 @@ Cumulative from baseline: 7131ms → 3477ms = **2.05x**.
 | Round 2 | INT8 GEMM + workspace pre-alloc | 4462ms | 1.32x | 1.60x |
 | Round 3 | NEON activations + Q8_0 LM Head + N-tiling | 3923ms | 1.14x | 1.82x |
 | Round 4 | NEON Norm/Add + stack argmax | 3477ms | 1.13x | 2.05x |
+| Round 5 | NEON RoPE + FP16 KV Cache + 2-pass attention | 3331ms | 1.04x | 2.14x |
 
 ### Potential next optimizations
 
-1. **KV cache FP16** (medium impact). KV cache is still FP32. Halving it would reduce attention memory bandwidth, especially for decode phase (28 layers × growing sequence).
+1. **Q4_K_M for decoder** (medium impact). Decoder weights could use 4-bit quantization for ~2x further bandwidth reduction on the 168 GEMM calls per inference.
 
-2. **Q4_K_M for decoder** (medium impact). Decoder weights could use 4-bit quantization for ~2x further bandwidth reduction on the 168 GEMM calls per inference.
+2. **Attention optimization** (medium impact for encoder). Encoder bidirectional attention is now the largest remaining bottleneck. Flash-attention style tiled computation could reduce memory traffic.
 
-3. **Attention optimization** (medium impact for encoder). Encoder bidirectional attention is now the largest remaining bottleneck. Flash-attention style tiled computation could reduce memory traffic.
+3. **Prefill profiling**: Per-layer breakdown would clarify whether GEMM or attention dominates the remaining ~1186ms prefill time.
 
-4. **Prefill attention profiling**: With norm/add/activations all NEON-optimized, the remaining prefill time (~1275ms for 28 layers) is increasingly dominated by GEMM and attention. Per-layer breakdown would clarify the split.
+## NEON RoPE + FP16 KV Cache + 2-pass attention (2026-02-23)
+
+Round 5 optimization: three changes targeting RoPE vectorization, KV cache bandwidth reduction, and attention softmax vectorization.
+
+### Problem
+
+After 4 rounds of optimization, GEMM/matvec (INT8 vdotq_s32), norm/activation (NEON) were all optimized. Remaining bottlenecks:
+
+1. **`qwen_apply_rope_neox` scalar on ARM**: AVX512/AVX2 paths existed, but `#else` fallback was pure scalar. Called for every head in every attention layer. Encoder: ~46M scalar FMA ops, Prefill: ~33M ops.
+
+2. **KV Cache FP32**: `float *kv_cache_k/v` at 4 bytes/element. Decode attention reads 28 layers × ~185 positions × 1024 × 4 bytes × 2 (K+V) = ~42MB/token, ×30 tokens = ~1.26GB. FP16 would halve this.
+
+3. **Scalar `expf()` in attention**: Online softmax called scalar `expf()` ~37.6M times (encoder) + ~5.3M times (prefill). ARM scalar `expf` costs ~30-50 cycles; `neon_expf` does 4 values in ~8 cycles.
+
+### Solution
+
+**1. NEON RoPE** (`qwen_asr_kernels.c`)
+
+Inserted `#elif defined(__ARM_NEON)` path in `qwen_apply_rope_neox` between AVX2 and scalar fallback:
+- `vsubq_f32(vmulq_f32(x1, cos), vmulq_f32(x2, sin))` for first half
+- `vfmaq_f32(vmulq_f32(x2, cos2), x1, sin2)` for second half
+- 4-wide processing, scalar tail loop (unnecessary since half=32/64 always divides by 4)
+
+**2. FP16 KV Cache** (4 files)
+
+- `qwen_asr.h`: Changed `float *kv_cache_k/v` → `uint16_t *kv_cache_k/v`
+- `qwen_asr_decoder.c`: `kv_cache_init`/`kv_cache_grow` use `sizeof(uint16_t)`, `kv_cache_k_at`/`kv_cache_v_at` return `uint16_t *`, KV writes use `qwen_f32_to_f16()`
+- `qwen_asr_kernels.h`: `qwen_causal_attention` signature changed to `const uint16_t *K_fp16/V_fp16`, added `qwen_f32_to_f16`/`qwen_f16_to_f32` declarations
+- `qwen_asr_kernels.c`: New NEON-accelerated conversion functions, plus mixed-precision helpers:
+  - `qwen_dot_f32_f16()`: dot(FP32 Q, FP16 K) with on-the-fly `vcvt_f32_f16` conversion pipelined with `vfmaq_f32`
+  - `qwen_vec_axpy_f16_inplace()`: `dst += alpha * FP16_src`
+  - `qwen_vec_scale_add_f16()`: `dst = dst * correction + FP16_src`
+
+Note: encoder bidirectional attention is unchanged (operates on FP32 Q/K/V tensors directly, no KV cache).
+
+**3. 2-pass attention with NEON expf** (`qwen_asr_kernels.c`)
+
+Replaced online softmax (sequential `expf` with data-dependent max tracking) with 3-pass algorithm:
+- **Pass 1**: Compute all scores via dot products into stack buffer `float scores[ATTN_MAX_KEYS]` (max 2048 = 8KB), find max score
+- **Pass 2**: NEON batch `neon_expf` 4-wide: `scores[j] = neon_expf(scores[j] - max_score)`, accumulate sum
+- **Pass 3**: Weighted V sum: `o_row += scores[j] * inv_sum * V_row[j]`
+
+Applied to both `qwen_bidirectional_attention_heads` (encoder, FP32 K/V) and `qwen_causal_attention_heads` (decoder, FP16 K/V).
+
+Trade-off: V is now read in a separate pass instead of being fused with the softmax loop. But V working set is small (encoder: ~104 × 64 × 4 = 26KB, decoder: ~185 × 128 × 2 = 47KB FP16) and stays in L2 cache, so the re-read cost is minimal.
+
+### Results (jfk.wav, 11s audio, 4 threads, Snapdragon)
+
+| Phase | Round 4 | Round 5 | Speedup |
+|-------|---------|---------|---------|
+| Mel | 19ms | 19ms | - |
+| Encoder | 1161ms | 1134ms | 1.02x |
+| Prefill | 1275ms | 1186ms | 1.07x |
+| Decode | 1041ms | 1011ms | 1.03x |
+| **Total** | **3477ms** | **3331ms** | **1.04x** |
+
+All 23 tests pass (correctness, streaming, repeat inference, unload/reload, error handling).
+
+Cumulative from baseline: 7131ms → 3331ms = **2.14x**.
+
+### Analysis
+
+The overall 1.04x speedup (146ms saved) is below the conservative estimate of ~250-480ms. Reasons:
+
+- **Encoder: only 1.02x (27ms saved)**. The 2-pass attention + NEON expf was expected to save ~110-180ms on encoder. The small actual improvement suggests that the encoder bottleneck has shifted away from attention `expf` to other operations — likely the dot products in Pass 1 and the V accumulation in Pass 3 now dominate. The windowed attention inner loop was already partially latency-hidden by the NEON dot product computation, so removing the sequential expf dependency gave less benefit than predicted. NEON RoPE also contributed minimally (~27ms shared with attention improvement).
+
+- **Prefill: 1.07x (89ms saved)**. FP16 KV cache writes + NEON RoPE + 2-pass attention combined for a modest improvement. The FP16 write bandwidth savings during prefill are real but small (writing is a small fraction of total prefill time). The 2-pass attention helps prefill less than encoder because prefill has fewer total `expf` calls (~5.3M vs ~37.6M).
+
+- **Decode: 1.03x (30ms saved)**. FP16 KV cache reduced read bandwidth from ~42MB/token to ~21MB/token. The expected ~60-100ms saving was offset by the overhead of the mixed-precision dot product (`qwen_dot_f32_f16` with on-the-fly `vcvt_f32_f16` is slightly slower per-element than a pure FP32 dot). The net effect is positive but smaller than the raw bandwidth calculation suggested.
+
+- **Why the estimates were off**: The plan predicted savings based on cycle counts of individual operations (scalar expf, DRAM bandwidth) without accounting for: (1) instruction-level parallelism already hiding some latency; (2) the overhead of FP16↔FP32 conversion instructions in the mixed-precision path; (3) the 2-pass algorithm's extra V re-read cost; (4) the fact that at this optimization stage, the easy wins are gone and remaining bottlenecks are more distributed across many operations.
+
+### Files modified
+
+| File | Change |
+|------|--------|
+| `qwen_asr_kernels.c` | NEON RoPE; FP16 conversion functions + mixed-precision dot/axpy/scale_add; 2-pass attention for both bidirectional and causal; `ATTN_MAX_KEYS=2048` |
+| `qwen_asr_kernels.h` | `qwen_f32_to_f16`/`qwen_f16_to_f32` declarations; `qwen_causal_attention` signature changed to FP16 K/V |
+| `qwen_asr.h` | `kv_cache_k/v` type `float *` → `uint16_t *` |
+| `qwen_asr_decoder.c` | Cache init/grow/at use `uint16_t`; KV writes use `qwen_f32_to_f16`; attention calls pass FP16 pointers |
 
 ## End-to-end test suite (2026-02-23)
 

@@ -184,9 +184,9 @@ typedef struct {
     void *safetensors;         /* multi_safetensors_t* */
     char model_dir[512];
 
-    /* KV cache for decoder */
-    float *kv_cache_k;         /* [layers, max_seq, kv_heads * head_dim] */
-    float *kv_cache_v;
+    /* KV cache for decoder (FP16 for bandwidth savings) */
+    uint16_t *kv_cache_k;     /* [layers, max_seq, kv_heads * head_dim] as FP16 */
+    uint16_t *kv_cache_v;
     int kv_cache_len;
     int kv_cache_max;
 
