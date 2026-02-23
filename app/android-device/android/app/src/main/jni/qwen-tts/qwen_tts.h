@@ -510,6 +510,9 @@ int qwen_tts_generate_stream(
     void *userdata
 );
 
+/* Ensure codec decoder weights are loaded (lazy-loads for WASM) */
+int qwen_tts_ensure_codec_loaded(qwen_tts_ctx_t *ctx);
+
 /* Cache directory override (for JNI / Android) */
 extern const char *qwen_tts_cache_dir_override;
 

@@ -43,6 +43,7 @@ set(QWEN_TTS_DIR "${CMAKE_SOURCE_DIR}/qwen-tts")
 
 add_library(qwentts SHARED
     ${QWEN_TTS_DIR}/qwen_tts.c
+    ${QWEN_TTS_DIR}/qwen_tts_generate.c
     ${QWEN_TTS_DIR}/qwen_tts_kernels.c
     ${QWEN_TTS_DIR}/qwen_tts_talker.c
     ${QWEN_TTS_DIR}/qwen_tts_codec.c
