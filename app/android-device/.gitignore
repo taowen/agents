@@ -57,6 +57,17 @@ yarn-error.log
 # Bundle artifact
 *.jsbundle
 
+# C/C++ build artifacts
+*.o
+*.so
+*.a
+*.dylib
+
+# JNI test binaries and samples
+**/jni/**/qwen_asr
+**/jni/**/qwen_tts
+**/jni/**/samples/
+
 # LLM config (contains API keys)
 llm-config.json
 android/llm-config.json
