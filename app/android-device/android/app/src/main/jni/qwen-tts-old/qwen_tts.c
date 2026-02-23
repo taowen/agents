@@ -24,7 +24,7 @@
 #endif
 
 int qwen_tts_verbose = 0;
-const char *qwen_tts_cache_dir_override = NULL;
+const char *qwen_tts_cache_dir_override = NULL;  /* set before qwen_tts_load() */
 
 /* ========================================================================
  * Timing helpers
@@ -266,6 +266,9 @@ static int load_config(qwen_tts_ctx_t *ctx) {
     cfg->mrope_section[0] = 16; cfg->mrope_section[1] = 16; cfg->mrope_section[2] = 0;
     jget_int_array(json, "talker_config.rope_scaling.mrope_section", cfg->mrope_section, 3);
 
+    /* Q4_K_M quantization (enabled by default: QKV+gate_up use Q4_K, wo+down keep INT8) */
+    cfg->use_q4k = 1;
+
     /* Sub-talker config */
     cfg->subtalker_vocab_size   = jget_int(json, "talker_config.code_predictor_config.vocab_size", QWEN_TTS_SUBTALKER_VOCAB);
     cfg->subtalker_hidden       = jget_int(json, "talker_config.code_predictor_config.hidden_size", QWEN_TTS_SUBTALKER_HIDDEN);
@@ -350,10 +353,495 @@ static int load_config(qwen_tts_ctx_t *ctx) {
         fprintf(stderr, "  M-RoPE sections: [%d, %d, %d]\n",
                 cfg->mrope_section[0], cfg->mrope_section[1], cfg->mrope_section[2]);
         fprintf(stderr, "  Speakers: %d, Languages: %d\n", cfg->n_speakers, cfg->n_languages);
+        fprintf(stderr, "  Q4_K_M: %s (QKV+gate_up=Q4_K, wo+down=INT8)\n",
+                cfg->use_q4k ? "enabled" : "disabled");
     }
 
     return 0;
 }
+
+/* ========================================================================
+ * INT8 Quantization Helper
+ *
+ * Per-row symmetric quantization: scale = max(|row|) / 127
+ * int8[i] = round(bf16_to_f32(row[i]) / scale)
+ * ======================================================================== */
+
+static void quantize_bf16_to_int8(const uint16_t *bf16, int rows, int cols,
+                                   int8_t **out_int8, float **out_scales) {
+    *out_int8 = (int8_t *)malloc((size_t)rows * cols * sizeof(int8_t));
+    *out_scales = (float *)malloc((size_t)rows * sizeof(float));
+    if (!*out_int8 || !*out_scales) {
+        free(*out_int8); free(*out_scales);
+        *out_int8 = NULL; *out_scales = NULL;
+        return;
+    }
+    for (int r = 0; r < rows; r++) {
+        const uint16_t *row = bf16 + (size_t)r * cols;
+        /* Find max absolute value in row */
+        float absmax = 0.0f;
+        for (int c = 0; c < cols; c++) {
+            uint32_t bits = ((uint32_t)row[c]) << 16;
+            float val;
+            __builtin_memcpy(&val, &bits, sizeof(float));
+            float a = val > 0 ? val : -val;
+            if (a > absmax) absmax = a;
+        }
+        float scale = absmax / 127.0f;
+        (*out_scales)[r] = scale;
+        float inv_scale = (absmax > 0.0f) ? 127.0f / absmax : 0.0f;
+        int8_t *dst = *out_int8 + (size_t)r * cols;
+        for (int c = 0; c < cols; c++) {
+            uint32_t bits = ((uint32_t)row[c]) << 16;
+            float val;
+            __builtin_memcpy(&val, &bits, sizeof(float));
+            float v = val * inv_scale;
+            int iv = (int)(v + (v > 0 ? 0.5f : -0.5f));
+            if (iv > 127) iv = 127;
+            if (iv < -128) iv = -128;
+            dst[c] = (int8_t)iv;
+        }
+    }
+}
+
+/* ========================================================================
+ * INT8 Quantization Helper (F32 source)
+ *
+ * Same per-row symmetric quantization as BF16 version, but from F32 weights.
+ * Used for codec transformer weights which are stored as F32.
+ * ======================================================================== */
+
+static void quantize_f32_to_int8(const float *f32, int rows, int cols,
+                                   int8_t **out_int8, float **out_scales) {
+    *out_int8 = (int8_t *)malloc((size_t)rows * cols * sizeof(int8_t));
+    *out_scales = (float *)malloc((size_t)rows * sizeof(float));
+    if (!*out_int8 || !*out_scales) {
+        free(*out_int8); free(*out_scales);
+        *out_int8 = NULL; *out_scales = NULL;
+        return;
+    }
+    for (int r = 0; r < rows; r++) {
+        const float *row = f32 + (size_t)r * cols;
+        float absmax = 0.0f;
+        for (int c = 0; c < cols; c++) {
+            float a = row[c] > 0 ? row[c] : -row[c];
+            if (a > absmax) absmax = a;
+        }
+        float scale = absmax / 127.0f;
+        (*out_scales)[r] = scale;
+        float inv_scale = (absmax > 0.0f) ? 127.0f / absmax : 0.0f;
+        int8_t *dst = *out_int8 + (size_t)r * cols;
+        for (int c = 0; c < cols; c++) {
+            float v = row[c] * inv_scale;
+            int iv = (int)(v + (v > 0 ? 0.5f : -0.5f));
+            if (iv > 127) iv = 127;
+            if (iv < -128) iv = -128;
+            dst[c] = (int8_t)iv;
+        }
+    }
+}
+
+/* ========================================================================
+ * Q4_K Super-Block Quantization Helper
+ *
+ * Two-level quantization: super-block scale/min (float) + sub-group integer scales/mins (uint8).
+ * Per super-block (256 elements, 8 sub-groups of 32):
+ *   weight ≈ d * scales[g] * q - dmin * mins[g]   where q ∈ [0, 15] (unsigned)
+ * ======================================================================== */
+
+static void quantize_bf16_to_q4k(const uint16_t *bf16, int rows, int cols,
+                                   block_q4_k **out_blocks) {
+    /* cols must be divisible by QK_K=256 */
+    if (cols % QK_K != 0) {
+        *out_blocks = NULL;
+        return;
+    }
+
+    int blocks_per_row = cols / QK_K;
+    size_t total_blocks = (size_t)rows * blocks_per_row;
+    *out_blocks = (block_q4_k *)malloc(total_blocks * sizeof(block_q4_k));
+    if (!*out_blocks) return;
+
+    /* Temporary buffer for dequantized f32 values (one super-block) */
+    float tmp[QK_K];
+
+    for (int r = 0; r < rows; r++) {
+        const uint16_t *row = bf16 + (size_t)r * cols;
+
+        for (int b = 0; b < blocks_per_row; b++) {
+            block_q4_k *blk = *out_blocks + (size_t)r * blocks_per_row + b;
+            int col_start = b * QK_K;
+
+            /* Convert BF16 block to F32 */
+            for (int i = 0; i < QK_K; i++) {
+                uint32_t bits = ((uint32_t)row[col_start + i]) << 16;
+                __builtin_memcpy(&tmp[i], &bits, sizeof(float));
+            }
+
+            /* Phase 1: Per sub-group min/max */
+            float per_group_scale[Q4K_NUM_SUBS];
+            float per_group_min[Q4K_NUM_SUBS];  /* positive offset = -min */
+
+            for (int g = 0; g < Q4K_NUM_SUBS; g++) {
+                float gmin = tmp[g * 32];
+                float gmax = tmp[g * 32];
+                for (int i = 1; i < 32; i++) {
+                    float v = tmp[g * 32 + i];
+                    if (v < gmin) gmin = v;
+                    if (v > gmax) gmax = v;
+                }
+                float range = gmax - gmin;
+                per_group_scale[g] = range / 15.0f;
+                per_group_min[g] = -gmin;
+                if (per_group_min[g] < 0.0f) per_group_min[g] = 0.0f;
+            }
+
+            /* Phase 2: Two-level scale quantization */
+            float max_scale = 0.0f;
+            float max_min = 0.0f;
+            for (int g = 0; g < Q4K_NUM_SUBS; g++) {
+                if (per_group_scale[g] > max_scale) max_scale = per_group_scale[g];
+                if (per_group_min[g] > max_min) max_min = per_group_min[g];
+            }
+
+            float d = max_scale / 255.0f;
+            float dmin = (max_min > 0.0f) ? max_min / 255.0f : 0.0f;
+            blk->d = d;
+            blk->dmin = dmin;
+
+            float inv_d = (d > 0.0f) ? 1.0f / d : 0.0f;
+            float inv_dmin = (dmin > 0.0f) ? 1.0f / dmin : 0.0f;
+
+            for (int g = 0; g < Q4K_NUM_SUBS; g++) {
+                float sv = per_group_scale[g] * inv_d;
+                int si = (int)(sv + 0.5f);
+                if (si > 255) si = 255;
+                if (si < 0) si = 0;
+                blk->scales[g] = (uint8_t)si;
+
+                float mv = per_group_min[g] * inv_dmin;
+                int mi = (int)(mv + 0.5f);
+                if (mi > 255) mi = 255;
+                if (mi < 0) mi = 0;
+                blk->mins[g] = (uint8_t)mi;
+            }
+
+            /* Phase 3: Quantize weights → unsigned int4 [0, 15] and pack */
+            for (int g = 0; g < Q4K_NUM_SUBS; g++) {
+                float eff_scale = d * (float)blk->scales[g];
+                float eff_min = dmin * (float)blk->mins[g];
+                float inv_eff_scale = (eff_scale > 0.0f) ? 1.0f / eff_scale : 0.0f;
+
+                for (int i = 0; i < 16; i++) {
+                    float v0 = tmp[g * 32 + i * 2];
+                    float v1 = tmp[g * 32 + i * 2 + 1];
+
+                    int q0, q1;
+                    if (eff_scale > 0.0f) {
+                        float fq0 = (v0 + eff_min) * inv_eff_scale;
+                        float fq1 = (v1 + eff_min) * inv_eff_scale;
+                        q0 = (int)(fq0 + 0.5f);
+                        q1 = (int)(fq1 + 0.5f);
+                    } else {
+                        q0 = 0;
+                        q1 = 0;
+                    }
+                    if (q0 < 0) q0 = 0; if (q0 > 15) q0 = 15;
+                    if (q1 < 0) q1 = 0; if (q1 > 15) q1 = 15;
+
+                    /* Pack: low nibble = even index, high nibble = odd index */
+                    blk->qs[g * 16 + i] = (uint8_t)(q0 | (q1 << 4));
+                }
+            }
+        }
+    }
+}
+
+/* ========================================================================
+ * Pre-quantized Weight Cache
+ *
+ * After first-time BF16→Q4_K/INT8 quantization, serialize the quantized
+ * weights to a binary cache file. Subsequent loads mmap the cache,
+ * avoiding the expensive quantization step.
+ *
+ * Cache format:
+ *   header (qcache_header_t)
+ *   for each talker layer:
+ *     wqkv_q4k blocks | gate_up_q4k blocks | wo_int8 + wo_scales | down_int8 + down_scales
+ *   for each subtalker layer:
+ *     wqkv_q4k blocks | gate_up_q4k blocks | wo_q4k blocks | down_q4k blocks
+ * ======================================================================== */
+
+#ifndef __EMSCRIPTEN__
+#include <sys/mman.h>
+#include <sys/stat.h>
+#include <fcntl.h>
+#include <unistd.h>
+#endif
+
+#define QCACHE_MAGIC   0x31435151   /* "QQC1" */
+#define QCACHE_VERSION 1
+
+typedef struct {
+    uint32_t magic;
+    uint32_t version;
+    uint64_t source_size;         /* original safetensors total file size for validation */
+    uint32_t n_talker_layers;
+    uint32_t n_subtalker_layers;
+    /* Talker per-layer sizes */
+    uint32_t tk_wqkv_q4k_bytes;  /* per layer */
+    uint32_t tk_gate_up_q4k_bytes;
+    uint32_t tk_wo_int8_bytes;
+    uint32_t tk_wo_scales_bytes;
+    uint32_t tk_down_int8_bytes;
+    uint32_t tk_down_scales_bytes;
+    /* Subtalker per-layer sizes */
+    uint32_t st_wqkv_q4k_bytes;
+    uint32_t st_gate_up_q4k_bytes;
+    uint32_t st_wo_q4k_bytes;
+    uint32_t st_down_q4k_bytes;
+    uint32_t reserved[4];         /* future use */
+} qcache_header_t;
+
+#ifndef __EMSCRIPTEN__
+
+static uint64_t get_safetensors_size(const char *model_dir) {
+    /* Sum the sizes of all .safetensors files in the model_dir */
+    char path[1024];
+    uint64_t total = 0;
+    struct stat st;
+
+    /* Try common patterns: model.safetensors, model-00001-of-NNNNN.safetensors */
+    snprintf(path, sizeof(path), "%s/model.safetensors", model_dir);
+    if (stat(path, &st) == 0) {
+        total += (uint64_t)st.st_size;
+    }
+    for (int i = 1; i <= 10; i++) {
+        snprintf(path, sizeof(path), "%s/model-%05d-of-00002.safetensors", model_dir, i);
+        if (stat(path, &st) == 0) {
+            total += (uint64_t)st.st_size;
+        }
+        snprintf(path, sizeof(path), "%s/model-%05d-of-00003.safetensors", model_dir, i);
+        if (stat(path, &st) == 0) {
+            total += (uint64_t)st.st_size;
+        }
+    }
+    return total;
+}
+
+static int save_quantized_cache(qwen_tts_ctx_t *ctx) {
+    qwen_tts_config_t *cfg = &ctx->config;
+    char path[1024];
+
+    /* Try cache_dir first, fall back to model_dir */
+    snprintf(path, sizeof(path), "%s/model.qcache", ctx->cache_dir);
+
+    /* Compute per-layer sizes */
+    /* Talker layer Q4_K/INT8 sizes */
+    int tk_qkv_rows = cfg->talker_heads * cfg->talker_head_dim +
+                       2 * cfg->talker_kv_heads * cfg->talker_head_dim;
+    int tk_qkv_bpr = cfg->talker_hidden / QK_K;  /* blocks per row */
+    uint32_t tk_wqkv_q4k_bytes = (uint32_t)((size_t)tk_qkv_rows * tk_qkv_bpr * sizeof(block_q4_k));
+
+    int tk_gu_rows = 2 * cfg->talker_intermediate;
+    int tk_gu_bpr = cfg->talker_hidden / QK_K;
+    uint32_t tk_gate_up_q4k_bytes = (uint32_t)((size_t)tk_gu_rows * tk_gu_bpr * sizeof(block_q4_k));
+
+    int tk_wo_rows = cfg->talker_hidden;
+    int tk_wo_cols = cfg->talker_heads * cfg->talker_head_dim;
+    uint32_t tk_wo_int8_bytes = (uint32_t)((size_t)tk_wo_rows * tk_wo_cols);
+    uint32_t tk_wo_scales_bytes = (uint32_t)(tk_wo_rows * sizeof(float));
+
+    int tk_down_rows = cfg->talker_hidden;
+    int tk_down_cols = cfg->talker_intermediate;
+    uint32_t tk_down_int8_bytes = (uint32_t)((size_t)tk_down_rows * tk_down_cols);
+    uint32_t tk_down_scales_bytes = (uint32_t)(tk_down_rows * sizeof(float));
+
+    /* Subtalker layer Q4_K sizes */
+    int st_qkv_rows = cfg->subtalker_heads * cfg->subtalker_head_dim +
+                       2 * cfg->subtalker_kv_heads * cfg->subtalker_head_dim;
+    int st_qkv_bpr = cfg->subtalker_hidden / QK_K;
+    uint32_t st_wqkv_q4k_bytes = (uint32_t)((size_t)st_qkv_rows * st_qkv_bpr * sizeof(block_q4_k));
+
+    int st_gu_rows = 2 * cfg->subtalker_intermediate;
+    int st_gu_bpr = cfg->subtalker_hidden / QK_K;
+    uint32_t st_gate_up_q4k_bytes = (uint32_t)((size_t)st_gu_rows * st_gu_bpr * sizeof(block_q4_k));
+
+    int st_wo_rows = cfg->subtalker_hidden;
+    int st_wo_cols = cfg->subtalker_heads * cfg->subtalker_head_dim;
+    int st_wo_bpr = st_wo_cols / QK_K;
+    uint32_t st_wo_q4k_bytes = (uint32_t)((size_t)st_wo_rows * st_wo_bpr * sizeof(block_q4_k));
+
+    int st_down_rows = cfg->subtalker_hidden;
+    int st_down_cols = cfg->subtalker_intermediate;
+    int st_down_bpr = st_down_cols / QK_K;
+    uint32_t st_down_q4k_bytes = (uint32_t)((size_t)st_down_rows * st_down_bpr * sizeof(block_q4_k));
+
+    /* Build header */
+    qcache_header_t hdr;
+    memset(&hdr, 0, sizeof(hdr));
+    hdr.magic = QCACHE_MAGIC;
+    hdr.version = QCACHE_VERSION;
+    hdr.source_size = get_safetensors_size(ctx->model_dir);
+    hdr.n_talker_layers = (uint32_t)cfg->talker_layers;
+    hdr.n_subtalker_layers = (uint32_t)cfg->subtalker_layers;
+    hdr.tk_wqkv_q4k_bytes = tk_wqkv_q4k_bytes;
+    hdr.tk_gate_up_q4k_bytes = tk_gate_up_q4k_bytes;
+    hdr.tk_wo_int8_bytes = tk_wo_int8_bytes;
+    hdr.tk_wo_scales_bytes = tk_wo_scales_bytes;
+    hdr.tk_down_int8_bytes = tk_down_int8_bytes;
+    hdr.tk_down_scales_bytes = tk_down_scales_bytes;
+    hdr.st_wqkv_q4k_bytes = st_wqkv_q4k_bytes;
+    hdr.st_gate_up_q4k_bytes = st_gate_up_q4k_bytes;
+    hdr.st_wo_q4k_bytes = st_wo_q4k_bytes;
+    hdr.st_down_q4k_bytes = st_down_q4k_bytes;
+
+    FILE *f = fopen(path, "wb");
+    if (!f) {
+        if (qwen_tts_verbose >= 1)
+            fprintf(stderr, "Warning: cannot create qcache at %s\n", path);
+        return -1;
+    }
+
+    fwrite(&hdr, sizeof(hdr), 1, f);
+
+    /* Write talker layers */
+    for (int i = 0; i < cfg->talker_layers; i++) {
+        qwen_tts_talker_layer_t *l = &ctx->talker.layers[i];
+        if (l->wqkv_q4k)   fwrite(l->wqkv_q4k, 1, tk_wqkv_q4k_bytes, f);
+        else { void *z = calloc(1, tk_wqkv_q4k_bytes); fwrite(z, 1, tk_wqkv_q4k_bytes, f); free(z); }
+        if (l->gate_up_q4k) fwrite(l->gate_up_q4k, 1, tk_gate_up_q4k_bytes, f);
+        else { void *z = calloc(1, tk_gate_up_q4k_bytes); fwrite(z, 1, tk_gate_up_q4k_bytes, f); free(z); }
+        if (l->wo_int8)     fwrite(l->wo_int8, 1, tk_wo_int8_bytes, f);
+        else { void *z = calloc(1, tk_wo_int8_bytes); fwrite(z, 1, tk_wo_int8_bytes, f); free(z); }
+        if (l->wo_scales)   fwrite(l->wo_scales, 1, tk_wo_scales_bytes, f);
+        else { void *z = calloc(1, tk_wo_scales_bytes); fwrite(z, 1, tk_wo_scales_bytes, f); free(z); }
+        if (l->down_int8)   fwrite(l->down_int8, 1, tk_down_int8_bytes, f);
+        else { void *z = calloc(1, tk_down_int8_bytes); fwrite(z, 1, tk_down_int8_bytes, f); free(z); }
+        if (l->down_scales) fwrite(l->down_scales, 1, tk_down_scales_bytes, f);
+        else { void *z = calloc(1, tk_down_scales_bytes); fwrite(z, 1, tk_down_scales_bytes, f); free(z); }
+    }
+
+    /* Write subtalker layers */
+    for (int i = 0; i < cfg->subtalker_layers; i++) {
+        qwen_tts_subtalker_layer_t *l = &ctx->subtalker.layers[i];
+        if (l->wqkv_q4k)    fwrite(l->wqkv_q4k, 1, st_wqkv_q4k_bytes, f);
+        else { void *z = calloc(1, st_wqkv_q4k_bytes); fwrite(z, 1, st_wqkv_q4k_bytes, f); free(z); }
+        if (l->gate_up_q4k) fwrite(l->gate_up_q4k, 1, st_gate_up_q4k_bytes, f);
+        else { void *z = calloc(1, st_gate_up_q4k_bytes); fwrite(z, 1, st_gate_up_q4k_bytes, f); free(z); }
+        if (l->wo_q4k)      fwrite(l->wo_q4k, 1, st_wo_q4k_bytes, f);
+        else { void *z = calloc(1, st_wo_q4k_bytes); fwrite(z, 1, st_wo_q4k_bytes, f); free(z); }
+        if (l->down_q4k)    fwrite(l->down_q4k, 1, st_down_q4k_bytes, f);
+        else { void *z = calloc(1, st_down_q4k_bytes); fwrite(z, 1, st_down_q4k_bytes, f); free(z); }
+    }
+
+    fclose(f);
+    if (qwen_tts_verbose >= 1)
+        fprintf(stderr, "Saved quantized cache to %s\n", path);
+    return 0;
+}
+
+/* Load quantized weights from cache; returns 0 on success, -1 on miss/mismatch.
+ * On success, sets the quantized weight pointers in talker/subtalker layers.
+ * Caller must still load norms/biases/embeddings from safetensors. */
+static int load_quantized_cache(qwen_tts_ctx_t *ctx) {
+    qwen_tts_config_t *cfg = &ctx->config;
+    char path[1024];
+    snprintf(path, sizeof(path), "%s/model.qcache", ctx->cache_dir);
+
+    int fd = open(path, O_RDONLY);
+    if (fd < 0) return -1;
+
+    struct stat st;
+    if (fstat(fd, &st) != 0) { close(fd); return -1; }
+    size_t file_size = (size_t)st.st_size;
+    if (file_size < sizeof(qcache_header_t)) { close(fd); return -1; }
+
+    void *mapped = mmap(NULL, file_size, PROT_READ, MAP_PRIVATE, fd, 0);
+    close(fd);
+    if (mapped == MAP_FAILED) return -1;
+
+    const qcache_header_t *hdr = (const qcache_header_t *)mapped;
+
+    /* Validate header */
+    if (hdr->magic != QCACHE_MAGIC || hdr->version != QCACHE_VERSION) {
+        munmap(mapped, file_size);
+        return -1;
+    }
+    if ((int)hdr->n_talker_layers != cfg->talker_layers ||
+        (int)hdr->n_subtalker_layers != cfg->subtalker_layers) {
+        munmap(mapped, file_size);
+        return -1;
+    }
+
+    /* Validate source file size */
+    uint64_t expected_src = get_safetensors_size(ctx->model_dir);
+    if (hdr->source_size != expected_src) {
+        if (qwen_tts_verbose >= 1)
+            fprintf(stderr, "qcache: source size mismatch (cache=%llu, actual=%llu), re-quantizing\n",
+                    (unsigned long long)hdr->source_size, (unsigned long long)expected_src);
+        munmap(mapped, file_size);
+        return -1;
+    }
+
+    /* Validate total file size */
+    size_t tk_per_layer = (size_t)hdr->tk_wqkv_q4k_bytes + hdr->tk_gate_up_q4k_bytes +
+                          hdr->tk_wo_int8_bytes + hdr->tk_wo_scales_bytes +
+                          hdr->tk_down_int8_bytes + hdr->tk_down_scales_bytes;
+    size_t st_per_layer = (size_t)hdr->st_wqkv_q4k_bytes + hdr->st_gate_up_q4k_bytes +
+                          hdr->st_wo_q4k_bytes + hdr->st_down_q4k_bytes;
+    size_t expected_size = sizeof(qcache_header_t) +
+                           tk_per_layer * hdr->n_talker_layers +
+                           st_per_layer * hdr->n_subtalker_layers;
+    if (file_size < expected_size) {
+        munmap(mapped, file_size);
+        return -1;
+    }
+
+    /* Copy weights from mmap into malloc'd buffers (so they survive munmap) */
+    const uint8_t *ptr = (const uint8_t *)mapped + sizeof(qcache_header_t);
+
+    #define CACHE_COPY(dst, type, n_bytes) do { \
+        if ((n_bytes) > 0) { \
+            dst = (type)malloc(n_bytes); \
+            if (dst) memcpy(dst, ptr, n_bytes); \
+            ptr += (n_bytes); \
+        } \
+    } while(0)
+
+    for (int i = 0; i < cfg->talker_layers; i++) {
+        qwen_tts_talker_layer_t *l = &ctx->talker.layers[i];
+        CACHE_COPY(l->wqkv_q4k, block_q4_k *, hdr->tk_wqkv_q4k_bytes);
+        CACHE_COPY(l->gate_up_q4k, block_q4_k *, hdr->tk_gate_up_q4k_bytes);
+        CACHE_COPY(l->wo_int8, int8_t *, hdr->tk_wo_int8_bytes);
+        CACHE_COPY(l->wo_scales, float *, hdr->tk_wo_scales_bytes);
+        CACHE_COPY(l->down_int8, int8_t *, hdr->tk_down_int8_bytes);
+        CACHE_COPY(l->down_scales, float *, hdr->tk_down_scales_bytes);
+    }
+
+    for (int i = 0; i < cfg->subtalker_layers; i++) {
+        qwen_tts_subtalker_layer_t *l = &ctx->subtalker.layers[i];
+        CACHE_COPY(l->wqkv_q4k, block_q4_k *, hdr->st_wqkv_q4k_bytes);
+        CACHE_COPY(l->gate_up_q4k, block_q4_k *, hdr->st_gate_up_q4k_bytes);
+        CACHE_COPY(l->wo_q4k, block_q4_k *, hdr->st_wo_q4k_bytes);
+        CACHE_COPY(l->down_q4k, block_q4_k *, hdr->st_down_q4k_bytes);
+    }
+
+    #undef CACHE_COPY
+
+    munmap(mapped, file_size);
+
+    if (qwen_tts_verbose >= 1)
+        fprintf(stderr, "Loaded quantized cache from %s\n", path);
+    return 0;
+}
+
+#else /* __EMSCRIPTEN__ */
+
+static int save_quantized_cache(qwen_tts_ctx_t *ctx) { (void)ctx; return -1; }
+static int load_quantized_cache(qwen_tts_ctx_t *ctx) { (void)ctx; return -1; }
+
+#endif /* __EMSCRIPTEN__ */
 
 /* ========================================================================
  * Weight Loading Helpers
@@ -488,6 +976,67 @@ static int load_talker_weights(qwen_tts_ctx_t *ctx, const multi_safetensors_t *m
                 memcpy(l->gate_up_fused_bf16 + gu_size, l->up_bf16, gu_size * sizeof(uint16_t));
             }
         }
+
+        /* Create fused Q+K+V weights for faster single-token attention */
+        {
+            int q_rows = cfg->talker_heads * cfg->talker_head_dim;
+            int kv_rows = cfg->talker_kv_heads * cfg->talker_head_dim;
+            int total_rows = q_rows + kv_rows + kv_rows;
+            size_t row_elems = (size_t)cfg->talker_hidden;
+            l->wqkv_fused_bf16 = (uint16_t *)malloc((size_t)total_rows * row_elems * sizeof(uint16_t));
+            if (l->wqkv_fused_bf16) {
+                memcpy(l->wqkv_fused_bf16,
+                       l->wq_bf16, (size_t)q_rows * row_elems * sizeof(uint16_t));
+                memcpy(l->wqkv_fused_bf16 + (size_t)q_rows * row_elems,
+                       l->wk_bf16, (size_t)kv_rows * row_elems * sizeof(uint16_t));
+                memcpy(l->wqkv_fused_bf16 + (size_t)(q_rows + kv_rows) * row_elems,
+                       l->wv_bf16, (size_t)kv_rows * row_elems * sizeof(uint16_t));
+            }
+
+            /* INT8 quantize fused QKV (skip if loaded from cache) */
+            if (l->wqkv_fused_bf16 && !l->wqkv_int8) {
+                quantize_bf16_to_int8(l->wqkv_fused_bf16, total_rows, (int)row_elems,
+                                      &l->wqkv_int8, &l->wqkv_scales);
+            }
+        }
+
+        /* INT8 quantize fused gate+up (skip if loaded from cache) */
+        if (l->gate_up_fused_bf16 && !l->gate_up_int8) {
+            int gu_rows = 2 * cfg->talker_intermediate;
+            quantize_bf16_to_int8(l->gate_up_fused_bf16, gu_rows, cfg->talker_hidden,
+                                  &l->gate_up_int8, &l->gate_up_scales);
+        }
+
+        /* INT8 quantize wo (skip if loaded from cache) */
+        if (l->wo_bf16 && !l->wo_int8) {
+            int q_dim = cfg->talker_heads * cfg->talker_head_dim;
+            quantize_bf16_to_int8(l->wo_bf16, cfg->talker_hidden, q_dim,
+                                  &l->wo_int8, &l->wo_scales);
+        }
+
+        /* INT8 quantize down (skip if loaded from cache) */
+        if (l->down_bf16 && !l->down_int8) {
+            quantize_bf16_to_int8(l->down_bf16, cfg->talker_hidden, cfg->talker_intermediate,
+                                  &l->down_int8, &l->down_scales);
+        }
+
+        /* Q4_K_M quantization: QKV and gate_up use Q4_K (skip if loaded from cache) */
+        if (cfg->use_q4k) {
+            int q_rows = cfg->talker_heads * cfg->talker_head_dim;
+            int kv_rows = cfg->talker_kv_heads * cfg->talker_head_dim;
+            int total_rows = q_rows + kv_rows + kv_rows;
+
+            if (l->wqkv_fused_bf16 && cfg->talker_hidden % QK_K == 0 && !l->wqkv_q4k) {
+                quantize_bf16_to_q4k(l->wqkv_fused_bf16, total_rows, cfg->talker_hidden,
+                                      &l->wqkv_q4k);
+            }
+            if (l->gate_up_fused_bf16 && cfg->talker_hidden % QK_K == 0 && !l->gate_up_q4k) {
+                int gu_rows = 2 * cfg->talker_intermediate;
+                quantize_bf16_to_q4k(l->gate_up_fused_bf16, gu_rows, cfg->talker_hidden,
+                                      &l->gate_up_q4k);
+            }
+            /* wo and down: intentionally NOT quantized to Q4_K (sensitive layers keep INT8) */
+        }
     }
 
     /* Final norm */
@@ -556,6 +1105,78 @@ static void load_subtalker_weights(qwen_tts_ctx_t *ctx, const multi_safetensors_
         if (l->gate_up_fused_bf16) {
             memcpy(l->gate_up_fused_bf16, l->gate_bf16, gu_size * sizeof(uint16_t));
             memcpy(l->gate_up_fused_bf16 + gu_size, l->up_bf16, gu_size * sizeof(uint16_t));
+        }
+
+        /* Create fused Q+K+V weights for faster single-token attention */
+        {
+            int q_rows = cfg->subtalker_heads * cfg->subtalker_head_dim;
+            int kv_rows = cfg->subtalker_kv_heads * cfg->subtalker_head_dim;
+            int total_rows = q_rows + kv_rows + kv_rows;
+            size_t row_elems = (size_t)cfg->subtalker_hidden;
+            l->wqkv_fused_bf16 = (uint16_t *)malloc((size_t)total_rows * row_elems * sizeof(uint16_t));
+            if (l->wqkv_fused_bf16) {
+                memcpy(l->wqkv_fused_bf16,
+                       l->wq_bf16, (size_t)q_rows * row_elems * sizeof(uint16_t));
+                memcpy(l->wqkv_fused_bf16 + (size_t)q_rows * row_elems,
+                       l->wk_bf16, (size_t)kv_rows * row_elems * sizeof(uint16_t));
+                memcpy(l->wqkv_fused_bf16 + (size_t)(q_rows + kv_rows) * row_elems,
+                       l->wv_bf16, (size_t)kv_rows * row_elems * sizeof(uint16_t));
+            }
+
+            /* INT8 quantize fused QKV (skip if loaded from cache) */
+            if (l->wqkv_fused_bf16 && !l->wqkv_int8) {
+                quantize_bf16_to_int8(l->wqkv_fused_bf16, total_rows, (int)row_elems,
+                                      &l->wqkv_int8, &l->wqkv_scales);
+            }
+        }
+
+        /* INT8 quantize fused gate+up (skip if loaded from cache) */
+        if (l->gate_up_fused_bf16 && !l->gate_up_int8) {
+            int gu_rows = 2 * cfg->subtalker_intermediate;
+            quantize_bf16_to_int8(l->gate_up_fused_bf16, gu_rows, cfg->subtalker_hidden,
+                                  &l->gate_up_int8, &l->gate_up_scales);
+        }
+
+        /* INT8 quantize wo (skip if loaded from cache) */
+        if (l->wo_bf16 && !l->wo_int8) {
+            int q_dim = cfg->subtalker_heads * cfg->subtalker_head_dim;
+            quantize_bf16_to_int8(l->wo_bf16, cfg->subtalker_hidden, q_dim,
+                                  &l->wo_int8, &l->wo_scales);
+        }
+
+        /* INT8 quantize down (skip if loaded from cache) */
+        if (l->down_bf16 && !l->down_int8) {
+            quantize_bf16_to_int8(l->down_bf16, cfg->subtalker_hidden, cfg->subtalker_intermediate,
+                                  &l->down_int8, &l->down_scales);
+        }
+
+        /* Full Q4_K quantization for sub-talker (skip if loaded from cache) */
+        if (cfg->use_q4k) {
+            int q_rows = cfg->subtalker_heads * cfg->subtalker_head_dim;
+            int kv_rows = cfg->subtalker_kv_heads * cfg->subtalker_head_dim;
+            int total_rows = q_rows + kv_rows + kv_rows;
+
+            if (l->wqkv_fused_bf16 && cfg->subtalker_hidden % QK_K == 0 && !l->wqkv_q4k) {
+                quantize_bf16_to_q4k(l->wqkv_fused_bf16, total_rows, cfg->subtalker_hidden,
+                                      &l->wqkv_q4k);
+            }
+            if (l->gate_up_fused_bf16 && cfg->subtalker_hidden % QK_K == 0 && !l->gate_up_q4k) {
+                int gu_rows = 2 * cfg->subtalker_intermediate;
+                quantize_bf16_to_q4k(l->gate_up_fused_bf16, gu_rows, cfg->subtalker_hidden,
+                                      &l->gate_up_q4k);
+            }
+            /* wo: Q4_K (sub-talker only; talker keeps INT8 for precision) */
+            if (l->wo_bf16 && !l->wo_q4k) {
+                int q_dim = cfg->subtalker_heads * cfg->subtalker_head_dim;
+                if (q_dim % QK_K == 0) {
+                    quantize_bf16_to_q4k(l->wo_bf16, cfg->subtalker_hidden, q_dim, &l->wo_q4k);
+                }
+            }
+            /* down: Q4_K (sub-talker only) */
+            if (l->down_bf16 && cfg->subtalker_intermediate % QK_K == 0 && !l->down_q4k) {
+                quantize_bf16_to_q4k(l->down_bf16, cfg->subtalker_hidden, cfg->subtalker_intermediate,
+                                      &l->down_q4k);
+            }
         }
     }
 
@@ -675,6 +1296,59 @@ static void load_codec_weights(qwen_tts_ctx_t *ctx, const multi_safetensors_t *m
         LOAD_F32_CHECK(l->up, ms, name);
         snprintf(name, sizeof(name), "decoder.pre_transformer.layers.%d.mlp.down_proj.weight", i);
         LOAD_F32_CHECK(l->down, ms, name);
+
+        /* INT8 quantize codec transformer weights for faster matvec */
+        {
+            int q_dim = cfg->codec_heads * (cfg->codec_hidden / cfg->codec_heads);
+            int kv_dim = cfg->codec_kv_heads * (cfg->codec_hidden / cfg->codec_heads);
+            int codec_hidden = cfg->codec_hidden;
+            int intermediate = cfg->codec_intermediate;
+
+            /* Fused QKV INT8 */
+            if (l->wq && l->wk && l->wv) {
+                int total_rows = q_dim + kv_dim + kv_dim;
+                /* Build fused QKV F32 buffer, quantize, then free */
+                float *fused_qkv = (float *)malloc((size_t)total_rows * codec_hidden * sizeof(float));
+                if (fused_qkv) {
+                    memcpy(fused_qkv,
+                           l->wq, (size_t)q_dim * codec_hidden * sizeof(float));
+                    memcpy(fused_qkv + (size_t)q_dim * codec_hidden,
+                           l->wk, (size_t)kv_dim * codec_hidden * sizeof(float));
+                    memcpy(fused_qkv + (size_t)(q_dim + kv_dim) * codec_hidden,
+                           l->wv, (size_t)kv_dim * codec_hidden * sizeof(float));
+                    quantize_f32_to_int8(fused_qkv, total_rows, codec_hidden,
+                                          &l->wqkv_int8, &l->wqkv_scales);
+                    free(fused_qkv);
+                }
+            }
+
+            /* Fused gate+up INT8 */
+            if (l->gate && l->up) {
+                int gu_rows = 2 * intermediate;
+                float *fused_gu = (float *)malloc((size_t)gu_rows * codec_hidden * sizeof(float));
+                if (fused_gu) {
+                    memcpy(fused_gu,
+                           l->gate, (size_t)intermediate * codec_hidden * sizeof(float));
+                    memcpy(fused_gu + (size_t)intermediate * codec_hidden,
+                           l->up, (size_t)intermediate * codec_hidden * sizeof(float));
+                    quantize_f32_to_int8(fused_gu, gu_rows, codec_hidden,
+                                          &l->gate_up_int8, &l->gate_up_scales);
+                    free(fused_gu);
+                }
+            }
+
+            /* wo INT8 */
+            if (l->wo) {
+                quantize_f32_to_int8(l->wo, codec_hidden, q_dim,
+                                      &l->wo_int8, &l->wo_scales);
+            }
+
+            /* down INT8 */
+            if (l->down) {
+                quantize_f32_to_int8(l->down, codec_hidden, intermediate,
+                                      &l->down_int8, &l->down_scales);
+            }
+        }
     }
 
     /* ---- Upsample stages ---- */
@@ -821,9 +1495,19 @@ static int ensure_codec_loaded(qwen_tts_ctx_t *ctx) {
  * Projects text embeddings: text_hidden -> text_hidden (SiLU) -> hidden
  * ======================================================================== */
 
+static void ensure_text_scratch(qwen_tts_ctx_t *ctx, int text_hidden) {
+    if (ctx->scratch_text_hidden_cap >= text_hidden) return;
+    ctx->scratch_text_hidden = (float *)realloc(ctx->scratch_text_hidden,
+                                                 text_hidden * sizeof(float));
+    ctx->scratch_text_embed = (float *)realloc(ctx->scratch_text_embed,
+                                                text_hidden * sizeof(float));
+    ctx->scratch_text_hidden_cap = text_hidden;
+}
+
 static void text_projection(qwen_tts_ctx_t *ctx, const float *text_embed,
                              float *out, int text_hidden, int hidden) {
-    float *fc1_out = (float *)malloc(text_hidden * sizeof(float));
+    ensure_text_scratch(ctx, text_hidden);
+    float *fc1_out = ctx->scratch_text_hidden;
     kernel_matvec_bf16(fc1_out, ctx->talker.text_proj_fc1_bf16, text_embed, text_hidden, text_hidden);
     if (ctx->talker.text_proj_fc1_bias)
         kernel_add_inplace(fc1_out, ctx->talker.text_proj_fc1_bias, text_hidden);
@@ -831,7 +1515,6 @@ static void text_projection(qwen_tts_ctx_t *ctx, const float *text_embed,
     kernel_matvec_bf16(out, ctx->talker.text_proj_fc2_bf16, fc1_out, hidden, text_hidden);
     if (ctx->talker.text_proj_fc2_bias)
         kernel_add_inplace(out, ctx->talker.text_proj_fc2_bias, hidden);
-    free(fc1_out);
 }
 
 /* ========================================================================
@@ -841,10 +1524,10 @@ static void text_projection(qwen_tts_ctx_t *ctx, const float *text_embed,
 static void embed_text_token(qwen_tts_ctx_t *ctx, int token_id, float *out) {
     int text_hidden = ctx->config.talker_text_hidden;
     int hidden = ctx->config.talker_hidden;
-    float *text_embed = (float *)malloc(text_hidden * sizeof(float));
+    ensure_text_scratch(ctx, text_hidden);
+    float *text_embed = ctx->scratch_text_embed;
     kernel_bf16_to_f32(text_embed, ctx->talker.text_embedding_bf16 + (size_t)token_id * text_hidden, text_hidden);
     text_projection(ctx, text_embed, out, text_hidden, hidden);
-    free(text_embed);
 }
 
 /* ========================================================================
@@ -867,6 +1550,12 @@ qwen_tts_ctx_t *qwen_tts_load(const char *model_dir) {
     if (!ctx) return NULL;
 
     strncpy(ctx->model_dir, model_dir, sizeof(ctx->model_dir) - 1);
+    /* Use override cache_dir if set, otherwise default to model_dir */
+    if (qwen_tts_cache_dir_override && qwen_tts_cache_dir_override[0]) {
+        strncpy(ctx->cache_dir, qwen_tts_cache_dir_override, sizeof(ctx->cache_dir) - 1);
+    } else {
+        strncpy(ctx->cache_dir, model_dir, sizeof(ctx->cache_dir) - 1);
+    }
 
     /* Set default generation parameters */
     ctx->temperature = 0.9f;
@@ -895,11 +1584,19 @@ qwen_tts_ctx_t *qwen_tts_load(const char *model_dir) {
     }
     ctx->safetensors = ms;
 
+    /* Try loading pre-quantized weight cache first */
+    int cache_loaded = load_quantized_cache(ctx);
+
     if (load_talker_weights(ctx, ms) != 0) {
         qwen_tts_free(ctx);
         return NULL;
     }
     load_subtalker_weights(ctx, ms);
+
+    /* Save cache if we didn't load from cache */
+    if (cache_loaded != 0) {
+        save_quantized_cache(ctx);
+    }
 
     /* Open codec decoder safetensors */
 #ifndef __EMSCRIPTEN__
@@ -919,6 +1616,19 @@ qwen_tts_ctx_t *qwen_tts_load(const char *model_dir) {
         fprintf(stderr, "Model loaded in %.1f ms\n", t1 - t0);
 
     return ctx;
+}
+
+void qwen_tts_set_cache_dir(qwen_tts_ctx_t *ctx, const char *cache_dir) {
+    if (ctx && cache_dir)
+        strncpy(ctx->cache_dir, cache_dir, sizeof(ctx->cache_dir) - 1);
+}
+
+int qwen_tts_save_cache(qwen_tts_ctx_t *ctx) {
+#ifndef __EMSCRIPTEN__
+    return save_quantized_cache(ctx);
+#else
+    return -1;
+#endif
 }
 
 /* ========================================================================
@@ -960,6 +1670,10 @@ void qwen_tts_free(qwen_tts_ctx_t *ctx) {
         free(l->attn_layer_scale); free(l->mlp_layer_scale);
         free(l->wq); free(l->wk); free(l->wv); free(l->wo);
         free(l->gate); free(l->up); free(l->down);
+        free(l->wqkv_int8); free(l->wqkv_scales);
+        free(l->gate_up_int8); free(l->gate_up_scales);
+        free(l->wo_int8); free(l->wo_scales);
+        free(l->down_int8); free(l->down_scales);
     }
 
     for (int s = 0; s < 2; s++) {
@@ -998,6 +1712,12 @@ void qwen_tts_free(qwen_tts_ctx_t *ctx) {
         free(l->q_norm_weight); free(l->k_norm_weight);
         free(l->input_norm); free(l->post_attn_norm);
         free(l->gate_up_fused_bf16);
+        free(l->wqkv_fused_bf16);
+        free(l->wqkv_int8); free(l->wqkv_scales);
+        free(l->gate_up_int8); free(l->gate_up_scales);
+        free(l->wo_int8); free(l->wo_scales);
+        free(l->down_int8); free(l->down_scales);
+        free(l->wqkv_q4k); free(l->gate_up_q4k);
     }
 
     /* Free subtalker LOAD_F32'd weights (norms + biases) */
@@ -1008,6 +1728,13 @@ void qwen_tts_free(qwen_tts_ctx_t *ctx) {
         free(l->q_norm_weight); free(l->k_norm_weight);
         free(l->input_norm); free(l->post_attn_norm);
         free(l->gate_up_fused_bf16);
+        free(l->wqkv_fused_bf16);
+        free(l->wqkv_int8); free(l->wqkv_scales);
+        free(l->gate_up_int8); free(l->gate_up_scales);
+        free(l->wo_int8); free(l->wo_scales);
+        free(l->down_int8); free(l->down_scales);
+        free(l->wqkv_q4k); free(l->gate_up_q4k);
+        free(l->wo_q4k); free(l->down_q4k);
     }
 
     /* Free KV caches and scratch buffers */
@@ -1016,6 +1743,7 @@ void qwen_tts_free(qwen_tts_ctx_t *ctx) {
     free(ctx->codec_kv_k); free(ctx->codec_kv_v);
     free(ctx->tk_x); free(ctx->tk_x_norm);
     free(ctx->tk_q); free(ctx->tk_k); free(ctx->tk_v);
+    free(ctx->tk_qkv);
     free(ctx->tk_attn_out); free(ctx->tk_proj_out);
     free(ctx->tk_gate); free(ctx->tk_up); free(ctx->tk_ffn_out);
     free(ctx->tk_scores);
@@ -1026,12 +1754,14 @@ void qwen_tts_free(qwen_tts_ctx_t *ctx) {
     free(ctx->tk_pref_gate); free(ctx->tk_pref_gate_up); free(ctx->tk_pref_ffn_out);
     free(ctx->st_x); free(ctx->st_x_norm);
     free(ctx->st_q); free(ctx->st_k); free(ctx->st_v);
+    free(ctx->st_qkv);
     free(ctx->st_attn_out); free(ctx->st_logits);
     free(ctx->st_gate); free(ctx->st_up);
     free(ctx->st_embed); free(ctx->st_proj_hidden);
     free(ctx->st_scores);
     free(ctx->st_rope_cos); free(ctx->st_rope_sin);
     free(ctx->talker_rope_cos_cache); free(ctx->talker_rope_sin_cache);
+    free(ctx->scratch_text_hidden); free(ctx->scratch_text_embed);
 
     /* Free config maps */
     for (int i = 0; i < ctx->config.n_speakers; i++) free(ctx->config.speaker_names[i]);
@@ -1279,6 +2009,7 @@ float *qwen_tts_generate(
     }
 
     double t_gen = time_ms();
+    ctx->perf_subtalker_ms = 0.0;
 
     for (int step = 0; step < max_tokens; step++) {
         /* If this is the first step after prefill, use the last hidden state from prefill */
@@ -1334,7 +2065,9 @@ float *qwen_tts_generate(
 
         /* Generate remaining code groups via sub-talker */
         int codes[QWEN_TTS_NUM_CODE_GROUPS];
+        double t_st = time_ms();
         qwen_tts_subtalker_generate(ctx, ctx->tk_x, token, codes);
+        ctx->perf_subtalker_ms += time_ms() - t_st;
 
         /* Store all codes */
         memcpy(all_codes + n_generated * num_groups, codes, num_groups * sizeof(int));
@@ -1387,6 +2120,16 @@ float *qwen_tts_generate(
         fprintf(stderr, "Generated %d codec tokens in %.1f ms (%.1f ms/token)\n",
                 n_generated, ctx->perf_talker_ms,
                 n_generated > 0 ? ctx->perf_talker_ms / n_generated : 0);
+        /* Time decomposition: talker (pure) vs sub-talker */
+        {
+            double talker_pure_ms = ctx->perf_talker_ms - ctx->perf_subtalker_ms;
+            double total_gen = ctx->perf_talker_ms;
+            if (total_gen > 0) {
+                fprintf(stderr, "Talker: %.0fms (%.1f%%) | Sub-talker: %.0fms (%.1f%%)\n",
+                        talker_pure_ms, 100.0 * talker_pure_ms / total_gen,
+                        ctx->perf_subtalker_ms, 100.0 * ctx->perf_subtalker_ms / total_gen);
+            }
+        }
         fprintf(stderr, "Stop: %s at step %d\n",
                 stop_reason == 1 ? "eos" : "max_tokens", stop_step);
         if (qwen_tts_verbose >= 2) {
@@ -1432,6 +2175,17 @@ float *qwen_tts_generate(
 
     if (qwen_tts_verbose >= 1) {
         fprintf(stderr, "Codec decode: %d samples in %.1f ms\n", *out_samples, ctx->perf_codec_ms);
+        /* Full time decomposition */
+        {
+            double talker_pure_ms = ctx->perf_talker_ms - ctx->perf_subtalker_ms;
+            double total = ctx->perf_total_ms;
+            if (total > 0) {
+                fprintf(stderr, "Talker: %.0fms (%.1f%%) | Sub-talker: %.0fms (%.1f%%) | Codec: %.0fms (%.1f%%)\n",
+                        talker_pure_ms, 100.0 * talker_pure_ms / total,
+                        ctx->perf_subtalker_ms, 100.0 * ctx->perf_subtalker_ms / total,
+                        ctx->perf_codec_ms, 100.0 * ctx->perf_codec_ms / total);
+            }
+        }
         fprintf(stderr, "Total: %.1f ms (%.2f s audio, %.2fx realtime)\n",
                 ctx->perf_total_ms,
                 *out_samples > 0 ? (float)*out_samples / QWEN_TTS_SAMPLE_RATE : 0,
@@ -1444,17 +2198,12 @@ float *qwen_tts_generate(
 }
 
 /* ========================================================================
- * Streaming (Dual-Track Chunked) Generate
+ * Streaming Generate
  *
- * Reuses the same prefill + AR loop as qwen_tts_generate(), but decodes
- * codec tokens in overlapping chunks during generation and delivers audio
- * via callback.
- *
- * chunk_size  = number of NEW codec frames per chunk (e.g. 25).
- *               0 means decode everything at the end (one callback).
- * left_context = chunk_size frames of overlap for continuity.
- *
- * Returns: 0 = success, -1 = error, 1 = aborted by callback.
+ * Same logic as qwen_tts_generate() but periodically decodes accumulated
+ * codec tokens and delivers new PCM samples via callback.
+ * Uses re-decode + diff strategy: codec decode is causal, so
+ * decode(N tokens)[0:N] == decode(N+M tokens)[0:N].
  * ======================================================================== */
 
 int qwen_tts_generate_stream(
@@ -1466,14 +2215,9 @@ int qwen_tts_generate_stream(
     qwen_tts_audio_cb audio_cb,
     void *userdata
 ) {
-    if (!ctx || !audio_cb) {
-        return -1;
-    }
+    if (!ctx || !audio_cb) return -1;
 
-    int effective_chunk = chunk_size > 0 ? chunk_size : 0;
-    int left_context = effective_chunk;  /* same as chunk_size */
-
-    /* ---- Parse text as comma-separated token IDs ---- */
+    /* Parse text as comma-separated token IDs (same as qwen_tts_generate) */
     int *text_tokens = NULL;
     int n_text_tokens = 0;
 
@@ -1481,7 +2225,6 @@ int qwen_tts_generate_stream(
         const char *p = text;
         int count = 1;
         while (*p) { if (*p == ',') count++; p++; }
-
         text_tokens = (int *)malloc(count * sizeof(int));
         p = text;
         while (*p && n_text_tokens < count) {
@@ -1520,9 +2263,8 @@ int qwen_tts_generate_stream(
                 break;
             }
         }
-        if (speaker_codec_id < 0) {
+        if (speaker_codec_id < 0)
             fprintf(stderr, "Warning: speaker '%s' not found, using no speaker embedding\n", speaker);
-        }
     }
 
     int language_codec_id = -1;
@@ -1533,18 +2275,16 @@ int qwen_tts_generate_stream(
                 break;
             }
         }
-        if (language_codec_id < 0) {
+        if (language_codec_id < 0)
             fprintf(stderr, "Warning: language '%s' not found\n", language);
-        }
     }
 
-    /* ---- Build prefix embedding sequence ---- */
+    /* ---- Build prefix embedding sequence (same as qwen_tts_generate) ---- */
     int n_content = n_text_tokens - 8;
     if (n_content < 0) n_content = 0;
 
     int codec_prefix[8];
     int n_codec_prefix = 0;
-
     if (language_codec_id < 0) {
         codec_prefix[n_codec_prefix++] = cfg->codec_nothink_id;
         codec_prefix[n_codec_prefix++] = cfg->codec_think_bos_id;
@@ -1555,22 +2295,17 @@ int qwen_tts_generate_stream(
         codec_prefix[n_codec_prefix++] = language_codec_id;
         codec_prefix[n_codec_prefix++] = cfg->codec_think_eos_id;
     }
-
-    if (speaker_codec_id >= 0) {
+    if (speaker_codec_id >= 0)
         codec_prefix[n_codec_prefix++] = speaker_codec_id;
-    }
     codec_prefix[n_codec_prefix++] = cfg->codec_pad_id;
     codec_prefix[n_codec_prefix++] = cfg->codec_bos_id;
 
     int prefill_len = 3 + n_codec_prefix;
     float *input_embeds = (float *)calloc((size_t)prefill_len * hidden, sizeof(float));
 
-    /* 1. Role tokens */
-    for (int i = 0; i < 3; i++) {
+    for (int i = 0; i < 3; i++)
         embed_text_token(ctx, text_tokens[i], input_embeds + i * hidden);
-    }
 
-    /* 2. Pad/bos section */
     float *tts_pad_proj = (float *)malloc(hidden * sizeof(float));
     float *tts_bos_proj = (float *)malloc(hidden * sizeof(float));
     float *tts_eos_proj = (float *)malloc(hidden * sizeof(float));
@@ -1581,16 +2316,14 @@ int qwen_tts_generate_stream(
 
     for (int i = 0; i < n_codec_prefix - 1; i++) {
         float *dst = input_embeds + (3 + i) * hidden;
-        if (i < n_codec_prefix - 2) {
+        if (i < n_codec_prefix - 2)
             memcpy(dst, tts_pad_proj, hidden * sizeof(float));
-        } else {
+        else
             memcpy(dst, tts_bos_proj, hidden * sizeof(float));
-        }
         embed_codec_token(ctx, codec_prefix[i], codec_emb_tmp);
         kernel_add_inplace(dst, codec_emb_tmp, hidden);
     }
 
-    /* 3. First text token + codec_bos */
     {
         int pos = 3 + n_codec_prefix - 1;
         float *dst = input_embeds + pos * hidden;
@@ -1600,44 +2333,24 @@ int qwen_tts_generate_stream(
     }
     free(codec_emb_tmp);
 
-    /* Build trailing text embeddings */
     int n_trailing = (n_text_tokens - 4 - 5) + 1;
     if (n_trailing < 1) n_trailing = 1;
     float *trailing_text = (float *)calloc((size_t)n_trailing * hidden, sizeof(float));
-    for (int i = 0; i < n_trailing - 1; i++) {
+    for (int i = 0; i < n_trailing - 1; i++)
         embed_text_token(ctx, text_tokens[4 + i], trailing_text + i * hidden);
-    }
     memcpy(trailing_text + (n_trailing - 1) * hidden, tts_eos_proj, hidden * sizeof(float));
 
-    /* ---- Ensure codec is loaded BEFORE AR loop (needed for streaming decode) ---- */
-    if (ensure_codec_loaded(ctx) != 0) {
-        fprintf(stderr,
-                "Error: codec decoder weights are unavailable (missing /model/speech_tokenizer/*.safetensors)\n");
-        free(input_embeds); free(trailing_text);
-        free(tts_pad_proj); free(tts_bos_proj); free(tts_eos_proj);
-        free(text_tokens);
-        return -1;
-    }
-
     /* ---- Prefill ---- */
-    double t_prefill = time_ms();
     ctx->talker_kv_len = 0;
     qwen_tts_talker_prefill(ctx, input_embeds, prefill_len);
-
-    double t_prefill_done = time_ms();
-    if (qwen_tts_verbose >= 1)
-        fprintf(stderr, "Stream prefill: %d tokens in %.1f ms\n", prefill_len, t_prefill_done - t_prefill);
-
     free(input_embeds);
 
-    /* ---- Autoregressive generation with chunked decode ---- */
+    /* ---- Autoregressive generation with streaming decode ---- */
     int fixed_tokens = ctx->fixed_codec_tokens > 0 ? ctx->fixed_codec_tokens : 0;
     int max_tokens = fixed_tokens > 0 ? fixed_tokens : ctx->max_new_tokens;
     int *all_codes = (int *)calloc((size_t)max_tokens * num_groups, sizeof(int));
     int *generated_tokens = (int *)calloc(max_tokens, sizeof(int));
     int n_generated = 0;
-    int stop_reason = 0;
-    int chunks_sent = 0;
     int aborted = 0;
 
     float *logits = (float *)malloc(cfg->talker_vocab_size * sizeof(float));
@@ -1645,7 +2358,6 @@ int qwen_tts_generate_stream(
     float *emb_tmp = (float *)malloc(hidden * sizeof(float));
     float rng_state = (float)ctx->sample_seed;
 
-    /* Suppress tokens */
     int suppress_start = cfg->talker_vocab_size - 1024;
     int *suppress_tokens = (int *)malloc(1024 * sizeof(int));
     int n_suppress = 0;
@@ -1653,10 +2365,38 @@ int qwen_tts_generate_stream(
         if (i != cfg->codec_eos_id) suppress_tokens[n_suppress++] = i;
     }
 
+    /* Ensure codec is loaded before starting (needed for streaming decode) */
+    if (ensure_codec_loaded(ctx) != 0) {
+        fprintf(stderr, "Error: codec decoder weights are unavailable\n");
+        free(all_codes); free(generated_tokens); free(logits); free(next_embed);
+        free(emb_tmp); free(suppress_tokens); free(trailing_text);
+        free(tts_pad_proj); free(tts_bos_proj); free(tts_eos_proj); free(text_tokens);
+        return -1;
+    }
+
+    int prev_audio_len = 0;    /* samples already sent via callback */
+    int prev_decoded_tokens = 0;  /* tokens already decoded */
     double t_gen = time_ms();
+    ctx->perf_subtalker_ms = 0.0;
+
+    /* chunk_size > 0: incremental mode (per-token decode + callback)
+     * chunk_size == 0: batch mode (decode all at EOS) */
+    int effective_chunk = (chunk_size > 0) ? chunk_size : 0;
+
+    /* Initialize incremental codec decode state for streaming mode */
+    qwen_tts_codec_stream_state_t *codec_state = NULL;
+    if (effective_chunk > 0) {
+        codec_state = qwen_tts_codec_stream_init(ctx);
+        if (!codec_state) {
+            fprintf(stderr, "Error: failed to init incremental codec state\n");
+            free(all_codes); free(generated_tokens); free(logits); free(next_embed);
+            free(emb_tmp); free(suppress_tokens); free(trailing_text);
+            free(tts_pad_proj); free(tts_bos_proj); free(tts_eos_proj); free(text_tokens);
+            return -1;
+        }
+    }
 
     for (int step = 0; step < max_tokens; step++) {
-        /* Compute logits */
         if (step == 0) {
             kernel_matvec_bf16(logits, ctx->talker.codec_head_bf16, ctx->tk_x,
                                cfg->talker_vocab_size, hidden);
@@ -1664,16 +2404,12 @@ int qwen_tts_generate_stream(
             qwen_tts_talker_forward(ctx, next_embed, logits);
         }
 
-        /* Apply suppress tokens */
-        for (int i = 0; i < n_suppress; i++) {
+        for (int i = 0; i < n_suppress; i++)
             logits[suppress_tokens[i]] = -1e9f;
-        }
 
-        /* Apply repetition penalty */
         kernel_apply_repetition_penalty(logits, generated_tokens, n_generated,
                                         cfg->talker_vocab_size, ctx->repetition_penalty);
 
-        /* Sample */
         int token = kernel_sample_top_k(logits, cfg->talker_vocab_size, ctx->top_k,
                                          ctx->top_p, ctx->temperature, &rng_state);
 
@@ -1685,155 +2421,111 @@ int qwen_tts_generate_stream(
             logits[cfg->codec_eos_id] = eos_logit;
         }
 
-        /* Check for EOS */
-        if (fixed_tokens == 0 && token == cfg->codec_eos_id) {
-            stop_reason = 1;
+        int is_eos = (fixed_tokens == 0 && token == cfg->codec_eos_id);
+        if (is_eos) {
             if (qwen_tts_verbose >= 1)
-                fprintf(stderr, "Stream EOS at step %d\n", step);
-            break;
+                fprintf(stderr, "EOS at step %d\n", step);
         }
 
-        generated_tokens[n_generated] = token;
+        if (!is_eos) {
+            generated_tokens[n_generated] = token;
 
-        /* Generate remaining code groups via sub-talker */
-        int codes[QWEN_TTS_NUM_CODE_GROUPS];
-        qwen_tts_subtalker_generate(ctx, ctx->tk_x, token, codes);
+            int codes[QWEN_TTS_NUM_CODE_GROUPS];
+            double t_st = time_ms();
+            qwen_tts_subtalker_generate(ctx, ctx->tk_x, token, codes);
+            ctx->perf_subtalker_ms += time_ms() - t_st;
 
-        /* Store all codes */
-        memcpy(all_codes + n_generated * num_groups, codes, num_groups * sizeof(int));
-        n_generated++;
+            memcpy(all_codes + n_generated * num_groups, codes, num_groups * sizeof(int));
+            n_generated++;
 
-        /* ---- Chunked decode: emit audio when we have a full chunk ---- */
-        if (effective_chunk > 0 && n_generated % effective_chunk == 0) {
-            int chunk_idx = chunks_sent;
-            int chunk_start = chunk_idx * effective_chunk;
-            int ctx_start = (chunks_sent > 0) ? chunk_start - left_context : 0;
-            if (ctx_start < 0) ctx_start = 0;
-            int ctx_frames = chunk_start - ctx_start;
-            int total_frames = ctx_frames + effective_chunk;
-
-            int n_audio = 0;
-            float *audio = qwen_tts_codec_decode(ctx,
-                all_codes + ctx_start * num_groups,
-                total_frames, &n_audio);
-
-            if (audio && n_audio > 0) {
-                int trim = ctx_frames * QWEN_TTS_DECODE_UPSAMPLE;
-                float *output = audio + trim;
-                int output_len = n_audio - trim;
-                if (output_len > 0) {
-                    int ret = audio_cb(output, output_len, userdata);
+            /* Incremental decode: process this token immediately */
+            if (codec_state) {
+                int n_audio = 0;
+                float *audio = qwen_tts_codec_decode_step(ctx, codec_state,
+                    all_codes + (n_generated - 1) * num_groups, &n_audio);
+                if (audio && n_audio > 0) {
+                    prev_audio_len += n_audio;
+                    if (qwen_tts_verbose >= 1)
+                        fprintf(stderr, "Stream incr: %d samples (%d total, %.2fs) at step %d\n",
+                                n_audio, prev_audio_len,
+                                (float)prev_audio_len / QWEN_TTS_SAMPLE_RATE, step);
+                    int ret = audio_cb(audio, n_audio, userdata);
+                    free(audio);
                     if (ret != 0) {
                         aborted = 1;
-                        free(audio);
                         break;
                     }
+                } else {
+                    free(audio);
                 }
-                free(audio);
-            }
-            chunks_sent++;
-
-            if (qwen_tts_verbose >= 1) {
-                double elapsed = time_ms() - t_gen;
-                fprintf(stderr, "  Stream chunk %d: %d frames (ctx %d), %.1f ms elapsed\n",
-                        chunks_sent, effective_chunk, ctx_frames, elapsed);
             }
         }
+
+        /* Batch mode: decode all at EOS */
+        if (!codec_state && effective_chunk == 0 && is_eos && n_generated > 0) {
+            int n_audio = 0;
+            float *audio = qwen_tts_codec_decode(ctx, all_codes, n_generated, &n_audio);
+            if (audio && n_audio > 0) {
+                if (qwen_tts_verbose >= 1)
+                    fprintf(stderr, "Batch decode: %d samples (%.2fs)\n",
+                            n_audio, (float)n_audio / QWEN_TTS_SAMPLE_RATE);
+                int ret = audio_cb(audio, n_audio, userdata);
+                prev_audio_len = n_audio;
+                if (ret != 0) aborted = 1;
+            }
+            free(audio);
+        }
+
+        if (is_eos) break;
 
         /* Build next input embedding */
-        memset(next_embed, 0, hidden * sizeof(float));
-        embed_codec_token(ctx, token, emb_tmp);
-        kernel_add_inplace(next_embed, emb_tmp, hidden);
-
-        for (int g = 1; g < num_groups; g++) {
-            int emb_dim = hidden;
-            kernel_bf16_to_f32(emb_tmp, ctx->subtalker.codec_embeddings_bf16[g - 1] +
-                               (size_t)codes[g] * emb_dim, emb_dim);
+        if (!is_eos) {
+            memset(next_embed, 0, hidden * sizeof(float));
+            embed_codec_token(ctx, token, emb_tmp);
             kernel_add_inplace(next_embed, emb_tmp, hidden);
-        }
-        if (step < n_trailing) {
-            kernel_add_inplace(next_embed, trailing_text + step * hidden, hidden);
-        } else {
-            kernel_add_inplace(next_embed, tts_pad_proj, hidden);
+            for (int g = 1; g < num_groups; g++) {
+                int emb_dim = hidden;
+                int code_g = all_codes[(n_generated - 1) * num_groups + g];
+                kernel_bf16_to_f32(emb_tmp, ctx->subtalker.codec_embeddings_bf16[g - 1] +
+                                   (size_t)code_g * emb_dim, emb_dim);
+                kernel_add_inplace(next_embed, emb_tmp, hidden);
+            }
+            if (step < n_trailing)
+                kernel_add_inplace(next_embed, trailing_text + step * hidden, hidden);
+            else
+                kernel_add_inplace(next_embed, tts_pad_proj, hidden);
         }
 
-        /* Progress callback */
-        if (ctx->progress_cb) {
+        if (ctx->progress_cb)
             ctx->progress_cb(step + 1, max_tokens, ctx->progress_cb_userdata);
-        }
         if (qwen_tts_verbose >= 1 && (n_generated % 10 == 0)) {
             double elapsed = time_ms() - t_gen;
             fprintf(stderr, "\r  Token %d (%.1f ms/token)...", n_generated, elapsed / n_generated);
         }
     }
 
-    /* ---- Flush remaining frames ---- */
-    if (!aborted && n_generated > 0) {
-        int flushed_start = chunks_sent * effective_chunk;
-        int remaining = n_generated - flushed_start;
-
-        if (remaining > 0) {
-            /* Decode remaining frames with left context */
-            int ctx_start = (chunks_sent > 0) ? flushed_start - left_context : 0;
-            if (ctx_start < 0) ctx_start = 0;
-            int ctx_frames = flushed_start - ctx_start;
-            int total_frames = ctx_frames + remaining;
-
-            int n_audio = 0;
-            float *audio = qwen_tts_codec_decode(ctx,
-                all_codes + ctx_start * num_groups,
-                total_frames, &n_audio);
-
-            if (audio && n_audio > 0) {
-                int trim = ctx_frames * QWEN_TTS_DECODE_UPSAMPLE;
-                float *output = audio + trim;
-                int output_len = n_audio - trim;
-                if (output_len > 0) {
-                    int ret = audio_cb(output, output_len, userdata);
-                    if (ret != 0) aborted = 1;
-                }
-                free(audio);
-            }
-
-            if (qwen_tts_verbose >= 1) {
-                fprintf(stderr, "  Stream flush: %d remaining frames (ctx %d)\n",
-                        remaining, ctx_frames);
-            }
-        } else if (effective_chunk == 0) {
-            /* chunk_size == 0: decode all at once, single callback */
-            int n_audio = 0;
-            float *audio = qwen_tts_codec_decode(ctx, all_codes, n_generated, &n_audio);
-            if (audio && n_audio > 0) {
-                int ret = audio_cb(audio, n_audio, userdata);
-                if (ret != 0) aborted = 1;
-                free(audio);
-            }
-        }
+    /* Clean up incremental state */
+    if (codec_state) {
+        qwen_tts_codec_stream_free(codec_state);
+        codec_state = NULL;
     }
 
-    if (stop_reason == 0 && !aborted) {
-        stop_reason = 2;
-    }
-
-    double t_done = time_ms();
-    ctx->perf_talker_ms = t_done - t_gen;
+    double t_gen_done = time_ms();
+    ctx->perf_talker_ms = t_gen_done - t_gen;
     ctx->perf_codec_tokens = n_generated;
-    ctx->perf_total_ms = t_done - t_start;
+    ctx->perf_total_ms = t_gen_done - t_start;
 
     if (qwen_tts_verbose >= 1) {
         fprintf(stderr, "\r                                        \r");
-        fprintf(stderr, "Stream: %d codec tokens in %.1f ms (%.1f ms/token)\n",
-                n_generated, ctx->perf_talker_ms,
-                n_generated > 0 ? ctx->perf_talker_ms / n_generated : 0);
-        fprintf(stderr, "Stop: %s, chunks sent: %d\n",
-                aborted ? "aborted" : (stop_reason == 1 ? "eos" : "max_tokens"),
-                chunks_sent);
+        fprintf(stderr, "Stream generate: %d codec tokens, %d audio samples sent, total %.1f ms\n",
+                n_generated, prev_audio_len, ctx->perf_total_ms);
     }
 
-    free(logits); free(generated_tokens); free(suppress_tokens); free(emb_tmp);
-    free(trailing_text); free(tts_pad_proj); free(tts_bos_proj); free(tts_eos_proj);
-    free(text_tokens); free(all_codes); free(next_embed);
+    free(all_codes); free(generated_tokens); free(logits); free(next_embed);
+    free(emb_tmp); free(suppress_tokens); free(trailing_text);
+    free(tts_pad_proj); free(tts_bos_proj); free(tts_eos_proj); free(text_tokens);
 
     if (aborted) return 1;
+    if (n_generated == 0) return -1;
     return 0;
 }

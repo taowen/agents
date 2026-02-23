@@ -15,6 +15,9 @@
 #include <stdint.h>
 #include <stdio.h>
 
+/* Forward declaration for Q4_K block type (defined in qwen_tts_kernels.h) */
+typedef struct block_q4_k block_q4_k;
+
 /* ========================================================================
  * Constants
  * ======================================================================== */
@@ -99,6 +102,9 @@ typedef struct {
     /* M-RoPE section sizes (3 sections for temporal, height, width) */
     int mrope_section[3];
 
+    /* Q4_K_M quantization config */
+    int use_q4k;                 /* 0=INT8 only, 1=Q4_K for QKV+gate_up (Q4_K_M strategy) */
+
     /* Sub-talker (code predictor) */
     int subtalker_vocab_size;
     int subtalker_hidden;
@@ -169,6 +175,24 @@ typedef struct {
 
     /* Fused gate+up for single-token matvec */
     uint16_t *gate_up_fused_bf16; /* [2*intermediate, hidden] */
+
+    /* Fused Q+K+V projection for single-token matvec */
+    uint16_t *wqkv_fused_bf16;   /* [q_dim+kv_dim+kv_dim, hidden] */
+
+    /* INT8 quantized weights (optional, created at load time) */
+    int8_t *wqkv_int8;           /* [q_dim+kv_dim+kv_dim, hidden] */
+    float  *wqkv_scales;         /* [q_dim+kv_dim+kv_dim] per-row scale */
+    int8_t *gate_up_int8;        /* [2*intermediate, hidden] */
+    float  *gate_up_scales;      /* [2*intermediate] */
+    int8_t *wo_int8;             /* [hidden, q_dim] */
+    float  *wo_scales;           /* [hidden] */
+    int8_t *down_int8;           /* [hidden, intermediate] */
+    float  *down_scales;         /* [hidden] */
+
+    /* Q4_K super-block quantized weights (Q4_K_M: only QKV and gate_up) */
+    block_q4_k *wqkv_q4k;        /* Q4_K for QKV projection, or NULL */
+    block_q4_k *gate_up_q4k;     /* Q4_K for MLP gate+up, or NULL */
+    /* wo and down keep INT8 (Q4_K_M strategy: sensitive layers use higher precision) */
 } qwen_tts_talker_layer_t;
 
 typedef struct {
@@ -209,6 +233,25 @@ typedef struct {
     uint16_t *up_bf16;
     uint16_t *down_bf16;
     uint16_t *gate_up_fused_bf16;
+
+    /* Fused Q+K+V projection for single-token matvec */
+    uint16_t *wqkv_fused_bf16;   /* [q_dim+kv_dim+kv_dim, hidden] */
+
+    /* INT8 quantized weights (optional, created at load time) */
+    int8_t *wqkv_int8;
+    float  *wqkv_scales;
+    int8_t *gate_up_int8;
+    float  *gate_up_scales;
+    int8_t *wo_int8;
+    float  *wo_scales;
+    int8_t *down_int8;
+    float  *down_scales;
+
+    /* Q4_K super-block quantized weights (full Q4_K for sub-talker) */
+    block_q4_k *wqkv_q4k;
+    block_q4_k *gate_up_q4k;
+    block_q4_k *wo_q4k;         /* Q4_K for wo (sub-talker only; talker keeps INT8) */
+    block_q4_k *down_q4k;       /* Q4_K for down (sub-talker only; talker keeps INT8) */
 } qwen_tts_subtalker_layer_t;
 
 typedef struct {
@@ -261,16 +304,26 @@ typedef struct {
     float *attn_layer_scale;       /* [hidden] LayerScale */
     float *mlp_layer_scale;        /* [hidden] LayerScale */
 
-    /* Attention (no bias) */
+    /* Attention (no bias) - F32 originals */
     float *wq;                     /* [num_heads*head_dim, hidden] */
     float *wk;                     /* [num_kv_heads*head_dim, hidden] */
     float *wv;                     /* [num_kv_heads*head_dim, hidden] */
     float *wo;                     /* [hidden, num_heads*head_dim] */
 
-    /* SwiGLU MLP */
+    /* SwiGLU MLP - F32 originals */
     float *gate;                   /* [intermediate, hidden] */
     float *up;                     /* [intermediate, hidden] */
     float *down;                   /* [hidden, intermediate] */
+
+    /* INT8 quantized weights (optional, created at load time from F32) */
+    int8_t *wqkv_int8;            /* fused [q_dim+kv_dim+kv_dim, hidden] */
+    float  *wqkv_scales;
+    int8_t *gate_up_int8;          /* fused [2*intermediate, hidden] */
+    float  *gate_up_scales;
+    int8_t *wo_int8;               /* [hidden, q_dim] */
+    float  *wo_scales;
+    int8_t *down_int8;             /* [hidden, intermediate] */
+    float  *down_scales;
 } qwen_tts_codec_transformer_layer_t;
 
 /* ConvNeXt block */
@@ -350,10 +403,16 @@ typedef struct {
 } qwen_tts_codec_decoder_t;
 
 /* ========================================================================
- * Token Callback
+ * Callbacks
  * ======================================================================== */
 
 typedef void (*qwen_tts_progress_cb)(int step, int total, void *userdata);
+
+/* Audio chunk callback: called with PCM float32 samples as they become available.
+ * samples: PCM float32 at 24kHz mono
+ * n_samples: number of samples in this chunk
+ * Return 0 to continue, non-zero to abort generation. */
+typedef int (*qwen_tts_audio_cb)(const float *samples, int n_samples, void *userdata);
 
 /* ========================================================================
  * Main Context
@@ -369,6 +428,7 @@ typedef struct {
     void *safetensors;              /* multi_safetensors_t* */
     void *codec_safetensors;        /* multi_safetensors_t* for speech_tokenizer */
     char model_dir[512];
+    char cache_dir[512];       /* writable directory for qcache; defaults to model_dir */
 
     /* Talker KV cache */
     float *talker_kv_k;             /* [layers, max_seq, kv_heads*head_dim] */
@@ -390,6 +450,7 @@ typedef struct {
 
     /* Persistent talker buffers (single-token generation) */
     float *tk_x, *tk_x_norm, *tk_q, *tk_k, *tk_v;
+    float *tk_qkv;              /* fused QKV output [q_dim+kv_dim+kv_dim] */
     float *tk_attn_out, *tk_proj_out;
     float *tk_gate, *tk_up, *tk_ffn_out;
     float *tk_scores;  /* attention scores [talker_kv_max] */
@@ -403,6 +464,7 @@ typedef struct {
 
     /* Persistent sub-talker scratch buffers */
     float *st_x, *st_x_norm, *st_q, *st_k, *st_v;
+    float *st_qkv;              /* fused QKV output [q_dim+kv_dim+kv_dim] */
     float *st_attn_out, *st_logits;
     float *st_gate, *st_up;
     float *st_embed, *st_proj_hidden;
@@ -433,9 +495,15 @@ typedef struct {
     qwen_tts_progress_cb progress_cb;
     void *progress_cb_userdata;
 
+    /* Scratch buffers for text_projection / embed_text_token (avoid hot-loop malloc) */
+    float *scratch_text_hidden;     /* [text_hidden] for text_projection fc1_out */
+    float *scratch_text_embed;      /* [text_hidden] for embed_text_token */
+    int scratch_text_hidden_cap;
+
     /* Performance stats */
     double perf_total_ms;
     double perf_talker_ms;
+    double perf_subtalker_ms;   /* cumulative sub-talker time */
     double perf_codec_ms;
     int perf_codec_tokens;
 } qwen_tts_ctx_t;
@@ -446,6 +514,13 @@ typedef struct {
 
 /* Load model from directory containing safetensors + config.json */
 qwen_tts_ctx_t *qwen_tts_load(const char *model_dir);
+
+/* Set writable cache directory for quantized weight cache.
+ * If model_dir is not writable, call this after qwen_tts_load, then qwen_tts_save_cache. */
+void qwen_tts_set_cache_dir(qwen_tts_ctx_t *ctx, const char *cache_dir);
+
+/* Save quantized weight cache to cache_dir. Returns 0 on success. */
+int qwen_tts_save_cache(qwen_tts_ctx_t *ctx);
 
 /* Free all resources */
 void qwen_tts_free(qwen_tts_ctx_t *ctx);
@@ -464,16 +539,10 @@ float *qwen_tts_generate(
     int *out_samples
 );
 
-/* Write PCM float32 audio to WAV file */
-int qwen_tts_write_wav(const char *path, const float *samples, int n_samples, int sample_rate);
-
-/* Audio callback for streaming generation.
- * Return 0 to continue, non-zero to abort. */
-typedef int (*qwen_tts_audio_cb)(const float *samples, int n_samples, void *userdata);
-
-/* Streaming generate: calls audio_cb with chunks of audio as they are decoded.
- * chunk_size = number of codec frames per chunk (0 = decode all at end).
- * Returns: 0=success, -1=error, 1=aborted by callback. */
+/* Generate speech with streaming audio output.
+ * Calls audio_cb with PCM chunks as they become available.
+ * chunk_size: number of codec tokens between decode+callback (0 = batch mode).
+ * Returns 0 on success, -1 on error, 1 if aborted by callback. */
 int qwen_tts_generate_stream(
     qwen_tts_ctx_t *ctx,
     const char *text,
@@ -484,8 +553,8 @@ int qwen_tts_generate_stream(
     void *userdata
 );
 
-/* Cache directory override (for JNI / Android) */
-extern const char *qwen_tts_cache_dir_override;
+/* Write PCM float32 audio to WAV file */
+int qwen_tts_write_wav(const char *path, const float *samples, int n_samples, int sample_rate);
 
 /* ========================================================================
  * Internal Functions
@@ -521,7 +590,59 @@ float *qwen_tts_codec_decode(
     int *out_samples
 );
 
+/* ========================================================================
+ * Incremental Codec Decode State
+ * ======================================================================== */
+
+typedef struct {
+    /* Pre-conv: CausalConv1d(512→1024, k=3, d=1), state_len = (3-1)*1 = 2 */
+    float *pre_conv_state;      /* [512, 2] = 1024 floats */
+
+    /* Codec transformer: position counter (KV cache uses ctx->codec_kv_*) */
+    int transformer_pos;
+
+    /* Upsample ConvNeXt dwconv states: k=7, d=1, groups=dim, state_len=6 */
+    float *upsample_cn_state[2]; /* each [1024, 6] = 6144 floats */
+
+    /* Vocoder pre-conv: CausalConv1d(1024→1536, k=7, d=1), state_len=6 */
+    float *voc_preconv_state;   /* [1024, 6] = 6144 floats */
+
+    /* Vocoder blocks (4 blocks) */
+    struct {
+        float *transconv_overlap;   /* [out_dim, K-stride] */
+        float *ru_conv1_state[3];   /* [dim, (K-1)*dilation] for each ResUnit */
+    } voc_blocks[4];
+
+    /* Final conv: CausalConv1d(96→1, k=7, d=1), state_len=6 */
+    float *final_conv_state;    /* [96, 6] = 576 floats */
+
+    int n_processed;            /* tokens processed so far */
+} qwen_tts_codec_stream_state_t;
+
+/* Allocate and initialize incremental decode state (all buffers zeroed) */
+qwen_tts_codec_stream_state_t *qwen_tts_codec_stream_init(qwen_tts_ctx_t *ctx);
+
+/* Free incremental decode state */
+void qwen_tts_codec_stream_free(qwen_tts_codec_stream_state_t *state);
+
+/* Decode a single codec token incrementally; returns malloc'd PCM (caller frees).
+ * codes: [num_quantizers] for 1 timestep.
+ * *out_samples is set to 1920 on success. */
+float *qwen_tts_codec_decode_step(
+    qwen_tts_ctx_t *ctx,
+    qwen_tts_codec_stream_state_t *state,
+    const int *codes,
+    int *out_samples
+);
+
+/* Verify incremental decode matches batch decode. Returns max absolute diff.
+ * If max_diff < 1e-4, incremental decode is correct. */
+int qwen_tts_codec_verify_incremental(qwen_tts_ctx_t *ctx,
+                                        const int *all_codes,
+                                        int n_tokens);
+
 /* Global verbose flag */
 extern int qwen_tts_verbose;
+extern const char *qwen_tts_cache_dir_override;  /* set before qwen_tts_load() */
 
 #endif /* QWEN_TTS_H */
