@@ -17,6 +17,10 @@
 #include <math.h>
 #include <limits.h>
 #include <sys/time.h>
+#include <unistd.h>
+#include <fcntl.h>
+#include <sys/stat.h>
+#include <sys/mman.h>
 
 /* Global verbose flag */
 int qwen_verbose = 0;
@@ -191,6 +195,257 @@ static int detect_config(qwen_ctx_t *ctx) {
 }
 
 /* ========================================================================
+ * Pre-quantized .qmodel Loading (mmap, zero-copy)
+ * ======================================================================== */
+
+#define QMODEL_MAGIC   0x384D5141  /* "AQM8" */
+#define QMODEL_VERSION 1
+
+static qwen_ctx_t *qwen_load_qmodel(qwen_ctx_t *ctx, const char *path) {
+    int fd = open(path, O_RDONLY);
+    if (fd < 0) {
+        fprintf(stderr, "qwen_load_qmodel: cannot open %s\n", path);
+        return NULL;
+    }
+
+    struct stat st;
+    if (fstat(fd, &st) != 0) {
+        close(fd);
+        return NULL;
+    }
+    size_t file_size = (size_t)st.st_size;
+
+    void *map = mmap(NULL, file_size, PROT_READ, MAP_PRIVATE, fd, 0);
+    close(fd);
+    if (map == MAP_FAILED) {
+        fprintf(stderr, "qwen_load_qmodel: mmap failed for %s\n", path);
+        return NULL;
+    }
+
+    ctx->qmodel_mmap = map;
+    ctx->qmodel_mmap_size = file_size;
+
+    uint8_t *cursor = (uint8_t *)map;
+    uint8_t *end = cursor + file_size;
+
+    /* --- Validate header --- */
+    if (file_size < 128) {
+        fprintf(stderr, "qwen_load_qmodel: file too small\n");
+        goto fail;
+    }
+
+    uint32_t *hdr = (uint32_t *)cursor;
+    if (hdr[0] != QMODEL_MAGIC) {
+        fprintf(stderr, "qwen_load_qmodel: bad magic 0x%08X (expected 0x%08X)\n",
+                hdr[0], QMODEL_MAGIC);
+        goto fail;
+    }
+    if (hdr[1] != QMODEL_VERSION) {
+        fprintf(stderr, "qwen_load_qmodel: unsupported version %u\n", hdr[1]);
+        goto fail;
+    }
+
+    /* --- Read config from header --- */
+    qwen_config_t *cfg = &ctx->config;
+    cfg->enc_d_model     = (int)hdr[2];
+    cfg->enc_layers      = (int)hdr[3];
+    cfg->enc_heads       = (int)hdr[4];
+    cfg->enc_head_dim    = (int)hdr[5];
+    cfg->enc_ffn_dim     = (int)hdr[6];
+    cfg->enc_output_dim  = (int)hdr[7];
+    cfg->dec_hidden      = (int)hdr[8];
+    cfg->dec_layers      = (int)hdr[9];
+    cfg->dec_heads       = (int)hdr[10];
+    cfg->dec_kv_heads    = (int)hdr[11];
+    cfg->dec_head_dim    = (int)hdr[12];
+    cfg->dec_intermediate = (int)hdr[13];
+    cfg->vocab_size      = (int)hdr[14];
+
+    /* Common derived parameters */
+    cfg->enc_n_window = 50;
+    cfg->enc_n_window_infer = 800;
+    cfg->enc_chunk_size = cfg->enc_n_window * 2;
+    cfg->enc_conv_proj_dim = QWEN_CONV_HIDDEN * 16;
+    cfg->dec_rms_norm_eps = 1e-6f;
+    cfg->dec_rope_theta = 1e6f;
+
+    if (qwen_verbose >= 1) {
+        const char *variant = (cfg->enc_layers > 18) ? "1.7B" : "0.6B";
+        fprintf(stderr, "Loading pre-quantized .qmodel: Qwen3-ASR-%s\n", variant);
+    }
+
+    cursor += 128; /* skip header */
+
+    /* Convenience macros for walking through mmap'd data */
+    #define CURSOR_F32(ptr, n) do { \
+        size_t _sz = (size_t)(n) * sizeof(float); \
+        if (cursor + _sz > end) goto fail; \
+        (ptr) = (float *)cursor; \
+        cursor += _sz; \
+    } while (0)
+
+    #define CURSOR_Q8(ptr, n_blocks) do { \
+        size_t _sz = (size_t)(n_blocks) * sizeof(block_q8_0); \
+        if (cursor + _sz > end) goto fail; \
+        (ptr) = (block_q8_0 *)cursor; \
+        cursor += _sz; \
+    } while (0)
+
+    #define CURSOR_BF16(ptr, n) do { \
+        size_t _sz = (size_t)(n) * sizeof(uint16_t); \
+        if (cursor + _sz > end) goto fail; \
+        (ptr) = (uint16_t *)cursor; \
+        cursor += _sz; \
+    } while (0)
+
+    int d_model = cfg->enc_d_model;
+    int ffn_dim = cfg->enc_ffn_dim;
+    int output_dim = cfg->enc_output_dim;
+    int hidden = cfg->dec_hidden;
+    int inter = cfg->dec_intermediate;
+    int head_dim = cfg->dec_head_dim;
+    int kv_heads = cfg->dec_kv_heads;
+    int n_heads = cfg->dec_heads;
+
+    qwen_encoder_t *enc = &ctx->encoder;
+    qwen_decoder_t *dec = &ctx->decoder;
+
+    /* --- Encoder conv stem --- */
+    int conv_k = QWEN_CONV_HIDDEN * QWEN_CONV_KERNEL * QWEN_CONV_KERNEL; /* 4320 */
+    int conv_n_elements = QWEN_CONV_HIDDEN * conv_k;  /* 2073600 */
+    int conv_n_blocks = conv_n_elements / QK8_0;       /* 64800 */
+
+    /* conv1: f32 weight + bias */
+    CURSOR_F32(enc->conv1_weight, QWEN_CONV_HIDDEN * 1 * QWEN_CONV_KERNEL * QWEN_CONV_KERNEL);
+    CURSOR_F32(enc->conv1_bias, QWEN_CONV_HIDDEN);
+
+    /* conv2: q8_0 weight + f32 bias */
+    CURSOR_Q8(enc->conv2_weight_q8, conv_n_blocks);
+    CURSOR_F32(enc->conv2_bias, QWEN_CONV_HIDDEN);
+
+    /* conv3: q8_0 weight + f32 bias */
+    CURSOR_Q8(enc->conv3_weight_q8, conv_n_blocks);
+    CURSOR_F32(enc->conv3_bias, QWEN_CONV_HIDDEN);
+
+    /* conv_out: q8_0 [d_model, 7680/QK8_0 blocks per row] */
+    {
+        int conv_proj_dim = QWEN_CONV_HIDDEN * 16; /* 7680 */
+        int total_blocks = d_model * (conv_proj_dim / QK8_0);
+        CURSOR_Q8(enc->conv_out_weight_q8, total_blocks);
+    }
+
+    /* Set unused f32 conv weights to NULL (they point into safetensors in the other path) */
+    enc->conv2_weight = NULL;
+    enc->conv3_weight = NULL;
+
+    /* --- Encoder layers --- */
+    for (int i = 0; i < cfg->enc_layers; i++) {
+        qwen_enc_layer_t *l = &enc->layers[i];
+        int d2 = d_model * d_model;
+        int d_blocks = d2 / QK8_0;
+
+        /* wq: q8_0 [d_model, d_model] + f32 bias [d_model] */
+        CURSOR_Q8(l->wq_weight_q8, d_blocks);
+        CURSOR_F32(l->wq_bias, d_model);
+
+        CURSOR_Q8(l->wk_weight_q8, d_blocks);
+        CURSOR_F32(l->wk_bias, d_model);
+
+        CURSOR_Q8(l->wv_weight_q8, d_blocks);
+        CURSOR_F32(l->wv_bias, d_model);
+
+        CURSOR_Q8(l->wo_weight_q8, d_blocks);
+        CURSOR_F32(l->wo_bias, d_model);
+
+        /* Pre-attention LayerNorm */
+        CURSOR_F32(l->attn_norm_weight, d_model);
+        CURSOR_F32(l->attn_norm_bias, d_model);
+
+        /* FFN fc1: q8_0 [ffn_dim, d_model] + f32 bias [ffn_dim] */
+        CURSOR_Q8(l->fc1_weight_q8, (ffn_dim * d_model) / QK8_0);
+        CURSOR_F32(l->fc1_bias, ffn_dim);
+
+        /* FFN fc2: q8_0 [d_model, ffn_dim] + f32 bias [d_model] */
+        CURSOR_Q8(l->fc2_weight_q8, (d_model * ffn_dim) / QK8_0);
+        CURSOR_F32(l->fc2_bias, d_model);
+
+        /* Pre-FFN LayerNorm */
+        CURSOR_F32(l->ffn_norm_weight, d_model);
+        CURSOR_F32(l->ffn_norm_bias, d_model);
+    }
+
+    /* --- Encoder post --- */
+    CURSOR_F32(enc->ln_post_weight, d_model);
+    CURSOR_F32(enc->ln_post_bias, d_model);
+
+    /* proj1: q8_0 [d_model, d_model] + f32 bias [d_model] */
+    CURSOR_Q8(enc->proj1_weight_q8, (d_model * d_model) / QK8_0);
+    CURSOR_F32(enc->proj1_bias, d_model);
+
+    /* proj2: q8_0 [output_dim, d_model] + f32 bias [output_dim] */
+    CURSOR_Q8(enc->proj2_weight_q8, (output_dim * d_model) / QK8_0);
+    CURSOR_F32(enc->proj2_bias, output_dim);
+
+    /* --- Decoder --- */
+    /* tok_embeddings bf16 [vocab_size, hidden] */
+    CURSOR_BF16(dec->tok_embeddings_bf16, (size_t)cfg->vocab_size * hidden);
+
+    /* tok_embeddings q8_0 [vocab_size * hidden / QK8_0 blocks] */
+    CURSOR_Q8(dec->tok_embeddings_q8, ((size_t)cfg->vocab_size * hidden) / QK8_0);
+
+    /* Decoder layers */
+    for (int i = 0; i < cfg->dec_layers; i++) {
+        qwen_dec_layer_t *l = &dec->layers[i];
+
+        /* Attention Q/K/V/O: q8_0, no biases */
+        CURSOR_Q8(l->wq_weight_q8, (n_heads * head_dim * hidden) / QK8_0);
+        CURSOR_Q8(l->wk_weight_q8, (kv_heads * head_dim * hidden) / QK8_0);
+        CURSOR_Q8(l->wv_weight_q8, (kv_heads * head_dim * hidden) / QK8_0);
+        CURSOR_Q8(l->wo_weight_q8, (hidden * n_heads * head_dim) / QK8_0);
+
+        /* Per-head Q/K RMSNorm */
+        CURSOR_F32(l->q_norm_weight, head_dim);
+        CURSOR_F32(l->k_norm_weight, head_dim);
+
+        /* RMSNorm */
+        CURSOR_F32(l->input_norm, hidden);
+        CURSOR_F32(l->post_attn_norm, hidden);
+
+        /* Gate+Up fused q8_0 [2*intermediate, hidden/QK8_0 blocks per row] */
+        CURSOR_Q8(l->gate_up_fused_q8, (size_t)(2 * inter) * (hidden / QK8_0));
+
+        /* Down: q8_0 [hidden, intermediate/QK8_0 blocks] */
+        CURSOR_Q8(l->down_weight_q8, ((size_t)hidden * inter) / QK8_0);
+
+        /* Set unused bf16 pointers to NULL */
+        l->gate_weight_bf16 = NULL;
+        l->up_weight_bf16 = NULL;
+    }
+
+    /* Final RMSNorm */
+    CURSOR_F32(dec->norm, hidden);
+
+    #undef CURSOR_F32
+    #undef CURSOR_Q8
+    #undef CURSOR_BF16
+
+    if (qwen_verbose >= 1) {
+        size_t used = (size_t)(cursor - (uint8_t *)map);
+        fprintf(stderr, "qmodel loaded: %zu / %zu bytes used (%.1f MB)\n",
+                used, file_size, (double)file_size / (1024.0 * 1024.0));
+    }
+
+    return ctx;
+
+fail:
+    fprintf(stderr, "qwen_load_qmodel: truncated or corrupt file %s\n", path);
+    munmap(map, file_size);
+    ctx->qmodel_mmap = NULL;
+    ctx->qmodel_mmap_size = 0;
+    return NULL;
+}
+
+/* ========================================================================
  * Model Loading
  * ======================================================================== */
 
@@ -198,6 +453,33 @@ qwen_ctx_t *qwen_load(const char *model_dir) {
     qwen_ctx_t *ctx = (qwen_ctx_t *)calloc(1, sizeof(qwen_ctx_t));
     if (!ctx) return NULL;
     snprintf(ctx->model_dir, sizeof(ctx->model_dir), "%s", model_dir);
+
+    /* Try pre-quantized .qmodel first (fast mmap path) */
+    char qmodel_path[1024];
+    snprintf(qmodel_path, sizeof(qmodel_path), "%s/model.qmodel", model_dir);
+    if (access(qmodel_path, R_OK) == 0) {
+        if (qwen_verbose >= 1)
+            fprintf(stderr, "Found pre-quantized model: %s\n", qmodel_path);
+        ctx = qwen_load_qmodel(ctx, qmodel_path);
+        if (ctx) {
+            /* Set defaults (same as safetensors path below) */
+            ctx->segment_sec = 0.0f;
+            ctx->search_sec = 3.0f;
+            ctx->stream_chunk_sec = 2.0f;
+            ctx->stream_rollback = 5;
+            ctx->stream_unfixed_chunks = 2;
+            ctx->stream_max_new_tokens = 32;
+            ctx->past_text_conditioning = 0;
+            ctx->skip_silence = 0;
+            if (qwen_verbose >= 1) fprintf(stderr, "Model loaded (qmodel).\n");
+            return ctx;
+        }
+        fprintf(stderr, "qwen_load: .qmodel load failed, falling back to safetensors\n");
+        /* Re-allocate ctx since qmodel path may have partially set it up */
+        ctx = (qwen_ctx_t *)calloc(1, sizeof(qwen_ctx_t));
+        if (!ctx) return NULL;
+        snprintf(ctx->model_dir, sizeof(ctx->model_dir), "%s", model_dir);
+    }
 
     /* Open safetensors (multi-shard) */
     if (qwen_verbose >= 1)
@@ -253,49 +535,61 @@ qwen_ctx_t *qwen_load(const char *model_dir) {
 void qwen_free(qwen_ctx_t *ctx) {
     if (!ctx) return;
 
-    #define FREE0(p) do { free(p); (p) = NULL; } while (0)
+    if (ctx->qmodel_mmap) {
+        /* All weight pointers point into the mmap'd region — just munmap. */
+        munmap(ctx->qmodel_mmap, ctx->qmodel_mmap_size);
+        ctx->qmodel_mmap = NULL;
+    } else {
+        /* Safetensors path: individually free allocated weights. */
+        #define FREE0(p) do { free(p); (p) = NULL; } while (0)
 
-    /* Encoder conv stem */
-    FREE0(ctx->encoder.conv1_weight); FREE0(ctx->encoder.conv1_bias);
-    FREE0(ctx->encoder.conv2_weight); FREE0(ctx->encoder.conv2_bias);
-    FREE0(ctx->encoder.conv3_weight); FREE0(ctx->encoder.conv3_bias);
-    FREE0(ctx->encoder.conv2_weight_q8);
-    FREE0(ctx->encoder.conv3_weight_q8);
-    FREE0(ctx->encoder.conv_out_weight_q8);
+        /* Encoder conv stem */
+        FREE0(ctx->encoder.conv1_weight); FREE0(ctx->encoder.conv1_bias);
+        FREE0(ctx->encoder.conv2_weight); FREE0(ctx->encoder.conv2_bias);
+        FREE0(ctx->encoder.conv3_weight); FREE0(ctx->encoder.conv3_bias);
+        FREE0(ctx->encoder.conv2_weight_q8);
+        FREE0(ctx->encoder.conv3_weight_q8);
+        FREE0(ctx->encoder.conv_out_weight_q8);
 
-    /* Encoder layers (Q8_0 quantized weights, all allocated) */
-    for (int i = 0; i < ctx->config.enc_layers; i++) {
-        qwen_enc_layer_t *l = &ctx->encoder.layers[i];
-        FREE0(l->wq_weight_q8); FREE0(l->wq_bias);
-        FREE0(l->wk_weight_q8); FREE0(l->wk_bias);
-        FREE0(l->wv_weight_q8); FREE0(l->wv_bias);
-        FREE0(l->wo_weight_q8); FREE0(l->wo_bias);
-        FREE0(l->attn_norm_weight); FREE0(l->attn_norm_bias);
-        FREE0(l->fc1_weight_q8); FREE0(l->fc1_bias);
-        FREE0(l->fc2_weight_q8); FREE0(l->fc2_bias);
-        FREE0(l->ffn_norm_weight); FREE0(l->ffn_norm_bias);
+        /* Encoder layers (Q8_0 quantized weights, all allocated) */
+        for (int i = 0; i < ctx->config.enc_layers; i++) {
+            qwen_enc_layer_t *l = &ctx->encoder.layers[i];
+            FREE0(l->wq_weight_q8); FREE0(l->wq_bias);
+            FREE0(l->wk_weight_q8); FREE0(l->wk_bias);
+            FREE0(l->wv_weight_q8); FREE0(l->wv_bias);
+            FREE0(l->wo_weight_q8); FREE0(l->wo_bias);
+            FREE0(l->attn_norm_weight); FREE0(l->attn_norm_bias);
+            FREE0(l->fc1_weight_q8); FREE0(l->fc1_bias);
+            FREE0(l->fc2_weight_q8); FREE0(l->fc2_bias);
+            FREE0(l->ffn_norm_weight); FREE0(l->ffn_norm_bias);
+        }
+        FREE0(ctx->encoder.ln_post_weight); FREE0(ctx->encoder.ln_post_bias);
+        FREE0(ctx->encoder.proj1_weight_q8); FREE0(ctx->encoder.proj1_bias);
+        FREE0(ctx->encoder.proj2_weight_q8); FREE0(ctx->encoder.proj2_bias);
+
+        /* Decoder layers */
+        for (int i = 0; i < ctx->config.dec_layers; i++) {
+            qwen_dec_layer_t *l = &ctx->decoder.layers[i];
+            FREE0(l->wq_weight_q8); FREE0(l->wk_weight_q8);
+            FREE0(l->wv_weight_q8); FREE0(l->wo_weight_q8);
+            FREE0(l->q_norm_weight); FREE0(l->k_norm_weight);
+            FREE0(l->input_norm); FREE0(l->post_attn_norm);
+            FREE0(l->down_weight_q8);
+            FREE0(l->gate_up_fused_q8);
+        }
+        FREE0(ctx->decoder.tok_embeddings_q8);
+        FREE0(ctx->decoder.norm);
+
+        #undef FREE0
+
+        /* Close safetensors */
+        if (ctx->safetensors) {
+            multi_safetensors_close((multi_safetensors_t *)ctx->safetensors);
+        }
     }
-    FREE0(ctx->encoder.ln_post_weight); FREE0(ctx->encoder.ln_post_bias);
-    FREE0(ctx->encoder.proj1_weight_q8); FREE0(ctx->encoder.proj1_bias);
-    FREE0(ctx->encoder.proj2_weight_q8); FREE0(ctx->encoder.proj2_bias);
-
-    /* Decoder layers */
-    for (int i = 0; i < ctx->config.dec_layers; i++) {
-        qwen_dec_layer_t *l = &ctx->decoder.layers[i];
-        FREE0(l->wq_weight_q8); FREE0(l->wk_weight_q8);
-        FREE0(l->wv_weight_q8); FREE0(l->wo_weight_q8);
-        FREE0(l->q_norm_weight); FREE0(l->k_norm_weight);
-        FREE0(l->input_norm); FREE0(l->post_attn_norm);
-        FREE0(l->down_weight_q8);
-        FREE0(l->gate_up_fused_q8);
-    }
-    FREE0(ctx->decoder.tok_embeddings_q8);
-    FREE0(ctx->decoder.norm);
 
     /* Free GEMM workspace */
     qwen_gemm_workspace_free();
-
-    #undef FREE0
 
     /* KV cache */
     free(ctx->kv_cache_k);
@@ -323,11 +617,6 @@ void qwen_free(qwen_ctx_t *ctx) {
     free(ctx->force_language);
     free(ctx->prompt_tokens);
     free(ctx->force_prompt_tokens);
-
-    /* Close safetensors */
-    if (ctx->safetensors) {
-        multi_safetensors_close((multi_safetensors_t *)ctx->safetensors);
-    }
 
     free(ctx);
 }

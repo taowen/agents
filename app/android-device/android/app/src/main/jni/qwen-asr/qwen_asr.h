@@ -190,6 +190,10 @@ typedef struct {
     void *safetensors;         /* multi_safetensors_t* */
     char model_dir[512];
 
+    /* Pre-quantized model mmap (NULL if using safetensors path) */
+    void *qmodel_mmap;
+    size_t qmodel_mmap_size;
+
     /* KV cache for decoder */
     float *kv_cache_k;         /* [layers, max_seq, kv_heads * head_dim] */
     float *kv_cache_v;

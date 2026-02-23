@@ -922,6 +922,94 @@ void kernel_causal_conv1d(float *out, const float *input, const float *weight,
         }
 #endif
 
+#if defined(__ARM_NEON) || defined(__aarch64__)
+        if (groups == 1) {
+            /*
+             * NEON tiled matmul: out[OC, T] = weight[OC, IC] * input[IC, T] + bias
+             * Micro-kernel: 4 OC rows × 8 time columns, IC-tiled for L2 reuse.
+             *
+             * Working set per IC tile: IC_TILE * length * 4 (input) + OC * IC_TILE * 4 (weight)
+             * Target ~256KB for IC_TILE slice.
+             */
+            const int IC_TILE = 32;
+
+            /* Initialize output to bias */
+            for (int oc = 0; oc < out_channels; oc++) {
+                float *out_ch = out + (size_t)oc * length;
+                float b = bias ? bias[oc] : 0.0f;
+                float32x4_t vb = vdupq_n_f32(b);
+                int t = 0;
+                for (; t + 3 < length; t += 4) vst1q_f32(out_ch + t, vb);
+                for (; t < length; t++) out_ch[t] = b;
+            }
+
+            /* IC-tiled accumulation */
+            for (int ic_start = 0; ic_start < in_channels; ic_start += IC_TILE) {
+                int ic_end = ic_start + IC_TILE;
+                if (ic_end > in_channels) ic_end = in_channels;
+
+                /* Process 4 OC rows at a time */
+                int oc = 0;
+                for (; oc + 3 < out_channels; oc += 4) {
+                    float *out0 = out + (size_t)(oc + 0) * length;
+                    float *out1 = out + (size_t)(oc + 1) * length;
+                    float *out2 = out + (size_t)(oc + 2) * length;
+                    float *out3 = out + (size_t)(oc + 3) * length;
+
+                    for (int ic = ic_start; ic < ic_end; ic++) {
+                        float w0 = weight[(size_t)(oc + 0) * in_channels + ic];
+                        float w1 = weight[(size_t)(oc + 1) * in_channels + ic];
+                        float w2 = weight[(size_t)(oc + 2) * in_channels + ic];
+                        float w3 = weight[(size_t)(oc + 3) * in_channels + ic];
+                        const float *in_ch = input + (size_t)ic * length;
+
+                        float32x4_t vw0 = vdupq_n_f32(w0);
+                        float32x4_t vw1 = vdupq_n_f32(w1);
+                        float32x4_t vw2 = vdupq_n_f32(w2);
+                        float32x4_t vw3 = vdupq_n_f32(w3);
+
+                        int t = 0;
+                        for (; t + 7 < length; t += 8) {
+                            float32x4_t i0 = vld1q_f32(in_ch + t);
+                            float32x4_t i1 = vld1q_f32(in_ch + t + 4);
+                            vst1q_f32(out0 + t,     vfmaq_f32(vld1q_f32(out0 + t),     i0, vw0));
+                            vst1q_f32(out0 + t + 4, vfmaq_f32(vld1q_f32(out0 + t + 4), i1, vw0));
+                            vst1q_f32(out1 + t,     vfmaq_f32(vld1q_f32(out1 + t),     i0, vw1));
+                            vst1q_f32(out1 + t + 4, vfmaq_f32(vld1q_f32(out1 + t + 4), i1, vw1));
+                            vst1q_f32(out2 + t,     vfmaq_f32(vld1q_f32(out2 + t),     i0, vw2));
+                            vst1q_f32(out2 + t + 4, vfmaq_f32(vld1q_f32(out2 + t + 4), i1, vw2));
+                            vst1q_f32(out3 + t,     vfmaq_f32(vld1q_f32(out3 + t),     i0, vw3));
+                            vst1q_f32(out3 + t + 4, vfmaq_f32(vld1q_f32(out3 + t + 4), i1, vw3));
+                        }
+                        for (; t < length; t++) {
+                            float v = in_ch[t];
+                            out0[t] += w0 * v;
+                            out1[t] += w1 * v;
+                            out2[t] += w2 * v;
+                            out3[t] += w3 * v;
+                        }
+                    }
+                }
+                /* Handle remaining OC rows (1-3) */
+                for (; oc < out_channels; oc++) {
+                    float *out_ch = out + (size_t)oc * length;
+                    for (int ic = ic_start; ic < ic_end; ic++) {
+                        float w = weight[(size_t)oc * in_channels + ic];
+                        const float *in_ch = input + (size_t)ic * length;
+                        float32x4_t vw = vdupq_n_f32(w);
+                        int t = 0;
+                        for (; t + 7 < length; t += 8) {
+                            vst1q_f32(out_ch + t,     vfmaq_f32(vld1q_f32(out_ch + t),     vld1q_f32(in_ch + t),     vw));
+                            vst1q_f32(out_ch + t + 4, vfmaq_f32(vld1q_f32(out_ch + t + 4), vld1q_f32(in_ch + t + 4), vw));
+                        }
+                        for (; t < length; t++) out_ch[t] += w * in_ch[t];
+                    }
+                }
+            }
+            return;
+        }
+#endif
+
 #ifdef USE_OPENMP
 #pragma omp parallel for schedule(static)
 #endif
@@ -1128,6 +1216,374 @@ void kernel_transposed_conv1d(float *out, const float *input, const float *weigh
     }
 
     if (out_length) *out_length = final_len;
+}
+
+/* ======================================================================== */
+/* Cache-tiled Causal Conv1d (k=7, groups=1) — vocoder hot path             */
+/* ======================================================================== */
+
+/*
+ * Auto-compute tile sizes to keep working set within L2 cache.
+ *
+ * Working set per tile iteration:
+ *   IC_TILE * T_TILE * 4  (input tile, read)
+ *   OC_TILE * T_TILE * 4  (output tile, read+write)
+ *   OC_TILE * IC_TILE * 7 * 4  (weight tile, read)
+ *
+ * Target: total <= L2_TARGET (256KB, leaving ~50% headroom in 512KB L2).
+ */
+static void compute_tile_sizes(int in_channels, int out_channels, int length,
+                                int *ic_tile, int *oc_tile, int *t_tile) {
+    const int L2_TARGET = 256 * 1024; /* bytes, ~50% of 512KB L2 */
+    const int MIN_T_TILE = 64;
+
+    /* Start with IC_TILE = OC_TILE = min(dim, 64) */
+    int ic = in_channels < 64 ? in_channels : 64;
+    int oc = out_channels < 64 ? out_channels : 64;
+
+    /* Compute max T_TILE that fits in L2 */
+    /* working_set = (ic + oc) * t * 4 + oc * ic * 7 * 4 */
+    int weight_bytes = oc * ic * 7 * 4;
+    int bytes_per_t = (ic + oc) * 4;
+    int remaining = L2_TARGET - weight_bytes;
+    int t = remaining > 0 ? remaining / bytes_per_t : MIN_T_TILE;
+    if (t < MIN_T_TILE) t = MIN_T_TILE;
+
+    /* If tile sizes are too large, shrink IC/OC tiles */
+    while (ic > 2 && oc > 2) {
+        weight_bytes = oc * ic * 7 * 4;
+        bytes_per_t = (ic + oc) * 4;
+        remaining = L2_TARGET - weight_bytes;
+        t = remaining > 0 ? remaining / bytes_per_t : MIN_T_TILE;
+        if (t >= MIN_T_TILE) break;
+        ic /= 2;
+        oc /= 2;
+    }
+
+    /* Round T_TILE down to multiple of 8 (NEON width) */
+    t = (t / 8) * 8;
+    if (t < 8) t = 8;
+    if (t > length) t = ((length + 7) / 8) * 8;
+
+    *ic_tile = ic;
+    *oc_tile = oc;
+    *t_tile = t;
+}
+
+void kernel_causal_conv1d_tiled(float *out, const float *input, const float *weight,
+                                const float *bias, int in_channels, int out_channels,
+                                int kernel_size, int length, int dilation) {
+    /*
+     * Cache-tiled k=7 causal conv1d for groups=1.
+     * Loop order: t_tile → ic_tile → oc_tile → oc → ic → t(NEON×8)
+     * The NEON inner loop is identical to kernel_causal_conv1d's k=7 path.
+     */
+    if (kernel_size != 7 || in_channels == 0 || out_channels == 0 || length == 0) {
+        /* Fallback for non-k=7 cases */
+        kernel_causal_conv1d(out, input, weight, bias, in_channels, out_channels,
+                             kernel_size, length, dilation, 1);
+        return;
+    }
+
+    int IC_TILE, OC_TILE, T_TILE;
+    compute_tile_sizes(in_channels, out_channels, length, &IC_TILE, &OC_TILE, &T_TILE);
+
+    int pad = 6 * dilation; /* (7-1) * dilation */
+
+    /* Initialize output to bias */
+    for (int oc = 0; oc < out_channels; oc++) {
+        float *out_ch = out + (size_t)oc * length;
+        float b = bias ? bias[oc] : 0.0f;
+#if defined(__ARM_NEON) || defined(__aarch64__)
+        float32x4_t vb = vdupq_n_f32(b);
+        int t = 0;
+        for (; t + 3 < length; t += 4) vst1q_f32(out_ch + t, vb);
+        for (; t < length; t++) out_ch[t] = b;
+#else
+        for (int t = 0; t < length; t++) out_ch[t] = b;
+#endif
+    }
+
+    /* Tiled loop */
+    for (int t_start = 0; t_start < length; t_start += T_TILE) {
+        int t_end = t_start + T_TILE;
+        if (t_end > length) t_end = length;
+        int t_len = t_end - t_start;
+
+        for (int ic_start = 0; ic_start < in_channels; ic_start += IC_TILE) {
+            int ic_end = ic_start + IC_TILE;
+            if (ic_end > in_channels) ic_end = in_channels;
+
+            for (int oc_start = 0; oc_start < out_channels; oc_start += OC_TILE) {
+                int oc_end = oc_start + OC_TILE;
+                if (oc_end > out_channels) oc_end = out_channels;
+
+                /* Inner kernel: process this OC x IC x T tile */
+                for (int oc = oc_start; oc < oc_end; oc++) {
+                    float *out_ch = out + (size_t)oc * length;
+
+                    for (int ic = ic_start; ic < ic_end; ic++) {
+                        const float *w = weight + ((size_t)oc * in_channels + ic) * 7;
+                        const float *in_ch = input + (size_t)ic * length;
+                        float w0 = w[0], w1 = w[1], w2 = w[2], w3 = w[3];
+                        float w4 = w[4], w5 = w[5], w6 = w[6];
+                        int dil = dilation;
+
+                        /* Process boundary region (where some taps hit zero-padding) */
+                        int boundary_end = pad < t_end ? pad : t_end;
+                        for (int t = t_start; t < boundary_end; t++) {
+                            float sum = 0;
+                            for (int k = 0; k < 7; k++) {
+                                int in_t = t - pad + k * dil;
+                                if (in_t >= 0) sum += w[k] * in_ch[in_t];
+                            }
+                            out_ch[t] += sum;
+                        }
+
+                        /* Steady state: all taps are valid */
+                        int ss_start = pad > t_start ? pad : t_start;
+#if defined(__ARM_NEON) || defined(__aarch64__)
+                        /* NEON: 8 outputs at a time */
+                        int t = ss_start;
+                        for (; t + 7 < t_end; t += 8) {
+                            float32x4_t acc0 = vdupq_n_f32(0);
+                            float32x4_t acc1 = vdupq_n_f32(0);
+                            int base = t - pad;
+                            acc0 = vfmaq_n_f32(acc0, vld1q_f32(in_ch + base),             w0);
+                            acc1 = vfmaq_n_f32(acc1, vld1q_f32(in_ch + base + 4),         w0);
+                            acc0 = vfmaq_n_f32(acc0, vld1q_f32(in_ch + base + dil),       w1);
+                            acc1 = vfmaq_n_f32(acc1, vld1q_f32(in_ch + base + dil + 4),   w1);
+                            acc0 = vfmaq_n_f32(acc0, vld1q_f32(in_ch + base + 2*dil),     w2);
+                            acc1 = vfmaq_n_f32(acc1, vld1q_f32(in_ch + base + 2*dil + 4), w2);
+                            acc0 = vfmaq_n_f32(acc0, vld1q_f32(in_ch + base + 3*dil),     w3);
+                            acc1 = vfmaq_n_f32(acc1, vld1q_f32(in_ch + base + 3*dil + 4), w3);
+                            acc0 = vfmaq_n_f32(acc0, vld1q_f32(in_ch + base + 4*dil),     w4);
+                            acc1 = vfmaq_n_f32(acc1, vld1q_f32(in_ch + base + 4*dil + 4), w4);
+                            acc0 = vfmaq_n_f32(acc0, vld1q_f32(in_ch + base + 5*dil),     w5);
+                            acc1 = vfmaq_n_f32(acc1, vld1q_f32(in_ch + base + 5*dil + 4), w5);
+                            acc0 = vfmaq_n_f32(acc0, vld1q_f32(in_ch + base + 6*dil),     w6);
+                            acc1 = vfmaq_n_f32(acc1, vld1q_f32(in_ch + base + 6*dil + 4), w6);
+
+                            vst1q_f32(out_ch + t, vaddq_f32(vld1q_f32(out_ch + t), acc0));
+                            vst1q_f32(out_ch + t + 4, vaddq_f32(vld1q_f32(out_ch + t + 4), acc1));
+                        }
+                        /* Scalar tail */
+                        for (; t < t_end; t++) {
+                            int base = t - pad;
+                            out_ch[t] += w0 * in_ch[base]
+                                       + w1 * in_ch[base + dil]
+                                       + w2 * in_ch[base + 2*dil]
+                                       + w3 * in_ch[base + 3*dil]
+                                       + w4 * in_ch[base + 4*dil]
+                                       + w5 * in_ch[base + 5*dil]
+                                       + w6 * in_ch[base + 6*dil];
+                        }
+#else
+                        for (int t = ss_start; t < t_end; t++) {
+                            int base = t - pad;
+                            out_ch[t] += w0 * in_ch[base]
+                                       + w1 * in_ch[base + dil]
+                                       + w2 * in_ch[base + 2*dil]
+                                       + w3 * in_ch[base + 3*dil]
+                                       + w4 * in_ch[base + 4*dil]
+                                       + w5 * in_ch[base + 5*dil]
+                                       + w6 * in_ch[base + 6*dil];
+                        }
+#endif
+                    } /* ic */
+                } /* oc */
+            } /* oc_start */
+        } /* ic_start */
+    } /* t_start */
+}
+
+/* ======================================================================== */
+/* Fused SnakeBeta + Cache-tiled Conv1d                                      */
+/* ======================================================================== */
+
+/*
+ * Inline SnakeBeta for one channel tile: out[t] = x[t] + inv_beta * sin^2(alpha * x[t])
+ * Uses the same NEON polynomial sin approximation as kernel_snake_beta.
+ */
+static void snake_beta_tile(float *dst, const float *src, float alpha_val, float inv_beta_val, int len) {
+#if defined(__ARM_NEON) || defined(__aarch64__)
+    float32x4_t va = vdupq_n_f32(alpha_val);
+    float32x4_t vib = vdupq_n_f32(inv_beta_val);
+    float32x4_t c3 = vdupq_n_f32(-1.0f / 6.0f);
+    float32x4_t c5 = vdupq_n_f32(1.0f / 120.0f);
+    float32x4_t inv_2pi = vdupq_n_f32(1.0f / 6.283185307f);
+    float32x4_t v2pi = vdupq_n_f32(6.283185307f);
+    float32x4_t vpi = vdupq_n_f32(3.141592654f);
+
+    int t = 0;
+    for (; t + 3 < len; t += 4) {
+        float32x4_t vx = vld1q_f32(src + t);
+        float32x4_t ax = vmulq_f32(vx, va);
+        float32x4_t n = vrndnq_f32(vmulq_f32(ax, inv_2pi));
+        ax = vsubq_f32(ax, vmulq_f32(n, v2pi));
+        ax = vmaxq_f32(vnegq_f32(vpi), vminq_f32(ax, vpi));
+        float32x4_t ax2 = vmulq_f32(ax, ax);
+        float32x4_t ax3 = vmulq_f32(ax2, ax);
+        float32x4_t ax5 = vmulq_f32(ax3, ax2);
+        float32x4_t s = vaddq_f32(ax, vaddq_f32(vmulq_f32(ax3, c3), vmulq_f32(ax5, c5)));
+        float32x4_t s2 = vmulq_f32(s, s);
+        vst1q_f32(dst + t, vaddq_f32(vx, vmulq_f32(vib, s2)));
+    }
+    for (; t < len; t++) {
+        float s = sinf(src[t] * alpha_val);
+        dst[t] = src[t] + inv_beta_val * s * s;
+    }
+#else
+    for (int t = 0; t < len; t++) {
+        float s = sinf(src[t] * alpha_val);
+        dst[t] = src[t] + inv_beta_val * s * s;
+    }
+#endif
+}
+
+/* Persistent scratch for snake_conv1d_tiled input tile */
+static float *_snake_tile_buf = NULL;
+static size_t _snake_tile_cap = 0;
+
+void kernel_snake_conv1d_tiled(float *out, const float *input,
+                               const float *alpha, const float *beta,
+                               const float *weight, const float *conv_bias,
+                               int channels, int length, int dilation) {
+    /*
+     * Fused SnakeBeta + k=7 causal conv1d (groups=1, in_channels == out_channels == channels).
+     * Input is NOT modified. SnakeBeta is applied on-the-fly per IC tile into a scratch buffer.
+     * This eliminates the intermediate buffer write+read (~5MB for block 0).
+     */
+    int IC_TILE, OC_TILE, T_TILE;
+    compute_tile_sizes(channels, channels, length, &IC_TILE, &OC_TILE, &T_TILE);
+
+    int pad = 6 * dilation;
+
+    /* Ensure scratch buffer for one IC tile row */
+    size_t tile_need = (size_t)length;
+    if (tile_need > _snake_tile_cap) {
+        free(_snake_tile_buf);
+        _snake_tile_buf = (float *)malloc(tile_need * sizeof(float));
+        _snake_tile_cap = tile_need;
+    }
+
+    /* Initialize output to bias */
+    for (int oc = 0; oc < channels; oc++) {
+        float *out_ch = out + (size_t)oc * length;
+        float b = conv_bias ? conv_bias[oc] : 0.0f;
+#if defined(__ARM_NEON) || defined(__aarch64__)
+        float32x4_t vb = vdupq_n_f32(b);
+        int t = 0;
+        for (; t + 3 < length; t += 4) vst1q_f32(out_ch + t, vb);
+        for (; t < length; t++) out_ch[t] = b;
+#else
+        for (int t = 0; t < length; t++) out_ch[t] = b;
+#endif
+    }
+
+    /* Tiled loop — same structure as kernel_causal_conv1d_tiled but with inline SnakeBeta */
+    for (int t_start = 0; t_start < length; t_start += T_TILE) {
+        int t_end = t_start + T_TILE;
+        if (t_end > length) t_end = length;
+
+        for (int ic_start = 0; ic_start < channels; ic_start += IC_TILE) {
+            int ic_end = ic_start + IC_TILE;
+            if (ic_end > channels) ic_end = channels;
+
+            for (int oc_start = 0; oc_start < channels; oc_start += OC_TILE) {
+                int oc_end = oc_start + OC_TILE;
+                if (oc_end > channels) oc_end = channels;
+
+                for (int oc = oc_start; oc < oc_end; oc++) {
+                    float *out_ch = out + (size_t)oc * length;
+
+                    for (int ic = ic_start; ic < ic_end; ic++) {
+                        const float *in_raw = input + (size_t)ic * length;
+
+                        /* Apply SnakeBeta on-the-fly for the range needed by this t_tile.
+                         * For the conv with pad, we may need input from t_start-pad to t_end-1.
+                         * Compute the full range needed including dilated taps. */
+                        int in_need_start = t_start - pad;
+                        if (in_need_start < 0) in_need_start = 0;
+                        int in_need_end = t_end - 1;  /* last output position needs input at most at t_end-1 */
+                        if (in_need_end >= length) in_need_end = length - 1;
+                        int in_len = in_need_end - in_need_start + 1;
+
+                        /* Apply SnakeBeta for this input range */
+                        snake_beta_tile(_snake_tile_buf + in_need_start,
+                                       in_raw + in_need_start,
+                                       alpha[ic], beta[ic], in_len);
+
+                        const float *in_ch = _snake_tile_buf;
+                        const float *w = weight + ((size_t)oc * channels + ic) * 7;
+                        float w0 = w[0], w1 = w[1], w2 = w[2], w3 = w[3];
+                        float w4 = w[4], w5 = w[5], w6 = w[6];
+                        int dil = dilation;
+
+                        /* Boundary region */
+                        int boundary_end = pad < t_end ? pad : t_end;
+                        for (int t = t_start; t < boundary_end; t++) {
+                            float sum = 0;
+                            for (int k = 0; k < 7; k++) {
+                                int in_t = t - pad + k * dil;
+                                if (in_t >= 0) sum += w[k] * in_ch[in_t];
+                            }
+                            out_ch[t] += sum;
+                        }
+
+                        /* Steady state */
+                        int ss_start = pad > t_start ? pad : t_start;
+#if defined(__ARM_NEON) || defined(__aarch64__)
+                        int t = ss_start;
+                        for (; t + 7 < t_end; t += 8) {
+                            float32x4_t acc0 = vdupq_n_f32(0);
+                            float32x4_t acc1 = vdupq_n_f32(0);
+                            int base = t - pad;
+                            acc0 = vfmaq_n_f32(acc0, vld1q_f32(in_ch + base),             w0);
+                            acc1 = vfmaq_n_f32(acc1, vld1q_f32(in_ch + base + 4),         w0);
+                            acc0 = vfmaq_n_f32(acc0, vld1q_f32(in_ch + base + dil),       w1);
+                            acc1 = vfmaq_n_f32(acc1, vld1q_f32(in_ch + base + dil + 4),   w1);
+                            acc0 = vfmaq_n_f32(acc0, vld1q_f32(in_ch + base + 2*dil),     w2);
+                            acc1 = vfmaq_n_f32(acc1, vld1q_f32(in_ch + base + 2*dil + 4), w2);
+                            acc0 = vfmaq_n_f32(acc0, vld1q_f32(in_ch + base + 3*dil),     w3);
+                            acc1 = vfmaq_n_f32(acc1, vld1q_f32(in_ch + base + 3*dil + 4), w3);
+                            acc0 = vfmaq_n_f32(acc0, vld1q_f32(in_ch + base + 4*dil),     w4);
+                            acc1 = vfmaq_n_f32(acc1, vld1q_f32(in_ch + base + 4*dil + 4), w4);
+                            acc0 = vfmaq_n_f32(acc0, vld1q_f32(in_ch + base + 5*dil),     w5);
+                            acc1 = vfmaq_n_f32(acc1, vld1q_f32(in_ch + base + 5*dil + 4), w5);
+                            acc0 = vfmaq_n_f32(acc0, vld1q_f32(in_ch + base + 6*dil),     w6);
+                            acc1 = vfmaq_n_f32(acc1, vld1q_f32(in_ch + base + 6*dil + 4), w6);
+
+                            vst1q_f32(out_ch + t, vaddq_f32(vld1q_f32(out_ch + t), acc0));
+                            vst1q_f32(out_ch + t + 4, vaddq_f32(vld1q_f32(out_ch + t + 4), acc1));
+                        }
+                        for (; t < t_end; t++) {
+                            int base = t - pad;
+                            out_ch[t] += w0 * in_ch[base]
+                                       + w1 * in_ch[base + dil]
+                                       + w2 * in_ch[base + 2*dil]
+                                       + w3 * in_ch[base + 3*dil]
+                                       + w4 * in_ch[base + 4*dil]
+                                       + w5 * in_ch[base + 5*dil]
+                                       + w6 * in_ch[base + 6*dil];
+                        }
+#else
+                        for (int t = ss_start; t < t_end; t++) {
+                            int base = t - pad;
+                            out_ch[t] += w0 * in_ch[base]
+                                       + w1 * in_ch[base + dil]
+                                       + w2 * in_ch[base + 2*dil]
+                                       + w3 * in_ch[base + 3*dil]
+                                       + w4 * in_ch[base + 4*dil]
+                                       + w5 * in_ch[base + 5*dil]
+                                       + w6 * in_ch[base + 6*dil];
+                        }
+#endif
+                    } /* ic */
+                } /* oc */
+            } /* oc_start */
+        } /* ic_start */
+    } /* t_start */
 }
 
 /* ======================================================================== */

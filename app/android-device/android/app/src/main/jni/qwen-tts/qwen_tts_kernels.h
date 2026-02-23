@@ -103,6 +103,21 @@ void kernel_causal_conv1d(float *out, const float *input, const float *weight,
                           const float *bias, int in_channels, int out_channels,
                           int kernel_size, int length, int dilation, int groups);
 
+/* Cache-tiled Causal Conv1d for k=7, groups=1 (vocoder hot path).
+ * Restructures loops as t_tile -> ic_tile -> oc_tile to keep working set in L2. */
+void kernel_causal_conv1d_tiled(float *out, const float *input, const float *weight,
+                                const float *bias, int in_channels, int out_channels,
+                                int kernel_size, int length, int dilation);
+
+/* Fused SnakeBeta + Cache-tiled Conv1d.
+ * Applies SnakeBeta inline as each input channel tile is loaded,
+ * eliminating the intermediate buffer write+read.
+ * Input is NOT modified (SnakeBeta applied on-the-fly to a temp tile). */
+void kernel_snake_conv1d_tiled(float *out, const float *input,
+                               const float *alpha, const float *beta,
+                               const float *weight, const float *conv_bias,
+                               int channels, int length, int dilation);
+
 /* Transposed Conv1d (for upsampling) */
 void kernel_transposed_conv1d(float *out, const float *input, const float *weight,
                               const float *bias, int in_channels, int out_channels,

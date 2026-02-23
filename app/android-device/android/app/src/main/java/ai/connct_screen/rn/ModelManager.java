@@ -24,13 +24,13 @@ public class ModelManager {
     // Files required for inference
     private static final String[] MODEL_FILES = {
             "vocab.json",
-            "model.safetensors",
+            "model.qmodel",
     };
 
     // Expected sizes for progress calculation (approximate)
     private static final long[] FILE_SIZES = {
             2_800_000L,       // vocab.json ~2.8MB
-            1_800_000_000L,   // model.safetensors ~1.8GB
+            950_000_000L,     // model.qmodel ~950MB (pre-quantized Q8_0)
     };
 
     public interface DownloadListener {

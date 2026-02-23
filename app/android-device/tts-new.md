@@ -488,6 +488,93 @@ text: 今天是个好天气，阳光明媚，微风轻拂，正是出门散步�
 ### Remaining (memory bandwidth targeted)
 
 7. **INT8 quantize vocoder conv weights** — halve weight memory bandwidth
-8. **Fuse SnakeBeta + Conv1d** — eliminate one full activation read+write pass per ResUnit
+8. ~~**Fuse SnakeBeta + Conv1d**~~ → see Phase 3 below
 9. **Tune chunk_size** for streaming: with INT8 talker (~37ms/token) + faster vocoder, TTFA improves proportionally
 10. **Test with speaker/language params**: `--es speaker serena --es language chinese`
+
+## Vocoder Optimization Attempt: Cache Tiling + Fusion (2026-02-23)
+
+### Hypothesis (disproved)
+
+The k=7 conv inner loop (oc→ic→t) re-reads the entire input activation buffer for every output channel. For block 0 (dim=768, length=832), the input buffer is 768×832×4 = 2.4MB >> L2 (512KB), causing ~1.8GB of DRAM traffic per conv1d call. Cache tiling should reduce this.
+
+### What was tried
+
+1. **Cache-tiled k=7 conv1d** — `kernel_causal_conv1d_tiled()` with `t_tile→ic_tile→oc_tile→oc→ic→t(NEON×8)` loop nesting
+2. **NEON k=1 matmul** — 4 OC rows × 8 time columns micro-kernel for pointwise conv
+3. **Fused SnakeBeta + Conv1d** — `kernel_snake_conv1d_tiled()` applying SnakeBeta on-the-fly per IC tile
+4. **No-memcpy residual** — SnakeBeta writes to scratch instead of in-place, so hidden IS the residual
+
+### Results: 2.6x REGRESSION
+
+| Metric | NEON baseline | Cache-tiled + fused | Change |
+|--------|--------------|-------------------|--------|
+| Codec decode | 3,524ms | **9,042ms** | **2.6x slower** |
+
+Per-kernel breakdown (verbose=3) showed `fused_snake_conv7` at 400-670ms per call (total 6.6s). Two root causes:
+
+**1. Redundant SnakeBeta in fused kernel**: For each `(t_tile, ic_tile, oc_tile, oc, ic)` combination, SnakeBeta was recomputed. With dim=768 and OC_TILE=64, each IC got SnakeBeta applied 12x redundantly.
+
+**2. L1 output thrashing from tiling**: The original `oc→ic→t` loop keeps one output channel (832×4 = 3.3KB) in L1 while iterating all ICs. The tiled loop processes OC_TILE=64 channels interleaved (64×3.3KB = 213KB >> L1 64KB), thrashing L1 for output accesses. The A77 hardware L2 prefetcher already handles the streaming input reads efficiently — tiling adds overhead without benefit.
+
+### Revert + No-memcpy trick only
+
+Reverted to original `kernel_causal_conv1d` for k=7. Kept the no-memcpy residual trick (SnakeBeta writes to scratch buffer instead of in-place):
+
+| Metric | NEON baseline | No-memcpy only | Change |
+|--------|--------------|----------------|--------|
+| Codec decode | 3,524ms | 3,572ms | ~same |
+| Vocoder | ~2,500ms | 3,116ms | ~same |
+| Total | 4,826ms | 4,889ms | ~same |
+
+The memcpy(2.4MB) only costs ~1ms. No measurable improvement.
+
+### Per-kernel breakdown (verbose=3, "Hello world" 26 tokens)
+
+```
+vocoder block 0 (dim=1536→768 len=832):  snake=0.0 transconv=221 ru=[139 131 132] total=623ms
+  resunit(dim=768 len=832 dil=1): snake1=2.6 conv7=63.3 snake2=0.1 conv1=72.7 add=0.1
+  resunit(dim=768 len=832 dil=3): snake1=0.3 conv7=59.9 snake2=0.1 conv1=70.4 add=0.2
+  resunit(dim=768 len=832 dil=9): snake1=0.4 conv7=67.1 snake2=0.1 conv1=63.8 add=0.2
+
+vocoder block 1 (dim=768→384 len=4160):  snake=0.1 transconv=217 ru=[163 287 188] total=856ms
+  resunit(dim=384 len=4160 dil=1): snake1=0.7 conv7=65.9 snake2=0.2 conv1=94.6 add=0.6
+  resunit(dim=384 len=4160 dil=3): snake1=0.6 conv7=108.9 snake2=0.2 conv1=176.4 add=0.5
+  resunit(dim=384 len=4160 dil=9): snake1=1.4 conv7=90.2 snake2=0.2 conv1=95.6 add=0.5
+
+vocoder block 2 (dim=384→192 len=16640): snake=0.3 transconv=374 ru=[170 212 201] total=957ms
+  resunit(dim=192 len=16640 dil=1): snake1=0.9 conv7=66.2 snake2=0.4 conv1=96.3 add=1.0
+  resunit(dim=192 len=16640 dil=3): snake1=18.1 conv7=100.8 snake2=3.4 conv1=88.4 add=1.2
+  resunit(dim=192 len=16640 dil=9): snake1=2.3 conv7=103.2 snake2=0.6 conv1=93.6 add=1.0
+
+vocoder block 3 (dim=192→96 len=49920):  snake=0.4 transconv=254 ru=[130 130 130] total=644ms
+  resunit(dim=96 len=49920 dil=1): snake1=1.9 conv7=54.4 snake2=0.5 conv1=72.0 add=1.2
+  resunit(dim=96 len=49920 dil=3): snake1=1.5 conv7=56.2 snake2=6.8 conv1=63.6 add=1.4
+  resunit(dim=96 len=49920 dil=9): snake1=0.9 conv7=53.6 snake2=1.0 conv1=72.8 add=1.6
+
+Codec stages (ms): rvq=3.9 preconv=15.6 transformer=87.5 upsample=348.6 vocoder=3116.4
+```
+
+### Actual bottleneck distribution
+
+| Component | Time (ms) | % of vocoder |
+|-----------|-----------|-------------|
+| **Conv1 (k=1)** | **~1,080** | **35%** |
+| **TransConv** | **~1,066** | **34%** |
+| Conv7 (k=7) | ~900 | 29% |
+| SnakeBeta + add | ~50 | 2% |
+
+**Key insight**: k=1 conv and TransConv together are **69% of vocoder time**. The original assumption that k=7 conv was the bottleneck was wrong — it's only 29%. The NEON k=7 output-centric path is already well-optimized.
+
+### What remains in code
+
+- **Kept**: Phase 0 instrumentation (verbose >= 2/3 timing), NEON k=1 matmul, no-memcpy residual trick
+- **Dead code**: `kernel_causal_conv1d_tiled()`, `kernel_snake_conv1d_tiled()` — still in source but not called from vocoder. Can be removed.
+
+### Next steps
+
+11. **Optimize TransConv** (~1,066ms, 34%) — the NEON k-loop scatter is suboptimal. Consider GEMM-per-tap approach (like the BLAS path but with NEON matmul instead of cblas_sgemm).
+12. **Optimize k=1 conv** (~1,080ms, 35%) — the NEON 4×8 micro-kernel is in place. Profile whether it's compute-bound or memory-bound. If memory-bound, INT8 weight quantization could help.
+13. **INT8 vocoder conv weights** — halve weight bandwidth for both k=7 and k=1 convs.
+14. **Tune chunk_size** for streaming
+15. **Test with speaker/language params**: `--es speaker serena --es language chinese`

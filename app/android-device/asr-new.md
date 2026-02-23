@@ -179,3 +179,87 @@ Already Q8_0 quantized. Could try Q4_K_M for decoder weights but diminishing ret
 | Optimized 5-round (old, from asr.md) | 1134ms | 1186ms | 1011ms | 3331ms |
 
 The Conv2D Q8_0 GEMM optimization reduced total inference from 23.2s to 3.15s (**7.4x overall speedup**). The new codebase now matches the old heavily-optimized version's performance, with cleaner code and a more maintainable architecture.
+
+## Round 2: Pre-quantized .qmodel (near-instant model loading)
+
+### What
+
+Offline pre-quantization of all ASR weights into a single flat binary (`.qmodel`) that the device mmap's directly — eliminates runtime quantization (BF16→Q8_0 + gate/up fusion) at model load time.
+
+### Binary format
+
+128-byte header (magic `0x384D5141` / "AQM8", version 1, all config dimensions as uint32), followed by all weights laid out sequentially: encoder conv stem → encoder layers × N → encoder post → decoder tok_embeddings (bf16 + q8_0) → decoder layers × 28 → final norm. Q8_0 block = 36 bytes (4-byte float scale + 32 int8 qs). 4-byte aligned throughout, no padding needed.
+
+### File sizes
+
+| File | Size |
+|------|------|
+| model.safetensors (original, BF16) | 1.8 GB |
+| **model.qmodel (pre-quantized)** | **1.1 GB** |
+
+Larger than the initial 950 MB estimate because `tok_embeddings` is stored twice: bf16 (311 MB, for embedding lookup) + Q8_0 (175 MB, for argmax matvec).
+
+### Model load time
+
+**Before (safetensors):** mmap safetensors → quantize ~200 weight tensors BF16→Q8_0 → fuse gate+up per decoder layer. Several seconds of CPU-heavy work.
+
+**After (qmodel):** `open()` + `fstat()` + `mmap(PROT_READ, MAP_PRIVATE)` + walk cursor. **~1 ms.**
+
+Logcat confirms all timestamps identical:
+```
+22:36:01.094 Found pre-quantized model: /data/local/tmp/qwen3-asr-0.6b/model.qmodel
+22:36:01.095 Loading pre-quantized .qmodel: Qwen3-ASR-0.6B
+22:36:01.095 qmodel loaded: 1192212864 / 1192212864 bytes used (1137.0 MB)
+22:36:01.095 Model loaded (qmodel).
+```
+
+### Inference performance (unchanged)
+
+| Phase | safetensors path | qmodel path |
+|-------|-----------------|-------------|
+| Mel | 18ms | 17ms |
+| Encoder | 1609ms | 1662ms |
+| Prefill | 858ms | 1058ms |
+| Decode | 666ms | 646ms |
+| Total | 3151ms | 3383ms |
+
+Within normal variance. Inference performance identical — same quantized weights, just pre-computed.
+
+### Conversion
+
+```bash
+cd app/android-device/scripts
+uv venv .venv
+uv pip install safetensors numpy ml-dtypes --python .venv/bin/python
+.venv/bin/python convert-asr-qmodel.py ~/qwen-asr/qwen3-asr-0.6b/ /tmp/model.qmodel
+```
+
+### Upload to R2
+
+Wrangler caps at 300 MB, Cloudflare REST API returns 413 at ~100 MB. Must use R2 S3-compatible multipart upload:
+
+```bash
+export R2_ACCESS_KEY_ID=...
+export R2_SECRET_ACCESS_KEY=...
+npm run upload:asr -w app/android-device -- /tmp
+```
+
+Create R2 S3 API credentials at: `https://dash.cloudflare.com/<account>/r2/api-tokens`
+
+### Files changed
+
+| File | Change |
+|------|--------|
+| `scripts/convert-asr-qmodel.py` | **New** — Python offline conversion (safetensors → qmodel) |
+| `scripts/upload-asr-model.ts` | **New** — R2 upload via S3 multipart |
+| `scripts/upload-asr-model.sh` | **New** — R2 upload via wrangler (small files only) |
+| `qwen_asr.h` | Added `qmodel_mmap`, `qmodel_mmap_size` to `qwen_ctx_t` |
+| `qwen_asr.c` | Added `qwen_load_qmodel()`, updated `qwen_load()` + `qwen_free()` |
+| `ModelManager.java` | `model.safetensors` → `model.qmodel` in download list |
+
+### Gotchas
+
+1. **ml-dtypes required** — numpy can't handle bfloat16 from safetensors without it. `TypeError: data type 'bfloat16' not understood`.
+2. **qmodel and safetensors coexist** — if both are present, qmodel is preferred. Delete `model.qmodel` to fall back.
+3. **All weight pointers into mmap** — `qwen_free()` must NOT `free()` individual weight pointers when loaded from qmodel. Only `munmap()` the whole region.
+4. **R2 upload needs S3 credentials** — wrangler and REST API both have size limits below 1.1 GB.

@@ -551,26 +551,46 @@ static int vocoder_resunit_forward(qwen_tts_vocoder_resunit_t *unit,
                                       vocoder_resunit_scratch_t *scratch) {
     size_t n = (size_t)dim * length;
     if (ensure_vocoder_resunit_scratch(scratch, n) != 0) return -1;
-    float *residual = scratch->residual;
     float *conv1_out = scratch->conv1_out;
-    memcpy(residual, hidden, n * sizeof(float));
 
-    /* SnakeBeta activation 1 (in-place) */
-    kernel_snake_beta(hidden, hidden, unit->act1_alpha, unit->act1_beta, dim, length);
+    double ru_t0 = 0, ru_snake1 = 0, ru_conv7 = 0, ru_snake2 = 0, ru_conv1k = 0, ru_add = 0;
+
+    /*
+     * No-memcpy residual trick: SnakeBeta writes to scratch->residual instead
+     * of in-place on hidden. This keeps hidden untouched so it IS the residual,
+     * eliminating the memcpy(residual, hidden) (~2.4MB for block 0).
+     */
+
+    /* SnakeBeta activation 1: hidden → scratch->residual (hidden preserved) */
+    if (qwen_tts_verbose >= 3) ru_t0 = now_ms();
+    kernel_snake_beta(scratch->residual, hidden, unit->act1_alpha, unit->act1_beta, dim, length);
+    if (qwen_tts_verbose >= 3) ru_snake1 = now_ms() - ru_t0;
 
     /* Causal conv1 (k=7, dilation) */
-    kernel_causal_conv1d(conv1_out, hidden, unit->conv1_weight, unit->conv1_bias,
+    if (qwen_tts_verbose >= 3) ru_t0 = now_ms();
+    kernel_causal_conv1d(conv1_out, scratch->residual, unit->conv1_weight, unit->conv1_bias,
                          dim, dim, 7, length, dilation, 1);
+    if (qwen_tts_verbose >= 3) ru_conv7 = now_ms() - ru_t0;
 
-    /* SnakeBeta activation 2 (in-place) */
+    /* SnakeBeta activation 2 (in-place on conv1_out) */
+    if (qwen_tts_verbose >= 3) ru_t0 = now_ms();
     kernel_snake_beta(conv1_out, conv1_out, unit->act2_alpha, unit->act2_beta, dim, length);
+    if (qwen_tts_verbose >= 3) ru_snake2 = now_ms() - ru_t0;
 
-    /* Causal conv2 (k=1, dilation=1) */
-    kernel_causal_conv1d(hidden, conv1_out, unit->conv2_weight, unit->conv2_bias,
+    /* Causal conv2 (k=1) into scratch->residual (reuse buffer), then add to hidden */
+    if (qwen_tts_verbose >= 3) ru_t0 = now_ms();
+    kernel_causal_conv1d(scratch->residual, conv1_out, unit->conv2_weight, unit->conv2_bias,
                          dim, dim, 1, length, 1, 1);
+    if (qwen_tts_verbose >= 3) ru_conv1k = now_ms() - ru_t0;
 
-    /* Skip connection */
-    kernel_add_inplace(hidden, residual, dim * length);
+    /* Skip connection: hidden += conv2_out (hidden was never overwritten) */
+    if (qwen_tts_verbose >= 3) ru_t0 = now_ms();
+    kernel_add_inplace(hidden, scratch->residual, dim * length);
+    if (qwen_tts_verbose >= 3) {
+        ru_add = now_ms() - ru_t0;
+        fprintf(stderr, "    resunit(dim=%d len=%d dil=%d): snake1=%.1f conv7=%.1f snake2=%.1f conv1=%.1f add=%.1f ms\n",
+                dim, length, dilation, ru_snake1, ru_conv7, ru_snake2, ru_conv1k, ru_add);
+    }
     return 0;
 }
 
@@ -684,21 +704,27 @@ float *qwen_tts_codec_decode(qwen_tts_ctx_t *ctx, const int *codes,
     vocoder_resunit_scratch_t ru_scratch = {0};
 
     for (int block = 0; block < 4; block++) {
+        double blk_t0 = now_ms(), blk_snake_ms = 0, blk_transconv_ms = 0;
+        double blk_ru_ms[3] = {0};
         int in_dim = current_dim;
         int out_dim = in_dim / 2;
         int rate = upsample_rates[block];
         qwen_tts_vocoder_block_t *vb = &ctx->codec.vocoder_blocks[block];
 
         /* SnakeBeta activation (in-place) */
+        double t0 = now_ms();
         kernel_snake_beta(voc, voc, vb->act_alpha, vb->act_beta, in_dim, current_len);
+        blk_snake_ms = now_ms() - t0;
 
         /* TransposedConv1d: [in_dim, current_len] → [out_dim, new_len] */
+        t0 = now_ms();
         int new_len;
         int kernel = 2 * rate;
         float *transconv_out = (float *)malloc((size_t)out_dim * (current_len * rate + kernel) * sizeof(float));
         kernel_transposed_conv1d(transconv_out, voc, vb->transconv_weight, vb->transconv_bias,
                                   in_dim, out_dim, kernel, rate, current_len, &new_len);
         free(voc);
+        blk_transconv_ms = now_ms() - t0;
 
         voc = (float *)realloc(transconv_out, (size_t)out_dim * new_len * sizeof(float));
         current_len = new_len;
@@ -707,6 +733,7 @@ float *qwen_tts_codec_decode(qwen_tts_ctx_t *ctx, const int *codes,
         /* 3 Residual units with dilations 1, 3, 9 */
         int dilations[3] = {1, 3, 9};
         for (int ru = 0; ru < 3; ru++) {
+            t0 = now_ms();
             if (vocoder_resunit_forward(&vb->resunits[ru], voc, current_dim, current_len,
                                         dilations[ru], &ru_scratch) != 0) {
                 free(voc);
@@ -715,6 +742,13 @@ float *qwen_tts_codec_decode(qwen_tts_ctx_t *ctx, const int *codes,
                 *out_samples = 0;
                 return NULL;
             }
+            blk_ru_ms[ru] = now_ms() - t0;
+        }
+
+        if (qwen_tts_verbose >= 2) {
+            fprintf(stderr, "  vocoder block %d (dim=%d len=%d): snake=%.1f transconv=%.1f ru=[%.1f %.1f %.1f] total=%.1f ms\n",
+                    block, in_dim, current_len, blk_snake_ms, blk_transconv_ms,
+                    blk_ru_ms[0], blk_ru_ms[1], blk_ru_ms[2], now_ms() - blk_t0);
         }
     }
 
