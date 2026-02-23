@@ -191,6 +191,61 @@
                 android:textAllCaps="false" />
         </LinearLayout>
 
+        <!-- Voice status bar -->
+        <LinearLayout
+            android:id="@+id/voiceStatusBar"
+            android:layout_width="match_parent"
+            android:layout_height="wrap_content"
+            android:orientation="horizontal"
+            android:gravity="center_vertical"
+            android:background="#E8F5E9"
+            android:padding="6dp"
+            android:layout_marginBottom="4dp"
+            android:visibility="gone">
+
+            <View
+                android:id="@+id/voiceStatusDot"
+                android:layout_width="10dp"
+                android:layout_height="10dp"
+                android:background="#4CAF50" />
+
+            <TextView
+                android:id="@+id/voiceStatusText"
+                android:layout_width="0dp"
+                android:layout_height="wrap_content"
+                android:layout_weight="1"
+                android:text="Listening..."
+                android:textColor="#388E3C"
+                android:textSize="12sp"
+                android:layout_marginStart="8dp" />
+
+            <Button
+                android:id="@+id/micToggleBtn"
+                android:layout_width="wrap_content"
+                android:layout_height="28dp"
+                android:text="Mic OFF"
+                android:textSize="11sp"
+                android:textColor="#ffffff"
+                android:background="#F44336"
+                android:paddingHorizontal="10dp"
+                android:textAllCaps="false" />
+        </LinearLayout>
+
+        <!-- Real-time transcription text -->
+        <TextView
+            android:id="@+id/transcriptionText"
+            android:layout_width="match_parent"
+            android:layout_height="wrap_content"
+            android:background="#FFF8E1"
+            android:padding="6dp"
+            android:textColor="#795548"
+            android:textSize="12sp"
+            android:fontFamily="monospace"
+            android:maxLines="3"
+            android:ellipsize="start"
+            android:layout_marginBottom="4dp"
+            android:visibility="gone" />
+
         <!-- Browser WebView (hidden by default) -->
         <android.webkit.WebView
             android:id="@+id/browserWebView"
@@ -274,5 +329,73 @@
                 android:lineSpacingExtra="4dp"
                 android:text="Enter a task and tap Send" />
         </ScrollView>
+    </LinearLayout>
+    <!-- Screen 2: Model Download -->
+    <LinearLayout
+        android:layout_width="match_parent"
+        android:layout_height="match_parent"
+        android:orientation="vertical"
+        android:gravity="center"
+        android:padding="24dp">
+
+        <TextView
+            android:layout_width="wrap_content"
+            android:layout_height="wrap_content"
+            android:text="Voice Model Setup"
+            android:textColor="#212121"
+            android:textSize="24sp"
+            android:textStyle="bold"
+            android:layout_marginBottom="16dp" />
+
+        <TextView
+            android:id="@+id/downloadStatusText"
+            android:layout_width="wrap_content"
+            android:layout_height="wrap_content"
+            android:text="Download ASR model (~1.8 GB) for voice recognition?"
+            android:textColor="#666666"
+            android:textSize="14sp"
+            android:gravity="center"
+            android:layout_marginBottom="16dp" />
+
+        <ProgressBar
+            android:id="@+id/downloadProgress"
+            style="?android:attr/progressBarStyleHorizontal"
+            android:layout_width="match_parent"
+            android:layout_height="wrap_content"
+            android:max="1000"
+            android:progress="0"
+            android:layout_marginBottom="16dp"
+            android:visibility="gone" />
+
+        <LinearLayout
+            android:layout_width="wrap_content"
+            android:layout_height="wrap_content"
+            android:orientation="horizontal">
+
+            <Button
+                android:id="@+id/downloadBtn"
+                android:layout_width="wrap_content"
+                android:layout_height="wrap_content"
+                android:text="Download"
+                android:textColor="#ffffff"
+                android:textSize="16sp"
+                android:background="#1976D2"
+                android:paddingHorizontal="24dp"
+                android:paddingVertical="10dp"
+                android:layout_marginEnd="12dp"
+                android:textAllCaps="false" />
+
+            <Button
+                android:id="@+id/skipDownloadBtn"
+                android:layout_width="wrap_content"
+                android:layout_height="wrap_content"
+                android:text="Skip"
+                android:textColor="#666666"
+                android:textSize="16sp"
+                android:background="#e0e0e0"
+                android:paddingHorizontal="24dp"
+                android:paddingVertical="10dp"
+                android:textAllCaps="false" />
+        </LinearLayout>
     </LinearLayout>
 </ViewFlipper>

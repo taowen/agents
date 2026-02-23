@@ -5,6 +5,7 @@
 
 import { Hono } from "hono";
 import * as Sentry from "@sentry/cloudflare";
+import { submitBugReport } from "./bug-report";
 import {
   getUser,
   listSessions,
@@ -128,56 +129,22 @@ api.get("/sessions/:id/schedules", async (c) => {
   );
 });
 
-// POST /sessions/:id/report-bug — handled directly in the worker
+// POST /sessions/:id/report-bug
 api.post("/sessions/:id/report-bug", async (c) => {
   const userId = c.get("userId");
   const sessionId = c.req.param("id");
-
   const { description } = await c.req.json<{ description: string }>();
-  const reportId = `BUG-${Date.now().toString(36).toUpperCase()}-${Array.from(
-    crypto.getRandomValues(new Uint8Array(2))
-  )
-    .map((b) => b.toString(16).padStart(2, "0"))
-    .join("")
-    .toUpperCase()}`;
 
-  // Compute sessionDir from the DO ID (first 12 hex chars)
-  const doId = c.env.ChatAgent.idFromName(
-    encodeURIComponent(`${userId}:${sessionId}`)
-  );
-  const sessionDir = doId.toString().slice(0, 12);
-
-  // Query D1 for recent chat messages
-  const chatPrefix = `/home/user/.chat/${sessionDir}/`;
-  const rows = await c.env.DB.prepare(
-    `SELECT path, CAST(content AS TEXT) as content FROM files
-     WHERE user_id = ? AND parent_path = ? AND is_directory = 0
-     ORDER BY mtime DESC LIMIT 10`
-  )
-    .bind(userId, chatPrefix.slice(0, -1))
-    .all<{ path: string; content: string }>();
-
-  const recentMessages = rows.results.map((r) => {
-    const text = r.content || "";
-    return `${r.path}: ${text.slice(0, 200)}`;
+  const result = await submitBugReport({
+    db: c.env.DB,
+    r2: c.env.R2,
+    chatAgentNs: c.env.ChatAgent,
+    userId,
+    sessionId,
+    description
   });
 
-  Sentry.withScope((scope) => {
-    scope.setUser({ id: userId });
-    scope.setTag("report_id", reportId);
-    scope.setTag("user_id", userId);
-    scope.setTag("session_uuid", sessionId);
-    scope.setContext("bug_report", {
-      description,
-      reportId,
-      sessionUuid: sessionId,
-      userId
-    });
-    scope.setContext("recent_messages", { messages: recentMessages });
-    Sentry.captureMessage(`[Bug Report ${reportId}] ${description}`, "warning");
-  });
-
-  return c.json({ reportId });
+  return c.json(result);
 });
 
 // GET /memory

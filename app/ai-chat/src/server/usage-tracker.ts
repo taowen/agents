@@ -1,3 +1,5 @@
+import { upsertSessionSnapshot } from "./usage-archive";
+
 export interface QuotaCache {
   exceeded: boolean;
   checkedAt: number;
@@ -112,20 +114,18 @@ export async function archiveSessionUsage(
     output_tokens: number;
   }[];
   for (const row of hourRows) {
-    db.prepare(
-      `INSERT OR REPLACE INTO usage_archive (user_id, session_id, hour, api_key_type, request_count, input_tokens, cache_read_tokens, cache_write_tokens, output_tokens)
-       VALUES (?, ?, ?, ?, ?, ?, ?, 0, ?)`
+    upsertSessionSnapshot(
+      db,
+      userId,
+      sessionId,
+      hour,
+      row.api_key_type,
+      row.request_count,
+      row.input_tokens || 0,
+      row.cache_read_tokens || 0,
+      0,
+      row.output_tokens || 0
     )
-      .bind(
-        userId,
-        sessionId,
-        hour,
-        row.api_key_type,
-        row.request_count,
-        row.input_tokens || 0,
-        row.cache_read_tokens || 0,
-        row.output_tokens || 0
-      )
       .run()
       .catch((e: unknown) =>
         console.error("usage_archive D1 write failed:", e)

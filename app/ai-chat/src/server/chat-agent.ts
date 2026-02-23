@@ -11,21 +11,17 @@ import {
   type ToolSet,
   type UIMessage
 } from "ai";
-import type { Bash } from "just-bash";
-import type { MountableFs } from "just-bash";
 
 import { buildSystemPrompt } from "./system-prompt";
+import {
+  DebugRingBuffer,
+  buildRequestSnapshot,
+  instrumentLlmCall,
+  getSentryTraceContext
+} from "./llm-debug-buffer";
 
 // Extracted modules
-import { initBash, doFstabMount } from "vfs";
-import type { FsBindings } from "vfs";
-import { createSessionsCommand } from "./session-commands";
-import { ensureMcpServers } from "./mcp-config";
-import {
-  getCachedLlmConfig,
-  getLlmModel,
-  type LlmConfigCache
-} from "./llm-config";
+import { getCachedLlmConfig, getLlmModel } from "./llm-config";
 import { handleFileRequest } from "./file-api";
 import { writeChatHistory, readMemoryBlock } from "./chat-history";
 import {
@@ -35,14 +31,10 @@ import {
   createDeviceTools
 } from "./tools";
 import { DeviceHub, isDeviceSession } from "./device-hub";
-import {
-  queryUsageData,
-  logUsageDiagnostics,
-  checkQuota,
-  archiveSessionUsage,
-  type QuotaCache
-} from "./usage-tracker";
+import { ensureMcpServers } from "./mcp-config";
+import { queryUsageData, logUsageDiagnostics } from "./usage-tracker";
 import { runScheduledTask } from "./scheduled-tasks";
+import { SessionContext } from "./session-context";
 
 interface DeviceTool {
   function?: { name?: string; description?: string };
@@ -55,24 +47,9 @@ interface DeviceTool {
 class ChatAgentBase extends AIChatAgent {
   maxPersistedMessages = 200;
 
-  private bash!: Bash;
-  private mountableFs!: MountableFs;
-  private mounted = false;
-  private mountPromise: Promise<void> | null = null;
-  private userId: string | null = null;
-  private sessionUuid: string | null = null;
-  private cachedLlmConfig: LlmConfigCache = null;
-  private mcpServersLoaded = false;
+  private session: SessionContext;
   private deviceHub: DeviceHub;
-
-  // System prompt cache — computed once per session, invalidated on clear history
-  private cachedSystemPrompt: string | null = null;
-  private cachedDynamicContext: string | null = null;
-  private cachedLlmModel: ReturnType<typeof getLlmModel> | null = null;
-  private cachedTools: ToolSet | null = null;
-
-  // Quota check cache — avoid per-message D1 queries
-  private quotaCheckCache: QuotaCache | null = null;
+  private debugBuffer = new DebugRingBuffer(20, this.ctx.storage.sql);
 
   // Deferred promise for dispatch-task: resolved by handleDeviceChatMessage's onFinish
   private deviceTaskDeferred: {
@@ -81,6 +58,7 @@ class ChatAgentBase extends AIChatAgent {
 
   constructor(ctx: DurableObjectState, env: Env) {
     super(ctx, env);
+    this.session = new SessionContext(ctx, env);
     this.deviceHub = new DeviceHub(ctx);
     const parentAlarm = this.alarm.bind(this);
     // eslint-disable-next-line @typescript-eslint/no-explicit-any -- framework workaround: alarm() not exposed on AIChatAgent type
@@ -90,114 +68,14 @@ class ChatAgentBase extends AIChatAgent {
     };
   }
 
-  private get fsBindings(): FsBindings {
-    return {
-      db: this.env.DB,
-      r2: this.env.R2,
-      googleClientId: this.env.GOOGLE_CLIENT_ID,
-      googleClientSecret: this.env.GOOGLE_CLIENT_SECRET
-    };
-  }
-
-  /**
-   * Initialize bash + filesystem for the given userId.
-   */
-  private doInitBash(userId: string): void {
-    if (this.bash && this.userId === userId) return;
-    this.userId = userId;
-    const { bash, mountableFs } = initBash({
-      bindings: this.fsBindings,
-      userId,
-      customCommands: [
-        createSessionsCommand(this.env.DB, userId, this.env.ChatAgent)
-      ]
-    });
-    this.bash = bash;
-    this.mountableFs = mountableFs;
-    this.mounted = false;
-    this.mountPromise = null;
-  }
-
-  /**
-   * Ensure fstab-declared mounts are applied. Called once before first bash exec.
-   */
-  private async ensureMounted(): Promise<void> {
-    if (this.mounted) return;
-    if (!this.mountPromise) {
-      this.mountPromise = doFstabMount(
-        this.mountableFs,
-        this.fsBindings,
-        this.userId!
-      ).then(
-        () => {
-          this.mounted = true;
-        },
-        (err) => {
-          console.error("ensureMounted: fstab mount failed:", err);
-          this.mountPromise = null;
-          throw err;
-        }
-      );
-    }
-    await this.mountPromise;
-  }
-
-  /**
-   * Extract userId from request header, with fallback to DO-local storage.
-   */
-  private async getUserId(request?: Request): Promise<string> {
-    if (request) {
-      const uid = request.headers.get("x-user-id");
-      if (uid) {
-        await this.ctx.storage.put("userId", uid);
-        return uid;
-      }
-    }
-    const stored = await this.ctx.storage.get<string>("userId");
-    if (stored) return stored;
-    throw new Error("No userId available");
-  }
-
-  /**
-   * Extract sessionUuid from request header, with fallback to DO-local storage.
-   */
-  private async getSessionUuid(request?: Request): Promise<string | null> {
-    if (request) {
-      const sid = request.headers.get("x-session-id");
-      if (sid) {
-        await this.ctx.storage.put("sessionUuid", sid);
-        this.sessionUuid = sid;
-        return sid;
-      }
-    }
-    if (this.sessionUuid) return this.sessionUuid;
-    const stored = await this.ctx.storage.get<string>("sessionUuid");
-    if (stored) {
-      this.sessionUuid = stored;
-      return stored;
-    }
-    return null;
-  }
-
-  /** Read the user's timezone from DO storage, defaulting to UTC. */
-  private async getTimezone(): Promise<string> {
-    const stored = await this.ctx.storage.get<string>("timezone");
-    return stored || "UTC";
-  }
-
-  /** Short session directory name derived from the DO ID. */
-  private get sessionDir(): string {
-    return this.ctx.id.toString().slice(0, 12);
-  }
-
   /** Tag all Sentry events with session/user context for correlation. */
   private applySentryTags(): void {
-    if (this.userId) {
-      Sentry.setUser({ id: this.userId });
-      Sentry.setTag("user_id", this.userId);
+    if (this.session.userId) {
+      Sentry.setUser({ id: this.session.userId });
+      Sentry.setTag("user_id", this.session.userId);
     }
-    if (this.sessionUuid) {
-      Sentry.setTag("session_uuid", this.sessionUuid);
+    if (this.session.sessionUuid) {
+      Sentry.setTag("session_uuid", this.session.sessionUuid);
     }
     Sentry.setTag("do_id", this.ctx.id.toString());
   }
@@ -218,9 +96,49 @@ class ChatAgentBase extends AIChatAgent {
 
     // Dispatch a task to this device session (called by send_to_device tool)
     if (url.pathname.endsWith("/dispatch-task") && request.method === "POST") {
+      const startTime = Date.now();
       const { text } = await request.json<{ text: string }>();
-      const result = await this.handleDeviceInitiatedTask(text);
-      return Response.json({ result });
+      const { traceId, spanId } = getSentryTraceContext();
+      try {
+        const result = await this.handleDeviceInitiatedTask(text);
+        this.debugBuffer.push({
+          type: "do_call",
+          timestamp: new Date().toISOString(),
+          traceId,
+          spanId,
+          direction: "inbound",
+          endpoint: "/dispatch-task",
+          request: { text },
+          response: { result },
+          durationMs: Date.now() - startTime
+        });
+        return Response.json({ result });
+      } catch (e) {
+        this.debugBuffer.push({
+          type: "do_call",
+          timestamp: new Date().toISOString(),
+          traceId,
+          spanId,
+          direction: "inbound",
+          endpoint: "/dispatch-task",
+          request: { text },
+          response: null,
+          durationMs: Date.now() - startTime,
+          error: String(e)
+        });
+        throw e;
+      }
+    }
+
+    // Collect debug context for bug reports (called by API worker)
+    if (url.pathname.endsWith("/collect-debug-context")) {
+      return Response.json({
+        debugEntries: this.debugBuffer.getAll(),
+        messages: this.messages,
+        bufferSize: this.debugBuffer.size,
+        messageCount: this.messages.length,
+        doId: this.ctx.id.toString()
+      });
     }
 
     const response = await super.fetch(request);
@@ -256,11 +174,11 @@ class ChatAgentBase extends AIChatAgent {
       return Response.json(queryUsageData(this.ctx.storage.sql, since));
     }
     if (url.pathname.startsWith("/api/files")) {
-      const uid = await this.getUserId(request);
-      this.doInitBash(uid);
-      await this.ensureMounted();
+      const uid = await this.session.getUserId(request);
+      this.session.doInitBash(uid);
+      await this.session.ensureMounted();
       this.applySentryTags();
-      return handleFileRequest(request, this.mountableFs);
+      return handleFileRequest(request, this.session.mountableFs);
     }
     return super.onRequest(request);
   }
@@ -269,23 +187,12 @@ class ChatAgentBase extends AIChatAgent {
     connection: import("agents").Connection,
     ctx: import("agents").ConnectionContext
   ) {
-    const uid = await this.getUserId(ctx.request);
-    await this.getSessionUuid(ctx.request);
-    this.doInitBash(uid);
+    const uid = await this.session.getUserId(ctx.request);
+    await this.session.getSessionUuid(ctx.request);
+    this.session.doInitBash(uid);
     this.applySentryTags();
     const origin = new URL(ctx.request.url).origin;
     await this.ctx.storage.put("callbackOrigin", origin);
-
-    // Send current messages to newly connected client.
-    // This fixes a race where the client's SWR cache returns stale messages
-    // (from before the latest user message was persisted), especially when
-    // the user navigates away during streaming and then returns.
-    connection.send(
-      JSON.stringify({
-        type: "cf_agent_chat_messages",
-        messages: this.messages
-      })
-    );
 
     return super.onConnect(connection, ctx);
   }
@@ -304,89 +211,29 @@ class ChatAgentBase extends AIChatAgent {
     return Sentry.startSpan(
       { name: "executeScheduledTask", op: "schedule" },
       async () => {
-        if (!this.userId) {
-          const uid = await this.getUserId();
-          this.doInitBash(uid);
-        }
-        if (!this.sessionUuid) {
-          await this.getSessionUuid();
-        }
+        await this.session.ensureReady();
         this.applySentryTags();
 
         const { data: llmConfig, cache } = await getCachedLlmConfig(
-          this.mountableFs,
-          this.cachedLlmConfig
+          this.session.mountableFs,
+          this.session.cachedLlmConfig
         );
-        this.cachedLlmConfig = cache;
+        this.session.cachedLlmConfig = cache;
         const model = getLlmModel(this.env, llmConfig);
-        const timezone = await this.getTimezone();
+        const timezone = await this.session.getTimezone();
 
         await runScheduledTask({
           messages: this.messages,
           persistMessages: (msgs) => this.persistMessages(msgs),
-          bash: this.bash,
-          ensureMounted: () => this.ensureMounted(),
+          bash: this.session.bash,
+          ensureMounted: () => this.session.ensureMounted(),
           model,
           timezone,
-          payload
+          payload,
+          debugBuffer: this.debugBuffer
         });
       }
     );
-  }
-
-  /**
-   * Resolve LLM config and enforce quota for builtin key users.
-   * Shared by onChatMessage and handleDeviceChatMessage.
-   */
-  private async resolveQuotaAndModel(): Promise<{
-    llmModel: ReturnType<typeof getLlmModel>;
-    apiKeyType: "builtin" | "custom";
-    isBuiltinKey: boolean;
-  }> {
-    const { data: llmConfig, cache } = await getCachedLlmConfig(
-      this.mountableFs,
-      this.cachedLlmConfig
-    );
-    this.cachedLlmConfig = cache;
-    const isBuiltinKey = llmConfig === null;
-
-    if (isBuiltinKey) {
-      this.quotaCheckCache = await checkQuota(
-        this.env.DB,
-        this.userId!,
-        this.quotaCheckCache
-      );
-      if (this.quotaCheckCache.exceeded) {
-        throw new Error(
-          "You have exceeded the builtin API key usage quota. " +
-            "Please configure your own API key in Settings to continue using the service."
-        );
-      }
-    }
-
-    const llmModel = getLlmModel(this.env, llmConfig);
-    return {
-      llmModel,
-      apiKeyType: isBuiltinKey ? "builtin" : "custom",
-      isBuiltinKey
-    };
-  }
-
-  /**
-   * Create the onFinish callback for archiving session usage.
-   */
-  private createOnFinish(): () => Promise<void> {
-    const { DB } = this.env;
-    const sql = this.ctx.storage.sql;
-    const userId = this.userId!;
-    const sessionId = this.sessionUuid;
-    return async () => {
-      try {
-        await archiveSessionUsage(DB, sql, userId, sessionId);
-      } catch (e) {
-        console.error("onFinish usage_archive write failed:", e);
-      }
-    };
   }
 
   /**
@@ -420,27 +267,22 @@ class ChatAgentBase extends AIChatAgent {
   ) {
     return Sentry.startSpan({ name: "onChatMessage", op: "chat" }, async () => {
       // Ensure we have userId + sessionUuid (may need recovery after hibernation)
-      if (!this.userId) {
-        await Sentry.startSpan(
-          { name: "getUserId", op: "db.query" },
-          async () => {
-            const uid = await this.getUserId();
-            this.doInitBash(uid);
-          }
+      if (!this.session.userId) {
+        await Sentry.startSpan({ name: "ensureReady", op: "db.query" }, () =>
+          this.session.ensureReady()
         );
-      }
-      if (!this.sessionUuid) {
-        await this.getSessionUuid();
+      } else if (!this.session.sessionUuid) {
+        await this.session.getSessionUuid();
       }
       this.applySentryTags();
 
       // Device sessions use streamText with device-reported prompt + execute_js tool
-      if (isDeviceSession(this.sessionUuid)) {
+      if (isDeviceSession(this.session.sessionUuid)) {
         return this.handleDeviceChatMessage(options?.abortSignal);
       }
 
       // Ensure /etc and fstab mounts are ready before any filesystem access
-      await this.ensureMounted();
+      await this.session.ensureMounted();
 
       // Persist client-reported timezone for scheduled tasks and hibernation recovery
       const clientTz = options?.body?.timezone;
@@ -449,20 +291,23 @@ class ChatAgentBase extends AIChatAgent {
       }
       const timezone =
         (typeof clientTz === "string" && clientTz) ||
-        (await this.getTimezone());
+        (await this.session.getTimezone());
 
       // Configure bash TZ env var and /etc/timezone so commands discover time natively
-      this.bash.setEnv("TZ", timezone);
-      await this.mountableFs.writeFile("/etc/timezone", timezone + "\n");
+      this.session.bash.setEnv("TZ", timezone);
+      await this.session.mountableFs.writeFile(
+        "/etc/timezone",
+        timezone + "\n"
+      );
 
       // Fire-and-forget: sync chat history to /home/user/.chat/
       Sentry.startSpan({ name: "writeChatHistory", op: "db.query" }, () =>
         writeChatHistory(
           this.messages,
           this.env.DB,
-          this.userId!,
-          this.sessionUuid,
-          this.sessionDir
+          this.session.userId!,
+          this.session.sessionUuid,
+          this.session.sessionDir
         )
       ).catch((e) => {
         console.error("writeChatHistory:", e);
@@ -470,15 +315,15 @@ class ChatAgentBase extends AIChatAgent {
       });
 
       // Auto-connect MCP servers from /etc/mcp-servers.json
-      if (!this.mcpServersLoaded) {
-        this.mcpServersLoaded = true;
+      if (!this.session.mcpServersLoaded) {
+        this.session.mcpServersLoaded = true;
         try {
           const callbackHost =
             (await this.ctx.storage.get<string>("callbackOrigin")) ?? "";
           const callbackPath = `mcp-callback/${this.ctx.id.toString()}`;
           await Sentry.startSpan({ name: "ensureMcpServers", op: "mcp" }, () =>
             ensureMcpServers(
-              this.mountableFs,
+              this.session.mountableFs,
               () => this.getMcpServers(),
               (name, url, opts) => this.addMcpServer(name, url, opts),
               callbackHost,
@@ -492,12 +337,12 @@ class ChatAgentBase extends AIChatAgent {
       }
 
       // Quota gate + LLM config resolution
-      const { apiKeyType, isBuiltinKey } = await this.resolveQuotaAndModel();
+      const { apiKeyType } = await this.session.resolveQuotaAndModel();
 
       // Compute system prompt, dynamic context, LLM model, and tools once per session.
       // Invalidate when this is the first message or after clear history (messages.length <= 1).
       const shouldRecompute =
-        !this.cachedSystemPrompt || this.messages.length <= 1;
+        !this.session.cachedSystemPrompt || this.messages.length <= 1;
 
       if (shouldRecompute) {
         // Ensure jsonSchema is initialized for getAITools() — needed after DO hibernation
@@ -509,24 +354,27 @@ class ChatAgentBase extends AIChatAgent {
         }
 
         const { data: llmConfig, cache: newLlmCache } =
-          await getCachedLlmConfig(this.mountableFs, this.cachedLlmConfig);
-        this.cachedLlmConfig = newLlmCache;
+          await getCachedLlmConfig(
+            this.session.mountableFs,
+            this.session.cachedLlmConfig
+          );
+        this.session.cachedLlmConfig = newLlmCache;
 
         const [llmModel, memoryBlock] = await Promise.all([
           Sentry.startSpan({ name: "getLlmModel", op: "config" }, () =>
             getLlmModel(this.env, llmConfig)
           ),
           Sentry.startSpan({ name: "readMemoryBlock", op: "db.query" }, () =>
-            readMemoryBlock(this.env.DB, this.userId!)
+            readMemoryBlock(this.env.DB, this.session.userId!)
           )
         ]);
 
-        this.cachedLlmModel = llmModel;
-        this.cachedSystemPrompt = buildSystemPrompt();
+        this.session.cachedLlmModel = llmModel;
+        this.session.cachedSystemPrompt = buildSystemPrompt();
 
         // Build dynamic context
         const dynamicParts = [
-          `Chat history directory: /home/user/.chat/${this.sessionDir}/`,
+          `Chat history directory: /home/user/.chat/${this.session.sessionDir}/`,
           memoryBlock
         ];
         // Inject connected MCP server info
@@ -544,7 +392,9 @@ class ChatAgentBase extends AIChatAgent {
           });
           dynamicParts.push(`\nConnected MCP servers:\n${mcpLines.join("\n")}`);
         }
-        this.cachedDynamicContext = dynamicParts.filter(Boolean).join("\n");
+        this.session.cachedDynamicContext = dynamicParts
+          .filter(Boolean)
+          .join("\n");
 
         // Cache tools (including MCP tools)
         let mcpTools: ToolSet = {};
@@ -554,16 +404,22 @@ class ChatAgentBase extends AIChatAgent {
           console.error("mcp.getAITools() failed:", e);
           Sentry.captureException(e);
         }
-        this.cachedTools = {
+        this.session.cachedTools = {
           ...createTools({
-            bashTool: createBashTool(this.bash, () => this.ensureMounted()),
+            bashTool: createBashTool(this.session.bash, () =>
+              this.session.ensureMounted()
+            ),
             schedule: (when, method, payload) =>
               this.schedule(when, method as keyof typeof this, payload),
             getSchedules: () => this.getSchedules(),
             cancelSchedule: (id) => this.cancelSchedule(id),
-            getTimezone: () => this.getTimezone()
+            getTimezone: () => this.session.getTimezone()
           }),
-          ...createDeviceTools(this.env, this.userId!),
+          ...createDeviceTools(
+            this.env,
+            this.session.userId!,
+            this.debugBuffer
+          ),
           ...mcpTools
         } as ToolSet;
       }
@@ -578,17 +434,36 @@ class ChatAgentBase extends AIChatAgent {
           })
       );
 
-      messages.unshift({ role: "system", content: this.cachedDynamicContext! });
+      messages.unshift({
+        role: "system",
+        content: this.session.cachedDynamicContext!
+      });
+
+      const { onResponse, hookAbort } = instrumentLlmCall(
+        this.debugBuffer,
+        buildRequestSnapshot(
+          this.session.cachedSystemPrompt!,
+          this.session.cachedDynamicContext!,
+          messages,
+          this.session.cachedTools!,
+          this.session.cachedModelId!
+        )
+      );
+      const archiveUsage = this.session.createUsageArchiver();
 
       const result = streamText({
-        model: this.cachedLlmModel!,
-        system: this.cachedSystemPrompt!,
+        model: this.session.cachedLlmModel!,
+        system: this.session.cachedSystemPrompt!,
         messages,
-        tools: this.cachedTools!,
+        tools: this.session.cachedTools!,
         stopWhen: stepCountIs(10),
-        onFinish: this.createOnFinish(),
+        onFinish: async (event) => {
+          onResponse(event);
+          await archiveUsage();
+        },
         abortSignal: options?.abortSignal
       });
+      hookAbort(options?.abortSignal);
 
       return this.toStreamResponse(result, apiKeyType);
     });
@@ -600,9 +475,10 @@ class ChatAgentBase extends AIChatAgent {
     abortSignal?: AbortSignal
   ): Promise<Response> {
     // userId and bash are guaranteed by onChatMessage caller
-    await this.ensureMounted();
+    await this.session.ensureMounted();
 
-    const { llmModel, apiKeyType } = await this.resolveQuotaAndModel();
+    const { llmModel, apiKeyType, modelId } =
+      await this.session.resolveQuotaAndModel();
 
     // Read device-reported system prompt and tool description from storage
     const deviceSystemPrompt =
@@ -627,14 +503,21 @@ class ChatAgentBase extends AIChatAgent {
       reasoning: "before-last-message"
     });
 
+    const { onResponse, hookAbort } = instrumentLlmCall(
+      this.debugBuffer,
+      buildRequestSnapshot(deviceSystemPrompt, "", messages, tools, modelId)
+    );
+    const archiveUsage = this.session.createUsageArchiver();
+
     const result = streamText({
       model: llmModel,
       system: deviceSystemPrompt,
       messages,
       tools,
       stopWhen: stepCountIs(30),
-      onFinish: async () => {
-        await this.createOnFinish()();
+      onFinish: async (event) => {
+        onResponse(event);
+        await archiveUsage();
         // Resolve the deferred so handleDeviceInitiatedTask can return the result
         if (this.deviceTaskDeferred) {
           const lastMsg = this.messages[this.messages.length - 1];
@@ -651,6 +534,7 @@ class ChatAgentBase extends AIChatAgent {
       },
       abortSignal
     });
+    hookAbort(abortSignal);
 
     return this.toStreamResponse(result, apiKeyType);
   }
@@ -662,13 +546,7 @@ class ChatAgentBase extends AIChatAgent {
       { name: "handleDeviceInitiatedTask", op: "device_task" },
       async () => {
         try {
-          if (!this.userId) {
-            const uid = await this.getUserId();
-            this.doInitBash(uid);
-          }
-          if (!this.sessionUuid) {
-            await this.getSessionUuid();
-          }
+          await this.session.ensureReady();
           this.applySentryTags();
 
           const userMsg: UIMessage = {
@@ -706,8 +584,8 @@ class ChatAgentBase extends AIChatAgent {
     const tags = this.ctx.getTags(ws);
     if (tags.includes("device")) {
       return this.deviceHub.handleMessage(ws, message, {
-        getUserId: () => this.getUserId(),
-        getSessionUuid: () => this.getSessionUuid(),
+        getUserId: () => this.session.getUserId(),
+        getSessionUuid: () => this.session.getSessionUuid(),
         onUserTask: (text) => {
           this.handleDeviceInitiatedTask(text);
         },

@@ -3,6 +3,10 @@ import { tool, type ToolSet } from "ai";
 import { z } from "zod";
 import type { Bash } from "just-bash";
 import type { DeviceHub, ExecLogEntry } from "./device-hub";
+import {
+  type DebugRingBuffer,
+  getSentryTraceContext
+} from "./llm-debug-buffer";
 
 export function createBashTool(bash: Bash, ensureMounted: () => Promise<void>) {
   return tool({
@@ -132,7 +136,11 @@ async function findDevices(
     .map((r) => r.value);
 }
 
-export function createDeviceTools(env: Env, userId: string): ToolSet {
+export function createDeviceTools(
+  env: Env,
+  userId: string,
+  debugBuffer?: DebugRingBuffer
+): ToolSet {
   return {
     list_devices: tool({
       description:
@@ -194,15 +202,52 @@ export function createDeviceTools(env: Env, userId: string): ToolSet {
           }
         }
 
-        const res = await target.stub.fetch(
-          new Request("http://agent/dispatch-task", {
-            method: "POST",
-            headers: { "Content-Type": "application/json" },
-            body: JSON.stringify({ text: task })
-          })
-        );
-        const result = (await res.json()) as { result: string };
-        return { device: target.name, result: result.result };
+        // Propagate Sentry trace context for distributed tracing
+        const traceHeaders = Sentry.getTraceData?.() ?? {};
+        const startTime = Date.now();
+        const { traceId, spanId } = getSentryTraceContext();
+
+        try {
+          const res = await target.stub.fetch(
+            new Request("http://agent/dispatch-task", {
+              method: "POST",
+              headers: {
+                "Content-Type": "application/json",
+                ...traceHeaders
+              },
+              body: JSON.stringify({ text: task })
+            })
+          );
+          const result = (await res.json()) as { result: string };
+          debugBuffer?.push({
+            type: "do_call",
+            timestamp: new Date().toISOString(),
+            traceId,
+            spanId,
+            direction: "outbound",
+            targetDoId: target.stub.id?.toString(),
+            endpoint: "/dispatch-task",
+            request: { task, device_name: target.name },
+            response: result,
+            durationMs: Date.now() - startTime
+          });
+          return { device: target.name, result: result.result };
+        } catch (e) {
+          debugBuffer?.push({
+            type: "do_call",
+            timestamp: new Date().toISOString(),
+            traceId,
+            spanId,
+            direction: "outbound",
+            targetDoId: target.stub.id?.toString(),
+            endpoint: "/dispatch-task",
+            request: { task, device_name: target.name },
+            response: null,
+            durationMs: Date.now() - startTime,
+            error: String(e)
+          });
+          throw e;
+        }
       }
     })
   };

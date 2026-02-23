@@ -29,6 +29,7 @@ struct CommonJniCache {
     jmethodID askUser;
     jmethodID hideOverlay;
     jmethodID sleepMs;
+    jmethodID speak;
 };
 
 // One runtime per agent type.

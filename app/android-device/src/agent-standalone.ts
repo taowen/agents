@@ -31,6 +31,7 @@ declare global {
   var show_notifications: () => boolean;
   var launch_app: (name: string) => string;
   var list_apps: () => string;
+  var speak: (text: string) => boolean;
   var sleep: (ms: number) => void;
   var log: (msg: string) => void;
   var update_status: (text: string) => void;
@@ -72,6 +73,7 @@ function wrapHostFunctions(opts: {
   const origPressBack = press_back;
   const origPressRecents = press_recents;
   const origShowNotifications = show_notifications;
+  const origSpeak = speak;
 
   globalThis.get_screen = function (): string {
     if (Date.now() > opts.deadline) throw new Error("Script execution timeout");
@@ -186,6 +188,13 @@ function wrapHostFunctions(opts: {
     return r;
   };
 
+  globalThis.speak = function (text: string): boolean {
+    if (Date.now() > opts.deadline) throw new Error("Script execution timeout");
+    const r = origSpeak(text);
+    opts.onAction?.({ fn: "speak", args: text, result: String(r) });
+    return r;
+  };
+
   return {
     getScreenCount: () => getScreenCount,
     restore() {
@@ -201,6 +210,7 @@ function wrapHostFunctions(opts: {
       globalThis.press_back = origPressBack;
       globalThis.press_recents = origPressRecents;
       globalThis.show_notifications = origShowNotifications;
+      globalThis.speak = origSpeak;
     }
   };
 }

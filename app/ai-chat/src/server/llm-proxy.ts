@@ -3,15 +3,15 @@
  * Extracted from api.ts to keep route handlers thin.
  */
 
-export interface LlmProxyResult {
-  baseURL: string;
-  apiKey: string;
-  model: string;
-  apiKeyType: "builtin" | "custom";
-}
+import { resolveFromRaw, type ResolvedLlmConfig } from "./llm-config";
+import type { LlmFileConfig } from "../client/api";
+import { incrementProxyUsage } from "./usage-archive";
+
+export type { ResolvedLlmConfig as LlmProxyResult };
 
 /**
- * Resolve LLM config for a user: prefer custom /etc/llm.json over builtin env vars.
+ * Resolve LLM config for a user: read /etc/llm.json from D1, then
+ * delegate to the shared resolveFromRaw() for builtin-vs-custom logic.
  */
 export async function resolveLlmConfig(
   db: D1Database,
@@ -20,8 +20,11 @@ export async function resolveLlmConfig(
     BUILTIN_LLM_BASE_URL: string;
     BUILTIN_LLM_API_KEY: string;
     BUILTIN_LLM_MODEL: string;
+    BUILTIN_LLM_PROVIDER?: string;
   }
-): Promise<LlmProxyResult> {
+): Promise<ResolvedLlmConfig> {
+  let raw: LlmFileConfig | null = null;
+
   const llmRow = await db
     .prepare("SELECT content FROM files WHERE user_id = ? AND path = ?")
     .bind(userId, "/etc/llm.json")
@@ -29,24 +32,13 @@ export async function resolveLlmConfig(
 
   if (llmRow?.content) {
     try {
-      const cfg = JSON.parse(new TextDecoder().decode(llmRow.content));
-      if (cfg.base_url && cfg.api_key) {
-        return {
-          baseURL: cfg.base_url,
-          apiKey: cfg.api_key,
-          model: cfg.model || env.BUILTIN_LLM_MODEL,
-          apiKeyType: "custom"
-        };
-      }
+      raw = JSON.parse(
+        new TextDecoder().decode(llmRow.content)
+      ) as LlmFileConfig;
     } catch {}
   }
 
-  return {
-    baseURL: env.BUILTIN_LLM_BASE_URL,
-    apiKey: env.BUILTIN_LLM_API_KEY,
-    model: env.BUILTIN_LLM_MODEL,
-    apiKeyType: "builtin"
-  };
+  return resolveFromRaw(raw, env);
 }
 
 type UpstreamResponseBody = {
@@ -63,7 +55,7 @@ type UpstreamResponseBody = {
  * Returns either the parsed JSON response or an error Response.
  */
 export async function callUpstreamLlm(
-  config: LlmProxyResult,
+  config: ResolvedLlmConfig,
   body: Record<string, unknown>
 ): Promise<
   { ok: true; body: UpstreamResponseBody } | { ok: false; response: Response }
@@ -113,24 +105,15 @@ export function archiveProxyUsage(
     responseBody.usage?.prompt_tokens_details?.cached_tokens || 0;
 
   const proxyHour = new Date().toISOString().slice(0, 13);
-  return db
-    .prepare(
-      `INSERT INTO usage_archive (user_id, session_id, hour, api_key_type, request_count, input_tokens, cache_read_tokens, cache_write_tokens, output_tokens)
-       VALUES (?, '__proxy__', ?, ?, 1, ?, ?, 0, ?)
-       ON CONFLICT(user_id, session_id, hour, api_key_type) DO UPDATE SET
-         request_count = request_count + 1,
-         input_tokens = input_tokens + excluded.input_tokens,
-         cache_read_tokens = cache_read_tokens + excluded.cache_read_tokens,
-         output_tokens = output_tokens + excluded.output_tokens`
-    )
-    .bind(
-      userId,
-      proxyHour,
-      apiKeyType,
-      inputTokens,
-      cacheReadTokens,
-      outputTokens
-    )
+  return incrementProxyUsage(
+    db,
+    userId,
+    proxyHour,
+    apiKeyType,
+    inputTokens,
+    cacheReadTokens,
+    outputTokens
+  )
     .run()
     .then(() => {})
     .catch((e: unknown) =>

@@ -1,0 +1,40 @@
+{
+  "compatibility_date": "2026-01-28",
+  "compatibility_flags": [
+    "nodejs_compat",
+    "enable_nodejs_tty_module",
+    "enable_nodejs_fs_module",
+    "enable_nodejs_http_modules",
+    "enable_nodejs_perf_hooks_module"
+  ],
+  "vars": {
+    "AUTH_SECRET": "test-auth-secret-for-integration-tests",
+    "BUILTIN_LLM_MODEL": "test-model",
+    "BUILTIN_LLM_BASE_URL": "https://test-llm.example.com/v1",
+    "BUILTIN_LLM_API_KEY": "test-api-key",
+    "BUILTIN_LLM_PROVIDER": "openai-compatible",
+    "ADMIN_SECRET": "test-admin-secret"
+  },
+  "d1_databases": [{ "binding": "DB", "database_name": "test-db", "database_id": "test-db-id" }],
+  "r2_buckets": [{ "binding": "R2", "bucket_name": "test-bucket" }],
+  "kv_namespaces": [{ "binding": "OTP_KV", "id": "test-kv-id" }],
+  "durable_objects": {
+    "bindings": [
+      {
+        "class_name": "TestChatAgent",
+        "name": "TestChatAgent"
+      },
+      {
+        "class_name": "TestChatAgent",
+        "name": "ChatAgent"
+      }
+    ]
+  },
+  "main": "worker.ts",
+  "migrations": [
+    {
+      "new_sqlite_classes": ["TestChatAgent"],
+      "tag": "v1"
+    }
+  ]
+}

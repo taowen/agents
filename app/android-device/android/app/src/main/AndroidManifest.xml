@@ -3,6 +3,10 @@
     <uses-permission android:name="android.permission.INTERNET" />
     <uses-permission android:name="android.permission.QUERY_ALL_PACKAGES" />
     <uses-permission android:name="android.permission.WAKE_LOCK" />
+    <uses-permission android:name="android.permission.RECORD_AUDIO" />
+    <uses-permission android:name="android.permission.FOREGROUND_SERVICE" />
+    <uses-permission android:name="android.permission.FOREGROUND_SERVICE_MICROPHONE" />
+    <uses-permission android:name="android.permission.POST_NOTIFICATIONS" />
 
     <application
       android:name=".MainApplication"
@@ -46,5 +50,25 @@
               <action android:name="ai.connct_screen.rn.EXECUTE_TASK" />
           </intent-filter>
       </receiver>
+
+      <receiver
+          android:name=".VoiceDebugReceiver"
+          android:exported="true">
+          <intent-filter>
+              <action android:name="ai.connct_screen.rn.VOICE_DEBUG" />
+          </intent-filter>
+      </receiver>
+
+      <receiver
+          android:name=".TtsDebugReceiver"
+          android:exported="true">
+          <intent-filter>
+              <action android:name="ai.connct_screen.rn.TTS_DEBUG" />
+          </intent-filter>
+      </receiver>
+
+      <service
+          android:name=".VoiceService"
+          android:foregroundServiceType="microphone" />
     </application>
 </manifest>

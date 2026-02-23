@@ -5,6 +5,7 @@
 
 import * as Sentry from "@sentry/cloudflare";
 import { listSessions } from "./db";
+import { upsertSessionSnapshot } from "./usage-archive";
 
 export type UsageRow = {
   hour: string;
@@ -34,22 +35,18 @@ export async function cacheSessionUsage(
 ): Promise<void> {
   if (rows.length === 0) return;
   const stmts = rows.map((r) =>
-    db
-      .prepare(
-        `INSERT OR REPLACE INTO usage_archive (user_id, session_id, hour, api_key_type, request_count, input_tokens, cache_read_tokens, cache_write_tokens, output_tokens)
-         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)`
-      )
-      .bind(
-        userId,
-        sessionId,
-        r.hour,
-        r.api_key_type || "unknown",
-        r.request_count,
-        r.input_tokens || 0,
-        r.cache_read_tokens || 0,
-        r.cache_write_tokens || 0,
-        r.output_tokens || 0
-      )
+    upsertSessionSnapshot(
+      db,
+      userId,
+      sessionId,
+      r.hour,
+      r.api_key_type || "unknown",
+      r.request_count,
+      r.input_tokens || 0,
+      r.cache_read_tokens || 0,
+      r.cache_write_tokens || 0,
+      r.output_tokens || 0
+    )
   );
   for (let i = 0; i < stmts.length; i += 100) {
     await db.batch(stmts.slice(i, i + 100));

@@ -155,6 +155,98 @@ Server-side bug report event structure:
 
 `recent_messages` comes from D1 (`files` table, `/.chat/` prefix). The authoritative message store is the DO's internal SQLite (`cf_ai_chat_agent_messages`), read via `/get-messages`.
 
+### Retrieve R2 debug payload
+
+Bug reports include a full debug payload uploaded to R2. Use `wrangler r2 object get` with the **`--remote` flag** (without it you'll hit the local dev bucket, which is empty):
+
+```bash
+# Download the debug payload for a bug report
+npx wrangler r2 object get ai-chat-files/bug-reports/BUG-XXXXXXXX-XXXX.json \
+  --remote > /tmp/bug-payload.json
+
+# Pretty-print the full payload
+cat /tmp/bug-payload.json | jq .
+```
+
+R2 payload structure:
+
+| Field | Content |
+|-------|---------|
+| `reportId` | Bug report ID (matches Sentry `report_id` tag) |
+| `debugContext.debugEntries[]` | Ring buffer of recent LLM interactions and cross-DO calls |
+| `debugContext.messages[]` | Full DO message history at time of report |
+| `debugContext.bufferSize` | Number of debug entries captured |
+| `debugContext.messageCount` | Number of messages in DO |
+| `debugContext.doId` | Durable Object ID |
+| `capturedAt` | ISO timestamp of report submission |
+
+Debug entry types:
+
+**`type: "llm"`** — each LLM `streamText`/`generateText` call:
+
+| Field | Content |
+|-------|---------|
+| `request.systemPrompt` | System prompt sent to the model |
+| `request.dynamicContext` | Dynamic context (memory, MCP servers) |
+| `request.messages` | Conversation messages sent to the model |
+| `request.toolNames` | Available tool names |
+| `request.modelId` | Model identifier |
+| `response.text` | Model response text |
+| `response.steps[]` | Individual steps with tool calls/results and per-step usage |
+| `response.finishReason` | How the model stopped (`stop`, `tool-calls`, etc.) |
+| `response.usage` | Token usage (`inputTokens`, `outputTokens`) |
+| `error` | Error string if the call failed or was aborted (`"aborted"` for cancelled streams) |
+
+**`type: "do_call"`** — cross-DO calls (e.g. `send_to_device` → `dispatch-task`):
+
+| Field | Content |
+|-------|---------|
+| `direction` | `"outbound"` or `"inbound"` |
+| `endpoint` | Target endpoint path |
+| `request` / `response` | Request and response payloads |
+| `durationMs` | Round-trip duration |
+| `error` | Error string if the call failed |
+
+### End-to-end diagnostics flow
+
+1. **Find the bug report in Sentry** — search by `report_id:BUG-XXXXXXXX-XXXX` to get the Sentry issue with user description and session metadata.
+
+2. **Download R2 debug payload** — this contains the actual LLM request/response data that Sentry events don't include:
+   ```bash
+   npx wrangler r2 object get ai-chat-files/bug-reports/BUG-XXXXXXXX-XXXX.json \
+     --remote > /tmp/bug-payload.json
+   ```
+
+3. **Inspect LLM interactions** — use `jq` to drill into specific entries:
+   ```bash
+   # List all debug entries with type and timestamp
+   cat /tmp/bug-payload.json | jq '.debugContext.debugEntries[] | {type, timestamp, error}'
+
+   # Show the last LLM request's system prompt and messages
+   cat /tmp/bug-payload.json | jq '[.debugContext.debugEntries[] | select(.type == "llm")] | last | .request'
+
+   # Show the last LLM response text and finish reason
+   cat /tmp/bug-payload.json | jq '[.debugContext.debugEntries[] | select(.type == "llm")] | last | .response | {text, finishReason, usage}'
+
+   # Show all tool calls across all steps
+   cat /tmp/bug-payload.json | jq '[.debugContext.debugEntries[] | select(.type == "llm")] | last | .response.steps[] | .toolCalls[]'
+   ```
+
+4. **Cross-reference with Sentry exceptions** — use the `session_uuid` tag from the bug report to find related error events:
+   ```bash
+   curl -s "https://us.sentry.io/api/0/projects/txom/cloudflare-worker/issues/?query=session_uuid:SESSION_UUID_HERE" \
+     -H "Authorization: Bearer $SENTRY_AUTH_TOKEN" | jq '.[] | {id, title, lastSeen}'
+   ```
+
+### Data distribution
+
+| Data | Location |
+|------|----------|
+| Bug metadata, user description | Sentry event (`contexts.bug_report`) |
+| Full LLM request/response | R2 payload (`debugContext.debugEntries[]`) |
+| DO full message history | R2 payload (`debugContext.messages[]`) |
+| Exception stack traces, breadcrumbs | Sentry event (`entries[]`) |
+
 ### Investigate errors
 
 List recent unresolved issues:

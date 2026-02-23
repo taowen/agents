@@ -1,4 +1,5 @@
 import * as Sentry from "@sentry/cloudflare";
+import { mkdirStatement, writeFileOnceStatement } from "./db";
 
 /**
  * Minimal message shape needed for writing chat history.
@@ -33,21 +34,12 @@ export async function writeChatHistory(
   const base = `/home/user/.chat/${sessionDir}`;
   const toolsDir = `${base}/tools`;
 
-  const mkdirSql = `INSERT OR IGNORE INTO files (user_id, path, parent_path, name, content, is_directory, mode, size, mtime)
-       VALUES (?, ?, ?, ?, NULL, 1, 16877, 0, unixepoch('now'))`;
-  const fileSql = `INSERT OR IGNORE INTO files (user_id, path, parent_path, name, content, is_directory, mode, size, mtime)
-       VALUES (?, ?, ?, ?, ?, 0, 33188, ?, unixepoch('now'))`;
-
   const stmts: D1PreparedStatement[] = [
-    db
-      .prepare(mkdirSql)
-      .bind(userId, "/home/user/.chat", "/home/user", ".chat"),
-    db.prepare(mkdirSql).bind(userId, base, "/home/user/.chat", sessionDir),
-    db.prepare(mkdirSql).bind(userId, toolsDir, base, "tools"),
+    mkdirStatement(db, userId, "/home/user/.chat", "/home/user", ".chat"),
+    mkdirStatement(db, userId, base, "/home/user/.chat", sessionDir),
+    mkdirStatement(db, userId, toolsDir, base, "tools"),
     // Ensure .memory/ directory exists
-    db
-      .prepare(mkdirSql)
-      .bind(userId, "/home/user/.memory", "/home/user", ".memory")
+    mkdirStatement(db, userId, "/home/user/.memory", "/home/user", ".memory")
   ];
 
   // Write .meta.md (INSERT OR IGNORE — only on first write)
@@ -65,16 +57,14 @@ export async function writeChatHistory(
   const metaContent = `title: ${title}\ndate: ${date}\nsession: ${sessionUuid || "unknown"}\n`;
   const metaBuf = enc.encode(metaContent);
   stmts.push(
-    db
-      .prepare(fileSql)
-      .bind(
-        userId,
-        `${base}/.meta.md`,
-        base,
-        ".meta.md",
-        metaBuf,
-        metaBuf.length
-      )
+    writeFileOnceStatement(
+      db,
+      userId,
+      `${base}/.meta.md`,
+      base,
+      ".meta.md",
+      metaBuf
+    )
   );
 
   for (let i = 0; i < messages.length; i++) {
@@ -124,16 +114,14 @@ export async function writeChatHistory(
           }
           const buf = enc.encode(output);
           stmts.push(
-            db
-              .prepare(fileSql)
-              .bind(
-                userId,
-                `${toolsDir}/${shortId}.txt`,
-                toolsDir,
-                `${shortId}.txt`,
-                buf,
-                buf.length
-              )
+            writeFileOnceStatement(
+              db,
+              userId,
+              `${toolsDir}/${shortId}.txt`,
+              toolsDir,
+              `${shortId}.txt`,
+              buf
+            )
           );
         }
       }
@@ -142,9 +130,14 @@ export async function writeChatHistory(
     const fileName = `${num}-${msg.role}.md`;
     const buf = enc.encode(text);
     stmts.push(
-      db
-        .prepare(fileSql)
-        .bind(userId, `${base}/${fileName}`, base, fileName, buf, buf.length)
+      writeFileOnceStatement(
+        db,
+        userId,
+        `${base}/${fileName}`,
+        base,
+        fileName,
+        buf
+      )
     );
   }
 

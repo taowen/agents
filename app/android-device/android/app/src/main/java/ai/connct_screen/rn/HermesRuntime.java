@@ -1,6 +1,9 @@
 package ai.connct_screen.rn;
 
 import android.content.Context;
+import android.media.AudioAttributes;
+import android.media.AudioFormat;
+import android.media.AudioTrack;
 import android.util.Log;
 
 import com.google.android.accessibility.selecttospeak.SelectToSpeakService;
@@ -15,6 +18,8 @@ import java.io.OutputStreamWriter;
 import java.net.HttpURLConnection;
 import java.net.URL;
 import java.util.Iterator;
+import java.util.concurrent.CountDownLatch;
+import java.util.concurrent.atomic.AtomicBoolean;
 
 import org.json.JSONObject;
 
@@ -29,9 +34,10 @@ public class HermesRuntime {
 
     private static final String TAG = "HermesRuntime";
 
-    // Load the native library
+    // Load native libraries
     static {
         System.loadLibrary("hermesruntime");
+        System.loadLibrary("qwentts");
     }
 
     // --- Native methods (implemented in hermes_runtime.cpp) ---
@@ -141,6 +147,141 @@ public class HermesRuntime {
             writer.close();
         } catch (Exception e) {
             Log.e(TAG, "[appendLog] failed", e);
+        }
+    }
+
+    // --- TTS native methods (implemented in qwen_tts_jni.c) ---
+    static native boolean nativeTtsLoadModel(String modelDir);
+    static native short[] nativeTtsGenerate(String tokenIds, String speaker, String language);
+    static native boolean nativeTtsIsLoaded();
+    static native void nativeTtsFree();
+
+    // Lazy-loaded tokenizer instance
+    private static BpeTokenizer sBpeTokenizer = null;
+
+    /**
+     * speak(text, speaker, language) -> "true" or "false"
+     * Called from C++ host function. Downloads model on first use, tokenizes text,
+     * runs TTS inference, and plays audio via AudioTrack (24kHz mono 16-bit).
+     * Blocks until audio playback completes.
+     *
+     * @param text     Text to speak
+     * @param speaker  Optional speaker name (null for default)
+     * @param language Optional language code e.g. "zh", "en" (null for auto)
+     */
+    public static String nativeSpeak(String text, String speaker, String language) {
+        SelectToSpeakService service = SelectToSpeakService.getInstance();
+        if (service == null) {
+            Log.e(TAG, "[speak] Accessibility service not available");
+            return "false";
+        }
+        Context ctx = service.getApplicationContext();
+
+        try {
+            // 1. Ensure model is downloaded
+            TtsModelManager mgr = new TtsModelManager(ctx);
+            if (!mgr.isModelReady()) {
+                nativeUpdateStatus("Downloading TTS model...");
+                Log.i(TAG, "[speak] Starting TTS model download");
+
+                final CountDownLatch latch = new CountDownLatch(1);
+                final AtomicBoolean success = new AtomicBoolean(false);
+
+                mgr.download(new TtsModelManager.DownloadListener() {
+                    @Override
+                    public void onProgress(long downloaded, long total, String currentFile) {
+                        int pct = total > 0 ? (int)(downloaded * 100 / total) : 0;
+                        nativeUpdateStatus("TTS model: " + pct + "% (" + currentFile + ")");
+                    }
+                    @Override
+                    public void onComplete(String modelDir) {
+                        Log.i(TAG, "[speak] TTS model download complete");
+                        success.set(true);
+                        latch.countDown();
+                    }
+                    @Override
+                    public void onError(String message) {
+                        Log.e(TAG, "[speak] TTS download error: " + message);
+                        latch.countDown();
+                    }
+                });
+
+                latch.await();
+                if (!success.get()) {
+                    nativeUpdateStatus("TTS download failed");
+                    return "false";
+                }
+            }
+
+            String modelDir = mgr.getModelDir();
+
+            // 2. Load model if not already loaded
+            if (!nativeTtsIsLoaded()) {
+                nativeUpdateStatus("Loading TTS model...");
+                if (!nativeTtsLoadModel(modelDir)) {
+                    Log.e(TAG, "[speak] Failed to load TTS model");
+                    nativeUpdateStatus("TTS model load failed");
+                    return "false";
+                }
+            }
+
+            // 3. Tokenize text
+            if (sBpeTokenizer == null) {
+                sBpeTokenizer = BpeTokenizer.load(modelDir);
+            }
+            if (sBpeTokenizer == null) {
+                Log.e(TAG, "[speak] Failed to load tokenizer");
+                return "false";
+            }
+            String tokenIds = sBpeTokenizer.tokenizeForTts(text);
+            Log.i(TAG, "[speak] Tokenized: " + tokenIds.length() + " chars");
+
+            // 4. Generate PCM audio
+            nativeUpdateStatus("Generating speech...");
+            short[] pcm = nativeTtsGenerate(tokenIds, speaker, language);
+            if (pcm == null || pcm.length == 0) {
+                Log.e(TAG, "[speak] TTS generate returned no audio");
+                return "false";
+            }
+            Log.i(TAG, "[speak] Generated " + pcm.length + " samples (" +
+                    String.format("%.2f", pcm.length / 24000.0) + "s)");
+
+            // 5. Play audio via AudioTrack (24kHz mono 16-bit)
+            nativeUpdateStatus("Speaking...");
+            int sampleRate = 24000;
+            int bufSize = AudioTrack.getMinBufferSize(sampleRate,
+                    AudioFormat.CHANNEL_OUT_MONO,
+                    AudioFormat.ENCODING_PCM_16BIT);
+            bufSize = Math.max(bufSize, pcm.length * 2);
+
+            AudioTrack track = new AudioTrack.Builder()
+                    .setAudioAttributes(new AudioAttributes.Builder()
+                            .setUsage(AudioAttributes.USAGE_ASSISTANT)
+                            .setContentType(AudioAttributes.CONTENT_TYPE_SPEECH)
+                            .build())
+                    .setAudioFormat(new AudioFormat.Builder()
+                            .setSampleRate(sampleRate)
+                            .setChannelMask(AudioFormat.CHANNEL_OUT_MONO)
+                            .setEncoding(AudioFormat.ENCODING_PCM_16BIT)
+                            .build())
+                    .setBufferSizeInBytes(bufSize)
+                    .setTransferMode(AudioTrack.MODE_STATIC)
+                    .build();
+
+            track.write(pcm, 0, pcm.length);
+            track.play();
+
+            // Block until playback completes
+            long durationMs = (long)(pcm.length * 1000.0 / sampleRate);
+            Thread.sleep(durationMs + 200); // Add small buffer
+
+            track.stop();
+            track.release();
+
+            return "true";
+        } catch (Exception e) {
+            Log.e(TAG, "[speak] failed", e);
+            return "false";
         }
     }
 

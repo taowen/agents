@@ -121,6 +121,62 @@ export async function deleteSession(
   return (result.meta.changes ?? 0) > 0;
 }
 
+// ---- Filesystem write helpers ----
+// Shared SQL patterns for "ensure directory + upsert file" used by
+// putMemoryFiles, writeChatHistory, and storeGDriveCredentials.
+
+/** INSERT OR IGNORE a directory row into the files table. */
+export function mkdirStatement(
+  db: D1Database,
+  userId: string,
+  path: string,
+  parentPath: string,
+  name: string
+): D1PreparedStatement {
+  return db
+    .prepare(
+      `INSERT OR IGNORE INTO files (user_id, path, parent_path, name, content, is_directory, mode, size, mtime)
+       VALUES (?, ?, ?, ?, NULL, 1, 16877, 0, unixepoch('now'))`
+    )
+    .bind(userId, path, parentPath, name);
+}
+
+/** INSERT or upsert a file row into the files table. */
+export function writeFileStatement(
+  db: D1Database,
+  userId: string,
+  path: string,
+  parentPath: string,
+  name: string,
+  content: Uint8Array
+): D1PreparedStatement {
+  return db
+    .prepare(
+      `INSERT INTO files (user_id, path, parent_path, name, content, is_directory, mode, size, mtime)
+       VALUES (?, ?, ?, ?, ?, 0, 33188, ?, unixepoch('now'))
+       ON CONFLICT(user_id, path) DO UPDATE SET
+         content = excluded.content, size = excluded.size, mtime = unixepoch('now')`
+    )
+    .bind(userId, path, parentPath, name, content, content.length);
+}
+
+/** INSERT OR IGNORE a file row (skip if already exists). */
+export function writeFileOnceStatement(
+  db: D1Database,
+  userId: string,
+  path: string,
+  parentPath: string,
+  name: string,
+  content: Uint8Array
+): D1PreparedStatement {
+  return db
+    .prepare(
+      `INSERT OR IGNORE INTO files (user_id, path, parent_path, name, content, is_directory, mode, size, mtime)
+       VALUES (?, ?, ?, ?, ?, 0, 33188, ?, unixepoch('now'))`
+    )
+    .bind(userId, path, parentPath, name, content, content.length);
+}
+
 export interface MemoryFiles {
   profile: string;
   preferences: string;
@@ -160,16 +216,8 @@ export async function putMemoryFiles(
   body: { profile?: string; preferences?: string; entities?: string }
 ): Promise<void> {
   const enc = new TextEncoder();
-  const mkdirSql = `INSERT OR IGNORE INTO files (user_id, path, parent_path, name, content, is_directory, mode, size, mtime)
-     VALUES (?, ?, ?, ?, NULL, 1, 16877, 0, unixepoch('now'))`;
-  const fileSql = `INSERT INTO files (user_id, path, parent_path, name, content, is_directory, mode, size, mtime)
-     VALUES (?, ?, ?, ?, ?, 0, 33188, ?, unixepoch('now'))
-     ON CONFLICT(user_id, path) DO UPDATE SET content=excluded.content, size=excluded.size, mtime=unixepoch('now')`;
-
   const stmts: D1PreparedStatement[] = [
-    db
-      .prepare(mkdirSql)
-      .bind(userId, "/home/user/.memory", "/home/user", ".memory")
+    mkdirStatement(db, userId, "/home/user/.memory", "/home/user", ".memory")
   ];
 
   const fileMap: Record<string, string | undefined> = {
@@ -181,16 +229,14 @@ export async function putMemoryFiles(
     if (content === undefined) continue;
     const buf = enc.encode(content);
     stmts.push(
-      db
-        .prepare(fileSql)
-        .bind(
-          userId,
-          `/home/user/.memory/${name}`,
-          "/home/user/.memory",
-          name,
-          buf,
-          buf.length
-        )
+      writeFileStatement(
+        db,
+        userId,
+        `/home/user/.memory/${name}`,
+        "/home/user/.memory",
+        name,
+        buf
+      )
     );
   }
   await db.batch(stmts);

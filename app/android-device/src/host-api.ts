@@ -1,6 +1,6 @@
 export interface HostFunctionDef {
   name: string;
-  params: { name: string; type: string }[];
+  params: { name: string; type: string; optional?: boolean }[];
   returns: string;
   description: string;
   /** Internal functions (e.g. http_post) are not shown to the LLM */
@@ -135,6 +135,18 @@ export const HOST_FUNCTIONS: HostFunctionDef[] = [
     returns: "string",
     description:
       'show a question overlay and block until user responds. Returns "continue" or "abandoned". Use when you encounter ambiguity or need user action (e.g. password input)',
+    agentVisible: true
+  },
+  {
+    name: "speak",
+    params: [
+      { name: "text", type: "string" },
+      { name: "speaker", type: "string", optional: true },
+      { name: "language", type: "string", optional: true }
+    ],
+    returns: "boolean",
+    description:
+      "speak text aloud using TTS (supports Chinese/English). Optional speaker name and language (e.g. 'zh', 'en').",
     agentVisible: true
   },
   {

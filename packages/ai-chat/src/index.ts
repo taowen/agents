@@ -328,6 +328,16 @@ export class AIChatAgent<
     this._chatMessageAbortControllers = new Map();
     const _onConnect = this.onConnect.bind(this);
     this.onConnect = async (connection: Connection, ctx: ConnectionContext) => {
+      // Send existing messages to the newly connected client so it has
+      // the full conversation state without a separate fetch.
+      if (this.messages.length > 0) {
+        connection.send(
+          JSON.stringify({
+            type: MessageType.CF_AGENT_CHAT_MESSAGES,
+            messages: this.messages
+          })
+        );
+      }
       // Notify client about active streams that can be resumed
       if (this._resumableStream.hasActiveStream()) {
         this._notifyStreamResuming(connection);
@@ -1703,6 +1713,16 @@ export class AIChatAgent<
             // not a UIMessageStreamPart (which expects "messageMetadata" instead).
             // See: https://github.com/cloudflare/agents/issues/677
             let eventToSend: unknown = data;
+
+            // Ensure the "start" event always includes a messageId so the
+            // client adopts the server's ID. Without this, the client
+            // generates its own ID (via nanoid/generateId) and the two
+            // diverge, causing duplicate assistant messages when the client
+            // sends its messages back on the next turn.
+            if (data.type === "start" && data.messageId == null) {
+              eventToSend = { ...(data as object), messageId: message.id };
+            }
+
             if (data.type === "finish" && "finishReason" in data) {
               const {
                 finishReason,
@@ -1750,7 +1770,23 @@ export class AIChatAgent<
     streamCompleted: { value: boolean },
     continuation = false
   ) {
-    // if not AI SDK SSE format, we need to inject text-start and text-end events ourselves
+    // if not AI SDK SSE format, we need to inject text-start and text-end events ourselves.
+    // Emit a "start" event with the server's message ID so the client adopts
+    // it instead of generating its own. Without this, the client and server
+    // diverge on IDs, causing duplicate assistant messages on the next turn.
+    const startBody = JSON.stringify({
+      type: "start",
+      messageId: message.id
+    });
+    this._storeStreamChunk(streamId, startBody);
+    this._broadcastChatMessage({
+      body: startBody,
+      done: false,
+      id,
+      type: MessageType.CF_AGENT_USE_CHAT_RESPONSE,
+      ...(continuation && { continuation: true })
+    });
+
     this._broadcastTextEvent(
       streamId,
       { type: "text-start", id },

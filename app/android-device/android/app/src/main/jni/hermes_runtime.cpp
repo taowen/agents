@@ -52,6 +52,7 @@ static void resolveCommonJniCache(JNIEnv* env) {
     g_common_cache.askUser      = env->GetStaticMethodID(cls, "nativeAskUser",      "(Ljava/lang/String;)Ljava/lang/String;");
     g_common_cache.hideOverlay  = env->GetStaticMethodID(cls, "nativeHideOverlay",  "()V");
     g_common_cache.sleepMs      = env->GetStaticMethodID(cls, "nativeSleepMs",      "(J)V");
+    g_common_cache.speak        = env->GetStaticMethodID(cls, "nativeSpeak",        "(Ljava/lang/String;Ljava/lang/String;Ljava/lang/String;)Ljava/lang/String;");
     env->DeleteLocalRef(cls);
 }
 
@@ -142,6 +143,34 @@ void registerCommonTools(Runtime& rt) {
                 JNIEnv* env = getEnv();
                 env->CallStaticVoidMethod(g_common_cache.clazz, g_common_cache.hideOverlay);
                 return Value::undefined();
+            }));
+
+    // speak(text, speaker?, language?) -> bool
+    rt.global().setProperty(rt, "speak",
+        Function::createFromHostFunction(rt, PropNameID::forAscii(rt, "speak"), 3,
+            [](Runtime& rt, const Value&, const Value* args, size_t count) -> Value {
+                if (count < 1) return Value(false);
+                JNIEnv* env = getEnv();
+                std::string text = args[0].asString(rt).utf8(rt);
+                jstring jtext = env->NewStringUTF(text.c_str());
+                jstring jspeaker = nullptr;
+                jstring jlanguage = nullptr;
+                if (count >= 2 && !args[1].isUndefined() && !args[1].isNull()) {
+                    std::string speaker = args[1].asString(rt).utf8(rt);
+                    jspeaker = env->NewStringUTF(speaker.c_str());
+                }
+                if (count >= 3 && !args[2].isUndefined() && !args[2].isNull()) {
+                    std::string language = args[2].asString(rt).utf8(rt);
+                    jlanguage = env->NewStringUTF(language.c_str());
+                }
+                jstring result = (jstring)env->CallStaticObjectMethod(
+                    g_common_cache.clazz, g_common_cache.speak, jtext, jspeaker, jlanguage);
+                std::string str = jstringToStd(env, result);
+                env->DeleteLocalRef(jtext);
+                if (jspeaker) env->DeleteLocalRef(jspeaker);
+                if (jlanguage) env->DeleteLocalRef(jlanguage);
+                if (result) env->DeleteLocalRef(result);
+                return Value(str == "true");
             }));
 }
 

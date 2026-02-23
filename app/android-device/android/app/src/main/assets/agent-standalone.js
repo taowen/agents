@@ -132,6 +132,18 @@
       agentVisible: true
     },
     {
+      name: "speak",
+      params: [
+        { name: "text", type: "string" },
+        { name: "speaker", type: "string", optional: true },
+        { name: "language", type: "string", optional: true }
+      ],
+      returns: "boolean",
+      description:
+        "speak text aloud using TTS (supports Chinese/English). Optional speaker name and language (e.g. 'zh', 'en').",
+      agentVisible: true
+    },
+    {
       name: "update_status",
       params: [{ name: "text", type: "string" }],
       returns: "void",
@@ -218,6 +230,7 @@
     const origPressBack = press_back;
     const origPressRecents = press_recents;
     const origShowNotifications = show_notifications;
+    const origSpeak = speak;
     globalThis.get_screen = function () {
       if (Date.now() > opts.deadline)
         throw new Error("Script execution timeout");
@@ -318,6 +331,13 @@
       });
       return r;
     };
+    globalThis.speak = function (text) {
+      if (Date.now() > opts.deadline)
+        throw new Error("Script execution timeout");
+      const r = origSpeak(text);
+      opts.onAction?.({ fn: "speak", args: text, result: String(r) });
+      return r;
+    };
     return {
       getScreenCount: () => getScreenCount,
       restore() {
@@ -333,6 +353,7 @@
         globalThis.press_back = origPressBack;
         globalThis.press_recents = origPressRecents;
         globalThis.show_notifications = origShowNotifications;
+        globalThis.speak = origSpeak;
       }
     };
   }

@@ -97,5 +97,5 @@ export function buildSystemPrompt(): string {
       "Check the dynamic context to see which MCP servers are currently connected and what tools they provide."
   ];
 
-  return sections.join(" ");
+  return sections.join("\n\n");
 }

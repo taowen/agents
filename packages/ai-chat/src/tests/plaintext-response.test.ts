@@ -76,7 +76,12 @@ describe("Plain text response handling", () => {
     const bodies = nonEmptyResponses.map((m) => JSON.parse(m.body as string));
     const types = bodies.map((b) => b.type);
 
-    expect(types[0]).toBe("text-start");
+    // The stream now starts with a "start" event carrying the server's
+    // messageId (to prevent client/server ID mismatch), followed by
+    // text-start, text-delta(s), text-end.
+    expect(types[0]).toBe("start");
+    expect(bodies[0].messageId).toBeDefined();
+    expect(types[1]).toBe("text-start");
     expect(types[types.length - 1]).toBe("text-end");
     expect(
       types.filter((t: string) => t === "text-delta").length
