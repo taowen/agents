@@ -295,6 +295,54 @@ void kernel_snake_beta(float *out, const float *x, const float *alpha,
 #endif
     return;
 #endif
+
+#if defined(__ARM_NEON) || defined(__aarch64__)
+    /* NEON polynomial sin approximation: sin(x) ~ x - x^3/6 + x^5/120
+     * Good enough for SnakeBeta where exact sin isn't critical */
+    {
+        float32x4_t c3 = vdupq_n_f32(-1.0f / 6.0f);
+        float32x4_t c5 = vdupq_n_f32(1.0f / 120.0f);
+        /* Range reduction: sin(x) = sin(x mod 2pi), reduce to [-pi, pi] */
+        float32x4_t inv_2pi = vdupq_n_f32(1.0f / 6.283185307f);
+        float32x4_t v2pi = vdupq_n_f32(6.283185307f);
+        float32x4_t vpi = vdupq_n_f32(3.141592654f);
+
+#ifdef USE_OPENMP
+        #pragma omp parallel for schedule(static)
+#endif
+        for (int c = 0; c < channels; c++) {
+            float32x4_t va = vdupq_n_f32(alpha[c]);
+            float32x4_t vib = vdupq_n_f32(beta[c]);
+            const float *xc = x + (size_t)c * length;
+            float *oc = out + (size_t)c * length;
+            int t = 0;
+            for (; t + 3 < length; t += 4) {
+                float32x4_t vx = vld1q_f32(xc + t);
+                float32x4_t ax = vmulq_f32(vx, va);
+                /* Range reduction to [-pi, pi] */
+                float32x4_t n = vrndnq_f32(vmulq_f32(ax, inv_2pi));
+                ax = vsubq_f32(ax, vmulq_f32(n, v2pi));
+                ax = vmaxq_f32(vnegq_f32(vpi), vminq_f32(ax, vpi));
+                /* 5th-order Taylor: sin(ax) ~ ax - ax^3/6 + ax^5/120 */
+                float32x4_t ax2 = vmulq_f32(ax, ax);
+                float32x4_t ax3 = vmulq_f32(ax2, ax);
+                float32x4_t ax5 = vmulq_f32(ax3, ax2);
+                float32x4_t s = vaddq_f32(ax, vaddq_f32(vmulq_f32(ax3, c3), vmulq_f32(ax5, c5)));
+                /* out = x + inv_beta * sin^2 */
+                float32x4_t s2 = vmulq_f32(s, s);
+                vst1q_f32(oc + t, vaddq_f32(vx, vmulq_f32(vib, s2)));
+            }
+            /* Scalar tail */
+            for (; t < length; t++) {
+                int idx = c * length + t;
+                float s = sinf(x[idx] * alpha[c]);
+                out[idx] = x[idx] + beta[c] * s * s;
+            }
+        }
+    }
+    return;
+#endif
+
     /* Scalar fallback */
 #ifdef USE_OPENMP
 #pragma omp parallel for schedule(static)

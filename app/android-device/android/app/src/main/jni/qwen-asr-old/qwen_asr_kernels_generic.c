@@ -21,6 +21,37 @@ void qwen_bf16_matvec_fused_generic(float *y, const float *x, const uint16_t *W_
     }
 }
 
+void qwen_f32_matvec_fused_generic(float *y, const float *x, const float *W,
+                                   const float *bias, int in_dim, int out_dim) {
+    for (int o = 0; o < out_dim; o++) {
+        const float *w_row = W + (size_t)o * in_dim;
+        float sum = bias ? bias[o] : 0.0f;
+        for (int k = 0; k < in_dim; k++) {
+            sum += w_row[k] * x[k];
+        }
+        y[o] = sum;
+    }
+}
+
+void qwen_q8_matvec_fused_generic(float *y, const block_q8_0 *x_q8,
+                                   const block_q8_0 *W_q8, const float *bias,
+                                   int n_blocks, int out_dim) {
+    for (int o = 0; o < out_dim; o++) {
+        const block_q8_0 *w_row = W_q8 + (size_t)o * n_blocks;
+        float sum = bias ? bias[o] : 0.0f;
+        for (int b = 0; b < n_blocks; b++) {
+            float ws = w_row[b].scale;
+            float xs = x_q8[b].scale;
+            int32_t dot = 0;
+            for (int j = 0; j < QK8_0; j++) {
+                dot += (int32_t)w_row[b].qs[j] * (int32_t)x_q8[b].qs[j];
+            }
+            sum += ws * xs * (float)dot;
+        }
+        y[o] = sum;
+    }
+}
+
 void qwen_argmax_bf16_range_generic(const float *x, const uint16_t *W_bf16,
                                     int in_dim, int start, int end,
                                     int *best_out, float *best_val_out) {
@@ -35,6 +66,35 @@ void qwen_argmax_bf16_range_generic(const float *x, const uint16_t *W_bf16,
             float w_val;
             memcpy(&w_val, &f32_bits, sizeof(float));
             sum += w_val * x[k];
+        }
+        if (sum > best_val) {
+            best_val = sum;
+            best = o;
+        }
+    }
+
+    *best_out = best;
+    *best_val_out = best_val;
+}
+
+void qwen_argmax_q8_range_generic(const block_q8_0 *x_q8,
+                                   const block_q8_0 *W_q8,
+                                   int n_blocks, int start, int end,
+                                   int *best_out, float *best_val_out) {
+    int best = start;
+    float best_val = -1e30f;
+
+    for (int o = start; o < end; o++) {
+        const block_q8_0 *w_row = W_q8 + (size_t)o * n_blocks;
+        float sum = 0.0f;
+        for (int b = 0; b < n_blocks; b++) {
+            float ws = w_row[b].scale;
+            float xs = x_q8[b].scale;
+            int32_t dot = 0;
+            for (int j = 0; j < QK8_0; j++) {
+                dot += (int32_t)w_row[b].qs[j] * (int32_t)x_q8[b].qs[j];
+            }
+            sum += ws * xs * (float)dot;
         }
         if (sum > best_val) {
             best_val = sum;

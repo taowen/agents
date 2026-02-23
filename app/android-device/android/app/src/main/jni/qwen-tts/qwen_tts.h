@@ -15,6 +15,9 @@
 #include <stdint.h>
 #include <stdio.h>
 
+/* Q4_K/INT8 quantization types (block_q4_k etc.) */
+#include "qwen_tts_quant.h"
+
 /* ========================================================================
  * Constants
  * ======================================================================== */
@@ -141,6 +144,9 @@ typedef struct {
     int codec_think_id;
     int codec_think_bos_id;
     int codec_think_eos_id;
+
+    /* Quantization strategy */
+    int use_q4k;  /* 1=Q4_K_M strategy (default on) */
 } qwen_tts_config_t;
 
 /* ========================================================================
@@ -169,6 +175,17 @@ typedef struct {
 
     /* Fused gate+up for single-token matvec */
     uint16_t *gate_up_fused_bf16; /* [2*intermediate, hidden] */
+
+    /* Fused QKV (created at load time) */
+    uint16_t *wqkv_fused_bf16;   /* [(num_heads+2*kv_heads)*head_dim, hidden] */
+
+    /* INT8 quantized weights (wo, down - sensitive layers) */
+    int8_t *wo_int8;     float *wo_scales;
+    int8_t *down_int8;   float *down_scales;
+
+    /* Q4_K quantized weights (QKV, gate_up) */
+    block_q4_k *wqkv_q4k;
+    block_q4_k *gate_up_q4k;
 } qwen_tts_talker_layer_t;
 
 typedef struct {
@@ -209,6 +226,21 @@ typedef struct {
     uint16_t *up_bf16;
     uint16_t *down_bf16;
     uint16_t *gate_up_fused_bf16;
+
+    /* Fused QKV (created at load time) */
+    uint16_t *wqkv_fused_bf16;
+
+    /* INT8 quantized weights (fallback) */
+    int8_t *wqkv_int8;     float *wqkv_scales;
+    int8_t *gate_up_int8;  float *gate_up_scales;
+    int8_t *wo_int8;       float *wo_scales;
+    int8_t *down_int8;     float *down_scales;
+
+    /* Q4_K quantized weights (sub-talker: all Q4_K) */
+    block_q4_k *wqkv_q4k;
+    block_q4_k *gate_up_q4k;
+    block_q4_k *wo_q4k;
+    block_q4_k *down_q4k;
 } qwen_tts_subtalker_layer_t;
 
 typedef struct {
@@ -359,7 +391,7 @@ typedef void (*qwen_tts_progress_cb)(int step, int total, void *userdata);
  * Main Context
  * ======================================================================== */
 
-typedef struct {
+typedef struct qwen_tts_ctx {
     qwen_tts_config_t config;
     qwen_tts_talker_t talker;
     qwen_tts_subtalker_t subtalker;
@@ -369,6 +401,7 @@ typedef struct {
     void *safetensors;              /* multi_safetensors_t* */
     void *codec_safetensors;        /* multi_safetensors_t* for speech_tokenizer */
     char model_dir[512];
+    char cache_dir[512];            /* for .qcache storage */
 
     /* Talker KV cache */
     float *talker_kv_k;             /* [layers, max_seq, kv_heads*head_dim] */
@@ -389,6 +422,7 @@ typedef struct {
     int codec_kv_max;
 
     /* Persistent talker buffers (single-token generation) */
+    float *tk_qkv;                  /* fused QKV output buffer */
     float *tk_x, *tk_x_norm, *tk_q, *tk_k, *tk_v;
     float *tk_attn_out, *tk_proj_out;
     float *tk_gate, *tk_up, *tk_ffn_out;
@@ -402,6 +436,7 @@ typedef struct {
     int tk_pref_cap;
 
     /* Persistent sub-talker scratch buffers */
+    float *st_qkv;                  /* sub-talker fused QKV buffer */
     float *st_x, *st_x_norm, *st_q, *st_k, *st_v;
     float *st_attn_out, *st_logits;
     float *st_gate, *st_up;
@@ -436,6 +471,7 @@ typedef struct {
     /* Performance stats */
     double perf_total_ms;
     double perf_talker_ms;
+    double perf_subtalker_ms;
     double perf_codec_ms;
     int perf_codec_tokens;
 } qwen_tts_ctx_t;

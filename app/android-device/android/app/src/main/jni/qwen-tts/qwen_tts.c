@@ -11,6 +11,7 @@
 
 #include "qwen_tts.h"
 #include "qwen_tts_kernels.h"
+#include "qwen_tts_quant.h"
 #include "qwen_tts_safetensors.h"
 
 #include <math.h>
@@ -339,6 +340,8 @@ static int load_config(qwen_tts_ctx_t *ctx) {
 
     free(json);
 
+    cfg->use_q4k = 1;  /* Q4_K_M quantization on by default */
+
     if (qwen_tts_verbose >= 1) {
         fprintf(stderr, "Config loaded:\n");
         fprintf(stderr, "  Talker: %d layers, hidden=%d, heads=%d/%d, head_dim=%d\n",
@@ -488,6 +491,54 @@ static int load_talker_weights(qwen_tts_ctx_t *ctx, const multi_safetensors_t *m
                 memcpy(l->gate_up_fused_bf16 + gu_size, l->up_bf16, gu_size * sizeof(uint16_t));
             }
         }
+
+        /* Create fused Q+K+V weights */
+        {
+            int q_rows = cfg->talker_heads * cfg->talker_head_dim;
+            int kv_rows = cfg->talker_kv_heads * cfg->talker_head_dim;
+            int total_rows = q_rows + kv_rows + kv_rows;
+            size_t row_elems = (size_t)cfg->talker_hidden;
+            l->wqkv_fused_bf16 = (uint16_t *)malloc((size_t)total_rows * row_elems * sizeof(uint16_t));
+            if (l->wqkv_fused_bf16) {
+                memcpy(l->wqkv_fused_bf16,
+                       l->wq_bf16, (size_t)q_rows * row_elems * sizeof(uint16_t));
+                memcpy(l->wqkv_fused_bf16 + (size_t)q_rows * row_elems,
+                       l->wk_bf16, (size_t)kv_rows * row_elems * sizeof(uint16_t));
+                memcpy(l->wqkv_fused_bf16 + (size_t)(q_rows + kv_rows) * row_elems,
+                       l->wv_bf16, (size_t)kv_rows * row_elems * sizeof(uint16_t));
+            }
+        }
+
+        /* INT8 quantize wo (skip if loaded from cache) */
+        if (l->wo_bf16 && !l->wo_int8) {
+            int q_dim = cfg->talker_heads * cfg->talker_head_dim;
+            quantize_bf16_to_int8(l->wo_bf16, cfg->talker_hidden, q_dim,
+                                  &l->wo_int8, &l->wo_scales);
+        }
+
+        /* INT8 quantize down (skip if loaded from cache) */
+        if (l->down_bf16 && !l->down_int8) {
+            quantize_bf16_to_int8(l->down_bf16, cfg->talker_hidden, cfg->talker_intermediate,
+                                  &l->down_int8, &l->down_scales);
+        }
+
+        /* Q4_K_M: QKV and gate_up use Q4_K (skip if loaded from cache) */
+        if (cfg->use_q4k && cfg->talker_hidden % QK_K == 0) {
+            int q_rows = cfg->talker_heads * cfg->talker_head_dim;
+            int kv_rows = cfg->talker_kv_heads * cfg->talker_head_dim;
+            int total_rows = q_rows + kv_rows + kv_rows;
+
+            if (l->wqkv_fused_bf16 && !l->wqkv_q4k) {
+                quantize_bf16_to_q4k(l->wqkv_fused_bf16, total_rows, cfg->talker_hidden,
+                                      &l->wqkv_q4k);
+            }
+            if (l->gate_up_fused_bf16 && !l->gate_up_q4k) {
+                int gu_rows = 2 * cfg->talker_intermediate;
+                quantize_bf16_to_q4k(l->gate_up_fused_bf16, gu_rows, cfg->talker_hidden,
+                                      &l->gate_up_q4k);
+            }
+            /* wo and down: intentionally NOT Q4_K (sensitive layers keep INT8) */
+        }
     }
 
     /* Final norm */
@@ -556,6 +607,61 @@ static void load_subtalker_weights(qwen_tts_ctx_t *ctx, const multi_safetensors_
         if (l->gate_up_fused_bf16) {
             memcpy(l->gate_up_fused_bf16, l->gate_bf16, gu_size * sizeof(uint16_t));
             memcpy(l->gate_up_fused_bf16 + gu_size, l->up_bf16, gu_size * sizeof(uint16_t));
+        }
+
+        /* Create fused Q+K+V weights */
+        {
+            int q_rows = cfg->subtalker_heads * cfg->subtalker_head_dim;
+            int kv_rows = cfg->subtalker_kv_heads * cfg->subtalker_head_dim;
+            int total_rows = q_rows + kv_rows + kv_rows;
+            size_t row_elems = (size_t)cfg->subtalker_hidden;
+            l->wqkv_fused_bf16 = (uint16_t *)malloc((size_t)total_rows * row_elems * sizeof(uint16_t));
+            if (l->wqkv_fused_bf16) {
+                memcpy(l->wqkv_fused_bf16,
+                       l->wq_bf16, (size_t)q_rows * row_elems * sizeof(uint16_t));
+                memcpy(l->wqkv_fused_bf16 + (size_t)q_rows * row_elems,
+                       l->wk_bf16, (size_t)kv_rows * row_elems * sizeof(uint16_t));
+                memcpy(l->wqkv_fused_bf16 + (size_t)(q_rows + kv_rows) * row_elems,
+                       l->wv_bf16, (size_t)kv_rows * row_elems * sizeof(uint16_t));
+            }
+        }
+
+        /* INT8 quantize all weights (skip if loaded from cache) */
+        if (l->wo_bf16 && !l->wo_int8) {
+            int q_dim = cfg->subtalker_heads * cfg->subtalker_head_dim;
+            quantize_bf16_to_int8(l->wo_bf16, cfg->subtalker_hidden, q_dim,
+                                  &l->wo_int8, &l->wo_scales);
+        }
+        if (l->down_bf16 && !l->down_int8) {
+            quantize_bf16_to_int8(l->down_bf16, cfg->subtalker_hidden, cfg->subtalker_intermediate,
+                                  &l->down_int8, &l->down_scales);
+        }
+
+        /* Sub-talker: all Q4_K (lower precision requirements) */
+        if (cfg->use_q4k && cfg->subtalker_hidden % QK_K == 0) {
+            int q_rows = cfg->subtalker_heads * cfg->subtalker_head_dim;
+            int kv_rows = cfg->subtalker_kv_heads * cfg->subtalker_head_dim;
+            int total_rows = q_rows + kv_rows + kv_rows;
+
+            if (l->wqkv_fused_bf16 && !l->wqkv_q4k) {
+                quantize_bf16_to_q4k(l->wqkv_fused_bf16, total_rows, cfg->subtalker_hidden,
+                                      &l->wqkv_q4k);
+            }
+            if (l->gate_up_fused_bf16 && !l->gate_up_q4k) {
+                int gu_rows = 2 * cfg->subtalker_intermediate;
+                quantize_bf16_to_q4k(l->gate_up_fused_bf16, gu_rows, cfg->subtalker_hidden,
+                                      &l->gate_up_q4k);
+            }
+            /* Sub-talker: wo and down also get Q4_K */
+            if (l->wo_bf16 && !l->wo_q4k) {
+                int q_dim = cfg->subtalker_heads * cfg->subtalker_head_dim;
+                quantize_bf16_to_q4k(l->wo_bf16, cfg->subtalker_hidden, q_dim,
+                                      &l->wo_q4k);
+            }
+            if (l->down_bf16 && !l->down_q4k) {
+                quantize_bf16_to_q4k(l->down_bf16, cfg->subtalker_hidden, cfg->subtalker_intermediate,
+                                      &l->down_q4k);
+            }
         }
     }
 
@@ -868,6 +974,13 @@ qwen_tts_ctx_t *qwen_tts_load(const char *model_dir) {
 
     strncpy(ctx->model_dir, model_dir, sizeof(ctx->model_dir) - 1);
 
+    /* Set cache directory (override from JNI or model_dir) */
+    if (qwen_tts_cache_dir_override && qwen_tts_cache_dir_override[0]) {
+        strncpy(ctx->cache_dir, qwen_tts_cache_dir_override, sizeof(ctx->cache_dir) - 1);
+    } else {
+        strncpy(ctx->cache_dir, model_dir, sizeof(ctx->cache_dir) - 1);
+    }
+
     /* Set default generation parameters */
     ctx->temperature = 0.9f;
     ctx->subtalker_temperature = 0.9f;
@@ -895,11 +1008,19 @@ qwen_tts_ctx_t *qwen_tts_load(const char *model_dir) {
     }
     ctx->safetensors = ms;
 
+    /* Try loading pre-quantized weights from cache */
+    int cache_loaded = load_quantized_cache(ctx);
+
     if (load_talker_weights(ctx, ms) != 0) {
         qwen_tts_free(ctx);
         return NULL;
     }
     load_subtalker_weights(ctx, ms);
+
+    /* Save quantized cache if we had to quantize (cache miss) */
+    if (cache_loaded != 0) {
+        save_quantized_cache(ctx);
+    }
 
     /* Open codec decoder safetensors */
 #ifndef __EMSCRIPTEN__
@@ -989,7 +1110,7 @@ void qwen_tts_free(qwen_tts_ctx_t *ctx) {
     free(ctx->codec.vocoder_final_act_alpha); free(ctx->codec.vocoder_final_act_beta);
     free(ctx->codec.vocoder_final_conv_weight); free(ctx->codec.vocoder_final_conv_bias);
 
-    /* Free talker LOAD_F32'd weights (norms + biases) */
+    /* Free talker LOAD_F32'd weights (norms + biases) + quantized */
     free(ctx->talker.text_proj_fc1_bias);
     free(ctx->talker.text_proj_fc2_bias);
     free(ctx->talker.norm);
@@ -998,9 +1119,14 @@ void qwen_tts_free(qwen_tts_ctx_t *ctx) {
         free(l->q_norm_weight); free(l->k_norm_weight);
         free(l->input_norm); free(l->post_attn_norm);
         free(l->gate_up_fused_bf16);
+        free(l->wqkv_fused_bf16);
+        free(l->wo_int8); free(l->wo_scales);
+        free(l->down_int8); free(l->down_scales);
+        free(l->wqkv_q4k);
+        free(l->gate_up_q4k);
     }
 
-    /* Free subtalker LOAD_F32'd weights (norms + biases) */
+    /* Free subtalker LOAD_F32'd weights (norms + biases) + quantized */
     free(ctx->subtalker.input_proj_bias);
     free(ctx->subtalker.norm);
     for (int i = 0; i < ctx->config.subtalker_layers; i++) {
@@ -1008,12 +1134,20 @@ void qwen_tts_free(qwen_tts_ctx_t *ctx) {
         free(l->q_norm_weight); free(l->k_norm_weight);
         free(l->input_norm); free(l->post_attn_norm);
         free(l->gate_up_fused_bf16);
+        free(l->wqkv_fused_bf16);
+        free(l->wqkv_int8); free(l->wqkv_scales);
+        free(l->gate_up_int8); free(l->gate_up_scales);
+        free(l->wo_int8); free(l->wo_scales);
+        free(l->down_int8); free(l->down_scales);
+        free(l->wqkv_q4k); free(l->gate_up_q4k);
+        free(l->wo_q4k); free(l->down_q4k);
     }
 
     /* Free KV caches and scratch buffers */
     free(ctx->talker_kv_k); free(ctx->talker_kv_v);
     free(ctx->subtalker_kv_k); free(ctx->subtalker_kv_v);
     free(ctx->codec_kv_k); free(ctx->codec_kv_v);
+    free(ctx->tk_qkv);
     free(ctx->tk_x); free(ctx->tk_x_norm);
     free(ctx->tk_q); free(ctx->tk_k); free(ctx->tk_v);
     free(ctx->tk_attn_out); free(ctx->tk_proj_out);
@@ -1024,6 +1158,7 @@ void qwen_tts_free(qwen_tts_ctx_t *ctx) {
     free(ctx->tk_pref_q); free(ctx->tk_pref_k); free(ctx->tk_pref_v);
     free(ctx->tk_pref_attn_out); free(ctx->tk_pref_proj_out);
     free(ctx->tk_pref_gate); free(ctx->tk_pref_gate_up); free(ctx->tk_pref_ffn_out);
+    free(ctx->st_qkv);
     free(ctx->st_x); free(ctx->st_x_norm);
     free(ctx->st_q); free(ctx->st_k); free(ctx->st_v);
     free(ctx->st_attn_out); free(ctx->st_logits);

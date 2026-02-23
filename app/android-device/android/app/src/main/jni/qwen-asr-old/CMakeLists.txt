@@ -3,6 +3,7 @@ project(qwen_asr C)
 
 set(QWEN_ASR_SOURCES
     qwen_asr.c
+    qwen_asr_quant.c
     qwen_asr_kernels.c
     qwen_asr_kernels_generic.c
     qwen_asr_kernels_neon.c

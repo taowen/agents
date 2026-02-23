@@ -10,6 +10,7 @@
 
 #include <stddef.h>
 #include <stdint.h>
+#include "qwen_asr_quant.h"
 
 /* ========================================================================
  * Basic Operations
@@ -50,6 +51,34 @@ void qwen_linear_nobias_bf16_qkv(float *q, float *k, float *v, const float *x,
 
 void qwen_matmul_t_bf16(float *C, const float *A, const uint16_t *B_bf16,
                          int M, int K, int N);
+
+/* Q8_0 weight variants */
+void qwen_linear_q8(float *y, const float *x, const block_q8_0 *W_q8,
+                    const float *b, int seq_len, int in_dim, int out_dim);
+
+void qwen_linear_nobias_q8(float *y, const float *x, const block_q8_0 *W_q8,
+                            int seq_len, int in_dim, int out_dim);
+
+/* seq=1 decoder fast path: compute Q/K/V matvecs with one threaded dispatch */
+void qwen_linear_nobias_q8_qkv(float *q, float *k, float *v, const float *x,
+                                const block_q8_0 *Wq_q8,
+                                const block_q8_0 *Wk_q8,
+                                const block_q8_0 *Wv_q8,
+                                int in_dim, int q_dim, int kv_dim);
+
+/* Fused QKV GEMM: quantize input once, compute Q/K/V projections.
+ * Falls back to matvec QKV path when seq_len=1. */
+void qwen_linear_q8_qkv_batched(
+    float *q, float *k, float *v,
+    const float *x,
+    const block_q8_0 *Wq_q8, const float *bq,
+    const block_q8_0 *Wk_q8, const float *bk,
+    const block_q8_0 *Wv_q8, const float *bv,
+    int seq_len, int in_dim, int q_dim, int kv_dim
+);
+
+/* Free GEMM workspace (call from qwen_free) */
+void qwen_gemm_workspace_free(void);
 
 /* ========================================================================
  * 2D Convolution (for audio encoder conv stem)
@@ -116,11 +145,12 @@ void qwen_bidirectional_attention(float *out, const float *Q, const float *K,
 /*
  * Causal attention with GQA (decoder).
  * Q: [seq_q, n_heads * head_dim]
- * K: [seq_k, n_kv_heads * head_dim]
- * V: [seq_k, n_kv_heads * head_dim]
+ * K_fp16: [seq_k, n_kv_heads * head_dim] as FP16 (uint16_t)
+ * V_fp16: [seq_k, n_kv_heads * head_dim] as FP16 (uint16_t)
  * q_offset: global position of first query (for causal mask)
  */
-void qwen_causal_attention(float *out, const float *Q, const float *K, const float *V,
+void qwen_causal_attention(float *out, const float *Q,
+                            const uint16_t *K_fp16, const uint16_t *V_fp16,
                             int seq_q, int seq_k, int n_heads, int n_kv_heads,
                             int head_dim, float scale, int q_offset);
 
@@ -155,6 +185,22 @@ void qwen_apply_rope_neox(float *x, const float *cos_vals, const float *sin_vals
  * Returns the index of the row with highest dot product. */
 int qwen_argmax_matvec_bf16(const float *x, const uint16_t *W_bf16,
                              int in_dim, int out_dim);
+
+/* Q8_0 streaming argmax: finds argmax(W_q8 @ x) using INT8 dot products.
+ * Quantizes x once, then computes dot products against all vocab rows.
+ * Returns the index of the row with highest dot product. */
+int qwen_argmax_matvec_q8(const float *x, const block_q8_0 *W_q8,
+                            int in_dim, int out_dim);
+
+/* ========================================================================
+ * FP16 Conversion
+ * ======================================================================== */
+
+/* Convert FP32 array to FP16 (stored as uint16_t). NEON-accelerated on ARM. */
+void qwen_f32_to_f16(uint16_t *dst, const float *src, int n);
+
+/* Convert FP16 (uint16_t) array to FP32. NEON-accelerated on ARM. */
+void qwen_f16_to_f32(float *dst, const uint16_t *src, int n);
 
 /* ========================================================================
  * Threading

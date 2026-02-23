@@ -259,32 +259,36 @@ void qwen_free(qwen_ctx_t *ctx) {
     FREE0(ctx->encoder.conv1_weight); FREE0(ctx->encoder.conv1_bias);
     FREE0(ctx->encoder.conv2_weight); FREE0(ctx->encoder.conv2_bias);
     FREE0(ctx->encoder.conv3_weight); FREE0(ctx->encoder.conv3_bias);
-    FREE0(ctx->encoder.conv_out_weight);
+    FREE0(ctx->encoder.conv_out_weight_q8);
 
-    /* Encoder layers (weights are pre-converted f32, all allocated) */
+    /* Encoder layers (weights are Q8_0, all allocated) */
     for (int i = 0; i < ctx->config.enc_layers; i++) {
         qwen_enc_layer_t *l = &ctx->encoder.layers[i];
-        FREE0(l->wq_weight); FREE0(l->wq_bias);
-        FREE0(l->wk_weight); FREE0(l->wk_bias);
-        FREE0(l->wv_weight); FREE0(l->wv_bias);
-        FREE0(l->wo_weight); FREE0(l->wo_bias);
+        FREE0(l->wq_weight_q8); FREE0(l->wq_bias);
+        FREE0(l->wk_weight_q8); FREE0(l->wk_bias);
+        FREE0(l->wv_weight_q8); FREE0(l->wv_bias);
+        FREE0(l->wo_weight_q8); FREE0(l->wo_bias);
         FREE0(l->attn_norm_weight); FREE0(l->attn_norm_bias);
-        FREE0(l->fc1_weight); FREE0(l->fc1_bias);
-        FREE0(l->fc2_weight); FREE0(l->fc2_bias);
+        FREE0(l->fc1_weight_q8); FREE0(l->fc1_bias);
+        FREE0(l->fc2_weight_q8); FREE0(l->fc2_bias);
         FREE0(l->ffn_norm_weight); FREE0(l->ffn_norm_bias);
     }
     FREE0(ctx->encoder.ln_post_weight); FREE0(ctx->encoder.ln_post_bias);
-    FREE0(ctx->encoder.proj1_weight); FREE0(ctx->encoder.proj1_bias);
-    FREE0(ctx->encoder.proj2_weight); FREE0(ctx->encoder.proj2_bias);
+    FREE0(ctx->encoder.proj1_weight_q8); FREE0(ctx->encoder.proj1_bias);
+    FREE0(ctx->encoder.proj2_weight_q8); FREE0(ctx->encoder.proj2_bias);
 
-    /* Decoder layers */
+    /* Decoder layers (Q8_0 weights are all malloc'd, must be freed) */
     for (int i = 0; i < ctx->config.dec_layers; i++) {
         qwen_dec_layer_t *l = &ctx->decoder.layers[i];
+        FREE0(l->wq_weight_q8); FREE0(l->wk_weight_q8);
+        FREE0(l->wv_weight_q8); FREE0(l->wo_weight_q8);
         FREE0(l->q_norm_weight); FREE0(l->k_norm_weight);
         FREE0(l->input_norm); FREE0(l->post_attn_norm);
-        FREE0(l->gate_up_fused_bf16);
+        FREE0(l->down_weight_q8);
+        FREE0(l->gate_up_fused_q8);
     }
     FREE0(ctx->decoder.norm);
+    FREE0(ctx->decoder.tok_embeddings_q8);
 
     #undef FREE0
 
@@ -308,6 +312,9 @@ void qwen_free(qwen_ctx_t *ctx) {
     /* Decoder RoPE caches */
     free(ctx->rope_cache_cos); free(ctx->rope_cache_sin);
     free(ctx->rope_inv_freq);
+
+    /* GEMM workspace */
+    qwen_gemm_workspace_free();
 
     /* Prompt/language options */
     free(ctx->prompt);
