@@ -555,6 +555,529 @@ void qwen_matmul_t_bf16(float *C, const float *A, const uint16_t *B_bf16,
 }
 
 /* ========================================================================
+ * Q8_0 Quantized Weight Operations
+ * ======================================================================== */
+
+/* Transpose Yt[N, M_pad] → Y[M, N] */
+static void transpose_back(float *Y, const float *Yt, int M, int N, int M_pad) {
+    for (int m = 0; m < M; m++) {
+        for (int n = 0; n < N; n++) {
+            Y[(size_t)m * N + n] = Yt[(size_t)n * M_pad + m];
+        }
+    }
+}
+
+/* Forward declarations */
+static void q8_matvec_threaded(float *y, const float *x, const block_q8_0 *W_q8,
+                                const float *bias, int in_dim, int out_dim);
+
+/* GEMM workspace: pre-allocated, lazily grown, never shrunk.
+ * Eliminates ~650 malloc/free per inference (~325 GEMM calls × 2). */
+static struct {
+    block_q8_0 *x_q8t;     /* [n_blocks * M_pad] transposed quantized input */
+    float *yt;              /* [N * M_pad] transposed output */
+    size_t x_q8t_cap;      /* allocated block_q8_0 count */
+    size_t yt_cap;          /* allocated float count */
+} gemm_ws = {0};
+
+static void gemm_ws_ensure(int n_blocks, int M_pad, int N) {
+    size_t need_q8 = (size_t)n_blocks * M_pad;
+    if (need_q8 > gemm_ws.x_q8t_cap) {
+        free(gemm_ws.x_q8t);
+        gemm_ws.x_q8t = (block_q8_0 *)malloc(need_q8 * sizeof(block_q8_0));
+        gemm_ws.x_q8t_cap = need_q8;
+    }
+    size_t need_yt = (size_t)N * M_pad;
+    if (need_yt > gemm_ws.yt_cap) {
+        free(gemm_ws.yt);
+        gemm_ws.yt = (float *)malloc(need_yt * sizeof(float));
+        gemm_ws.yt_cap = need_yt;
+    }
+}
+
+void qwen_gemm_workspace_free(void) {
+    free(gemm_ws.x_q8t); gemm_ws.x_q8t = NULL; gemm_ws.x_q8t_cap = 0;
+    free(gemm_ws.yt);    gemm_ws.yt = NULL;    gemm_ws.yt_cap = 0;
+}
+
+/* Q8_0 INT8 GEMM worker: INT8×INT8 dot products via vdotq_s32.
+ * X_q8t: [n_blocks, M_pad] (transposed quantized input)
+ * W_q8:  [N, n_blocks] (quantized weights)
+ * Yt:    [N, M_pad] (output, pre-initialized with bias) */
+typedef struct {
+    float *Yt;                  /* [N, M_pad] */
+    const block_q8_0 *X_q8t;   /* [n_blocks, M_pad] */
+    const block_q8_0 *W_q8;    /* [N, n_blocks] */
+    int M_pad, N, n_blocks;
+} q8_gemm_task_t;
+
+static void q8_gemm_worker(int tid, int n_threads, void *arg) {
+    q8_gemm_task_t *t = (q8_gemm_task_t *)arg;
+    int chunk = (t->N + n_threads - 1) / n_threads;
+    int n_start = tid * chunk;
+    int n_end = n_start + chunk;
+    if (n_end > t->N) n_end = t->N;
+    if (n_start >= n_end) return;
+
+    int M_pad = t->M_pad;
+    int n_blocks = t->n_blocks;
+
+    /* N-tiling: tile the N dimension so Yt[Nc, M_pad] fits in L1D (~32KB). */
+    int Nc = 32768 / (M_pad * (int)sizeof(float));
+    if (Nc < 4) Nc = 4;
+    if (Nc > (n_end - n_start)) Nc = n_end - n_start;
+
+#if defined(__ARM_NEON) && defined(__ARM_FEATURE_DOTPROD)
+    for (int n_base = n_start; n_base < n_end; n_base += Nc) {
+        int n_tile_end = n_base + Nc;
+        if (n_tile_end > n_end) n_tile_end = n_end;
+
+        for (int kb = 0; kb < n_blocks; kb++) {
+            const block_q8_0 *x_col = t->X_q8t + (size_t)kb * M_pad;
+
+            for (int n = n_base; n < n_tile_end; n++) {
+                float *yt_row = t->Yt + (size_t)n * M_pad;
+                const block_q8_0 *wb = &t->W_q8[(size_t)n * n_blocks + kb];
+                float w_scale = wb->scale;
+
+                int8x16_t w_lo = vld1q_s8(wb->qs);
+                int8x16_t w_hi = vld1q_s8(wb->qs + 16);
+
+                for (int m = 0; m < M_pad; m += 4) {
+                    const block_q8_0 *xb0 = &x_col[m];
+                    const block_q8_0 *xb1 = &x_col[m + 1];
+                    const block_q8_0 *xb2 = &x_col[m + 2];
+                    const block_q8_0 *xb3 = &x_col[m + 3];
+
+                    int32x4_t d0 = vdotq_s32(vdupq_n_s32(0), w_lo, vld1q_s8(xb0->qs));
+                    d0 = vdotq_s32(d0, w_hi, vld1q_s8(xb0->qs + 16));
+                    int32x4_t d1 = vdotq_s32(vdupq_n_s32(0), w_lo, vld1q_s8(xb1->qs));
+                    d1 = vdotq_s32(d1, w_hi, vld1q_s8(xb1->qs + 16));
+                    int32x4_t d2 = vdotq_s32(vdupq_n_s32(0), w_lo, vld1q_s8(xb2->qs));
+                    d2 = vdotq_s32(d2, w_hi, vld1q_s8(xb2->qs + 16));
+                    int32x4_t d3 = vdotq_s32(vdupq_n_s32(0), w_lo, vld1q_s8(xb3->qs));
+                    d3 = vdotq_s32(d3, w_hi, vld1q_s8(xb3->qs + 16));
+
+                    int32x4_t p01 = vpaddq_s32(d0, d1);
+                    int32x4_t p23 = vpaddq_s32(d2, d3);
+                    int32x4_t all4 = vpaddq_s32(p01, p23);
+
+                    float32x4_t dots_f = vcvtq_f32_s32(all4);
+                    float32x4_t xs = {xb0->scale, xb1->scale, xb2->scale, xb3->scale};
+                    float32x4_t scaled = vmulq_f32(vmulq_n_f32(dots_f, w_scale), xs);
+
+                    float32x4_t acc = vld1q_f32(yt_row + m);
+                    vst1q_f32(yt_row + m, vaddq_f32(acc, scaled));
+                }
+            }
+        }
+    }
+#elif defined(__ARM_NEON)
+    /* NEON fallback without dotprod: use vmovl_s8 + vmlal_s16 */
+    for (int n_base = n_start; n_base < n_end; n_base += Nc) {
+        int n_tile_end = n_base + Nc;
+        if (n_tile_end > n_end) n_tile_end = n_end;
+
+        for (int kb = 0; kb < n_blocks; kb++) {
+            const block_q8_0 *x_col = t->X_q8t + (size_t)kb * M_pad;
+
+            for (int n = n_base; n < n_tile_end; n++) {
+                float *yt_row = t->Yt + (size_t)n * M_pad;
+                const block_q8_0 *wb = &t->W_q8[(size_t)n * n_blocks + kb];
+                float w_scale = wb->scale;
+
+                for (int m = 0; m < M_pad; m += 4) {
+                    const block_q8_0 *xb0 = &x_col[m];
+                    const block_q8_0 *xb1 = &x_col[m + 1];
+                    const block_q8_0 *xb2 = &x_col[m + 2];
+                    const block_q8_0 *xb3 = &x_col[m + 3];
+
+                    int32x4_t sum0 = vdupq_n_s32(0), sum1 = vdupq_n_s32(0);
+                    int32x4_t sum2 = vdupq_n_s32(0), sum3 = vdupq_n_s32(0);
+
+                    for (int j = 0; j < QK8_0; j += 8) {
+                        int8x8_t wq = vld1_s8(wb->qs + j);
+                        int16x8_t wq16 = vmovl_s8(wq);
+                        int16x4_t wq_lo = vget_low_s16(wq16);
+                        int16x4_t wq_hi = vget_high_s16(wq16);
+
+                        int16x8_t x0_16 = vmovl_s8(vld1_s8(xb0->qs + j));
+                        sum0 = vmlal_s16(sum0, wq_lo, vget_low_s16(x0_16));
+                        sum0 = vmlal_s16(sum0, wq_hi, vget_high_s16(x0_16));
+
+                        int16x8_t x1_16 = vmovl_s8(vld1_s8(xb1->qs + j));
+                        sum1 = vmlal_s16(sum1, wq_lo, vget_low_s16(x1_16));
+                        sum1 = vmlal_s16(sum1, wq_hi, vget_high_s16(x1_16));
+
+                        int16x8_t x2_16 = vmovl_s8(vld1_s8(xb2->qs + j));
+                        sum2 = vmlal_s16(sum2, wq_lo, vget_low_s16(x2_16));
+                        sum2 = vmlal_s16(sum2, wq_hi, vget_high_s16(x2_16));
+
+                        int16x8_t x3_16 = vmovl_s8(vld1_s8(xb3->qs + j));
+                        sum3 = vmlal_s16(sum3, wq_lo, vget_low_s16(x3_16));
+                        sum3 = vmlal_s16(sum3, wq_hi, vget_high_s16(x3_16));
+                    }
+
+                    int32x4_t p01 = vpaddq_s32(sum0, sum1);
+                    int32x4_t p23 = vpaddq_s32(sum2, sum3);
+                    int32x4_t all4 = vpaddq_s32(p01, p23);
+
+                    float32x4_t dots_f = vcvtq_f32_s32(all4);
+                    float32x4_t xs = {xb0->scale, xb1->scale, xb2->scale, xb3->scale};
+                    float32x4_t scaled = vmulq_f32(vmulq_n_f32(dots_f, w_scale), xs);
+
+                    float32x4_t acc = vld1q_f32(yt_row + m);
+                    vst1q_f32(yt_row + m, vaddq_f32(acc, scaled));
+                }
+            }
+        }
+    }
+#else
+    /* Scalar fallback */
+    for (int n_base = n_start; n_base < n_end; n_base += Nc) {
+        int n_tile_end = n_base + Nc;
+        if (n_tile_end > n_end) n_tile_end = n_end;
+
+        for (int kb = 0; kb < n_blocks; kb++) {
+            const block_q8_0 *x_col = t->X_q8t + (size_t)kb * M_pad;
+
+            for (int n = n_base; n < n_tile_end; n++) {
+                float *yt_row = t->Yt + (size_t)n * M_pad;
+                const block_q8_0 *wb = &t->W_q8[(size_t)n * n_blocks + kb];
+                float w_scale = wb->scale;
+
+                for (int m = 0; m < M_pad; m++) {
+                    const block_q8_0 *xb = &x_col[m];
+                    int32_t dot = 0;
+                    for (int j = 0; j < QK8_0; j++)
+                        dot += (int32_t)wb->qs[j] * (int32_t)xb->qs[j];
+                    yt_row[m] += w_scale * xb->scale * (float)dot;
+                }
+            }
+        }
+    }
+#endif
+}
+
+/* Batched Q8_0 GEMM: Y[M,N] = X[M,K] @ W_q8[N,K/32 blocks]^T + bias[N] */
+static void q8_gemm_batched(float *Y, const float *X, const block_q8_0 *W_q8,
+                              const float *bias, int M, int K, int N) {
+    int M_pad = (M + 3) & ~3;
+    int n_blocks = K / QK8_0;
+
+    gemm_ws_ensure(n_blocks, M_pad, N);
+    quantize_f32_rows_transpose_q8(X, gemm_ws.x_q8t, M, K, M_pad);
+
+    /* Initialize Yt with bias (or zero) */
+    for (int n = 0; n < N; n++) {
+        float b = bias ? bias[n] : 0.0f;
+        float *yt_row = gemm_ws.yt + (size_t)n * M_pad;
+        for (int m = 0; m < M_pad; m++)
+            yt_row[m] = (m < M) ? b : 0.0f;
+    }
+
+    q8_gemm_task_t task = { gemm_ws.yt, gemm_ws.x_q8t, W_q8, M_pad, N, n_blocks };
+    if (tp.n_threads <= 1) {
+        q8_gemm_worker(0, 1, &task);
+    } else {
+        parallel_for(q8_gemm_worker, &task);
+    }
+
+    transpose_back(Y, gemm_ws.yt, M, N, M_pad);
+}
+
+/* Q8_0 Threaded MatVec: quantize x once, then dispatch to threads */
+typedef struct {
+    float *y;
+    const block_q8_0 *x_q8;
+    const block_q8_0 *W_q8;
+    const float *bias;
+    int n_blocks;
+    int out_dim;
+} q8_matvec_task_t;
+
+static void q8_matvec_fused(float *y, const block_q8_0 *x_q8, const block_q8_0 *W_q8,
+                              const float *bias, int n_blocks, int out_dim) {
+    qwen_q8_matvec_fused_impl(y, x_q8, W_q8, bias, n_blocks, out_dim);
+}
+
+static void q8_matvec_worker(int tid, int n_threads, void *arg) {
+    q8_matvec_task_t *t = (q8_matvec_task_t *)arg;
+    int chunk = (t->out_dim + n_threads - 1) / n_threads;
+    int start = tid * chunk;
+    int end = start + chunk;
+    if (end > t->out_dim) end = t->out_dim;
+    if (start >= end) return;
+
+    q8_matvec_fused(t->y + start, t->x_q8,
+                     t->W_q8 + (size_t)start * t->n_blocks,
+                     t->bias ? t->bias + start : NULL,
+                     t->n_blocks, end - start);
+}
+
+static void q8_matvec_threaded(float *y, const float *x, const block_q8_0 *W_q8,
+                                const float *bias, int in_dim, int out_dim) {
+    int n_blocks = in_dim / QK8_0;
+
+    /* Quantize input x to Q8_0 once, reused for all output rows */
+    block_q8_0 *x_q8 = (block_q8_0 *)malloc((size_t)n_blocks * sizeof(block_q8_0));
+    quantize_f32_to_q8_0(x, x_q8, in_dim);
+
+    if (tp.n_threads <= 1) {
+        q8_matvec_fused(y, x_q8, W_q8, bias, n_blocks, out_dim);
+    } else {
+        q8_matvec_task_t task = { y, x_q8, W_q8, bias, n_blocks, out_dim };
+        parallel_for(q8_matvec_worker, &task);
+    }
+
+    free(x_q8);
+}
+
+/* Q8_0 QKV fused matvec for single-token decoder */
+typedef struct {
+    float *q;
+    float *k;
+    float *v;
+    const block_q8_0 *x_q8;
+    const block_q8_0 *Wq_q8;
+    const block_q8_0 *Wk_q8;
+    const block_q8_0 *Wv_q8;
+    int n_blocks;
+    int q_dim;
+    int kv_dim;
+    int total_dim;
+} q8_qkv_matvec_task_t;
+
+static void q8_qkv_matvec_worker(int tid, int n_threads, void *arg) {
+    q8_qkv_matvec_task_t *t = (q8_qkv_matvec_task_t *)arg;
+    int chunk = (t->total_dim + n_threads - 1) / n_threads;
+    int start = tid * chunk;
+    int end = start + chunk;
+    if (end > t->total_dim) end = t->total_dim;
+    if (start >= end) return;
+
+    int q_end = t->q_dim;
+    int k_end = q_end + t->kv_dim;
+    int v_end = k_end + t->kv_dim;
+
+    if (start < q_end) {
+        int s = start;
+        int e = end < q_end ? end : q_end;
+        if (s < e) {
+            q8_matvec_fused(t->q + s, t->x_q8,
+                             t->Wq_q8 + (size_t)s * t->n_blocks,
+                             NULL, t->n_blocks, e - s);
+        }
+    }
+
+    if (end > q_end && start < k_end) {
+        int s = start > q_end ? start - q_end : 0;
+        int e_abs = end < k_end ? end : k_end;
+        int e = e_abs - q_end;
+        if (s < e) {
+            q8_matvec_fused(t->k + s, t->x_q8,
+                             t->Wk_q8 + (size_t)s * t->n_blocks,
+                             NULL, t->n_blocks, e - s);
+        }
+    }
+
+    if (end > k_end && start < v_end) {
+        int s = start > k_end ? start - k_end : 0;
+        int e_abs = end < v_end ? end : v_end;
+        int e = e_abs - k_end;
+        if (s < e) {
+            q8_matvec_fused(t->v + s, t->x_q8,
+                             t->Wv_q8 + (size_t)s * t->n_blocks,
+                             NULL, t->n_blocks, e - s);
+        }
+    }
+}
+
+void qwen_linear_nobias_q8_qkv(float *q, float *k, float *v, const float *x,
+                                const block_q8_0 *Wq_q8,
+                                const block_q8_0 *Wk_q8,
+                                const block_q8_0 *Wv_q8,
+                                int in_dim, int q_dim, int kv_dim) {
+    int n_blocks = in_dim / QK8_0;
+
+    /* Quantize x once, shared across Q/K/V */
+    block_q8_0 *x_q8 = (block_q8_0 *)malloc((size_t)n_blocks * sizeof(block_q8_0));
+    quantize_f32_to_q8_0(x, x_q8, in_dim);
+
+    if (tp.n_threads <= 1) {
+        q8_matvec_fused(q, x_q8, Wq_q8, NULL, n_blocks, q_dim);
+        q8_matvec_fused(k, x_q8, Wk_q8, NULL, n_blocks, kv_dim);
+        q8_matvec_fused(v, x_q8, Wv_q8, NULL, n_blocks, kv_dim);
+        free(x_q8);
+        return;
+    }
+
+    q8_qkv_matvec_task_t task = {
+        .q = q,
+        .k = k,
+        .v = v,
+        .x_q8 = x_q8,
+        .Wq_q8 = Wq_q8,
+        .Wk_q8 = Wk_q8,
+        .Wv_q8 = Wv_q8,
+        .n_blocks = n_blocks,
+        .q_dim = q_dim,
+        .kv_dim = kv_dim,
+        .total_dim = q_dim + 2 * kv_dim,
+    };
+    parallel_for(q8_qkv_matvec_worker, &task);
+    free(x_q8);
+}
+
+void qwen_linear_nobias_q8(float *y, const float *x, const block_q8_0 *W_q8,
+                            int seq_len, int in_dim, int out_dim) {
+    if (seq_len > 1) {
+        q8_gemm_batched(y, x, W_q8, NULL, seq_len, in_dim, out_dim);
+    } else {
+        q8_matvec_threaded(y, x, W_q8, NULL, in_dim, out_dim);
+    }
+}
+
+void qwen_linear_q8(float *y, const float *x, const block_q8_0 *W_q8,
+                    const float *b, int seq_len, int in_dim, int out_dim) {
+    if (seq_len > 1) {
+        q8_gemm_batched(y, x, W_q8, b, seq_len, in_dim, out_dim);
+    } else {
+        q8_matvec_threaded(y, x, W_q8, b, in_dim, out_dim);
+    }
+}
+
+/* Fused QKV GEMM: quantize input once, run Q/K/V projections sharing the
+ * quantized input. Saves 2× redundant quantizations for encoder/prefill. */
+static void q8_gemm_batched_with_q8t(float *Y, const block_q8_0 *X_q8t,
+                                       const block_q8_0 *W_q8, const float *bias,
+                                       int M, int M_pad, int n_blocks, int N) {
+    /* Initialize Yt with bias (or zero) */
+    size_t yt_need = (size_t)N * M_pad;
+    if (yt_need > gemm_ws.yt_cap) {
+        free(gemm_ws.yt);
+        gemm_ws.yt = (float *)malloc(yt_need * sizeof(float));
+        gemm_ws.yt_cap = yt_need;
+    }
+
+    for (int n = 0; n < N; n++) {
+        float b = bias ? bias[n] : 0.0f;
+        float *yt_row = gemm_ws.yt + (size_t)n * M_pad;
+        for (int m = 0; m < M_pad; m++)
+            yt_row[m] = (m < M) ? b : 0.0f;
+    }
+
+    q8_gemm_task_t task = { gemm_ws.yt, X_q8t, W_q8, M_pad, N, n_blocks };
+    if (tp.n_threads <= 1) {
+        q8_gemm_worker(0, 1, &task);
+    } else {
+        parallel_for(q8_gemm_worker, &task);
+    }
+
+    transpose_back(Y, gemm_ws.yt, M, N, M_pad);
+}
+
+void qwen_linear_q8_qkv_batched(
+    float *q, float *k, float *v,
+    const float *x,
+    const block_q8_0 *Wq_q8, const float *bq,
+    const block_q8_0 *Wk_q8, const float *bk,
+    const block_q8_0 *Wv_q8, const float *bv,
+    int seq_len, int in_dim, int q_dim, int kv_dim
+) {
+    /* seq_len=1: use existing matvec QKV path */
+    if (seq_len <= 1) {
+        if (bq || bk || bv) {
+            /* Encoder path with biases: separate matvec calls */
+            q8_matvec_threaded(q, x, Wq_q8, bq, in_dim, q_dim);
+            q8_matvec_threaded(k, x, Wk_q8, bk, in_dim, kv_dim);
+            q8_matvec_threaded(v, x, Wv_q8, bv, in_dim, kv_dim);
+        } else {
+            qwen_linear_nobias_q8_qkv(q, k, v, x, Wq_q8, Wk_q8, Wv_q8,
+                                        in_dim, q_dim, kv_dim);
+        }
+        return;
+    }
+
+    int M_pad = (seq_len + 3) & ~3;
+    int n_blocks = in_dim / QK8_0;
+
+    /* Quantize input once */
+    gemm_ws_ensure(n_blocks, M_pad, q_dim > kv_dim ? q_dim : kv_dim);
+    quantize_f32_rows_transpose_q8(x, gemm_ws.x_q8t, seq_len, in_dim, M_pad);
+
+    /* Run Q/K/V GEMMs sharing the quantized input */
+    q8_gemm_batched_with_q8t(q, gemm_ws.x_q8t, Wq_q8, bq, seq_len, M_pad, n_blocks, q_dim);
+    q8_gemm_batched_with_q8t(k, gemm_ws.x_q8t, Wk_q8, bk, seq_len, M_pad, n_blocks, kv_dim);
+    q8_gemm_batched_with_q8t(v, gemm_ws.x_q8t, Wv_q8, bv, seq_len, M_pad, n_blocks, kv_dim);
+}
+
+/* Q8_0 argmax: find argmax(W_q8 @ x) using INT8 dot products */
+static void argmax_q8_range(const block_q8_0 *x_q8, const block_q8_0 *W_q8,
+                              int n_blocks, int start, int end,
+                              int *best_out, float *best_val_out) {
+    qwen_argmax_q8_range_impl(x_q8, W_q8, n_blocks, start, end, best_out, best_val_out);
+}
+
+typedef struct {
+    const block_q8_0 *x_q8;
+    const block_q8_0 *W_q8;
+    int n_blocks;
+    int out_dim;
+    int best_idx[QWEN_MAX_THREADS];
+    float best_val[QWEN_MAX_THREADS];
+} argmax_q8_task_t;
+
+static void argmax_q8_worker(int tid, int n_threads, void *arg) {
+    argmax_q8_task_t *t = (argmax_q8_task_t *)arg;
+    int chunk = (t->out_dim + n_threads - 1) / n_threads;
+    int start = tid * chunk;
+    int end = start + chunk;
+    if (end > t->out_dim) end = t->out_dim;
+    if (start >= end) {
+        t->best_val[tid] = -1e30f;
+        t->best_idx[tid] = 0;
+        return;
+    }
+    argmax_q8_range(t->x_q8, t->W_q8, t->n_blocks, start, end,
+                     &t->best_idx[tid], &t->best_val[tid]);
+}
+
+int qwen_argmax_matvec_q8(const float *x, const block_q8_0 *W_q8,
+                            int in_dim, int out_dim) {
+    int n_blocks = in_dim / QK8_0;
+
+    /* Stack-allocate x_q8: max 64 blocks = 2048 elements, ~2.3KB on stack */
+    block_q8_0 x_q8[64];
+    quantize_f32_to_q8_0(x, x_q8, in_dim);
+
+    int best;
+    float best_val;
+
+    if (tp.n_threads <= 1) {
+        argmax_q8_range(x_q8, W_q8, n_blocks, 0, out_dim, &best, &best_val);
+    } else {
+        argmax_q8_task_t task;
+        task.x_q8 = x_q8;
+        task.W_q8 = W_q8;
+        task.n_blocks = n_blocks;
+        task.out_dim = out_dim;
+        parallel_for(argmax_q8_worker, &task);
+
+        best = task.best_idx[0];
+        best_val = task.best_val[0];
+        for (int i = 1; i < tp.n_threads; i++) {
+            if (task.best_val[i] > best_val) {
+                best_val = task.best_val[i];
+                best = task.best_idx[i];
+            }
+        }
+    }
+
+    return best;
+}
+
+/* ========================================================================
  * 2D Convolution (im2col + BLAS sgemm)
  * ======================================================================== */
 

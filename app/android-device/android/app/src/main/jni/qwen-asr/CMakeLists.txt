@@ -7,6 +7,7 @@ set(QWEN_ASR_SOURCES
     qwen_asr_kernels_generic.c
     qwen_asr_kernels_neon.c
     qwen_asr_kernels_avx.c
+    qwen_asr_quant.c
     qwen_asr_audio.c
     qwen_asr_encoder.c
     qwen_asr_decoder.c

@@ -10,6 +10,7 @@
 
 #include <stddef.h>
 #include <stdint.h>
+#include "qwen_asr_quant.h"
 
 /* ========================================================================
  * Basic Operations
@@ -155,6 +156,40 @@ void qwen_apply_rope_neox(float *x, const float *cos_vals, const float *sin_vals
  * Returns the index of the row with highest dot product. */
 int qwen_argmax_matvec_bf16(const float *x, const uint16_t *W_bf16,
                              int in_dim, int out_dim);
+
+/* ========================================================================
+ * Q8_0 Quantized Weight Operations
+ * ======================================================================== */
+
+/* y = x @ W_q8^T + b: x[seq,in], W_q8[out, in/QK8_0 blocks], b[out], y[seq,out] */
+void qwen_linear_q8(float *y, const float *x, const block_q8_0 *W_q8,
+                    const float *b, int seq_len, int in_dim, int out_dim);
+
+void qwen_linear_nobias_q8(float *y, const float *x, const block_q8_0 *W_q8,
+                            int seq_len, int in_dim, int out_dim);
+
+/* seq=1 decoder fast path: compute Q/K/V matvecs with one threaded dispatch */
+void qwen_linear_nobias_q8_qkv(float *q, float *k, float *v, const float *x,
+                                const block_q8_0 *Wq_q8,
+                                const block_q8_0 *Wk_q8,
+                                const block_q8_0 *Wv_q8,
+                                int in_dim, int q_dim, int kv_dim);
+
+/* Fused QKV GEMM: quantize input once, run Q/K/V projections */
+void qwen_linear_q8_qkv_batched(
+    float *q, float *k, float *v,
+    const float *x,
+    const block_q8_0 *Wq_q8, const float *bq,
+    const block_q8_0 *Wk_q8, const float *bk,
+    const block_q8_0 *Wv_q8, const float *bv,
+    int seq_len, int in_dim, int q_dim, int kv_dim);
+
+/* Streaming Q8 argmax: finds argmax(W_q8 @ x) without materializing full logits */
+int qwen_argmax_matvec_q8(const float *x, const block_q8_0 *W_q8,
+                            int in_dim, int out_dim);
+
+/* Free GEMM workspace buffers */
+void qwen_gemm_workspace_free(void);
 
 /* ========================================================================
  * Threading

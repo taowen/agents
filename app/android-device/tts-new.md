@@ -181,9 +181,149 @@ TTFA ≈ prefill + chunk_size × talker_ms/token + codec_decode(chunk_size)
 
 Smaller chunks = lower TTFA but more chunks = more overhead from context re-decode.
 
+## Q4_K_M Quantization Test Results (2026-02-23)
+
+Ported INT8/Q4_K quantization from `jni/qwen-tts-old/` into new `qwen_tts_quant.c`/`.h`.
+
+Strategy:
+- **Talker**: QKV/gate_up → Q4_K, wo/down → INT8 (sensitive layers)
+- **Sub-talker**: all → Q4_K
+- **Cache**: binary `.qcache` file for pre-quantized weights
+
+### Model load
+
+| Load type | Time | Notes |
+|-----------|------|-------|
+| BF16 (no quant) | 467ms | baseline |
+| First load (quantize + save cache) | 2,004ms | one-time cost |
+| Cached load (.qcache) | 758ms | subsequent loads |
+
+### "Hello world" batch — Q4_K_M
+
+| Metric | BF16 baseline | Q4_K_M (1st run) | Q4_K_M (cached) |
+|--------|--------------|------------------|-----------------|
+| Codec tokens | 29 | 34 | 34 |
+| Audio length | 2.32s | 2.72s | 2.72s |
+| Talker ms/token | 281.5 | 61.1 | 46.9 |
+| Talker total | 8,163ms | 2,077ms | 1,594ms |
+| Codec decode | 5,009ms | 6,461ms | 5,993ms |
+| **Total** | **13,695ms** | **8,872ms** | **7,929ms** |
+
+Talker speedup: **281→47 ms/token = 6.0x** (cached, warm process).
+Total speedup: **13,695→7,929 = 1.7x** (codec dominates).
+
+### Longer Chinese batch — Q4_K_M
+
+```
+text: 今天是个好天气，阳光明媚，微风轻拂，正是出门散步的好时候。公园里的花都开了，五颜六色的，真好看。
+```
+
+| Metric | Value |
+|--------|-------|
+| Codec tokens | 184 |
+| Audio length | 14.72s |
+| Talker time | 12,654ms (68.8 ms/token avg) |
+| Token rate trend | 44→69 ms/token (O(n²) attention scaling) |
+| Codec decode | 44,952ms |
+| **Total** | **57,901ms** |
+
+### 音质影响（Quality Impact）
+
+**Q4_K 对音质影响明显。** Token 数量从 BF16 的 29 变为 Q4_K 的 34（"Hello world"），说明量化误差影响了采样分布，导致生成不同的 token 序列。听感上有可察觉的质量退化。
+
+原因分析：
+1. 模型只有 0.6B 参数，hidden=1024，权重冗余度低，Q4_K（4-bit）量化太激进
+2. Sub-talker 生成 31/32 的 codec code groups，全 Q4_K 量化直接影响音频编码质量
+3. Q4_K 是 4-bit 非对称量化（256元素/block），精度远低于 INT8 的 8-bit 对称量化
+
+**结论：需要回退到 INT8-only（全部权重用 INT8 对称量化），牺牲一些速度换回音质。**
+
+预期 INT8-only 性能（基于旧代码经验）：
+- Talker: ~80-90 ms/token（vs Q4_K 47ms, BF16 281ms）
+- 音质: 接近 BF16（INT8 对称量化精度损失很小）
+
+## INT8-Only Rollback (2026-02-23)
+
+Rolled back Q4_K_M to **INT8-only** quantization across all weight matrices. Q4_K (4-bit) was too aggressive for the 0.6B model — audible quality degradation and different token sequences vs BF16.
+
+### What changed
+
+Removed all Q4_K code, switched to INT8 (8-bit symmetric per-row) for every weight matrix:
+
+| Component | Before (Q4_K_M) | After (INT8-only) |
+|-----------|-----------------|-------------------|
+| Talker QKV | Q4_K | INT8 |
+| Talker gate_up | Q4_K | INT8 |
+| Talker wo | INT8 | INT8 (unchanged) |
+| Talker down | INT8 | INT8 (unchanged) |
+| Sub-talker QKV | Q4_K | INT8 |
+| Sub-talker gate_up | Q4_K | INT8 |
+| Sub-talker wo | Q4_K | INT8 |
+| Sub-talker down | Q4_K | INT8 |
+
+Files modified:
+- `qwen_tts_quant.h` — removed `block_q4_k` struct, `QK_K`/`Q4K_NUM_SUBS` macros, Q4_K kernel declarations
+- `qwen_tts_quant.c` — removed `kernel_matvec_q4k()`, `kernel_swiglu_matvec_q4k()`, `quantize_bf16_to_q4k()` (~250 lines); updated cache format to all-INT8, bumped `QCACHE_VERSION` to 2
+- `qwen_tts.h` — added `wqkv_int8/scales`, `gate_up_int8/scales` to talker layer; removed all `block_q4_k *` fields; removed `use_q4k` config flag
+- `qwen_tts.c` — added INT8 quantization for QKV/gate_up in both talker and sub-talker load; removed Q4_K quantization blocks; updated `qwen_tts_free()`
+- `qwen_tts_talker.c` — changed all dispatch paths from `Q4K > INT8 > BF16` to `INT8 > BF16`
+
+Cache note: old `.qcache` files (version 1, Q4_K format) are automatically invalidated by the version bump. First run after this change will re-quantize and save a new version 2 cache.
+
+### Expected performance
+
+| Metric | BF16 | Q4_K_M | INT8-only (expected) |
+|--------|------|--------|---------------------|
+| Talker ms/token | 281 | 47 | ~80-90 |
+| Token count ("Hello world") | 29 | 34 | ~29 |
+| Audio quality | baseline | degraded | near-baseline |
+
+### Verification
+
+```bash
+cd app/android-device/android && ./gradlew assembleDebug
+adb install -r app/build/outputs/apk/debug/app-debug.apk
+adb shell am force-stop ai.connct_screen.rn && adb shell am start -n ai.connct_screen.rn/.MainActivity
+adb shell "run-as ai.connct_screen.rn rm -f cache/model.qcache"
+adb shell "am broadcast -a ai.connct_screen.rn.TTS_DEBUG -p ai.connct_screen.rn \
+  --es cmd speak --es text 'Hello world' --es path /data/local/tmp/qwen-tts-model"
+```
+
+Expected: token count close to BF16 (~29), talker ~80-90 ms/token, audio quality near BF16.
+
 ## Next steps
 
-1. **Port INT8/Q4_K quantization** from `jni/qwen-tts-old/` to recover 3x talker speedup
-2. **Verify audio continuity** by listening — the overlap/trim should produce seamless audio between chunks
-3. **Tune chunk_size**: with quantized talker (~88ms/token), chunk_size=10 would give TTFA ≈ 250 + 880 + ~2000 ≈ **3.1s**
-4. **Test with speaker/language params**: `--es speaker serena --es language chinese`
+### Done
+
+1. ~~Port INT8/Q4_K quantization~~ ✅ Q4_K quality too low for 0.6B model
+2. ~~Roll back to INT8-only~~ ✅ All weights now INT8 symmetric
+
+### Immediate: verify INT8-only rollback
+
+3. **Benchmark INT8-only on device** — verify ms/token, token count, audio quality
+4. **Verify audio continuity** (dual-track chunked streaming) — listen to overlap/trim output
+
+### Main bottleneck: Vocoder (BigVGAN) — 71-81% of total time
+
+Round 5 instrumentation (`tts.md`) showed talker/sub-talker are well optimized (~15-19% of total). The vocoder dominates:
+
+```
+Vocoder: 7,511ms / 10,513ms total = 71.5%  ("Hello world")
+Vocoder: 44,741ms / 55,225ms total = 81.0%  (Chinese 30 chars)
+```
+
+**Root cause**: `kernel_causal_conv1d` and `kernel_transposed_conv1d` are **pure scalar C loops**. `USE_BLAS` is not defined in CMakeLists.txt, so no BLAS and no NEON — the two hottest functions in the entire pipeline have zero SIMD optimization.
+
+Current vocoder throughput: ~6.7 GFLOPS (33% of A77 peak ~20 GFLOPS).
+
+5. **NEON vectorize `kernel_causal_conv1d`** — hot path is `kernel_size=7, groups=1, dilation=1/3/9`. Write NEON float32x4 inner loops for the k=7 dot product. Expected 2-3x speedup on vocoder conv. This is the single highest-impact change.
+6. **NEON vectorize `kernel_transposed_conv1d`** — currently a triple-nested scalar loop. NEON vectorize the output channel accumulation.
+7. **INT8 quantize vocoder conv weights** (~100MB F32) — halve memory bandwidth, same pattern as talker INT8. Conv weights are small (k=7 × in_ch × out_ch) but activations are large; bandwidth savings help on the activation side too.
+8. **Fuse SnakeBeta + Conv1d** — reduce memory round-trips. Currently SnakeBeta writes entire activation to memory, then conv1d reads it back. Fusion eliminates one full read+write pass.
+
+**Expected combined impact**: vocoder from ~7.5s → ~2-3s ("Hello world" batch), total from ~10s → ~5-6s.
+
+### Lower priority
+
+9. **Tune chunk_size** for streaming: with INT8 talker (~85ms/token) + faster vocoder, TTFA improves proportionally
+10. **Test with speaker/language params**: `--es speaker serena --es language chinese`

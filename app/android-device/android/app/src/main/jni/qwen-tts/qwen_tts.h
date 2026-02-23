@@ -15,7 +15,7 @@
 #include <stdint.h>
 #include <stdio.h>
 
-/* Q4_K/INT8 quantization types (block_q4_k etc.) */
+/* INT8 quantization types */
 #include "qwen_tts_quant.h"
 
 /* ========================================================================
@@ -145,8 +145,6 @@ typedef struct {
     int codec_think_bos_id;
     int codec_think_eos_id;
 
-    /* Quantization strategy */
-    int use_q4k;  /* 1=Q4_K_M strategy (default on) */
 } qwen_tts_config_t;
 
 /* ========================================================================
@@ -179,13 +177,11 @@ typedef struct {
     /* Fused QKV (created at load time) */
     uint16_t *wqkv_fused_bf16;   /* [(num_heads+2*kv_heads)*head_dim, hidden] */
 
-    /* INT8 quantized weights (wo, down - sensitive layers) */
-    int8_t *wo_int8;     float *wo_scales;
-    int8_t *down_int8;   float *down_scales;
-
-    /* Q4_K quantized weights (QKV, gate_up) */
-    block_q4_k *wqkv_q4k;
-    block_q4_k *gate_up_q4k;
+    /* INT8 quantized weights */
+    int8_t *wqkv_int8;     float *wqkv_scales;
+    int8_t *gate_up_int8;  float *gate_up_scales;
+    int8_t *wo_int8;       float *wo_scales;
+    int8_t *down_int8;     float *down_scales;
 } qwen_tts_talker_layer_t;
 
 typedef struct {
@@ -230,17 +226,11 @@ typedef struct {
     /* Fused QKV (created at load time) */
     uint16_t *wqkv_fused_bf16;
 
-    /* INT8 quantized weights (fallback) */
+    /* INT8 quantized weights */
     int8_t *wqkv_int8;     float *wqkv_scales;
     int8_t *gate_up_int8;  float *gate_up_scales;
     int8_t *wo_int8;       float *wo_scales;
     int8_t *down_int8;     float *down_scales;
-
-    /* Q4_K quantized weights (sub-talker: all Q4_K) */
-    block_q4_k *wqkv_q4k;
-    block_q4_k *gate_up_q4k;
-    block_q4_k *wo_q4k;
-    block_q4_k *down_q4k;
 } qwen_tts_subtalker_layer_t;
 
 typedef struct {

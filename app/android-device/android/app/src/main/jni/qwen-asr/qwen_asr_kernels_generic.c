@@ -46,6 +46,54 @@ void qwen_argmax_bf16_range_generic(const float *x, const uint16_t *W_bf16,
     *best_val_out = best_val;
 }
 
+void qwen_q8_matvec_fused_generic(float *y, const block_q8_0 *x_q8,
+                                   const block_q8_0 *W_q8, const float *bias,
+                                   int n_blocks, int out_dim) {
+    for (int o = 0; o < out_dim; o++) {
+        const block_q8_0 *w_row = W_q8 + (size_t)o * n_blocks;
+        float sum = bias ? bias[o] : 0.0f;
+        for (int b = 0; b < n_blocks; b++) {
+            float ws = w_row[b].scale;
+            float xs = x_q8[b].scale;
+            int32_t dot = 0;
+            for (int j = 0; j < QK8_0; j++) {
+                dot += (int32_t)w_row[b].qs[j] * (int32_t)x_q8[b].qs[j];
+            }
+            sum += ws * xs * (float)dot;
+        }
+        y[o] = sum;
+    }
+}
+
+void qwen_argmax_q8_range_generic(const block_q8_0 *x_q8,
+                                   const block_q8_0 *W_q8,
+                                   int n_blocks, int start, int end,
+                                   int *best_out, float *best_val_out) {
+    int best = start;
+    float best_val = -1e30f;
+
+    for (int o = start; o < end; o++) {
+        const block_q8_0 *w_row = W_q8 + (size_t)o * n_blocks;
+        float sum = 0.0f;
+        for (int b = 0; b < n_blocks; b++) {
+            float ws = w_row[b].scale;
+            float xs = x_q8[b].scale;
+            int32_t dot = 0;
+            for (int j = 0; j < QK8_0; j++) {
+                dot += (int32_t)w_row[b].qs[j] * (int32_t)x_q8[b].qs[j];
+            }
+            sum += ws * xs * (float)dot;
+        }
+        if (sum > best_val) {
+            best_val = sum;
+            best = o;
+        }
+    }
+
+    *best_out = best;
+    *best_val_out = best_val;
+}
+
 float qwen_dot_f32_generic(const float *a, const float *b, int n) {
     float sum = 0.0f;
     for (int i = 0; i < n; i++) sum += a[i] * b[i];
