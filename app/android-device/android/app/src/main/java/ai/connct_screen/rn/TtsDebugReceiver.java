@@ -49,7 +49,7 @@ public class TtsDebugReceiver extends BroadcastReceiver {
     public void onReceive(Context context, Intent intent) {
         String cmd = intent.getStringExtra("cmd");
         if (cmd == null || cmd.isEmpty()) {
-            Log.e(TAG, "No cmd provided. Use: --es cmd status|download|load|tokenize|speak|free");
+            Log.e(TAG, "No cmd provided. Use: --es cmd status|download|load|tokenize|speak|speak_stream|free");
             return;
         }
 
@@ -73,6 +73,12 @@ public class TtsDebugReceiver extends BroadcastReceiver {
                 doSpeak(context, intent.getStringExtra("text"),
                         intent.getStringExtra("speaker"),
                         intent.getStringExtra("language"), path);
+                break;
+            case "speak_stream":
+                doSpeakStream(context, intent.getStringExtra("text"),
+                        intent.getStringExtra("speaker"),
+                        intent.getStringExtra("language"), path,
+                        intent.getIntExtra("chunk_size", 10));
                 break;
             case "free":
                 doFree();
@@ -250,6 +256,132 @@ public class TtsDebugReceiver extends BroadcastReceiver {
 
             } catch (Exception e) {
                 Log.e(TAG, "speak: failed", e);
+            }
+        }).start();
+    }
+
+    private void doSpeakStream(Context context, String text, String speaker, String language,
+                               String path, int chunkSize) {
+        if (text == null || text.isEmpty()) {
+            Log.e(TAG, "speak_stream requires --es text <text>");
+            return;
+        }
+        String modelDir = resolveModelDir(context, path);
+        if (modelDir == null) return;
+
+        new Thread(() -> {
+            try {
+                // Load model if needed
+                if (!HermesRuntime.nativeTtsIsLoaded()) {
+                    Log.i(TAG, "speak_stream: loading model...");
+                    long loadStart = System.currentTimeMillis();
+                    boolean ok = HermesRuntime.nativeTtsLoadModel(modelDir);
+                    Log.i(TAG, "speak_stream: load_model=" + ok + " in "
+                            + (System.currentTimeMillis() - loadStart) + "ms");
+                    if (!ok) {
+                        Log.e(TAG, "speak_stream: model load failed");
+                        return;
+                    }
+                }
+
+                // Tokenize
+                ensureTokenizer(modelDir);
+                if (sTokenizer == null) {
+                    Log.e(TAG, "speak_stream: tokenizer load failed");
+                    return;
+                }
+                long tokStart = System.currentTimeMillis();
+                String tokenIds = sTokenizer.tokenizeForTts(text);
+                int tokenCount = tokenIds.isEmpty() ? 0 : tokenIds.split(",").length;
+                Log.i(TAG, "speak_stream: tokenized " + tokenCount + " tokens in "
+                        + (System.currentTimeMillis() - tokStart) + "ms");
+
+                // Create AudioTrack in MODE_STREAM
+                int sampleRate = 24000;
+                int bufSize = AudioTrack.getMinBufferSize(sampleRate,
+                        AudioFormat.CHANNEL_OUT_MONO,
+                        AudioFormat.ENCODING_PCM_16BIT);
+                bufSize = Math.max(bufSize, 8192);
+
+                AudioTrack track = new AudioTrack.Builder()
+                        .setAudioAttributes(new AudioAttributes.Builder()
+                                .setUsage(AudioAttributes.USAGE_ASSISTANT)
+                                .setContentType(AudioAttributes.CONTENT_TYPE_SPEECH)
+                                .build())
+                        .setAudioFormat(new AudioFormat.Builder()
+                                .setSampleRate(sampleRate)
+                                .setChannelMask(AudioFormat.CHANNEL_OUT_MONO)
+                                .setEncoding(AudioFormat.ENCODING_PCM_16BIT)
+                                .build())
+                        .setBufferSizeInBytes(bufSize)
+                        .setTransferMode(AudioTrack.MODE_STREAM)
+                        .build();
+
+                track.play();
+
+                final long streamStart = System.currentTimeMillis();
+                final long[] ttfaMs = {0};
+                final int[] chunkCount = {0};
+                final int[] totalSamples = {0};
+
+                Log.i(TAG, "speak_stream: generating (speaker=" + speaker
+                        + ", language=" + language + ", chunk_size=" + chunkSize + ")...");
+
+                HermesRuntime.nativeTtsGenerateStream(tokenIds, speaker, language, chunkSize,
+                        new HermesRuntime.TtsStreamCallback() {
+                    @Override
+                    public void onAudioChunk(short[] samples, int numSamples) {
+                        chunkCount[0]++;
+                        totalSamples[0] += numSamples;
+                        long nowMs = System.currentTimeMillis() - streamStart;
+
+                        if (chunkCount[0] == 1) {
+                            ttfaMs[0] = nowMs;
+                            Log.i(TAG, "speak_stream: TTFA=" + nowMs + "ms (chunk 1: "
+                                    + numSamples + " samples, "
+                                    + String.format("%.2f", numSamples / 24000.0) + "s)");
+                        } else {
+                            Log.i(TAG, "speak_stream: chunk " + chunkCount[0] + ": "
+                                    + totalSamples[0] + " samples ("
+                                    + String.format("%.2f", totalSamples[0] / 24000.0) + "s) at "
+                                    + nowMs + "ms");
+                        }
+
+                        track.write(samples, 0, numSamples);
+                    }
+
+                    @Override
+                    public void onComplete(int total, long elapsedMs) {
+                        long nowMs = System.currentTimeMillis() - streamStart;
+                        Log.i(TAG, "speak_stream: complete " + totalSamples[0] + " samples ("
+                                + String.format("%.2f", totalSamples[0] / 24000.0) + "s) total="
+                                + nowMs + "ms TTFA=" + ttfaMs[0] + "ms");
+                    }
+
+                    @Override
+                    public void onError(String message) {
+                        Log.e(TAG, "speak_stream: error: " + message);
+                    }
+                });
+
+                // Wait for AudioTrack to finish playing remaining buffer
+                if (totalSamples[0] > 0) {
+                    long durationMs = (long)(totalSamples[0] * 1000.0 / sampleRate);
+                    long elapsed = System.currentTimeMillis() - streamStart;
+                    long remaining = durationMs - elapsed;
+                    if (remaining > 0) {
+                        Thread.sleep(remaining + 200);
+                    } else {
+                        Thread.sleep(200);
+                    }
+                }
+
+                track.stop();
+                track.release();
+                Log.i(TAG, "speak_stream: playback complete");
+
+            } catch (Exception e) {
+                Log.e(TAG, "speak_stream: failed", e);
             }
         }).start();
     }

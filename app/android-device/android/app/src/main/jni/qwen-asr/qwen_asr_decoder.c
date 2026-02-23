@@ -149,6 +149,22 @@ int qwen_decoder_load(qwen_decoder_t *dec, multi_safetensors_t *ms,
     dec->norm = load_f32(ms, "thinker.model.norm.weight");
     if (!dec->norm) return -1;
 
+    /* Quantize token embeddings BF16 -> Q8_0 for fast argmax */
+    {
+        int emb_elements = cfg->vocab_size * cfg->dec_hidden;
+        int emb_blocks = emb_elements / QK8_0;
+        dec->tok_embeddings_q8 = (block_q8_0 *)malloc((size_t)emb_blocks * sizeof(block_q8_0));
+        if (!dec->tok_embeddings_q8) {
+            fprintf(stderr, "decoder: failed to allocate Q8_0 token embeddings\n");
+            return -1;
+        }
+        quantize_bf16_to_q8_0(dec->tok_embeddings_bf16, dec->tok_embeddings_q8, emb_elements);
+        if (qwen_verbose >= 1) {
+            fprintf(stderr, "decoder: quantized tok_embeddings to Q8_0 (%d blocks, %.1f MB)\n",
+                    emb_blocks, (double)emb_blocks * sizeof(block_q8_0) / (1024.0 * 1024.0));
+        }
+    }
+
     return 0;
 }
 
@@ -511,5 +527,5 @@ int qwen_decoder_forward(qwen_ctx_t *ctx, const float *input_embed) {
 
     /* Final norm + streaming argmax (no logits buffer needed) */
     qwen_rms_norm(x, x, dec->norm, 1, dim, eps);
-    return qwen_argmax_matvec_bf16(x, dec->tok_embeddings_bf16, dim, cfg->vocab_size);
+    return qwen_argmax_matvec_q8(x, dec->tok_embeddings_q8, dim, cfg->vocab_size);
 }

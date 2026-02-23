@@ -403,10 +403,16 @@ typedef struct {
 } qwen_tts_codec_decoder_t;
 
 /* ========================================================================
- * Token Callback
+ * Callbacks
  * ======================================================================== */
 
 typedef void (*qwen_tts_progress_cb)(int step, int total, void *userdata);
+
+/* Audio chunk callback: called with PCM float32 samples as they become available.
+ * samples: PCM float32 at 24kHz mono
+ * n_samples: number of samples in this chunk
+ * Return 0 to continue, non-zero to abort generation. */
+typedef int (*qwen_tts_audio_cb)(const float *samples, int n_samples, void *userdata);
 
 /* ========================================================================
  * Main Context
@@ -531,6 +537,20 @@ float *qwen_tts_generate(
     const char *speaker,      /* speaker name or NULL for default */
     const char *language,     /* "auto", "chinese", "english", etc. or NULL */
     int *out_samples
+);
+
+/* Generate speech with streaming audio output.
+ * Calls audio_cb with PCM chunks as they become available.
+ * chunk_size: number of codec tokens between decode+callback (0 = batch mode).
+ * Returns 0 on success, -1 on error, 1 if aborted by callback. */
+int qwen_tts_generate_stream(
+    qwen_tts_ctx_t *ctx,
+    const char *text,
+    const char *speaker,
+    const char *language,
+    int chunk_size,
+    qwen_tts_audio_cb audio_cb,
+    void *userdata
 );
 
 /* Write PCM float32 audio to WAV file */

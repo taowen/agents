@@ -4,6 +4,8 @@
  * Exposes native methods called from HermesRuntime.java:
  *   - nativeTtsLoadModel(String modelDir) -> boolean
  *   - nativeTtsGenerate(String tokenIds, String speaker, String language) -> short[]
+ *   - nativeTtsGenerateStream(String tokenIds, String speaker, String language,
+ *                             int chunkSize, TtsStreamCallback callback) -> void
  *   - nativeTtsIsLoaded() -> boolean
  *   - nativeTtsFree() -> void
  */
@@ -15,6 +17,7 @@
 #include <math.h>
 #include <pthread.h>
 #include <unistd.h>
+#include <time.h>
 
 #include "qwen_tts.h"
 
@@ -146,6 +149,123 @@ Java_ai_connct_1screen_rn_HermesRuntime_nativeTtsGenerate(JNIEnv *env, jclass cl
 
     free(pcm_float);
     return result;
+}
+
+/* ========================================================================
+ * Streaming TTS: C audio callback → Java TtsStreamCallback bridge
+ * ======================================================================== */
+
+typedef struct {
+    JavaVM *jvm;
+    jobject callback_ref;   /* global ref to TtsStreamCallback */
+    jmethodID onAudioChunk;
+    jmethodID onComplete;
+    jmethodID onError;
+    int total_samples;
+    long start_ms;
+} stream_cb_data_t;
+
+static long now_ms_jni(void) {
+    struct timespec ts;
+    clock_gettime(CLOCK_MONOTONIC, &ts);
+    return (long)(ts.tv_sec * 1000L + ts.tv_nsec / 1000000L);
+}
+
+/* C audio callback: convert float32→int16 and call Java onAudioChunk */
+static int jni_audio_cb(const float *samples, int n_samples, void *userdata) {
+    stream_cb_data_t *data = (stream_cb_data_t *)userdata;
+    JNIEnv *env = NULL;
+    int attached = 0;
+
+    if ((*data->jvm)->GetEnv(data->jvm, (void **)&env, JNI_VERSION_1_6) != JNI_OK) {
+        if ((*data->jvm)->AttachCurrentThread(data->jvm, &env, NULL) != JNI_OK) {
+            LOGE("Failed to attach thread for audio callback");
+            return -1;
+        }
+        attached = 1;
+    }
+
+    /* Convert float32 → int16 */
+    jshortArray arr = (*env)->NewShortArray(env, n_samples);
+    if (arr) {
+        jshort *shorts = (*env)->GetShortArrayElements(env, arr, NULL);
+        for (int i = 0; i < n_samples; i++) {
+            float s = samples[i];
+            if (s > 1.0f) s = 1.0f;
+            if (s < -1.0f) s = -1.0f;
+            shorts[i] = (jshort)(s * 32767.0f);
+        }
+        (*env)->ReleaseShortArrayElements(env, arr, shorts, 0);
+
+        (*env)->CallVoidMethod(env, data->callback_ref, data->onAudioChunk, arr, n_samples);
+        (*env)->DeleteLocalRef(env, arr);
+    }
+
+    data->total_samples += n_samples;
+
+    if (attached) {
+        (*data->jvm)->DetachCurrentThread(data->jvm);
+    }
+    return 0;
+}
+
+JNIEXPORT void JNICALL
+Java_ai_connct_1screen_rn_HermesRuntime_nativeTtsGenerateStream(
+    JNIEnv *env, jclass cls,
+    jstring jTokenIds, jstring jSpeaker, jstring jLanguage,
+    jint chunkSize, jobject jCallback)
+{
+    if (!g_tts_ctx) {
+        LOGE("TTS model not loaded");
+        /* Call onError */
+        jclass cbClass = (*env)->GetObjectClass(env, jCallback);
+        jmethodID onError = (*env)->GetMethodID(env, cbClass, "onError", "(Ljava/lang/String;)V");
+        if (onError) {
+            jstring msg = (*env)->NewStringUTF(env, "TTS model not loaded");
+            (*env)->CallVoidMethod(env, jCallback, onError, msg);
+        }
+        return;
+    }
+
+    const char *token_ids = (*env)->GetStringUTFChars(env, jTokenIds, NULL);
+    const char *speaker = jSpeaker ? (*env)->GetStringUTFChars(env, jSpeaker, NULL) : NULL;
+    const char *language = jLanguage ? (*env)->GetStringUTFChars(env, jLanguage, NULL) : NULL;
+
+    LOGI("TTS stream generate: tokens=%s speaker=%s language=%s chunk_size=%d",
+         token_ids, speaker ? speaker : "(null)", language ? language : "(null)", chunkSize);
+
+    /* Set up callback bridge */
+    jclass cbClass = (*env)->GetObjectClass(env, jCallback);
+    stream_cb_data_t cb_data;
+    (*env)->GetJavaVM(env, &cb_data.jvm);
+    cb_data.callback_ref = (*env)->NewGlobalRef(env, jCallback);
+    cb_data.onAudioChunk = (*env)->GetMethodID(env, cbClass, "onAudioChunk", "([SI)V");
+    cb_data.onComplete = (*env)->GetMethodID(env, cbClass, "onComplete", "(IJ)V");
+    cb_data.onError = (*env)->GetMethodID(env, cbClass, "onError", "(Ljava/lang/String;)V");
+    cb_data.total_samples = 0;
+    cb_data.start_ms = now_ms_jni();
+
+    int ret = qwen_tts_generate_stream(g_tts_ctx, token_ids, speaker, language,
+                                        (int)chunkSize, jni_audio_cb, &cb_data);
+
+    (*env)->ReleaseStringUTFChars(env, jTokenIds, token_ids);
+    if (speaker) (*env)->ReleaseStringUTFChars(env, jSpeaker, speaker);
+    if (language) (*env)->ReleaseStringUTFChars(env, jLanguage, language);
+
+    long elapsed_ms = now_ms_jni() - cb_data.start_ms;
+
+    if (ret == 0) {
+        LOGI("TTS stream complete: %d samples in %ldms", cb_data.total_samples, elapsed_ms);
+        (*env)->CallVoidMethod(env, cb_data.callback_ref, cb_data.onComplete,
+                               cb_data.total_samples, (jlong)elapsed_ms);
+    } else {
+        const char *err = (ret == 1) ? "Generation aborted by callback" : "Generation failed";
+        LOGE("TTS stream error: %s (ret=%d)", err, ret);
+        jstring msg = (*env)->NewStringUTF(env, err);
+        (*env)->CallVoidMethod(env, cb_data.callback_ref, cb_data.onError, msg);
+    }
+
+    (*env)->DeleteGlobalRef(env, cb_data.callback_ref);
 }
 
 JNIEXPORT jboolean JNICALL

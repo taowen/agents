@@ -210,13 +210,179 @@ All 23 tests pass (correctness, repeat inference, unload/reload, error handling)
 
 ### Potential next optimizations
 
-1. **KV cache FP16** (medium impact). KV cache is still FP32. Halving it would reduce attention memory bandwidth.
+1. ~~**Tiled GEMM with better L2 reuse**~~ Done — see Round 3 below.
+
+2. **KV cache FP16** (medium impact). KV cache is still FP32. Halving it would reduce attention memory bandwidth.
+
+3. **Q4_K_M for decoder** (medium impact). Decoder weights could use 4-bit quantization for ~2x further bandwidth reduction on the 168 GEMM calls per inference.
+
+4. **Attention optimization** (medium impact for encoder). Encoder bidirectional attention is now a larger fraction of the remaining time. Flash-attention style or tiled attention could help.
+
+## NEON activations + Q8_0 LM Head + GEMM N-tiling (2026-02-23)
+
+Round 3 optimization: three independent improvements targeting different bottlenecks.
+
+### Problem
+
+Three bottlenecks identified from Round 2 profiling (4462ms total):
+
+1. **LM Head argmax reads 311MB BF16/token**: `qwen_argmax_matvec_bf16` scans 151936 × 1024 × 2 bytes = 311MB per decode token. ~30 tokens → ~9.3GB DRAM. Q8_0 would reduce to 175MB (44% savings) with `vdotq_s32` for faster compute.
+
+2. **Scalar GELU (encoder) and SiLU (decoder)**: `qwen_gelu` calls `tanhf()` per element (9.2M calls across 18 encoder layers). `swiglu_worker` calls `expf()` per element (13.3M calls across 28 decoder layers). ARM scalar tanhf/expf costs ~20-50 cycles each; NEON polynomial approximation: ~5-8 cycles per 4 elements.
+
+3. **GEMM Yt working set exceeds L1**: `q8_gemm_worker` loop structure K-outer → N-middle → M-inner. For encoder fc1 (N=3584, 4 threads): each thread processes ~896 rows. Yt working set = 896 × 144 × 4 bytes = 516KB, far exceeding L1D (32KB). Every `vld1q_f32`/`vst1q_f32` on Yt hits L2 (~10 cycles) instead of L1 (~4 cycles).
+
+### Solution
+
+**1. NEON GELU and SiLU vectorization** (`qwen_asr_kernels.c`)
+
+- Added `neon_expf()`: 7th-order minimax polynomial for `2^f` on [-0.5, 0.5], combined with integer exponent scaling via `vshlq_n_s32`. Max error ~1e-5 vs standard `expf()`. Uses `vrndnq_f32` for banker's rounding.
+- Added `neon_tanhf()` via `tanh(x) = 1 - 2/(1 + exp(2x))`, reusing `neon_expf`.
+- Vectorized `qwen_gelu()`: processes 4 elements per iteration with `neon_tanhf`, scalar tail for remainder.
+- Vectorized SiLU in `swiglu_worker()` for both non-alias (prefill) and in-place (decode seq=1) paths. Uses `vld2q_f32` to deinterleave gate/up pairs, `neon_expf` for sigmoid, `vdivq_f32` for the division. In-place write is safe because `out[j]` writes position j while reading positions 2j and 2j+1 (2j >= j for j >= 1 when scanning forward).
+
+**2. Q8_0 LM Head argmax** (7 files)
+
+- Added `tok_embeddings_q8` field to `qwen_decoder_t`. Quantized from BF16 at model load time (~175MB Q8_0 vs 311MB BF16).
+- New `qwen_argmax_matvec_q8()`: quantizes input x to Q8_0 once, then computes INT8 dot products against all 151936 vocab rows. Multi-threaded (splits vocab rows across threads).
+- NEON kernel (`qwen_argmax_q8_range_neon`): 2-row processing, block-unrolled by 2, both `__ARM_FEATURE_DOTPROD` and widening-multiply fallback paths (same structure as existing `qwen_q8_matvec_fused_neon`).
+- Embedding lookup (`tok_embed_bf16_to_f32`) unchanged — still uses mmap'd BF16 (reads only 1 row = 1024 values per token, negligible).
+
+**3. GEMM N-tiling** (`qwen_asr_kernels.c`)
+
+- Added N-tile outer loop to `q8_gemm_worker`. Tile size Nc = 32768 / (M_pad × 4). For M_pad=144: Nc=56.
+- New loop order: `for n_tile → for kb → for n in tile → for m`. Yt[Nc, M_pad] = 56 × 144 × 4 = 32KB → fits L1D.
+- x_col per kb (5KB) and W blocks per tile per kb (2KB) also fit L1D. Total ~39KB per tile.
+- Trade-off: x_col is re-read from L2 for each N-tile, but x_col total is small (~140KB) and stays warm in L2.
+- Applied to all three code paths (dotprod, NEON-no-dotprod, scalar).
+
+### Results (jfk.wav, 11s audio, 4 threads, Snapdragon)
+
+| Phase | Round 2 | Round 3 | Speedup |
+|-------|---------|---------|---------|
+| Mel | 19ms | 19ms | - |
+| Encoder | 1750ms | 1385ms | 1.26x |
+| Prefill | 1451ms | 1477ms | ~1.0x |
+| Decode | 1261ms | 1061ms | 1.19x |
+| **Total** | **4462ms** | **3923ms** | **1.14x** |
+
+All 23 tests pass (correctness, streaming, repeat inference, unload/reload, error handling).
+
+Cumulative from baseline: 7131ms → 3923ms = **1.82x**.
+
+### Analysis
+
+- **Encoder improved 1.26x**: Combination of NEON GELU (eliminated 9.2M scalar `tanhf` calls) and N-tiled GEMM (Yt now stays in L1D). The encoder has 18 layers of GELU-activated FFN (3584 dim), so both optimizations contribute meaningfully.
+
+- **Prefill unchanged (~1.0x)**: Surprising — expected improvement from NEON SiLU + N-tiled GEMM. Possible reasons: (1) prefill SiLU time was smaller than estimated (SwiGLU MLP is gate×up after activation, the linear projections dominate); (2) N-tiling helps less when the N dimension is smaller (decoder intermediate=3072 vs encoder ffn=3584), and the decoder has fewer tokens per prefill; (3) measurement variance between runs may mask a small improvement.
+
+- **Decode improved 1.19x**: Q8_0 argmax replacing BF16 argmax. Each token now reads 175MB instead of 311MB for the LM head scan. The 1.19x is below the theoretical 1.78x (bandwidth ratio) likely because: (1) argmax is only part of decode time — the 28 decoder layers' matvec + attention are unchanged; (2) Q8_0 dot product has slightly more overhead per element than BF16 FMA (block scale handling).
+
+### Files modified
+
+| File | Change |
+|------|--------|
+| `qwen_asr_kernels.c` | NEON `neon_expf`/`neon_tanhf` helpers; vectorized `qwen_gelu` and `swiglu_worker`; N-tiled `q8_gemm_worker`; threaded `qwen_argmax_matvec_q8` |
+| `qwen_asr.h` | Added `tok_embeddings_q8` field to `qwen_decoder_t` |
+| `qwen_asr_decoder.c` | Quantize tok_embeddings BF16→Q8_0 at load; replaced `qwen_argmax_matvec_bf16` with `qwen_argmax_matvec_q8` |
+| `qwen_asr_kernels.h` | Declared `qwen_argmax_matvec_q8` |
+| `qwen_asr_kernels_impl.h` | Added `qwen_argmax_q8_range_{neon,generic}` declarations and dispatch macros |
+| `qwen_asr_kernels_neon.c` | `qwen_argmax_q8_range_neon` with dotprod + fallback |
+| `qwen_asr_kernels_generic.c` | `qwen_argmax_q8_range_generic` scalar reference |
+| `qwen_asr.c` | Free `tok_embeddings_q8` in `qwen_free` |
+
+### Potential next optimizations
+
+1. **KV cache FP16** (medium impact). KV cache is still FP32. Halving it would reduce attention memory bandwidth, especially for decode phase (28 layers × growing sequence).
 
 2. **Q4_K_M for decoder** (medium impact). Decoder weights could use 4-bit quantization for ~2x further bandwidth reduction on the 168 GEMM calls per inference.
 
-3. **Tiled GEMM with better L2 reuse** (medium impact). Current INT8 GEMM is K-outer, N-middle, M-inner. A tiled approach (blocking N into cache-friendly chunks) could improve L2 hit rate for larger N dimensions (e.g. gate+up: N=6144).
+3. **Attention optimization** (medium impact for encoder). Encoder bidirectional attention is now the largest remaining bottleneck. Flash-attention style tiled computation could reduce memory traffic.
 
-4. **Attention optimization** (medium impact for encoder). Encoder bidirectional attention is now a larger fraction of the remaining time. Flash-attention style or tiled attention could help.
+4. **Prefill investigation**: Prefill didn't improve despite NEON SiLU + N-tiling. Profiling individual layers would reveal whether the bottleneck is attention (KV cache writes, softmax) rather than MLP.
+
+## NEON Norm/Add + stack argmax (2026-02-23)
+
+Round 4 optimization: added NEON SIMD paths for all normalization and element-wise add operations that were falling back to scalar on ARM, plus eliminated per-token malloc/free in argmax.
+
+### Problem
+
+Code review found three categories of scalar fallback on ARM and one unnecessary allocation:
+
+1. **`qwen_rms_norm` / `qwen_rms_norm_per_head` scalar on ARM**: Had AVX512/AVX2 SIMD paths but the `#else` branch was pure scalar loops. Called ~15,500 times (RMSNorm) and ~248K times (per-head) per inference. Two-pass loops (sum_sq + scale_multiply) over hidden=896/1024 or head_dim=128 elements.
+
+2. **`qwen_layer_norm` scalar on ARM**: Same pattern — AVX512/AVX2 paths existed, `#else` was scalar. Called ~5,148 times (encoder only, 18 layers × 2 norms × 143 tokens). Three-pass loops (mean + variance + normalize) over hidden=896.
+
+3. **`qwen_add_inplace` no SIMD at all**: `for (int i = 0; i < n; i++) a[i] += b[i];` — no architecture-specific optimization. Called for every residual connection: ~15.2M float adds per inference.
+
+4. **`qwen_argmax_matvec_q8` per-token malloc/free**: Allocated ~1152 bytes via `malloc`/`free` on every decode token (~30 calls). Fixed buffer size, safe for stack allocation.
+
+### Solution
+
+**1. NEON `qwen_rms_norm`** — Inserted `#elif defined(__ARM_NEON)` between `__AVX2__` and `#else` for both phases:
+- sum_sq: Two `float32x4_t` accumulators with `vfmaq_f32` (fused multiply-add), `vaddvq_f32` horizontal reduction. 8-wide unroll per iteration.
+- scale_multiply: `vdupq_n_f32(rms_inv)` broadcast, `vmulq_f32(vmulq_f32(x, w), scale)`. 8-wide unroll.
+
+**2. NEON `qwen_rms_norm_per_head`** — Same pattern as above, operating on `vec`/`head_dim` (128 elements, exactly 16 iterations of 8-wide). In-place write back.
+
+**3. NEON `qwen_layer_norm`** — Three NEON phases:
+- mean: `vaddq_f32` accumulation + `vaddvq_f32` reduction, two accumulators.
+- variance: `vsubq_f32(x, mean)` + `vfmaq_f32` squared-diff accumulation, two accumulators.
+- normalize: `vsubq_f32` + `vmulq_f32` × 2 (inv_std, weight) + `vaddq_f32` (bias). 8-wide unroll.
+
+**4. NEON `qwen_add_inplace`** — 8-wide `vaddq_f32` + `vst1q_f32` with scalar tail, wrapped in `#ifdef __ARM_NEON` / `#else`.
+
+**5. Stack-allocated argmax buffer** — Replaced `malloc`/`free` of `x_q8` with `block_q8_0 x_q8[64]` (fixed-size stack array, ~2.3KB, sufficient for hidden=1024 which needs 32 blocks).
+
+### Results (jfk.wav, 11s audio, 4 threads, Snapdragon)
+
+| Phase | Round 3 | Round 4 | Speedup |
+|-------|---------|---------|---------|
+| Mel | 19ms | 19ms | - |
+| Encoder | 1385ms | 1161ms | 1.19x |
+| Prefill | 1477ms | 1275ms | 1.16x |
+| Decode | 1061ms | 1041ms | 1.02x |
+| **Total** | **3923ms** | **3477ms** | **1.13x** |
+
+All 23 tests pass (correctness, streaming, repeat inference, unload/reload, error handling).
+
+Cumulative from baseline: 7131ms → 3477ms = **2.05x**.
+
+### Analysis
+
+- **Encoder improved 1.19x**: NEON LayerNorm (5,148 calls × hidden=896) was the primary contributor. The encoder uses LayerNorm (3-pass: mean + variance + normalize) which had more scalar overhead per call than RMSNorm (2-pass). NEON add_inplace also contributed (~36 residual adds × 143 × 896 elements).
+
+- **Prefill improved 1.16x**: NEON RMSNorm (~8,680 calls × hidden=1024) and NEON RMSNorm_per_head (~208K calls × head_dim=128) both contributed. The per-head normalization has extremely high call count because it runs per-head per-token per-layer (28 layers × 2 × 155 tokens × 24 heads). Even though each call is small (128 elements), the aggregate NEON vs scalar difference adds up.
+
+- **Decode improved marginally (1.02x)**: Expected — decode runs only ~30 tokens, so norm calls (~1,680 RMSNorm + ~40K per-head) are far fewer. The stack allocation for argmax saved trivial overhead. Decode is dominated by matvec DRAM bandwidth, not normalization compute.
+
+- **Actual savings (~446ms) exceeded the conservative estimate (~150-240ms)**: The plan underestimated the per-head norm impact. With ~248K per-head calls, even small per-call savings (scalar ~128 cycles → NEON ~20 cycles) compound significantly at 2GHz: ~248K × 108 cycles saved = ~27M cycles = ~13ms just from per-head norm. The larger-than-expected encoder improvement suggests LayerNorm's 3-pass structure benefited more from NEON than the 2-pass RMSNorm estimate predicted.
+
+### Files modified
+
+| File | Change |
+|------|--------|
+| `qwen_asr_kernels.c` | NEON paths for `qwen_rms_norm`, `qwen_rms_norm_per_head`, `qwen_layer_norm`, `qwen_add_inplace`; stack alloc in `qwen_argmax_matvec_q8` |
+
+### Cumulative optimization history
+
+| Round | Optimization | Total | Speedup vs prev | Cumulative |
+|-------|-------------|-------|-----------------|------------|
+| Baseline | FP32/BF16 | 7131ms | - | 1.00x |
+| Round 1 | Q8_0 weight quantization | 5910ms | 1.21x | 1.21x |
+| Round 2 | INT8 GEMM + workspace pre-alloc | 4462ms | 1.32x | 1.60x |
+| Round 3 | NEON activations + Q8_0 LM Head + N-tiling | 3923ms | 1.14x | 1.82x |
+| Round 4 | NEON Norm/Add + stack argmax | 3477ms | 1.13x | 2.05x |
+
+### Potential next optimizations
+
+1. **KV cache FP16** (medium impact). KV cache is still FP32. Halving it would reduce attention memory bandwidth, especially for decode phase (28 layers × growing sequence).
+
+2. **Q4_K_M for decoder** (medium impact). Decoder weights could use 4-bit quantization for ~2x further bandwidth reduction on the 168 GEMM calls per inference.
+
+3. **Attention optimization** (medium impact for encoder). Encoder bidirectional attention is now the largest remaining bottleneck. Flash-attention style tiled computation could reduce memory traffic.
+
+4. **Prefill attention profiling**: With norm/add/activations all NEON-optimized, the remaining prefill time (~1275ms for 28 layers) is increasingly dominated by GEMM and attention. Per-layer breakdown would clarify the split.
 
 ## End-to-end test suite (2026-02-23)
 

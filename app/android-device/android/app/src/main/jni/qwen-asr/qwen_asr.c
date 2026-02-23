@@ -288,6 +288,7 @@ void qwen_free(qwen_ctx_t *ctx) {
         FREE0(l->gate_up_fused_q8);
     }
     FREE0(ctx->decoder.norm);
+    FREE0(ctx->decoder.tok_embeddings_q8);
 
     #undef FREE0
 

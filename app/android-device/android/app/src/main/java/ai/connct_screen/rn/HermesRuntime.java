@@ -153,8 +153,20 @@ public class HermesRuntime {
     // --- TTS native methods (implemented in qwen_tts_jni.c) ---
     static native boolean nativeTtsLoadModel(String modelDir);
     static native short[] nativeTtsGenerate(String tokenIds, String speaker, String language);
+    static native void nativeTtsGenerateStream(String tokenIds, String speaker, String language,
+                                                int chunkSize, TtsStreamCallback callback);
     static native boolean nativeTtsIsLoaded();
     static native void nativeTtsFree();
+
+    /** Callback interface for streaming TTS audio delivery. */
+    public interface TtsStreamCallback {
+        /** Called with each chunk of PCM int16 samples at 24kHz mono. */
+        void onAudioChunk(short[] samples, int numSamples);
+        /** Called when generation completes successfully. */
+        void onComplete(int totalSamples, long elapsedMs);
+        /** Called on error. */
+        void onError(String message);
+    }
 
     // Lazy-loaded tokenizer instance
     private static BpeTokenizer sBpeTokenizer = null;
@@ -236,25 +248,15 @@ public class HermesRuntime {
             String tokenIds = sBpeTokenizer.tokenizeForTts(text);
             Log.i(TAG, "[speak] Tokenized: " + tokenIds.length() + " chars");
 
-            // 4. Generate PCM audio
+            // 4. Stream generate + play via AudioTrack MODE_STREAM
             nativeUpdateStatus("Generating speech...");
-            short[] pcm = nativeTtsGenerate(tokenIds, speaker, language);
-            if (pcm == null || pcm.length == 0) {
-                Log.e(TAG, "[speak] TTS generate returned no audio");
-                return "false";
-            }
-            Log.i(TAG, "[speak] Generated " + pcm.length + " samples (" +
-                    String.format("%.2f", pcm.length / 24000.0) + "s)");
-
-            // 5. Play audio via AudioTrack (24kHz mono 16-bit)
-            nativeUpdateStatus("Speaking...");
-            int sampleRate = 24000;
+            final int sampleRate = 24000;
             int bufSize = AudioTrack.getMinBufferSize(sampleRate,
                     AudioFormat.CHANNEL_OUT_MONO,
                     AudioFormat.ENCODING_PCM_16BIT);
-            bufSize = Math.max(bufSize, pcm.length * 2);
+            bufSize = Math.max(bufSize, 8192);
 
-            AudioTrack track = new AudioTrack.Builder()
+            final AudioTrack track = new AudioTrack.Builder()
                     .setAudioAttributes(new AudioAttributes.Builder()
                             .setUsage(AudioAttributes.USAGE_ASSISTANT)
                             .setContentType(AudioAttributes.CONTENT_TYPE_SPEECH)
@@ -265,20 +267,49 @@ public class HermesRuntime {
                             .setEncoding(AudioFormat.ENCODING_PCM_16BIT)
                             .build())
                     .setBufferSizeInBytes(bufSize)
-                    .setTransferMode(AudioTrack.MODE_STATIC)
+                    .setTransferMode(AudioTrack.MODE_STREAM)
                     .build();
 
-            track.write(pcm, 0, pcm.length);
             track.play();
+            nativeUpdateStatus("Speaking...");
 
-            // Block until playback completes
-            long durationMs = (long)(pcm.length * 1000.0 / sampleRate);
-            Thread.sleep(durationMs + 200); // Add small buffer
+            final int[] totalSamples = {0};
+            final CountDownLatch doneLatch = new CountDownLatch(1);
+            final AtomicBoolean genSuccess = new AtomicBoolean(false);
+
+            nativeTtsGenerateStream(tokenIds, speaker, language, 10, new TtsStreamCallback() {
+                @Override
+                public void onAudioChunk(short[] samples, int numSamples) {
+                    track.write(samples, 0, numSamples);
+                    totalSamples[0] += numSamples;
+                }
+
+                @Override
+                public void onComplete(int total, long elapsedMs) {
+                    Log.i(TAG, "[speak] Stream complete: " + total + " samples in " + elapsedMs + "ms");
+                    genSuccess.set(true);
+                    doneLatch.countDown();
+                }
+
+                @Override
+                public void onError(String message) {
+                    Log.e(TAG, "[speak] Stream error: " + message);
+                    doneLatch.countDown();
+                }
+            });
+
+            doneLatch.await();
+
+            // Wait for AudioTrack to finish playing remaining buffer
+            if (totalSamples[0] > 0) {
+                long durationMs = (long)(totalSamples[0] * 1000.0 / sampleRate);
+                Thread.sleep(Math.min(durationMs, 500) + 200);
+            }
 
             track.stop();
             track.release();
 
-            return "true";
+            return genSuccess.get() ? "true" : "false";
         } catch (Exception e) {
             Log.e(TAG, "[speak] failed", e);
             return "false";

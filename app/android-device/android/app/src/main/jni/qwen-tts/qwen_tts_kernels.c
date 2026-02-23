@@ -21,6 +21,30 @@
 #endif
 
 /* ======================================================================== */
+/* SAXPY broadcast helper: dst[i] += alpha * src[i]                          */
+/* ======================================================================== */
+
+static inline void saxpy_broadcast(
+    float * __restrict__ dst, float alpha,
+    const float * __restrict__ src, int n) {
+#if defined(__ARM_NEON) || defined(__aarch64__)
+    float32x4_t va = vdupq_n_f32(alpha);
+    int i = 0;
+    for (; i + 15 < n; i += 16) {
+        vst1q_f32(dst+i,    vfmaq_f32(vld1q_f32(dst+i),    va, vld1q_f32(src+i)));
+        vst1q_f32(dst+i+4,  vfmaq_f32(vld1q_f32(dst+i+4),  va, vld1q_f32(src+i+4)));
+        vst1q_f32(dst+i+8,  vfmaq_f32(vld1q_f32(dst+i+8),  va, vld1q_f32(src+i+8)));
+        vst1q_f32(dst+i+12, vfmaq_f32(vld1q_f32(dst+i+12), va, vld1q_f32(src+i+12)));
+    }
+    for (; i + 3 < n; i += 4)
+        vst1q_f32(dst+i, vfmaq_f32(vld1q_f32(dst+i), va, vld1q_f32(src+i)));
+    for (; i < n; i++) dst[i] += alpha * src[i];
+#else
+    for (int i = 0; i < n; i++) dst[i] += alpha * src[i];
+#endif
+}
+
+/* ======================================================================== */
 /* RMSNorm                                                                   */
 /* ======================================================================== */
 
@@ -1523,15 +1547,17 @@ void kernel_causal_conv1d(float *out, const float *input, const float *weight,
 #pragma omp parallel for schedule(static)
 #endif
         for (int oc = 0; oc < out_channels; oc++) {
+            float *out_ch = out + (size_t)oc * length;
+            float b = bias ? bias[oc] : 0.0f;
+            for (int t = 0; t < length; t++) out_ch[t] = b;
+
             int g = oc / out_per_group;
+            int ic_base = g * ch_per_group;
             const float *w_row = weight + (size_t)oc * ch_per_group;
-            for (int t = 0; t < length; t++) {
-                float sum = bias ? bias[oc] : 0.0f;
-                int ic_base = g * ch_per_group;
-                for (int ic = 0; ic < ch_per_group; ic++) {
-                    sum += w_row[ic] * input[(ic_base + ic) * length + t];
-                }
-                out[oc * length + t] = sum;
+            for (int ic = 0; ic < ch_per_group; ic++) {
+                float w = w_row[ic];
+                const float *in_ch = input + (size_t)(ic_base + ic) * length;
+                saxpy_broadcast(out_ch, w, in_ch, length);
             }
         }
         return;
@@ -1566,9 +1592,7 @@ void kernel_causal_conv1d(float *out, const float *input, const float *weight,
 #ifdef USE_BLAS
                     cblas_saxpy(n, wk, src, 1, dst, 1);
 #else
-                    for (int i = 0; i < n; i++) {
-                        dst[i] += wk * src[i];
-                    }
+                    saxpy_broadcast(dst, wk, src, n);
 #endif
                 }
             }
@@ -1608,11 +1632,7 @@ void kernel_causal_conv1d(float *out, const float *input, const float *weight,
 #ifdef USE_BLAS
                 cblas_saxpy(n, wk, in_ch + in_start, 1, out_ch + out_start, 1);
 #else
-                const float *src = in_ch + in_start;
-                float *dst = out_ch + out_start;
-                for (int i = 0; i < n; i++) {
-                    dst[i] += wk * src[i];
-                }
+                saxpy_broadcast(out_ch + out_start, wk, in_ch + in_start, n);
 #endif
             }
         }
@@ -1694,7 +1714,72 @@ void kernel_transposed_conv1d(float *out, const float *input, const float *weigh
     }
 #endif
 
-    /* Scalar fallback */
+    /* GEMM-per-tap fallback (mirrors BLAS path algorithm, using saxpy_broadcast) */
+    {
+        size_t wk_size = (size_t)out_channels * in_channels;
+        size_t temp_size = (size_t)out_channels * length;
+        float *wk_packed = (float *)malloc(wk_size * sizeof(float));
+        float *temp = (float *)malloc(temp_size * sizeof(float));
+        if (wk_packed && temp) {
+#ifdef USE_OPENMP
+#pragma omp parallel for schedule(static)
+#endif
+            for (int oc = 0; oc < out_channels; oc++) {
+                float *out_ch = out + (size_t)oc * final_len;
+                float b = bias ? bias[oc] : 0.0f;
+                for (int t = 0; t < final_len; t++) out_ch[t] = b;
+            }
+
+            for (int k = 0; k < kernel_size; k++) {
+                /* Pack weights for this tap: wk_packed[oc, ic] */
+                for (int oc = 0; oc < out_channels; oc++) {
+                    for (int ic = 0; ic < in_channels; ic++) {
+                        wk_packed[(size_t)oc * in_channels + ic] =
+                            weight[(size_t)ic * out_channels * kernel_size + (size_t)oc * kernel_size + k];
+                    }
+                }
+
+                /* Compute valid output range for this tap */
+                int n = (final_len - 1 - k) / stride + 1;
+                if (n <= 0) continue;
+                if (n > length) n = length;
+
+                /* Manual GEMM via saxpy: temp[oc, t] = sum_ic wk[oc,ic] * input[ic,t] */
+#ifdef USE_OPENMP
+#pragma omp parallel for schedule(static)
+#endif
+                for (int oc = 0; oc < out_channels; oc++) {
+                    float *tp = temp + (size_t)oc * length;
+                    memset(tp, 0, (size_t)n * sizeof(float));
+                    const float *wk_row = wk_packed + (size_t)oc * in_channels;
+                    for (int ic = 0; ic < in_channels; ic++) {
+                        const float *in_ch = input + (size_t)ic * length;
+                        saxpy_broadcast(tp, wk_row[ic], in_ch, n);
+                    }
+                }
+
+                /* Scatter to strided output */
+#ifdef USE_OPENMP
+#pragma omp parallel for schedule(static)
+#endif
+                for (int oc = 0; oc < out_channels; oc++) {
+                    const float *tp = temp + (size_t)oc * length;
+                    float *op = out + (size_t)oc * final_len + k;
+                    for (int t = 0; t < n; t++) {
+                        op[t * stride] += tp[t];
+                    }
+                }
+            }
+            free(wk_packed);
+            free(temp);
+            if (out_length) *out_length = final_len;
+            return;
+        }
+        free(wk_packed);
+        free(temp);
+    }
+
+    /* Ultimate scalar fallback (malloc failed) */
 #ifdef USE_OPENMP
 #pragma omp parallel for schedule(static)
 #endif

@@ -2196,3 +2196,308 @@ float *qwen_tts_generate(
 
     return audio;
 }
+
+/* ========================================================================
+ * Streaming Generate
+ *
+ * Same logic as qwen_tts_generate() but periodically decodes accumulated
+ * codec tokens and delivers new PCM samples via callback.
+ * Uses re-decode + diff strategy: codec decode is causal, so
+ * decode(N tokens)[0:N] == decode(N+M tokens)[0:N].
+ * ======================================================================== */
+
+int qwen_tts_generate_stream(
+    qwen_tts_ctx_t *ctx,
+    const char *text,
+    const char *speaker,
+    const char *language,
+    int chunk_size,
+    qwen_tts_audio_cb audio_cb,
+    void *userdata
+) {
+    if (!ctx || !audio_cb) return -1;
+
+    /* Parse text as comma-separated token IDs (same as qwen_tts_generate) */
+    int *text_tokens = NULL;
+    int n_text_tokens = 0;
+
+    if (text) {
+        const char *p = text;
+        int count = 1;
+        while (*p) { if (*p == ',') count++; p++; }
+        text_tokens = (int *)malloc(count * sizeof(int));
+        p = text;
+        while (*p && n_text_tokens < count) {
+            while (*p == ' ' || *p == ',') p++;
+            if (*p == '\0') break;
+            char *endp = NULL;
+            long v = strtol(p, &endp, 10);
+            if (endp == p) {
+                fprintf(stderr, "Error: invalid token ID near '%s'\n", p);
+                free(text_tokens);
+                return -1;
+            }
+            text_tokens[n_text_tokens++] = (int)v;
+            p = endp;
+        }
+    }
+
+    if (n_text_tokens < 8) {
+        fprintf(stderr, "Error: need at least 8 text tokens (chat template format)\n");
+        free(text_tokens);
+        return -1;
+    }
+
+    qwen_tts_config_t *cfg = &ctx->config;
+    int hidden = cfg->talker_hidden;
+    int num_groups = cfg->num_code_groups;
+
+    double t_start = time_ms();
+
+    /* ---- Look up speaker and language IDs ---- */
+    int speaker_codec_id = -1;
+    if (speaker && strlen(speaker) > 0) {
+        for (int i = 0; i < cfg->n_speakers; i++) {
+            if (strcasecmp(cfg->speaker_names[i], speaker) == 0) {
+                speaker_codec_id = cfg->speaker_ids[i];
+                break;
+            }
+        }
+        if (speaker_codec_id < 0)
+            fprintf(stderr, "Warning: speaker '%s' not found, using no speaker embedding\n", speaker);
+    }
+
+    int language_codec_id = -1;
+    if (language && strlen(language) > 0 && strcasecmp(language, "auto") != 0) {
+        for (int i = 0; i < cfg->n_languages; i++) {
+            if (strcasecmp(cfg->language_names[i], language) == 0) {
+                language_codec_id = cfg->language_ids[i];
+                break;
+            }
+        }
+        if (language_codec_id < 0)
+            fprintf(stderr, "Warning: language '%s' not found\n", language);
+    }
+
+    /* ---- Build prefix embedding sequence (same as qwen_tts_generate) ---- */
+    int n_content = n_text_tokens - 8;
+    if (n_content < 0) n_content = 0;
+
+    int codec_prefix[8];
+    int n_codec_prefix = 0;
+    if (language_codec_id < 0) {
+        codec_prefix[n_codec_prefix++] = cfg->codec_nothink_id;
+        codec_prefix[n_codec_prefix++] = cfg->codec_think_bos_id;
+        codec_prefix[n_codec_prefix++] = cfg->codec_think_eos_id;
+    } else {
+        codec_prefix[n_codec_prefix++] = cfg->codec_think_id;
+        codec_prefix[n_codec_prefix++] = cfg->codec_think_bos_id;
+        codec_prefix[n_codec_prefix++] = language_codec_id;
+        codec_prefix[n_codec_prefix++] = cfg->codec_think_eos_id;
+    }
+    if (speaker_codec_id >= 0)
+        codec_prefix[n_codec_prefix++] = speaker_codec_id;
+    codec_prefix[n_codec_prefix++] = cfg->codec_pad_id;
+    codec_prefix[n_codec_prefix++] = cfg->codec_bos_id;
+
+    int prefill_len = 3 + n_codec_prefix;
+    float *input_embeds = (float *)calloc((size_t)prefill_len * hidden, sizeof(float));
+
+    for (int i = 0; i < 3; i++)
+        embed_text_token(ctx, text_tokens[i], input_embeds + i * hidden);
+
+    float *tts_pad_proj = (float *)malloc(hidden * sizeof(float));
+    float *tts_bos_proj = (float *)malloc(hidden * sizeof(float));
+    float *tts_eos_proj = (float *)malloc(hidden * sizeof(float));
+    float *codec_emb_tmp = (float *)malloc(hidden * sizeof(float));
+    embed_text_token(ctx, QWEN_TTS_TOKEN_TTS_PAD, tts_pad_proj);
+    embed_text_token(ctx, QWEN_TTS_TOKEN_TTS_BOS, tts_bos_proj);
+    embed_text_token(ctx, QWEN_TTS_TOKEN_TTS_EOS, tts_eos_proj);
+
+    for (int i = 0; i < n_codec_prefix - 1; i++) {
+        float *dst = input_embeds + (3 + i) * hidden;
+        if (i < n_codec_prefix - 2)
+            memcpy(dst, tts_pad_proj, hidden * sizeof(float));
+        else
+            memcpy(dst, tts_bos_proj, hidden * sizeof(float));
+        embed_codec_token(ctx, codec_prefix[i], codec_emb_tmp);
+        kernel_add_inplace(dst, codec_emb_tmp, hidden);
+    }
+
+    {
+        int pos = 3 + n_codec_prefix - 1;
+        float *dst = input_embeds + pos * hidden;
+        embed_text_token(ctx, text_tokens[3], dst);
+        embed_codec_token(ctx, cfg->codec_bos_id, codec_emb_tmp);
+        kernel_add_inplace(dst, codec_emb_tmp, hidden);
+    }
+    free(codec_emb_tmp);
+
+    int n_trailing = (n_text_tokens - 4 - 5) + 1;
+    if (n_trailing < 1) n_trailing = 1;
+    float *trailing_text = (float *)calloc((size_t)n_trailing * hidden, sizeof(float));
+    for (int i = 0; i < n_trailing - 1; i++)
+        embed_text_token(ctx, text_tokens[4 + i], trailing_text + i * hidden);
+    memcpy(trailing_text + (n_trailing - 1) * hidden, tts_eos_proj, hidden * sizeof(float));
+
+    /* ---- Prefill ---- */
+    ctx->talker_kv_len = 0;
+    qwen_tts_talker_prefill(ctx, input_embeds, prefill_len);
+    free(input_embeds);
+
+    /* ---- Autoregressive generation with streaming decode ---- */
+    int fixed_tokens = ctx->fixed_codec_tokens > 0 ? ctx->fixed_codec_tokens : 0;
+    int max_tokens = fixed_tokens > 0 ? fixed_tokens : ctx->max_new_tokens;
+    int *all_codes = (int *)calloc((size_t)max_tokens * num_groups, sizeof(int));
+    int *generated_tokens = (int *)calloc(max_tokens, sizeof(int));
+    int n_generated = 0;
+    int aborted = 0;
+
+    float *logits = (float *)malloc(cfg->talker_vocab_size * sizeof(float));
+    float *next_embed = (float *)malloc(hidden * sizeof(float));
+    float *emb_tmp = (float *)malloc(hidden * sizeof(float));
+    float rng_state = (float)ctx->sample_seed;
+
+    int suppress_start = cfg->talker_vocab_size - 1024;
+    int *suppress_tokens = (int *)malloc(1024 * sizeof(int));
+    int n_suppress = 0;
+    for (int i = suppress_start; i < cfg->talker_vocab_size; i++) {
+        if (i != cfg->codec_eos_id) suppress_tokens[n_suppress++] = i;
+    }
+
+    /* Ensure codec is loaded before starting (needed for streaming decode) */
+    if (ensure_codec_loaded(ctx) != 0) {
+        fprintf(stderr, "Error: codec decoder weights are unavailable\n");
+        free(all_codes); free(generated_tokens); free(logits); free(next_embed);
+        free(emb_tmp); free(suppress_tokens); free(trailing_text);
+        free(tts_pad_proj); free(tts_bos_proj); free(tts_eos_proj); free(text_tokens);
+        return -1;
+    }
+
+    int prev_audio_len = 0;    /* samples already sent via callback */
+    int prev_decoded_tokens = 0;  /* tokens already decoded */
+    double t_gen = time_ms();
+    ctx->perf_subtalker_ms = 0.0;
+
+    /* If chunk_size <= 0, decode only at the end (batch mode) */
+    int effective_chunk = (chunk_size > 0) ? chunk_size : 0;
+
+    for (int step = 0; step < max_tokens; step++) {
+        if (step == 0) {
+            kernel_matvec_bf16(logits, ctx->talker.codec_head_bf16, ctx->tk_x,
+                               cfg->talker_vocab_size, hidden);
+        } else {
+            qwen_tts_talker_forward(ctx, next_embed, logits);
+        }
+
+        for (int i = 0; i < n_suppress; i++)
+            logits[suppress_tokens[i]] = -1e9f;
+
+        kernel_apply_repetition_penalty(logits, generated_tokens, n_generated,
+                                        cfg->talker_vocab_size, ctx->repetition_penalty);
+
+        int token = kernel_sample_top_k(logits, cfg->talker_vocab_size, ctx->top_k,
+                                         ctx->top_p, ctx->temperature, &rng_state);
+
+        if (fixed_tokens > 0 && token == cfg->codec_eos_id && n_generated < fixed_tokens) {
+            float eos_logit = logits[cfg->codec_eos_id];
+            logits[cfg->codec_eos_id] = -1e9f;
+            token = kernel_sample_top_k(logits, cfg->talker_vocab_size, ctx->top_k,
+                                        ctx->top_p, ctx->temperature, &rng_state);
+            logits[cfg->codec_eos_id] = eos_logit;
+        }
+
+        int is_eos = (fixed_tokens == 0 && token == cfg->codec_eos_id);
+        if (is_eos) {
+            if (qwen_tts_verbose >= 1)
+                fprintf(stderr, "EOS at step %d\n", step);
+        }
+
+        if (!is_eos) {
+            generated_tokens[n_generated] = token;
+
+            int codes[QWEN_TTS_NUM_CODE_GROUPS];
+            double t_st = time_ms();
+            qwen_tts_subtalker_generate(ctx, ctx->tk_x, token, codes);
+            ctx->perf_subtalker_ms += time_ms() - t_st;
+
+            memcpy(all_codes + n_generated * num_groups, codes, num_groups * sizeof(int));
+            n_generated++;
+        }
+
+        /* Stream decode: on chunk boundary or EOS with remaining tokens */
+        int should_decode = 0;
+        if (effective_chunk > 0 && n_generated > 0) {
+            if (n_generated % effective_chunk == 0) should_decode = 1;
+            if (is_eos && n_generated > prev_decoded_tokens) should_decode = 1;
+        } else if (effective_chunk == 0 && is_eos && n_generated > 0) {
+            should_decode = 1;  /* batch mode: decode all at EOS */
+        }
+
+        if (should_decode) {
+            int n_audio = 0;
+            float *audio = qwen_tts_codec_decode(ctx, all_codes, n_generated, &n_audio);
+            prev_decoded_tokens = n_generated;
+            if (audio && n_audio > prev_audio_len) {
+                int new_samples = n_audio - prev_audio_len;
+                if (qwen_tts_verbose >= 1)
+                    fprintf(stderr, "Stream chunk: %d new samples (%d total, %.2fs) at step %d\n",
+                            new_samples, n_audio, (float)n_audio / QWEN_TTS_SAMPLE_RATE, step);
+                int ret = audio_cb(audio + prev_audio_len, new_samples, userdata);
+                prev_audio_len = n_audio;
+                if (ret != 0) {
+                    aborted = 1;
+                    free(audio);
+                    break;
+                }
+            }
+            free(audio);
+        }
+
+        if (is_eos) break;
+
+        /* Build next input embedding */
+        if (!is_eos) {
+            memset(next_embed, 0, hidden * sizeof(float));
+            embed_codec_token(ctx, token, emb_tmp);
+            kernel_add_inplace(next_embed, emb_tmp, hidden);
+            for (int g = 1; g < num_groups; g++) {
+                int emb_dim = hidden;
+                int code_g = all_codes[(n_generated - 1) * num_groups + g];
+                kernel_bf16_to_f32(emb_tmp, ctx->subtalker.codec_embeddings_bf16[g - 1] +
+                                   (size_t)code_g * emb_dim, emb_dim);
+                kernel_add_inplace(next_embed, emb_tmp, hidden);
+            }
+            if (step < n_trailing)
+                kernel_add_inplace(next_embed, trailing_text + step * hidden, hidden);
+            else
+                kernel_add_inplace(next_embed, tts_pad_proj, hidden);
+        }
+
+        if (ctx->progress_cb)
+            ctx->progress_cb(step + 1, max_tokens, ctx->progress_cb_userdata);
+        if (qwen_tts_verbose >= 1 && (n_generated % 10 == 0)) {
+            double elapsed = time_ms() - t_gen;
+            fprintf(stderr, "\r  Token %d (%.1f ms/token)...", n_generated, elapsed / n_generated);
+        }
+    }
+
+    double t_gen_done = time_ms();
+    ctx->perf_talker_ms = t_gen_done - t_gen;
+    ctx->perf_codec_tokens = n_generated;
+    ctx->perf_total_ms = t_gen_done - t_start;
+
+    if (qwen_tts_verbose >= 1) {
+        fprintf(stderr, "\r                                        \r");
+        fprintf(stderr, "Stream generate: %d codec tokens, %d audio samples sent, total %.1f ms\n",
+                n_generated, prev_audio_len, ctx->perf_total_ms);
+    }
+
+    free(all_codes); free(generated_tokens); free(logits); free(next_embed);
+    free(emb_tmp); free(suppress_tokens); free(trailing_text);
+    free(tts_pad_proj); free(tts_bos_proj); free(tts_eos_proj); free(text_tokens);
+
+    if (aborted) return 1;
+    if (n_generated == 0) return -1;
+    return 0;
+}

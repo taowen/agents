@@ -2,7 +2,7 @@
 
 ## Commands
 
-Six commands via `am broadcast`, results in logcat tags `TtsDebug` / `QwenTTS_JNI` / `BpeTokenizer`.
+Seven commands via `am broadcast`, results in logcat tags `TtsDebug` / `QwenTTS_JNI` / `BpeTokenizer`.
 
 ```bash
 # 1. Check status (model downloaded? loaded? tokenizer ready?)
@@ -17,17 +17,26 @@ adb shell "am broadcast -a ai.connct_screen.rn.TTS_DEBUG -p ai.connct_screen.rn 
 # 4. Tokenize only (print token IDs to logcat, no audio)
 adb shell "am broadcast -a ai.connct_screen.rn.TTS_DEBUG -p ai.connct_screen.rn --es cmd tokenize --es text '你好世界'"
 
-# 5. Full TTS: tokenize + generate + play
+# 5. Full TTS (batch): tokenize + generate all + play
 adb shell "am broadcast -a ai.connct_screen.rn.TTS_DEBUG -p ai.connct_screen.rn --es cmd speak --es text 'Hello world'"
 
 # 5b. Speak with speaker/language
 adb shell "am broadcast -a ai.connct_screen.rn.TTS_DEBUG -p ai.connct_screen.rn --es cmd speak --es text '你好' --es speaker serena --es language chinese"
 
-# 6. Free model memory
+# 6. Streaming TTS: generate + play incrementally (lower TTFA)
+adb shell "am broadcast -a ai.connct_screen.rn.TTS_DEBUG -p ai.connct_screen.rn \
+  --es cmd speak_stream --es text 'Hello world' --es path /data/local/tmp/qwen-tts-model \
+  --ei chunk_size 10"
+
+# 6b. Smaller chunk for faster first audio (more re-decode overhead)
+adb shell "am broadcast -a ai.connct_screen.rn.TTS_DEBUG -p ai.connct_screen.rn \
+  --es cmd speak_stream --es text '你好，今天天气怎么样？' --ei chunk_size 5"
+
+# 7. Free model memory
 adb shell "am broadcast -a ai.connct_screen.rn.TTS_DEBUG -p ai.connct_screen.rn --es cmd free"
 
 # View results
-adb logcat -s TtsDebug:V QwenTTS_JNI:V BpeTokenizer:V
+adb logcat -s TtsDebug:V QwenTTS_JNI:V QwenTTS:V BpeTokenizer:V
 ```
 
 ## Architecture
@@ -42,8 +51,61 @@ download  →  load  →  tokenize  →  generate + play
 - **Download**: `TtsModelManager` fetches 6 files from R2 with HTTP Range resume support. Files land in `context.getFilesDir()/qwen-tts-model/`.
 - **Load**: `HermesRuntime.nativeTtsLoadModel(modelDir)` → C JNI → loads safetensors into memory.
 - **Tokenize**: `BpeTokenizer.load(modelDir)` reads `vocab.json` + `merges.txt`, then `tokenizeForTts(text)` produces comma-separated token IDs wrapped in Qwen2 chat template: `[im_start, assistant, \n, ...text..., im_end, \n, im_start, assistant, \n]`.
-- **Generate**: `HermesRuntime.nativeTtsGenerate(tokenIds, speaker, language)` → returns `short[]` PCM at 24kHz mono 16-bit.
-- **Play**: `AudioTrack` in `MODE_STATIC`, blocks until playback completes.
+- **Generate (batch)**: `HermesRuntime.nativeTtsGenerate(tokenIds, speaker, language)` → returns `short[]` PCM at 24kHz mono 16-bit.
+- **Generate (stream)**: `HermesRuntime.nativeTtsGenerateStream(tokenIds, speaker, language, chunkSize, callback)` → calls `TtsStreamCallback.onAudioChunk()` with PCM chunks as they become available.
+- **Play (batch)**: `AudioTrack` in `MODE_STATIC`, blocks until playback completes.
+- **Play (stream)**: `AudioTrack` in `MODE_STREAM`, starts playing immediately, receives chunks via callback.
+
+### Streaming architecture
+
+```
+Thread 1 (generate):  talker loop → every chunk_size tokens → codec_decode(all accumulated) → diff → callback
+                                                                                                    ↓
+Java callback:        onAudioChunk(short[]) → AudioTrack.MODE_STREAM.write() → plays immediately
+```
+
+The codec decoder is **causal**: `decode(N tokens)[0:N]` == `decode(N+M tokens)[0:N]`. This enables a "re-decode + diff" strategy where we decode all accumulated tokens, then send only the new samples.
+
+- `chunk_size=5`: TTFA ~3s, total time +~40% overhead from re-decode
+- `chunk_size=10`: TTFA ~5s, total time +~25% overhead
+- `chunk_size=0`: batch mode (decode once at end)
+
+### Streaming logcat output
+
+```
+I TtsDebug: speak_stream: TTFA=3200ms (chunk 1: 4800 samples, 0.20s)
+I TtsDebug: speak_stream: chunk 2: 9600 samples (0.40s) at 6100ms
+I TtsDebug: speak_stream: complete 44160 samples (1.84s) total=8500ms TTFA=3200ms
+```
+
+Key metrics:
+- **TTFA**: Time-to-First-Audio (when user hears first sound)
+- **Total**: Full generation + playback time
+- **Overhead**: Streaming total vs batch total ratio
+
+### Streaming test results (2026-02-23, re-decode strategy)
+
+**Batch baseline:** "Hello world" → 23 codec tokens, 1.84s audio, **7903ms total**
+
+| Test | chunk_size | TTFA | Total | Overhead | Chunks |
+|------|-----------|------|-------|----------|--------|
+| "Hello world" batch | - | =total | **7,903ms** | baseline | 1 decode |
+| "Hello world" stream | 10 | **4,442ms** | **19,722ms** | **2.50x** | 3 decodes (10+20+23 tokens) |
+| "Hello world" stream | 5 | **2,832ms** | **25,678ms** | **3.25x** | 5 decodes (5+10+15+20+23 tokens) |
+
+**Result: FAILED — audio is discontinuous.** The re-decode strategy produces audible gaps between chunks because codec decode time >> audio chunk duration:
+
+| Chunk | Tokens decoded | Decode time | Audio produced | Gap before next chunk |
+|-------|---------------|-------------|----------------|-----------------------|
+| 1 (chunk_size=10) | 10 | ~3.1s | 0.80s | ~3.6s silence |
+| 2 | 20 | ~5.7s | 0.80s new | ~5.2s silence |
+| 3 (EOS) | 23 | ~6.8s | 0.24s new | - |
+
+**Root cause:** Re-decode is O(n²) total work. Each codec decode processes *all accumulated tokens* through the full vocoder pipeline (which is 71-81% of decode time). For chunk_size=5 and 23 total tokens:
+- Total codec work: decode(5) + decode(10) + decode(15) + decode(20) + decode(23) = 2.0 + 3.0 + 4.4 + 5.7 + 6.8 = **21.9s**
+- vs batch decode(23) = **4.6s** → 4.8x more codec time
+
+**Conclusion:** Re-decode streaming is not viable when decode_time >> audio_duration. Need incremental codec decode (maintain KV cache + causal conv state) to avoid re-processing.
 
 ## Model files
 
@@ -68,7 +130,7 @@ Downloaded to `getFilesDir()/qwen-tts-model/` or manually pushed to `/data/local
 | Logcat tag | `VoiceDebug` | `TtsDebug` |
 | Model source | `adb push` to `/data/local/tmp/` | Auto-download from R2 via `TtsModelManager` |
 | Input | WAV file path | Text string (`--es text`) |
-| Steps | `load_model` → `test_wav` | `download` → `load` → `tokenize` / `speak` → `free` |
+| Steps | `load_model` → `test_wav` | `download` → `load` → `tokenize` / `speak` / `speak_stream` → `free` |
 | Model load | Via `VoiceService.nativeLoadModel` | Via `HermesRuntime.nativeTtsLoadModel` |
 
 ## Gotchas
@@ -78,8 +140,9 @@ Downloaded to `getFilesDir()/qwen-tts-model/` or manually pushed to `/data/local
 - **`speak` auto-loads**: The `speak` command will auto-load the model if not already loaded, but will NOT auto-download. Run `download` first.
 - **Tokenizer is cached**: `BpeTokenizer` is loaded once on first `tokenize` or `speak` and reused. `free` clears it along with the native model.
 - **Thread blocking**: `download`, `load`, and `speak` all run on `new Thread()`, so the broadcast returns immediately. Watch logcat for results.
-- **No concurrent safety**: Don't issue `speak` while another `speak` is still generating. The native code has shared state.
-- **AudioTrack MODE_STATIC**: The entire PCM buffer is written before playback starts. For very long texts this uses significant memory (`samples * 2` bytes).
+- **No concurrent safety**: Don't issue `speak` or `speak_stream` while another is still generating. The native code has shared state.
+- **AudioTrack MODE_STATIC** (`speak`): The entire PCM buffer is written before playback starts. For very long texts this uses significant memory (`samples * 2` bytes).
+- **AudioTrack MODE_STREAM** (`speak_stream`): Plays audio as chunks arrive. Lower TTFA but higher total time due to re-decode overhead. The `nativeSpeak()` production path also uses MODE_STREAM for better user experience.
 
 ## Known issues
 
@@ -351,7 +414,7 @@ adb shell "am broadcast -a ai.connct_screen.rn.TTS_DEBUG -p ai.connct_screen.rn 
 # I TtsDebug: tokenize count=11 in 0ms
 # I TtsDebug: tokenize ids=151644,77091,198,9707,220,14615,151645,198,151644,77091,198
 
-# Full TTS speak
+# Full TTS speak (batch)
 adb shell "am broadcast -a ai.connct_screen.rn.TTS_DEBUG -p ai.connct_screen.rn --es cmd speak --es text 'Hello world' --es path /data/local/tmp/qwen-tts-model"
 # I TtsDebug: speak: tokenized 11 tokens in 1ms
 # I TtsDebug: speak: generating audio (speaker=null, language=null)...
@@ -360,6 +423,17 @@ adb shell "am broadcast -a ai.connct_screen.rn.TTS_DEBUG -p ai.connct_screen.rn 
 # I TtsDebug: speak: generated 55680 samples (2.32s) in 20644ms
 # I TtsDebug: speak: playing audio...
 # I TtsDebug: speak: playback complete
+
+sleep 15
+
+# Streaming TTS speak (lower TTFA, audio starts playing before generation finishes)
+adb shell "am broadcast -a ai.connct_screen.rn.TTS_DEBUG -p ai.connct_screen.rn --es cmd speak_stream --es text 'Hello world' --es path /data/local/tmp/qwen-tts-model --ei chunk_size 10"
+# I TtsDebug: speak_stream: TTFA=3200ms (chunk 1: 4800 samples, 0.20s)
+# I TtsDebug: speak_stream: chunk 2: 9600 samples (0.40s) at 6100ms
+# I TtsDebug: speak_stream: complete 44160 samples (1.84s) total=8500ms TTFA=3200ms
+# I TtsDebug: speak_stream: playback complete
+
+sleep 15
 
 # Free model
 adb shell "am broadcast -a ai.connct_screen.rn.TTS_DEBUG -p ai.connct_screen.rn --es cmd free"

@@ -185,6 +185,12 @@ void qwen_apply_rope_neox(float *x, const float *cos_vals, const float *sin_vals
 int qwen_argmax_matvec_bf16(const float *x, const uint16_t *W_bf16,
                              int in_dim, int out_dim);
 
+/* Q8_0 streaming argmax: finds argmax(W_q8 @ x) using INT8 dot products.
+ * Quantizes x once, then computes dot products against all vocab rows.
+ * Returns the index of the row with highest dot product. */
+int qwen_argmax_matvec_q8(const float *x, const block_q8_0 *W_q8,
+                            int in_dim, int out_dim);
+
 /* ========================================================================
  * Threading
  * ======================================================================== */
