@@ -10,6 +10,7 @@
 
 #include <stddef.h>
 #include <stdint.h>
+#include "qwen_asr_quant.h"
 
 /* ========================================================================
  * Basic Operations
@@ -50,6 +51,34 @@ void qwen_linear_nobias_bf16_qkv(float *q, float *k, float *v, const float *x,
 
 void qwen_matmul_t_bf16(float *C, const float *A, const uint16_t *B_bf16,
                          int M, int K, int N);
+
+/* Q8_0 weight variants */
+void qwen_linear_q8(float *y, const float *x, const block_q8_0 *W_q8,
+                    const float *b, int seq_len, int in_dim, int out_dim);
+
+void qwen_linear_nobias_q8(float *y, const float *x, const block_q8_0 *W_q8,
+                            int seq_len, int in_dim, int out_dim);
+
+/* seq=1 decoder fast path: compute Q/K/V matvecs with one threaded dispatch */
+void qwen_linear_nobias_q8_qkv(float *q, float *k, float *v, const float *x,
+                                const block_q8_0 *Wq_q8,
+                                const block_q8_0 *Wk_q8,
+                                const block_q8_0 *Wv_q8,
+                                int in_dim, int q_dim, int kv_dim);
+
+/* Fused QKV GEMM: quantize input once, compute Q/K/V projections.
+ * Falls back to matvec QKV path when seq_len=1. */
+void qwen_linear_q8_qkv_batched(
+    float *q, float *k, float *v,
+    const float *x,
+    const block_q8_0 *Wq_q8, const float *bq,
+    const block_q8_0 *Wk_q8, const float *bk,
+    const block_q8_0 *Wv_q8, const float *bv,
+    int seq_len, int in_dim, int q_dim, int kv_dim
+);
+
+/* Free GEMM workspace (call from qwen_free) */
+void qwen_gemm_workspace_free(void);
 
 /* ========================================================================
  * 2D Convolution (for audio encoder conv stem)

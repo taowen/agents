@@ -27,8 +27,8 @@
 #define N_MEL        128
 #define HOP_LENGTH   160
 #define WIN_LENGTH   400
-#define N_FFT        400
-#define N_FREQ       (N_FFT / 2 + 1)    /* 201 bins */
+#define N_FFT        512        /* power-of-2 for radix-2 FFT (zero-pad from 400) */
+#define N_FREQ       (N_FFT / 2 + 1)    /* 257 bins */
 
 /* ========================================================================
  * WAV File Loading (adapted from voxtral)
@@ -290,10 +290,46 @@ static float *build_mel_filters(void) {
  * Mel Spectrogram (dynamic max, returns [128, n_frames])
  * ======================================================================== */
 
+/* Radix-2 Cooley-Tukey FFT (in-place, decimation-in-time).
+ * N must be a power of 2. re[] and im[] are length N. */
+static void fft_radix2(float *re, float *im, int N) {
+    /* Bit-reversal permutation */
+    for (int i = 1, j = 0; i < N; i++) {
+        int bit = N >> 1;
+        for (; j & bit; bit >>= 1) j ^= bit;
+        j ^= bit;
+        if (i < j) {
+            float t;
+            t = re[i]; re[i] = re[j]; re[j] = t;
+            t = im[i]; im[i] = im[j]; im[j] = t;
+        }
+    }
+
+    /* Butterfly stages */
+    for (int len = 2; len <= N; len <<= 1) {
+        float angle = -2.0f * (float)M_PI / (float)len;
+        float wR = cosf(angle), wI = sinf(angle);
+        for (int i = 0; i < N; i += len) {
+            float tR = 1.0f, tI = 0.0f;
+            for (int j = 0; j < len / 2; j++) {
+                float uR = re[i + j], uI = im[i + j];
+                float vR = re[i + j + len/2] * tR - im[i + j + len/2] * tI;
+                float vI = re[i + j + len/2] * tI + im[i + j + len/2] * tR;
+                re[i + j] = uR + vR;
+                im[i + j] = uI + vI;
+                re[i + j + len/2] = uR - vR;
+                im[i + j + len/2] = uI - vI;
+                float newT = tR * wR - tI * wI;
+                tI = tR * wI + tI * wR;
+                tR = newT;
+            }
+        }
+    }
+}
+
 float *qwen_mel_spectrogram(const float *samples, int n_samples, int *out_frames) {
-    int n_fft = N_FFT;
     int n_freqs = N_FREQ;
-    int pad_len = n_fft / 2; /* center=True padding (reflect) */
+    int pad_len = WIN_LENGTH / 2; /* center=True padding (reflect), based on window size */
 
     /* Reflect-pad the signal */
     int padded_len = n_samples + 2 * pad_len;
@@ -308,7 +344,7 @@ float *qwen_mel_spectrogram(const float *samples, int n_samples, int *out_frames
         padded[pad_len + n_samples + i] = (src >= 0) ? samples[src] : 0.0f;
     }
 
-    int n_frames_total = (padded_len - n_fft) / HOP_LENGTH + 1;
+    int n_frames_total = (padded_len - WIN_LENGTH) / HOP_LENGTH + 1;
     int n_frames = n_frames_total - 1; /* drop last frame */
     if (n_frames <= 0) {
         fprintf(stderr, "qwen_mel_spectrogram: audio too short (%d samples)\n", n_samples);
@@ -324,38 +360,30 @@ float *qwen_mel_spectrogram(const float *samples, int n_samples, int *out_frames
     for (int i = 0; i < WIN_LENGTH; i++)
         window[i] = 0.5f * (1.0f - cosf(2.0f * (float)M_PI * (float)i / (float)WIN_LENGTH));
 
-    /* Precompute DFT tables */
-    float *dft_cos = (float *)malloc((size_t)N_FREQ * N_FFT * sizeof(float));
-    float *dft_sin = (float *)malloc((size_t)N_FREQ * N_FFT * sizeof(float));
-    for (int k = 0; k < N_FREQ; k++) {
-        for (int n = 0; n < N_FFT; n++) {
-            float angle = 2.0f * (float)M_PI * (float)k * (float)n / (float)N_FFT;
-            dft_cos[k * N_FFT + n] = cosf(angle);
-            dft_sin[k * N_FFT + n] = sinf(angle);
-        }
-    }
-
     /* First pass: compute mel values and find global max.
      * Store as [n_frames, N_MEL] temporarily for convenient max search. */
     float *mel_tmp = (float *)calloc(n_frames * N_MEL, sizeof(float));
-    float windowed[N_FFT];
+    float fft_re[N_FFT];
+    float fft_im[N_FFT];
     float power[N_FREQ];
     float global_max = -1e30f;
 
     for (int t = 0; t < n_frames; t++) {
         int start = t * HOP_LENGTH;
-        for (int i = 0; i < N_FFT; i++)
-            windowed[i] = padded[start + i] * window[i];
 
+        /* Window and zero-pad to N_FFT */
+        for (int i = 0; i < WIN_LENGTH; i++)
+            fft_re[i] = padded[start + i] * window[i];
+        for (int i = WIN_LENGTH; i < N_FFT; i++)
+            fft_re[i] = 0.0f;
+        memset(fft_im, 0, N_FFT * sizeof(float));
+
+        /* In-place radix-2 FFT */
+        fft_radix2(fft_re, fft_im, N_FFT);
+
+        /* Power spectrum (first N_FREQ = N_FFT/2+1 bins) */
         for (int k = 0; k < n_freqs; k++) {
-            float re = 0, im = 0;
-            const float *cos_row = dft_cos + k * N_FFT;
-            const float *sin_row = dft_sin + k * N_FFT;
-            for (int n = 0; n < N_FFT; n++) {
-                re += windowed[n] * cos_row[n];
-                im += windowed[n] * sin_row[n];
-            }
-            power[k] = re * re + im * im;
+            power[k] = fft_re[k] * fft_re[k] + fft_im[k] * fft_im[k];
         }
 
         for (int m = 0; m < N_MEL; m++) {
@@ -384,8 +412,6 @@ float *qwen_mel_spectrogram(const float *samples, int n_samples, int *out_frames
     }
 
     free(mel_tmp);
-    free(dft_cos);
-    free(dft_sin);
     free(padded);
     free(mel_filters);
 

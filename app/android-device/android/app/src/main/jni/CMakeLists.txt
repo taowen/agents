@@ -32,6 +32,8 @@ set(QWEN_ASR_DIR "${CMAKE_SOURCE_DIR}/qwen-asr")
 add_subdirectory(${QWEN_ASR_DIR} ${CMAKE_CURRENT_BINARY_DIR}/qwen_asr)
 
 add_library(qwenasr_jni SHARED qwen_asr_jni.cpp)
+target_compile_options(qwenasr_jni PRIVATE -O3 -flto)
+target_link_options(qwenasr_jni PRIVATE -flto)
 target_link_libraries(qwenasr_jni qwen_asr_static log)
 
 # --- Qwen TTS JNI library ---

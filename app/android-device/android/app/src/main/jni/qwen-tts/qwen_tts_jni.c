@@ -13,12 +13,43 @@
 #include <stdlib.h>
 #include <string.h>
 #include <math.h>
+#include <pthread.h>
+#include <unistd.h>
 
 #include "qwen_tts.h"
 
 #define TAG "QwenTTS_JNI"
 #define LOGI(...) __android_log_print(ANDROID_LOG_INFO, TAG, __VA_ARGS__)
 #define LOGE(...) __android_log_print(ANDROID_LOG_ERROR, TAG, __VA_ARGS__)
+
+/* Redirect stderr to logcat so C-level fprintf(stderr, ...) is visible */
+static int s_stderr_redirected = 0;
+
+static void *stderr_reader_thread(void *arg) {
+    int fd = (int)(intptr_t)arg;
+    char buf[512];
+    ssize_t n;
+    while ((n = read(fd, buf, sizeof(buf) - 1)) > 0) {
+        buf[n] = '\0';
+        /* Remove trailing newlines */
+        while (n > 0 && (buf[n-1] == '\n' || buf[n-1] == '\r')) buf[--n] = '\0';
+        if (n > 0) __android_log_print(ANDROID_LOG_INFO, "QwenTTS", "%s", buf);
+    }
+    close(fd);
+    return NULL;
+}
+
+static void redirect_stderr_to_logcat(void) {
+    if (s_stderr_redirected) return;
+    s_stderr_redirected = 1;
+    int pipefd[2];
+    if (pipe(pipefd) == -1) return;
+    dup2(pipefd[1], STDERR_FILENO);
+    close(pipefd[1]);
+    pthread_t tid;
+    pthread_create(&tid, NULL, stderr_reader_thread, (void *)(intptr_t)pipefd[0]);
+    pthread_detach(tid);
+}
 
 /* Global TTS context - lazy-loaded, kept in memory */
 static qwen_tts_ctx_t *g_tts_ctx = NULL;
@@ -44,7 +75,12 @@ Java_ai_connct_1screen_rn_HermesRuntime_nativeTtsLoadModel(JNIEnv *env, jclass c
     }
 
     LOGI("Loading TTS model from: %s", model_dir);
+    redirect_stderr_to_logcat();
     qwen_tts_verbose = 1;
+
+    /* Set writable cache directory for quantized weight cache */
+    qwen_tts_cache_dir_override = "/data/data/ai.connct_screen.rn/cache";
+
     g_tts_ctx = qwen_tts_load(model_dir);
     (*env)->ReleaseStringUTFChars(env, jModelDir, model_dir);
 

@@ -46,6 +46,12 @@ public class VoiceDebugReceiver extends BroadcastReceiver {
             case "test_wav":
                 doTestWav(intent.getStringExtra("path"));
                 break;
+            case "test_wav_stream":
+                doTestWavStream(intent.getStringExtra("path"));
+                break;
+            case "free_model":
+                doFreeModel();
+                break;
             default:
                 Log.e(TAG, "Unknown cmd: " + cmd);
                 break;
@@ -91,5 +97,32 @@ public class VoiceDebugReceiver extends BroadcastReceiver {
                 Log.e(TAG, "test_wav failed", e);
             }
         }).start();
+    }
+
+    private void doTestWavStream(String path) {
+        if (path == null || path.isEmpty()) {
+            Log.e(TAG, "test_wav_stream requires --es path <wav_file>");
+            return;
+        }
+        if (!new File(path).exists()) {
+            Log.e(TAG, "WAV file not found: " + path);
+            return;
+        }
+        Log.i(TAG, "Testing WAV (stream): " + path);
+
+        new Thread(() -> {
+            try {
+                VoiceService.nativeTestWavStream(path);
+                Log.i(TAG, "test_wav_stream completed");
+            } catch (Exception e) {
+                Log.e(TAG, "test_wav_stream failed", e);
+            }
+        }).start();
+    }
+
+    private void doFreeModel() {
+        Log.i(TAG, "Freeing model...");
+        VoiceService.nativeFreeModel();
+        Log.i(TAG, "free_model completed");
     }
 }

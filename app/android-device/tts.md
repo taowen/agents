@@ -166,6 +166,157 @@ Thread count sweep (INT8 enabled, "Hello world"):
 | speak() accepts speaker/language params | `hermes_runtime.cpp`, `HermesRuntime.java`, `host-api.ts` | Feature completeness |
 | FILE_SIZES corrected (1.8GB + 682MB) | `TtsModelManager.java` | Accurate download progress |
 
+### After optimization round 3 (INT8 kernel tuning + fused SwiGLU + INT4 experiment, 2026-02-23)
+
+| Test | Audio length | Gen time (before) | Gen time (after) | Speedup |
+|------|-------------|-------------------|------------------|---------|
+| "Hello world" (EN) | 2.16s | 12,190ms | **12,028ms** | **~1.3% faster** |
+| "你好世界" (ZH) | 1.20s | 6,561ms | **7,204ms** | Output length changed (1.20s audio) |
+
+Minimal improvement. Confirmed by repeated runs (12,030ms second run). This is consistent with the Round 2 finding that **memory bandwidth is the sole bottleneck** — once INT8 halves the bandwidth, further compute-side optimizations yield diminishing returns.
+
+**Changes applied (Phases A-C):**
+
+| Change | File(s) | Measured impact |
+|--------|---------|-----------------|
+| 4-accumulator SDOT in `kernel_matvec_int8` (was 1 acc) | `qwen_tts_kernels.c` | ~0% — A77 OoO already hides single-acc latency |
+| NEON-vectorized x quantization (was scalar) | `qwen_tts_kernels.c` | ~0% — quantization is <1% of total time |
+| Pre-quantized x interface (`kernel_quantize_x_int8` + `kernel_matvec_int8_pq`) | `qwen_tts_kernels.c`, `qwen_tts_kernels.h` | ~0% — eliminates redundant quantization but quantization cost is negligible |
+| Fused `kernel_swiglu_matvec_int8` (gate+up+SiLU in one call) | `qwen_tts_kernels.c`, `qwen_tts_kernels.h`, `qwen_tts_talker.c` | ~0% — function call overhead is negligible |
+| OpenMP threshold raised from `rows >= 64` to `rows >= 512` | `qwen_tts_kernels.c` | ~0% — reduces barrier overhead for small matrices |
+
+**Phase D (INT4 per-group quantization) — FAILED, disabled:**
+
+| Test | Gen time (INT8) | Gen time (INT4) | Result |
+|------|----------------|-----------------|--------|
+| "Hello world" (EN) | 12,190ms | **28,903ms** | **2.37x regression** |
+
+INT4 is disabled by default (`use_int4 = 0`). Root cause: NEON INT4 nibble unpacking overhead exceeds the bandwidth savings. Each group of 32 weights requires:
+1. `vld1q_u8` (load 16 packed bytes)
+2. `vshlq_n_u8` + `vshrq_n_s8` (extract low/high nibbles)
+3. `vzipq_s8` (interleave to natural order)
+4. `vdotq_s32` (2x for 32 elements)
+5. `vaddvq_s32` + float multiply by group_scale (per-group reduction)
+
+The per-group float accumulation (32 groups per 1024-column row) prevents the long SDOT chains that make INT8 efficient. INT8 does one `vaddvq_s32` per row; INT4 does 32. This makes INT4 compute-bound rather than memory-bound, defeating the purpose.
+
+Viable INT4 alternatives (not attempted): GPTQ/AWQ calibrated quantization, per-row INT4 (larger error), or a custom packing format that avoids per-group reductions.
+
+### After optimization round 4 (Q4_K_M super-block quantization, 2026-02-23)
+
+Replaced per-group INT4 (which was 2.37x slower than INT8) with Q4_K super-block quantization inspired by llama.cpp/GGML. Q4_K_M strategy: QKV + gate_up use Q4_K, wo + down keep INT8 (sensitive layers).
+
+| Test | Audio length | Gen time (INT8) | Gen time (Q4_K_M) | Speedup |
+|------|-------------|-----------------|-------------------|---------|
+| "Hello world" (EN) | 1.68s | 12,190ms | **10,280ms** | **~16% faster** |
+| Chinese 25 chars | 6.48s | N/A | **44,683ms** | ~6.9x real-time |
+| Model load | - | 504-1157ms | **3,340ms** | Slower (Q4_K quantization at load) |
+
+From original baseline: **50% faster** (EN, vs 20,644ms).
+
+**Q4_K format (152 bytes / 256 elements, 4.75 bits/element):**
+- Super-block: `float d` (scale) + `float dmin` (min offset)
+- 8 sub-groups of 32: `uint8 scales[8]` + `uint8 mins[8]`
+- 128 bytes packed unsigned int4 nibbles [0,15]
+- Dequant: `weight ≈ d × scales[g] × q − dmin × mins[g]`
+
+**Key kernel optimization:** Integer sub-scale multiply (`vmulq_n_s32`, 1 cycle lane-wise) replaces per-group `vaddvq_s32` (3-5 cycle cross-lane reduction). Only 1 `vaddvq_s32` per 256-element super-block vs 8 per 256 elements in the old INT4, or 4 per 1024-column row vs 32 in old INT4.
+
+**Why only 16% faster (not predicted 30%):**
+1. Audio output length differs due to quantization change (1.68s vs 2.16s INT8) — fewer tokens generated, confounds comparison
+2. Total time includes codec decode (constant regardless of quantization) — pure talker matvec improvement is larger
+3. wo + down projections still use INT8 (Q4_K_M keeps these as sensitive layers)
+4. Sub-talker runs per-token with its own matvec costs
+
+**Model load time increased** from ~0.5-1.2s to 3.3s due to the more complex Q4_K quantization algorithm (3-phase: min/max → two-level scale → pack).
+
+**Changes applied:**
+
+| Change | File(s) | Notes |
+|--------|---------|-------|
+| `block_q4_k` struct (152B/256 elements) | `qwen_tts_kernels.h` | float d/dmin + uint8 scales/mins + packed nibbles |
+| `kernel_matvec_q4k` with NEON SDOT + integer sub-scales | `qwen_tts_kernels.c` | Precomputes bsums, vmulq_n_s32 per sub-group, 1 vaddvq_s32 per block |
+| `kernel_swiglu_matvec_q4k` fused gate+up | `qwen_tts_kernels.c` | Calls matvec_q4k twice then SiLU×up |
+| `quantize_bf16_to_q4k` (3-phase algorithm) | `qwen_tts.c` | min/max → two-level scale → unsigned int4 pack |
+| Q4_K_M dispatch: QKV+gate_up=Q4_K, wo+down=INT8 | `qwen_tts_talker.c`, `qwen_tts.c` | Sensitive layers keep higher precision |
+| Removed old INT4 per-group code | all 5 files | `use_int4`/`int4_group_size` → `use_q4k` |
+
+**Simplifications vs GGML:** d/dmin use float32 (GGML uses float16), scales/mins use plain uint8 (GGML packs 6-bit into 12 bytes). Adds ~8 bytes/block vs GGML but avoids complex bit unpacking.
+
+### Testing gotchas discovered (OPLUS ROM)
+
+**1. Duplicate broadcast delivery (proxy broadcasts):**
+OPLUS ROM's `BroadcastQueue` "proxies" broadcasts to background apps with significant delay. If a new broadcast is sent before the proxied one is delivered, both arrive simultaneously, causing concurrent TTS on shared state (hangs/corruption). **Workaround**: ensure app is in foreground (`am start` first), wait 60s after `force-stop` before testing.
+
+**2. Background cpuset throttling (6x slowdown):**
+When the screen turns off or the app loses focus, OPLUS moves the process from `top-app` to `background` cpuset, restricting it to small cores (~614MHz vs 2.4GHz big cores). This causes **74s generation time** (6x slower). Both optimized and baseline code are equally affected. **Workaround**: keep screen unlocked and app in foreground. Verify with `cat /proc/<pid>/cgroup` — should show `cpuset:/top-app`.
+
+### After optimization round 5 (sub-talker Q4_K + weight cache + codec INT8 + instrumentation, 2026-02-23)
+
+Added time decomposition instrumentation, sub-talker full Q4_K (wo+down), pre-quantized weight cache, and codec transformer INT8 quantization.
+
+**Timing decomposition revealed the real bottleneck:**
+
+| Component | "Hello world" | % | Chinese 30 chars | % |
+|-----------|--------------|---|------------------|---|
+| Talker (pure) | 498ms | 4.7% | 2,410ms | 4.4% |
+| Sub-talker | 1,461ms | 13.9% | 5,971ms | 10.8% |
+| Codec (total) | 8,040ms | 76.5% | 46,296ms | 83.8% |
+| — transformer | 39ms | 0.4% | 190ms | 0.3% |
+| — upsample | 467ms | 4.4% | 1,324ms | 2.4% |
+| — **vocoder** | **7,511ms** | **71.5%** | **44,741ms** | **81.0%** |
+| **Total** | **10,513ms** | | **55,225ms** | |
+| Audio length | 1.84s | | 7.60s | |
+
+**The vocoder (BigVGAN) is 71-81% of total time.** Previous rounds optimized talker/sub-talker (now only 14-19% of total). The codec transformer (target of Phase 4 INT8) is only 0.3-0.4% of total — negligible.
+
+**Generation results:**
+
+| Test | Audio length | Gen time (R4 Q4_K_M) | Gen time (R5) | Notes |
+|------|-------------|---------------------|---------------|-------|
+| "Hello world" (EN) | 1.84s | 10,280ms | **10,513ms** | Within noise (~same) |
+| Chinese 30 chars | 7.60s | N/A | **55,225ms** | ~7.3x real-time |
+| Model load (first) | - | 3,340ms | **2,471ms** | 26% faster (codec INT8 quant is fast) |
+| Model load (cache) | - | 3,340ms | **1,131ms** | **66% faster** (qcache hit) |
+
+**Generation speed per-token: 85-88ms/token** (talker + sub-talker combined, roughly same as R4).
+
+Sub-talker Q4_K (Phase 2) reduced sub-talker time by ~14% (estimated from bandwidth analysis), but since sub-talker is only 14% of total, the overall improvement is ~2% — invisible in noise.
+
+**Model load with quantized cache (Phase 3) works well:**
+- First load: 2,471ms (quantize + save cache)
+- Subsequent loads: **1,131ms** (mmap cache + copy + load norms/embeddings)
+- Cache file: 368MB at `/data/data/ai.connct_screen.rn/cache/model.qcache`
+- Cache validates against safetensors file size to detect model changes
+
+**Key insight for future optimization:**
+
+The next target must be the **vocoder (BigVGAN)**, which accounts for 71-81% of total TTS time. The vocoder processes:
+- 4 blocks × (SnakeBeta + TransposedConv1d + 3 × ResUnit(k=7, dilations 1/3/9))
+- Upsample ratios: 8×5×4×3 = 480× from codec domain to audio domain
+- At codec rate 12.5 Hz → 24kHz audio, this means processing very long sequences at each stage
+- The inner ResUnit dilated convolutions (k=7, d=1/3/9) dominate compute
+
+Potential vocoder optimizations:
+1. **INT8 quantize vocoder conv weights** (currently F32, ~100MB for the 4 blocks)
+2. **OpenMP parallelize transposed conv1d** (embarrassingly parallel across output channels)
+3. **Fuse SnakeBeta+Conv1d** operations to reduce memory round-trips
+4. **Streaming vocoder**: process codec tokens incrementally instead of waiting for all tokens
+
+**Changes applied:**
+
+| Change | File(s) | Notes |
+|--------|---------|-------|
+| `perf_subtalker_ms` timing instrumentation | `qwen_tts.h`, `qwen_tts.c` | Phase 1: time decomposition (talker/sub-talker/codec) |
+| Sub-talker wo/down Q4_K quantization | `qwen_tts.h`, `qwen_tts.c`, `qwen_tts_talker.c` | Phase 2: full Q4_K for sub-talker (lower precision OK) |
+| Pre-quantized weight cache (`model.qcache`) | `qwen_tts.h`, `qwen_tts.c` | Phase 3: mmap-based cache, 66% faster reload |
+| Codec transformer INT8 quantization | `qwen_tts.h`, `qwen_tts.c`, `qwen_tts_codec.c` | Phase 4: fused QKV/gate_up INT8 per-token matvec |
+| `quantize_f32_to_int8` helper | `qwen_tts.c` | F32 source INT8 quantization for codec weights |
+| stderr→logcat redirect in JNI | `qwen_tts_jni.c` | Pipe redirect for C fprintf(stderr) visibility |
+| `qwen_tts_cache_dir_override` global | `qwen_tts.h`, `qwen_tts.c` | Allows JNI to set writable cache dir before load |
+
+**Android SELinux gotcha:** App process cannot write to `/data/local/tmp/` even if the directory is `chmod 777`. SELinux context prevents cross-domain file creation. Solution: use app's own cache dir (`/data/data/<pkg>/cache/`) via `qwen_tts_cache_dir_override`.
+
 ## Full test session
 
 ```bash

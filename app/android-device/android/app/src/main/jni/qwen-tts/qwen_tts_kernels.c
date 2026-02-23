@@ -487,23 +487,21 @@ void kernel_matvec_int8_pq(float *out, const int8_t *A_int8, const float *scales
 }
 
 /* ======================================================================== */
-/* INT4 per-group matvec                                                     */
+/* Q4_K super-block matvec                                                   */
 /* ======================================================================== */
 
-void kernel_matvec_int4(float *out, const uint8_t *A_int4_packed,
-                         const float *group_scales, const float *x,
-                         int rows, int cols, int group_size) {
+void kernel_matvec_q4k(float *out, const block_q4_k *blocks,
+                        const float *x, int rows, int cols) {
     /*
-     * INT4 per-group quantization with packed nibbles.
-     * Each byte stores 2 int4 values: low nibble = even index, high nibble = odd index.
-     * Values are signed [-8, 7].
-     * group_scales: [rows * num_groups] where num_groups = cols / group_size.
+     * Q4_K super-block quantization matvec.
+     * Each block covers 256 elements (8 sub-groups of 32).
+     * Uses integer sub-scales (vmulq_n_s32) to avoid per-group vaddvq_s32.
+     * Only 1 vaddvq_s32 per super-block instead of 8.
      *
-     * We quantize x to int8 once, then for each group:
-     *   partial_sum = dot(A_int4_group, x_int8_group)   (integer)
-     *   out[r] += group_scale * x_scale * partial_sum
+     * Dequantization: weight ≈ d * scales[g] * q - dmin * mins[g]
+     * where q ∈ [0, 15] (unsigned).
      */
-    int num_groups = cols / group_size;
+    int blocks_per_row = cols / QK_K;
 
     /* Quantize x to int8 */
     static int8_t *x_int8 = NULL;
@@ -516,68 +514,78 @@ void kernel_matvec_int4(float *out, const uint8_t *A_int4_packed,
     float x_scale;
     kernel_quantize_x_int8(x, cols, x_int8, &x_scale);
 
+    /* Precompute bsums: per-sub-group sum of x_int8 (shared across all rows) */
+    int total_subs = cols / 32;
+    static int32_t *bsums = NULL;
+    static int bsums_cap = 0;
+    if (total_subs > bsums_cap) {
+        free(bsums);
+        bsums = (int32_t *)malloc(total_subs * sizeof(int32_t));
+        bsums_cap = total_subs;
+    }
+
 #if (defined(__ARM_NEON) || defined(__aarch64__)) && defined(__ARM_FEATURE_DOTPROD)
+    /* NEON bsums: sum 32 int8 values per sub-group using SDOT with all-ones vector */
+    {
+        int8x16_t ones = vdupq_n_s8(1);
+        for (int s = 0; s < total_subs; s++) {
+            const int8_t *xg = x_int8 + s * 32;
+            int32x4_t sum4 = vdupq_n_s32(0);
+            sum4 = vdotq_s32(sum4, vld1q_s8(xg), ones);
+            sum4 = vdotq_s32(sum4, vld1q_s8(xg + 16), ones);
+            bsums[s] = vaddvq_s32(sum4);
+        }
+    }
+#else
+    for (int s = 0; s < total_subs; s++) {
+        int32_t sum = 0;
+        const int8_t *xg = x_int8 + s * 32;
+        for (int i = 0; i < 32; i++) sum += (int32_t)xg[i];
+        bsums[s] = sum;
+    }
+#endif
+
+#if (defined(__ARM_NEON) || defined(__aarch64__)) && defined(__ARM_FEATURE_DOTPROD)
+    /* NEON + SDOT path */
 #ifdef USE_OPENMP
     #pragma omp parallel for schedule(static) num_threads(2) if(rows >= 512)
 #endif
     for (int r = 0; r < rows; r++) {
-        const uint8_t *row_packed = A_int4_packed + (size_t)r * (cols / 2);
-        const float *row_scales = group_scales + (size_t)r * num_groups;
-        float sum = 0.0f;
+        float row_sum = 0.0f;
 
-        for (int g = 0; g < num_groups; g++) {
-            int col_start = g * group_size;
-            const uint8_t *gp = row_packed + col_start / 2;
-            const int8_t *gx = x_int8 + col_start;
-            float gs = row_scales[g];
+        for (int b = 0; b < blocks_per_row; b++) {
+            const block_q4_k *blk = &blocks[(size_t)r * blocks_per_row + b];
+            const int8_t *xq = x_int8 + b * QK_K;
 
-            int32x4_t iacc0 = vdupq_n_s32(0);
-            int32x4_t iacc1 = vdupq_n_s32(0);
-            int c = 0;
+            int32x4_t acc = vdupq_n_s32(0);
+            int32_t min_acc = 0;
 
-            /* Process 32 elements at a time (16 packed bytes -> 32 int4 -> SDOT with x_int8) */
-            for (; c + 31 < group_size; c += 32) {
-                /* Load 16 packed bytes = 32 nibbles */
-                uint8x16_t packed = vld1q_u8(gp + c / 2);
+            for (int g = 0; g < Q4K_NUM_SUBS; g++) {
+                /* Unpack unsigned nibbles */
+                uint8x16_t packed = vld1q_u8(blk->qs + g * 16);
+                int8x16_t lo = vreinterpretq_s8_u8(vandq_u8(packed, vdupq_n_u8(0x0F)));
+                int8x16_t hi = vreinterpretq_s8_u8(vshrq_n_u8(packed, 4));
 
-                /* Unpack low nibbles (even indices): shift left 4, arithmetic right 4 */
-                int8x16_t lo = vshrq_n_s8(vreinterpretq_s8_u8(vshlq_n_u8(packed, 4)), 4);
-                /* Unpack high nibbles (odd indices): arithmetic right 4 */
-                int8x16_t hi = vshrq_n_s8(vreinterpretq_s8_u8(packed), 4);
+                /* Interleave to get elements in order */
+                int8x16x2_t z = vzipq_s8(lo, hi);
 
-                /* Interleave lo and hi to get elements in order:
-                 * lo = [a0, a2, a4, ...], hi = [a1, a3, a5, ...]
-                 * We need [a0, a1, a2, a3, ...] = zip(lo, hi) */
-                int8x16x2_t zipped = vzipq_s8(lo, hi);
-                int8x16_t vals0 = zipped.val[0];  /* elements 0-15 */
-                int8x16_t vals1 = zipped.val[1];  /* elements 16-31 */
+                /* SDOT: dot product of q4 weights with x_int8 */
+                int32x4_t dot = vdupq_n_s32(0);
+                dot = vdotq_s32(dot, z.val[0], vld1q_s8(xq + g * 32));
+                dot = vdotq_s32(dot, z.val[1], vld1q_s8(xq + g * 32 + 16));
 
-                /* Load x_int8 for this group chunk */
-                int8x16_t vx0 = vld1q_s8(gx + c);
-                int8x16_t vx1 = vld1q_s8(gx + c + 16);
+                /* Integer sub-scale multiply (avoids vaddvq_s32 per group) */
+                dot = vmulq_n_s32(dot, (int32_t)blk->scales[g]);
+                acc = vaddq_s32(acc, dot);
 
-                iacc0 = vdotq_s32(iacc0, vals0, vx0);
-                iacc1 = vdotq_s32(iacc1, vals1, vx1);
+                /* Min correction (integer multiply-add) */
+                min_acc += (int32_t)blk->mins[g] * bsums[b * Q4K_NUM_SUBS + g];
             }
 
-            int32_t isum = vaddvq_s32(iacc0) + vaddvq_s32(iacc1);
-
-            /* Scalar tail for remaining elements in this group */
-            for (; c < group_size; c++) {
-                int byte_idx = (col_start + c) / 2;
-                int nibble_idx = (col_start + c) % 2;
-                int8_t val;
-                if (nibble_idx == 0) {
-                    val = (int8_t)((A_int4_packed[(size_t)r * (cols / 2) + byte_idx] << 4)) >> 4;
-                } else {
-                    val = (int8_t)(A_int4_packed[(size_t)r * (cols / 2) + byte_idx]) >> 4;
-                }
-                isum += (int32_t)val * (int32_t)x_int8[col_start + c];
-            }
-
-            sum += gs * x_scale * (float)isum;
+            /* Only 1 vaddvq_s32 per super-block */
+            row_sum += blk->d * (float)vaddvq_s32(acc) - blk->dmin * (float)min_acc;
         }
-        out[r] = sum;
+        out[r] = row_sum * x_scale;
     }
 #else
     /* Scalar fallback */
@@ -585,60 +593,58 @@ void kernel_matvec_int4(float *out, const uint8_t *A_int4_packed,
     #pragma omp parallel for schedule(static) num_threads(2) if(rows >= 512)
 #endif
     for (int r = 0; r < rows; r++) {
-        const uint8_t *row_packed = A_int4_packed + (size_t)r * (cols / 2);
-        const float *row_scales = group_scales + (size_t)r * num_groups;
-        float sum = 0.0f;
+        float row_sum = 0.0f;
 
-        for (int g = 0; g < num_groups; g++) {
-            int col_start = g * group_size;
-            float gs = row_scales[g];
-            int32_t isum = 0;
+        for (int b = 0; b < blocks_per_row; b++) {
+            const block_q4_k *blk = &blocks[(size_t)r * blocks_per_row + b];
+            const int8_t *xq = x_int8 + b * QK_K;
 
-            for (int c = 0; c < group_size; c++) {
-                int idx = col_start + c;
-                int byte_idx = idx / 2;
-                int8_t val;
-                if (idx % 2 == 0) {
-                    val = (int8_t)((row_packed[byte_idx] << 4)) >> 4;
-                } else {
-                    val = (int8_t)(row_packed[byte_idx]) >> 4;
+            int32_t scale_acc = 0;
+            int32_t min_acc = 0;
+
+            for (int g = 0; g < Q4K_NUM_SUBS; g++) {
+                int32_t dot = 0;
+                for (int i = 0; i < 16; i++) {
+                    uint8_t packed = blk->qs[g * 16 + i];
+                    int8_t lo = (int8_t)(packed & 0x0F);
+                    int8_t hi = (int8_t)(packed >> 4);
+                    dot += (int32_t)lo * (int32_t)xq[g * 32 + i * 2];
+                    dot += (int32_t)hi * (int32_t)xq[g * 32 + i * 2 + 1];
                 }
-                isum += (int32_t)val * (int32_t)x_int8[idx];
+                scale_acc += dot * (int32_t)blk->scales[g];
+                min_acc += (int32_t)blk->mins[g] * bsums[b * Q4K_NUM_SUBS + g];
             }
-            sum += gs * x_scale * (float)isum;
+
+            row_sum += blk->d * (float)scale_acc - blk->dmin * (float)min_acc;
         }
-        out[r] = sum;
+        out[r] = row_sum * x_scale;
     }
 #endif
 }
 
-void kernel_swiglu_matvec_int4(float *out, const uint8_t *gate_up_int4,
-                                const float *group_scales, const float *x,
-                                int intermediate, int hidden, int group_size) {
-    static float *up_scratch_int4 = NULL;
-    static size_t up_scratch_int4_cap = 0;
-    if ((size_t)intermediate > up_scratch_int4_cap) {
-        free(up_scratch_int4);
-        up_scratch_int4 = (float *)malloc((size_t)intermediate * sizeof(float));
-        up_scratch_int4_cap = (size_t)intermediate;
+void kernel_swiglu_matvec_q4k(float *out, const block_q4_k *gate_up_blocks,
+                                const float *x, int intermediate, int hidden) {
+    static float *up_scratch_q4k = NULL;
+    static size_t up_scratch_q4k_cap = 0;
+    if ((size_t)intermediate > up_scratch_q4k_cap) {
+        free(up_scratch_q4k);
+        up_scratch_q4k = (float *)malloc((size_t)intermediate * sizeof(float));
+        up_scratch_q4k_cap = (size_t)intermediate;
     }
 
-    int num_groups_per_row = hidden / group_size;
-    size_t packed_cols = (size_t)hidden / 2;  /* bytes per row in packed format */
+    int blocks_per_row = hidden / QK_K;
 
     /* Gate (first `intermediate` rows) */
-    kernel_matvec_int4(out, gate_up_int4, group_scales,
-                       x, intermediate, hidden, group_size);
+    kernel_matvec_q4k(out, gate_up_blocks, x, intermediate, hidden);
     /* Up (next `intermediate` rows) */
-    kernel_matvec_int4(up_scratch_int4,
-                       gate_up_int4 + (size_t)intermediate * packed_cols,
-                       group_scales + (size_t)intermediate * num_groups_per_row,
-                       x, intermediate, hidden, group_size);
+    kernel_matvec_q4k(up_scratch_q4k,
+                       gate_up_blocks + (size_t)intermediate * blocks_per_row,
+                       x, intermediate, hidden);
 
     /* SiLU(gate) * up */
     for (int i = 0; i < intermediate; i++) {
         float g = out[i];
-        out[i] = (g / (1.0f + expf(-g))) * up_scratch_int4[i];
+        out[i] = (g / (1.0f + expf(-g))) * up_scratch_q4k[i];
     }
 }
 

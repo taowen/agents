@@ -9,6 +9,21 @@
 #include <stdint.h>
 
 /* ========================================================================
+ * Q4_K super-block quantization format
+ * ======================================================================== */
+
+#define QK_K 256
+#define Q4K_NUM_SUBS 8   /* QK_K / 32 */
+
+typedef struct block_q4_k {
+    float d;               /* 4B: super-block scale */
+    float dmin;            /* 4B: super-block min (asymmetric offset) */
+    uint8_t scales[8];     /* 8B: per-sub-group integer scales (0-255) */
+    uint8_t mins[8];       /* 8B: per-sub-group integer mins (0-255) */
+    uint8_t qs[128];       /* 128B: 256 unsigned int4 [0,15] packed nibbles */
+} block_q4_k;              /* 152 bytes / 256 elements */
+
+/* ========================================================================
  * BLAS configuration
  * ======================================================================== */
 
@@ -55,20 +70,17 @@ void kernel_quantize_x_int8(const float *x, int cols, int8_t *x_int8_out, float 
 void kernel_matvec_int8_pq(float *out, const int8_t *A_int8, const float *scales,
                             const int8_t *x_int8, float x_scale, int rows, int cols);
 
-/* Matrix-vector multiply with INT4 per-group quantized weights:
- * A_int4_packed: [rows, cols/2] packed nibbles (2 int4 per byte, low nibble first)
- * group_scales: [rows, cols/group_size] per-group scales
- * group_size: number of elements per quantization group (typically 32)
- * out[r] = sum_g( group_scales[r,g] * dot(A_int4[r,g*gs:(g+1)*gs], x_int8[g*gs:(g+1)*gs]) ) * x_scale
+/* Matrix-vector multiply with Q4_K super-block quantized weights:
+ * blocks: array of block_q4_k, blocks_per_row = cols / QK_K
+ * Total blocks = rows * blocks_per_row
+ * Uses integer sub-scales to minimize vaddvq_s32 cross-lane reductions.
  */
-void kernel_matvec_int4(float *out, const uint8_t *A_int4_packed,
-                         const float *group_scales, const float *x,
-                         int rows, int cols, int group_size);
+void kernel_matvec_q4k(float *out, const block_q4_k *blocks,
+                        const float *x, int rows, int cols);
 
-/* Fused SwiGLU with INT4 weights (analogous to kernel_swiglu_matvec_int8) */
-void kernel_swiglu_matvec_int4(float *out, const uint8_t *gate_up_int4,
-                                const float *group_scales, const float *x,
-                                int intermediate, int hidden, int group_size);
+/* Fused SwiGLU with Q4_K weights (analogous to kernel_swiglu_matvec_int8) */
+void kernel_swiglu_matvec_q4k(float *out, const block_q4_k *gate_up_blocks,
+                                const float *x, int intermediate, int hidden);
 
 /* Matrix-matrix multiply: C = A @ B^T
  * A is [M, K], B is [N, K], C is [M, N] - all F32 */

@@ -5,7 +5,8 @@
   "scripts": {
     "build:agent": "esbuild src/agent-standalone.ts --bundle --format=iife --target=es2020 --outfile=android/app/src/main/assets/agent-standalone.js",
     "build:browser": "esbuild src/browser-standalone.ts --bundle --format=iife --target=es2020 --outfile=android/app/src/main/assets/browser-standalone.js",
-    "publish:apk": "tsx scripts/publish.ts"
+    "publish:apk": "tsx scripts/publish.ts",
+    "test:asr": "bash scripts/test-asr.sh"
   },
   "devDependencies": {
     "typescript": "^5.8.3"

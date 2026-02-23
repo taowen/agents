@@ -173,9 +173,9 @@ static void talker_attention_single(
             ctx->tk_qkv = (float *)malloc(total_rows * sizeof(float));
             qkv_buf = ctx->tk_qkv;
         }
-        if (layer->wqkv_int4 && layer->wqkv_int4_scales) {
-            kernel_matvec_int4(qkv_buf, layer->wqkv_int4, layer->wqkv_int4_scales,
-                               x_norm, total_rows, hidden, cfg->int4_group_size);
+        if (layer->wqkv_q4k) {
+            kernel_matvec_q4k(qkv_buf, layer->wqkv_q4k,
+                               x_norm, total_rows, hidden);
             memcpy(q_buf, qkv_buf, q_dim * sizeof(float));
             memcpy(k_buf, qkv_buf + q_dim, kv_dim * sizeof(float));
             memcpy(v_buf, qkv_buf + q_dim + kv_dim, kv_dim * sizeof(float));
@@ -273,12 +273,9 @@ static void talker_attention_single(
         }
     }
 
-    /* 7. Output projection (INT4 > INT8 > BF16) */
+    /* 7. Output projection (INT8 > BF16, sensitive layer keeps higher precision) */
     float *proj_out = x_norm; /* reuse buffer */
-    if (layer->wo_int4 && layer->wo_int4_scales) {
-        kernel_matvec_int4(proj_out, layer->wo_int4, layer->wo_int4_scales,
-                           attn_out, hidden, num_heads * head_dim, cfg->int4_group_size);
-    } else if (layer->wo_int8 && layer->wo_scales) {
+    if (layer->wo_int8 && layer->wo_scales) {
         kernel_matvec_int8(proj_out, layer->wo_int8, layer->wo_scales, attn_out, hidden, num_heads * head_dim);
     } else {
         kernel_matvec_bf16(proj_out, layer->wo_bf16, attn_out, hidden, num_heads * head_dim);
@@ -292,10 +289,10 @@ static void talker_attention_single(
 
     float *gate_buf = ctx->tk_gate;
 
-    /* Fused SwiGLU MLP (INT4 > INT8 > BF16) */
-    if (layer->gate_up_int4 && layer->gate_up_int4_scales) {
-        kernel_swiglu_matvec_int4(gate_buf, layer->gate_up_int4, layer->gate_up_int4_scales,
-                                  x_norm, cfg->talker_intermediate, hidden, cfg->int4_group_size);
+    /* Fused SwiGLU MLP (Q4_K > INT8 > BF16) */
+    if (layer->gate_up_q4k) {
+        kernel_swiglu_matvec_q4k(gate_buf, layer->gate_up_q4k,
+                                  x_norm, cfg->talker_intermediate, hidden);
     } else if (layer->gate_up_int8 && layer->gate_up_scales) {
         kernel_swiglu_matvec_int8(gate_buf, layer->gate_up_int8, layer->gate_up_scales,
                                   x_norm, cfg->talker_intermediate, hidden);
@@ -304,11 +301,8 @@ static void talker_attention_single(
                                   cfg->talker_intermediate, hidden);
     }
 
-    /* down projection (INT4 > INT8 > BF16) */
-    if (layer->down_int4 && layer->down_int4_scales) {
-        kernel_matvec_int4(proj_out, layer->down_int4, layer->down_int4_scales,
-                           gate_buf, hidden, cfg->talker_intermediate, cfg->int4_group_size);
-    } else if (layer->down_int8 && layer->down_scales) {
+    /* down projection (INT8 > BF16, sensitive layer keeps higher precision) */
+    if (layer->down_int8 && layer->down_scales) {
         kernel_matvec_int8(proj_out, layer->down_int8, layer->down_scales,
                            gate_buf, hidden, cfg->talker_intermediate);
     } else {
@@ -720,9 +714,9 @@ void qwen_tts_subtalker_generate(
         for (int sl = 0; sl < st_layers; sl++) { \
             qwen_tts_subtalker_layer_t *l = &ctx->subtalker.layers[sl]; \
             kernel_rms_norm(x_norm, x, l->input_norm, st_hidden, eps); \
-            if (l->wqkv_int4 && l->wqkv_int4_scales) { \
-                kernel_matvec_int4(st_qkv_buf, l->wqkv_int4, l->wqkv_int4_scales, \
-                                   x_norm, st_qkv_total, st_hidden, cfg->int4_group_size); \
+            if (l->wqkv_q4k) { \
+                kernel_matvec_q4k(st_qkv_buf, l->wqkv_q4k, \
+                                   x_norm, st_qkv_total, st_hidden); \
                 memcpy(q_buf, st_qkv_buf, st_q_dim * sizeof(float)); \
                 memcpy(k_buf, st_qkv_buf + st_q_dim, st_kv_dim * sizeof(float)); \
                 memcpy(v_buf, st_qkv_buf + st_q_dim + st_kv_dim, st_kv_dim * sizeof(float)); \
@@ -768,9 +762,8 @@ void qwen_tts_subtalker_generate(
                     st_axpy(st_head_dim, w, _v, _o); \
                 } \
             } \
-            if (l->wo_int4 && l->wo_int4_scales) { \
-                kernel_matvec_int4(x_norm, l->wo_int4, l->wo_int4_scales, \
-                                   attn_out, st_hidden, st_heads * st_head_dim, cfg->int4_group_size); \
+            if (l->wo_q4k) { \
+                kernel_matvec_q4k(x_norm, l->wo_q4k, attn_out, st_hidden, st_heads * st_head_dim); \
             } else if (l->wo_int8 && l->wo_scales) { \
                 kernel_matvec_int8(x_norm, l->wo_int8, l->wo_scales, attn_out, st_hidden, st_heads * st_head_dim); \
             } else { \
@@ -780,9 +773,9 @@ void qwen_tts_subtalker_generate(
             kernel_rms_norm(x_norm, x, l->post_attn_norm, st_hidden, eps); \
             float *_gate = st_gate_buf; \
             float *_up = st_up_buf; \
-            if (l->gate_up_int4 && l->gate_up_int4_scales) { \
-                kernel_swiglu_matvec_int4(_gate, l->gate_up_int4, l->gate_up_int4_scales, \
-                                          x_norm, st_intermediate, st_hidden, cfg->int4_group_size); \
+            if (l->gate_up_q4k) { \
+                kernel_swiglu_matvec_q4k(_gate, l->gate_up_q4k, \
+                                          x_norm, st_intermediate, st_hidden); \
             } else if (l->gate_up_int8 && l->gate_up_scales) { \
                 kernel_swiglu_matvec_int8(_gate, l->gate_up_int8, l->gate_up_scales, \
                                           x_norm, st_intermediate, st_hidden); \
@@ -794,9 +787,8 @@ void qwen_tts_subtalker_generate(
                 kernel_silu_inplace(_gate, st_intermediate); \
                 kernel_mul_inplace(_gate, _up, st_intermediate); \
             } \
-            if (l->down_int4 && l->down_int4_scales) { \
-                kernel_matvec_int4(x_norm, l->down_int4, l->down_int4_scales, \
-                                   _gate, st_hidden, st_intermediate, cfg->int4_group_size); \
+            if (l->down_q4k) { \
+                kernel_matvec_q4k(x_norm, l->down_q4k, _gate, st_hidden, st_intermediate); \
             } else if (l->down_int8 && l->down_scales) { \
                 kernel_matvec_int8(x_norm, l->down_int8, l->down_scales, _gate, st_hidden, st_intermediate); \
             } else { \

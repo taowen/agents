@@ -359,10 +359,24 @@ static void codec_transformer_forward(qwen_tts_ctx_t *ctx, float *hidden,
             kernel_rms_norm(x_norm + t * codec_hidden, x + t * codec_hidden,
                            l->input_norm, codec_hidden, eps);
 
-        /* 2. Q, K, V projections (batch GEMM) */
-        kernel_matmul_f32(q_all, x_norm, l->wq, seq_len, heads * head_dim, codec_hidden);
-        kernel_matmul_f32(k_all, x_norm, l->wk, seq_len, kv_dim, codec_hidden);
-        kernel_matmul_f32(v_all, x_norm, l->wv, seq_len, kv_dim, codec_hidden);
+        /* 2. Q, K, V projections (INT8 fused QKV > F32 batch GEMM) */
+        if (l->wqkv_int8 && l->wqkv_scales) {
+            int q_dim = heads * head_dim;
+            int total_rows = q_dim + kv_dim + kv_dim;
+            float *qkv_tmp = (float *)malloc(total_rows * sizeof(float));
+            for (int t = 0; t < seq_len; t++) {
+                kernel_matvec_int8(qkv_tmp, l->wqkv_int8, l->wqkv_scales,
+                                    x_norm + t * codec_hidden, total_rows, codec_hidden);
+                memcpy(q_all + t * q_dim, qkv_tmp, q_dim * sizeof(float));
+                memcpy(k_all + t * kv_dim, qkv_tmp + q_dim, kv_dim * sizeof(float));
+                memcpy(v_all + t * kv_dim, qkv_tmp + q_dim + kv_dim, kv_dim * sizeof(float));
+            }
+            free(qkv_tmp);
+        } else {
+            kernel_matmul_f32(q_all, x_norm, l->wq, seq_len, heads * head_dim, codec_hidden);
+            kernel_matmul_f32(k_all, x_norm, l->wk, seq_len, kv_dim, codec_hidden);
+            kernel_matmul_f32(v_all, x_norm, l->wv, seq_len, kv_dim, codec_hidden);
+        }
 
         /* 3. RoPE (standard, not M-RoPE. No QK-Norm for codec decoder) */
         for (int t = 0; t < seq_len; t++) {
@@ -405,14 +419,21 @@ static void codec_transformer_forward(qwen_tts_ctx_t *ctx, float *hidden,
         }
 
         /* 5. Output projection + LayerScale + residual */
-        kernel_matmul_f32(
-            x_norm,
-            attn_out,
-            l->wo,
-            seq_len,
-            codec_hidden,
-            heads * head_dim
-        );
+        if (l->wo_int8 && l->wo_scales) {
+            for (int t = 0; t < seq_len; t++) {
+                kernel_matvec_int8(x_norm + t * codec_hidden, l->wo_int8, l->wo_scales,
+                                    attn_out + t * heads * head_dim, codec_hidden, heads * head_dim);
+            }
+        } else {
+            kernel_matmul_f32(
+                x_norm,
+                attn_out,
+                l->wo,
+                seq_len,
+                codec_hidden,
+                heads * head_dim
+            );
+        }
         for (int t = 0; t < seq_len; t++) {
             if (l->attn_layer_scale)
                 kernel_mul_inplace(x_norm + t * codec_hidden, l->attn_layer_scale, codec_hidden);
@@ -424,25 +445,41 @@ static void codec_transformer_forward(qwen_tts_ctx_t *ctx, float *hidden,
             kernel_rms_norm(x_norm + t * codec_hidden, x + t * codec_hidden,
                            l->post_attn_norm, codec_hidden, eps);
 
-        /* MLP: gate + up -> silu -> mul -> down (batch GEMM) */
-        kernel_matmul_f32(gate_all, x_norm, l->gate, seq_len, intermediate, codec_hidden);
-        kernel_matmul_f32(up_all, x_norm, l->up, seq_len, intermediate, codec_hidden);
-
-        for (int t = 0; t < seq_len; t++) {
-            float *gate = gate_all + (size_t)t * intermediate;
-            float *up = up_all + (size_t)t * intermediate;
-            kernel_silu_inplace(gate, intermediate);
-            kernel_mul_inplace(gate, up, intermediate);
+        /* MLP: gate + up -> silu -> mul -> down (INT8 fused > F32 batch GEMM) */
+        if (l->gate_up_int8 && l->gate_up_scales) {
+            for (int t = 0; t < seq_len; t++) {
+                kernel_swiglu_matvec_int8(gate_all + (size_t)t * intermediate,
+                                           l->gate_up_int8, l->gate_up_scales,
+                                           x_norm + t * codec_hidden,
+                                           intermediate, codec_hidden);
+            }
+        } else {
+            kernel_matmul_f32(gate_all, x_norm, l->gate, seq_len, intermediate, codec_hidden);
+            kernel_matmul_f32(up_all, x_norm, l->up, seq_len, intermediate, codec_hidden);
+            for (int t = 0; t < seq_len; t++) {
+                float *gate = gate_all + (size_t)t * intermediate;
+                float *up = up_all + (size_t)t * intermediate;
+                kernel_silu_inplace(gate, intermediate);
+                kernel_mul_inplace(gate, up, intermediate);
+            }
         }
 
-        kernel_matmul_f32(
-            x_norm,
-            gate_all,
-            l->down,
-            seq_len,
-            codec_hidden,
-            intermediate
-        );
+        if (l->down_int8 && l->down_scales) {
+            for (int t = 0; t < seq_len; t++) {
+                kernel_matvec_int8(x_norm + t * codec_hidden, l->down_int8, l->down_scales,
+                                    gate_all + (size_t)t * intermediate,
+                                    codec_hidden, intermediate);
+            }
+        } else {
+            kernel_matmul_f32(
+                x_norm,
+                gate_all,
+                l->down,
+                seq_len,
+                codec_hidden,
+                intermediate
+            );
+        }
 
         for (int t = 0; t < seq_len; t++) {
             /* LayerScale */

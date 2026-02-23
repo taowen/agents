@@ -10,6 +10,7 @@
 #include <pthread.h>
 #include <cstring>
 #include <cstdlib>
+#include <unistd.h>
 
 extern "C" {
 #include "qwen_asr.h"
@@ -20,6 +21,33 @@ extern "C" {
 #define TAG "QwenASR_JNI"
 #define LOGI(...) __android_log_print(ANDROID_LOG_INFO,  TAG, __VA_ARGS__)
 #define LOGE(...) __android_log_print(ANDROID_LOG_ERROR, TAG, __VA_ARGS__)
+
+// ---------------------------------------------------------------------------
+// Redirect stderr to logcat so C library fprintf(stderr,...) becomes visible
+// ---------------------------------------------------------------------------
+static int g_stderr_pipe[2] = {-1, -1};
+static pthread_t g_stderr_thread;
+
+static void *stderr_reader_thread(void *) {
+    char buf[512];
+    ssize_t n;
+    while ((n = read(g_stderr_pipe[0], buf, sizeof(buf) - 1)) > 0) {
+        buf[n] = '\0';
+        // Trim trailing newline
+        while (n > 0 && (buf[n-1] == '\n' || buf[n-1] == '\r')) buf[--n] = '\0';
+        if (n > 0) __android_log_print(ANDROID_LOG_INFO, "QwenASR", "%s", buf);
+    }
+    return nullptr;
+}
+
+static void setup_stderr_redirect() {
+    if (g_stderr_pipe[0] >= 0) return; // already set up
+    if (pipe(g_stderr_pipe) == -1) return;
+    dup2(g_stderr_pipe[1], STDERR_FILENO);
+    close(g_stderr_pipe[1]);
+    g_stderr_pipe[1] = -1;
+    pthread_create(&g_stderr_thread, nullptr, stderr_reader_thread, nullptr);
+}
 
 // ---------------------------------------------------------------------------
 // Global state
@@ -280,6 +308,10 @@ Java_ai_connct_1screen_rn_VoiceService_nativeTestWav(
         g_on_native_token = env->GetStaticMethodID(clazz, "onNativeToken", "(Ljava/lang/String;)V");
     }
 
+    // Enable verbose timing for per-phase profiling
+    qwen_verbose = 2;
+    setup_stderr_redirect();
+
     LOGI("nativeTestWav: loading %s", path);
     int n_samples = 0;
     float *samples = qwen_load_wav(path, &n_samples);
@@ -308,6 +340,71 @@ Java_ai_connct_1screen_rn_VoiceService_nativeTestWav(
     }
 
     LOGI("nativeTestWav: done");
+}
+
+JNIEXPORT void JNICALL
+Java_ai_connct_1screen_rn_VoiceService_nativeTestWavStream(
+        JNIEnv *env, jclass clazz, jstring wavPath) {
+
+    const char *path = env->GetStringUTFChars(wavPath, nullptr);
+    if (!path) {
+        LOGE("nativeTestWavStream: null path");
+        return;
+    }
+
+    if (!g_ctx) {
+        LOGE("nativeTestWavStream: model not loaded");
+        env->ReleaseStringUTFChars(wavPath, path);
+        return;
+    }
+
+    // Cache JNI refs if not yet done
+    if (!g_voice_service_class) {
+        g_voice_service_class = (jclass)env->NewGlobalRef(clazz);
+        g_on_native_token = env->GetStaticMethodID(clazz, "onNativeToken", "(Ljava/lang/String;)V");
+    }
+
+    qwen_verbose = 2;
+    setup_stderr_redirect();
+
+    LOGI("nativeTestWavStream: loading %s", path);
+    int n_samples = 0;
+    float *samples = qwen_load_wav(path, &n_samples);
+    env->ReleaseStringUTFChars(wavPath, path);
+
+    if (!samples || n_samples <= 0) {
+        LOGE("nativeTestWavStream: failed to load WAV");
+        return;
+    }
+    LOGI("nativeTestWavStream: loaded %d samples (%.2f sec)", n_samples, (float)n_samples / 16000.0f);
+
+    // Reset KV cache for clean inference
+    g_ctx->kv_cache_len = 0;
+
+    // Use streaming path: create live audio, push all samples, signal EOF, transcribe
+    qwen_live_audio_t *live = qwen_live_audio_create();
+    if (!live) {
+        LOGE("nativeTestWavStream: failed to create live audio");
+        free(samples);
+        return;
+    }
+
+    qwen_live_audio_push(live, samples, n_samples);
+    qwen_live_audio_signal_eof(live);
+
+    LOGI("nativeTestWavStream: starting streaming transcription...");
+    char *text = qwen_transcribe_stream_live(g_ctx, live);
+
+    if (text) {
+        LOGI("nativeTestWavStream: result = %s", text);
+        free(text);
+    } else {
+        LOGI("nativeTestWavStream: no text returned");
+    }
+
+    LOGI("nativeTestWavStream: done");
+    qwen_live_audio_free(live);
+    free(samples);
 }
 
 } // extern "C"

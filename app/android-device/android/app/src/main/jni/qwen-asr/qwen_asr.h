@@ -11,6 +11,7 @@
 #include <stdint.h>
 #include <stdio.h>
 #include <pthread.h>
+#include "qwen_asr_quant.h"
 
 /* ========================================================================
  * Constants
@@ -73,24 +74,24 @@ typedef struct {
  * ======================================================================== */
 
 typedef struct {
-    /* Self-attention (ALL have biases) - pre-converted to f32 */
-    float *wq_weight;          /* [d_model, d_model] */
+    /* Self-attention (ALL have biases) - quantized to Q8_0 */
+    block_q8_0 *wq_weight_q8;  /* [d_model, d_model] as Q8_0 blocks */
     float *wq_bias;            /* [d_model] */
-    float *wk_weight;          /* [d_model, d_model] */
+    block_q8_0 *wk_weight_q8;  /* [d_model, d_model] as Q8_0 blocks */
     float *wk_bias;            /* [d_model] */
-    float *wv_weight;          /* [d_model, d_model] */
+    block_q8_0 *wv_weight_q8;  /* [d_model, d_model] as Q8_0 blocks */
     float *wv_bias;            /* [d_model] */
-    float *wo_weight;          /* [d_model, d_model] */
+    block_q8_0 *wo_weight_q8;  /* [d_model, d_model] as Q8_0 blocks */
     float *wo_bias;            /* [d_model] */
 
     /* Pre-attention LayerNorm (with bias) */
     float *attn_norm_weight;   /* [d_model] */
     float *attn_norm_bias;     /* [d_model] */
 
-    /* FFN: GELU(fc1(x)) -> fc2 (ALL have biases) - pre-converted to f32 */
-    float *fc1_weight;         /* [ffn_dim, d_model] */
+    /* FFN: GELU(fc1(x)) -> fc2 (ALL have biases) - quantized to Q8_0 */
+    block_q8_0 *fc1_weight_q8; /* [ffn_dim, d_model] as Q8_0 blocks */
     float *fc1_bias;           /* [ffn_dim] */
-    float *fc2_weight;         /* [d_model, ffn_dim] */
+    block_q8_0 *fc2_weight_q8; /* [d_model, ffn_dim] as Q8_0 blocks */
     float *fc2_bias;           /* [d_model] */
 
     /* Pre-FFN LayerNorm (with bias) */
@@ -107,8 +108,8 @@ typedef struct {
     float *conv3_weight;       /* [480, 480, 3, 3] */
     float *conv3_bias;         /* [480] */
 
-    /* Conv output projection - pre-converted to f32 */
-    float *conv_out_weight;    /* [d_model, 7680] */
+    /* Conv output projection - quantized to Q8_0 */
+    block_q8_0 *conv_out_weight_q8; /* [d_model, 7680] as Q8_0 blocks */
 
     /* Transformer layers */
     qwen_enc_layer_t layers[QWEN_MAX_ENC_LAYERS];
@@ -117,10 +118,10 @@ typedef struct {
     float *ln_post_weight;     /* [d_model] */
     float *ln_post_bias;       /* [d_model] */
 
-    /* Projection layers - pre-converted to f32 */
-    float *proj1_weight;       /* [d_model, d_model] */
+    /* Projection layers - quantized to Q8_0 */
+    block_q8_0 *proj1_weight_q8; /* [d_model, d_model] as Q8_0 blocks */
     float *proj1_bias;         /* [d_model] */
-    float *proj2_weight;       /* [output_dim, d_model] */
+    block_q8_0 *proj2_weight_q8; /* [output_dim, d_model] as Q8_0 blocks */
     float *proj2_bias;         /* [output_dim] */
 } qwen_encoder_t;
 
@@ -129,11 +130,11 @@ typedef struct {
  * ======================================================================== */
 
 typedef struct {
-    /* Self-attention (NO biases in decoder) */
-    uint16_t *wq_weight_bf16;  /* [n_heads*head_dim, hidden] */
-    uint16_t *wk_weight_bf16;  /* [n_kv_heads*head_dim, hidden] */
-    uint16_t *wv_weight_bf16;  /* [n_kv_heads*head_dim, hidden] */
-    uint16_t *wo_weight_bf16;  /* [hidden, n_heads*head_dim] */
+    /* Self-attention (NO biases in decoder) - quantized to Q8_0 */
+    block_q8_0 *wq_weight_q8;  /* [n_heads*head_dim, hidden] as Q8_0 blocks */
+    block_q8_0 *wk_weight_q8;  /* [n_kv_heads*head_dim, hidden] as Q8_0 blocks */
+    block_q8_0 *wv_weight_q8;  /* [n_kv_heads*head_dim, hidden] as Q8_0 blocks */
+    block_q8_0 *wo_weight_q8;  /* [hidden, n_heads*head_dim] as Q8_0 blocks */
 
     /* Per-head Q/K RMSNorm */
     float *q_norm_weight;      /* [head_dim] = [128] */
@@ -143,13 +144,11 @@ typedef struct {
     float *input_norm;         /* [hidden] */
     float *post_attn_norm;     /* [hidden] */
 
-    /* SwiGLU MLP (NO biases) */
-    uint16_t *gate_weight_bf16; /* [intermediate, hidden] */
-    uint16_t *up_weight_bf16;   /* [intermediate, hidden] */
-    uint16_t *down_weight_bf16; /* [hidden, intermediate] */
+    /* SwiGLU MLP (NO biases) - quantized to Q8_0 */
+    block_q8_0 *down_weight_q8; /* [hidden, intermediate] as Q8_0 blocks */
 
-    /* Fused gate+up weight for single-token matvec [2*intermediate, hidden] */
-    uint16_t *gate_up_fused_bf16;
+    /* Fused gate+up weight [2*intermediate, hidden] as Q8_0 blocks */
+    block_q8_0 *gate_up_fused_q8;
 } qwen_dec_layer_t;
 
 typedef struct {

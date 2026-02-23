@@ -18,6 +18,9 @@
 #else
 #include <unistd.h>
 #endif
+#ifdef __ARM_NEON
+#include <arm_neon.h>
+#endif
 
 #ifdef USE_BLAS
 #ifdef __APPLE__
@@ -172,6 +175,286 @@ void qwen_copy(float *dst, const float *src, int n) {
     memcpy(dst, src, n * sizeof(float));
 }
 
+/* Forward declarations for threaded matvec helpers */
+static void f32_matvec_threaded(float *y, const float *x, const float *W,
+                                 const float *bias, int in_dim, int out_dim);
+static void bf16_matvec_threaded(float *y, const float *x, const uint16_t *W_bf16,
+                                  const float *bias, int in_dim, int out_dim);
+
+/* ========================================================================
+ * Batched GEMM for seq_len > 1
+ *
+ * Problem: per-row matvec re-reads the entire weight matrix for each input
+ * row, leading to M * |W| bytes of DRAM traffic. For M=143, K=N=1280:
+ * 143 * 6.25MB = 894MB, bottlenecked on memory bandwidth.
+ *
+ * Solution: transpose X to Xt[K,M], then for each W row n, accumulate
+ * W[n,k] * Xt[k,:] into Yt[n,:]. Xt fits in L2 (~713KB for M=143, K=1280)
+ * so W is read only once (~6.25MB total) — 128× less memory traffic.
+ * ======================================================================== */
+
+/* FP32 batched GEMM worker: processes a slice of output rows [n_start, n_end) */
+typedef struct {
+    float *Yt;        /* [N, M_pad] transposed output */
+    const float *Xt;  /* [K, M_pad] transposed input */
+    const float *W;   /* [N, K] weight matrix */
+    const float *bias; /* [N] or NULL */
+    int M_pad;        /* padded M (multiple of 4) */
+    int K;
+    int N;
+} f32_gemm_task_t;
+
+static void f32_gemm_worker(int tid, int n_threads, void *arg) {
+    f32_gemm_task_t *t = (f32_gemm_task_t *)arg;
+    int chunk = (t->N + n_threads - 1) / n_threads;
+    int n_start = tid * chunk;
+    int n_end = n_start + chunk;
+    if (n_end > t->N) n_end = t->N;
+    if (n_start >= n_end) return;
+
+    int M_pad = t->M_pad;
+    int K = t->K;
+
+    /* Initialize all Yt rows with bias (or zero) */
+    for (int n = n_start; n < n_end; n++) {
+        float *yt_row = t->Yt + (size_t)n * M_pad;
+        if (t->bias) {
+            float b = t->bias[n];
+#ifdef __ARM_NEON
+            float32x4_t bv = vdupq_n_f32(b);
+            for (int m = 0; m < M_pad; m += 4)
+                vst1q_f32(yt_row + m, bv);
+#else
+            for (int m = 0; m < M_pad; m++) yt_row[m] = b;
+#endif
+        } else {
+            memset(yt_row, 0, M_pad * sizeof(float));
+        }
+    }
+
+    /* K-outer, N-inner: Xt rows loaded once from DRAM, reused for all N.
+     * Thread's Yt block stays in L2 (e.g. 768×160×4 = 480KB). */
+    int k = 0;
+#ifdef __ARM_NEON
+    for (; k + 7 < K; k += 8) {
+        const float *xt0 = t->Xt + (size_t)k * M_pad;
+        const float *xt4 = t->Xt + (size_t)(k + 4) * M_pad;
+
+        for (int n = n_start; n < n_end; n++) {
+            float *yt_row = t->Yt + (size_t)n * M_pad;
+            const float *w_row = t->W + (size_t)n * K;
+            float32x4_t wv0 = vld1q_f32(w_row + k);
+            float32x4_t wv1 = vld1q_f32(w_row + k + 4);
+
+            for (int m = 0; m < M_pad; m += 4) {
+                float32x4_t yt = vld1q_f32(yt_row + m);
+                yt = vfmaq_laneq_f32(yt, vld1q_f32(xt0 + m), wv0, 0);
+                yt = vfmaq_laneq_f32(yt, vld1q_f32(xt0 + M_pad + m), wv0, 1);
+                yt = vfmaq_laneq_f32(yt, vld1q_f32(xt0 + 2*M_pad + m), wv0, 2);
+                yt = vfmaq_laneq_f32(yt, vld1q_f32(xt0 + 3*M_pad + m), wv0, 3);
+                yt = vfmaq_laneq_f32(yt, vld1q_f32(xt4 + m), wv1, 0);
+                yt = vfmaq_laneq_f32(yt, vld1q_f32(xt4 + M_pad + m), wv1, 1);
+                yt = vfmaq_laneq_f32(yt, vld1q_f32(xt4 + 2*M_pad + m), wv1, 2);
+                yt = vfmaq_laneq_f32(yt, vld1q_f32(xt4 + 3*M_pad + m), wv1, 3);
+                vst1q_f32(yt_row + m, yt);
+            }
+        }
+    }
+    for (; k < K; k++) {
+        const float *xt_col = t->Xt + (size_t)k * M_pad;
+        for (int n = n_start; n < n_end; n++) {
+            float *yt_row = t->Yt + (size_t)n * M_pad;
+            float32x4_t wv = vdupq_n_f32(t->W[(size_t)n * K + k]);
+            for (int m = 0; m < M_pad; m += 4) {
+                float32x4_t yt = vld1q_f32(yt_row + m);
+                yt = vfmaq_f32(yt, vld1q_f32(xt_col + m), wv);
+                vst1q_f32(yt_row + m, yt);
+            }
+        }
+    }
+#else
+    for (; k < K; k++) {
+        const float *xt_col = t->Xt + (size_t)k * M_pad;
+        for (int n = n_start; n < n_end; n++) {
+            float wk = t->W[(size_t)n * K + k];
+            float *yt_row = t->Yt + (size_t)n * M_pad;
+            for (int m = 0; m < M_pad; m++)
+                yt_row[m] += wk * xt_col[m];
+        }
+    }
+#endif
+}
+
+/* BF16 batched GEMM worker */
+typedef struct {
+    float *Yt;
+    const float *Xt;
+    const uint16_t *W_bf16;
+    const float *bias;
+    int M_pad;
+    int K;
+    int N;
+} bf16_gemm_task_t;
+
+static void bf16_gemm_worker(int tid, int n_threads, void *arg) {
+    bf16_gemm_task_t *t = (bf16_gemm_task_t *)arg;
+    int chunk = (t->N + n_threads - 1) / n_threads;
+    int n_start = tid * chunk;
+    int n_end = n_start + chunk;
+    if (n_end > t->N) n_end = t->N;
+    if (n_start >= n_end) return;
+
+    int M_pad = t->M_pad;
+    int K = t->K;
+
+    /* Initialize all Yt rows with bias (or zero) */
+    for (int n = n_start; n < n_end; n++) {
+        float *yt_row = t->Yt + (size_t)n * M_pad;
+        if (t->bias) {
+            float b = t->bias[n];
+#ifdef __ARM_NEON
+            float32x4_t bv = vdupq_n_f32(b);
+            for (int m = 0; m < M_pad; m += 4)
+                vst1q_f32(yt_row + m, bv);
+#else
+            for (int m = 0; m < M_pad; m++) yt_row[m] = b;
+#endif
+        } else {
+            memset(yt_row, 0, M_pad * sizeof(float));
+        }
+    }
+
+    /* K-outer, N-inner: Xt rows loaded once, reused for all N rows.
+     * Thread's Yt block stays in L2. */
+    int k = 0;
+#ifdef __ARM_NEON
+    for (; k + 7 < K; k += 8) {
+        const float *xt0 = t->Xt + (size_t)k * M_pad;
+        const float *xt4 = t->Xt + (size_t)(k + 4) * M_pad;
+
+        for (int n = n_start; n < n_end; n++) {
+            float *yt_row = t->Yt + (size_t)n * M_pad;
+            const uint16_t *w_row = t->W_bf16 + (size_t)n * K;
+            uint16x8_t raw = vld1q_u16(w_row + k);
+            float32x4_t wv0 = vreinterpretq_f32_u32(
+                vshlq_n_u32(vmovl_u16(vget_low_u16(raw)), 16));
+            float32x4_t wv1 = vreinterpretq_f32_u32(
+                vshlq_n_u32(vmovl_u16(vget_high_u16(raw)), 16));
+
+            for (int m = 0; m < M_pad; m += 4) {
+                float32x4_t yt = vld1q_f32(yt_row + m);
+                yt = vfmaq_laneq_f32(yt, vld1q_f32(xt0 + m), wv0, 0);
+                yt = vfmaq_laneq_f32(yt, vld1q_f32(xt0 + M_pad + m), wv0, 1);
+                yt = vfmaq_laneq_f32(yt, vld1q_f32(xt0 + 2*M_pad + m), wv0, 2);
+                yt = vfmaq_laneq_f32(yt, vld1q_f32(xt0 + 3*M_pad + m), wv0, 3);
+                yt = vfmaq_laneq_f32(yt, vld1q_f32(xt4 + m), wv1, 0);
+                yt = vfmaq_laneq_f32(yt, vld1q_f32(xt4 + M_pad + m), wv1, 1);
+                yt = vfmaq_laneq_f32(yt, vld1q_f32(xt4 + 2*M_pad + m), wv1, 2);
+                yt = vfmaq_laneq_f32(yt, vld1q_f32(xt4 + 3*M_pad + m), wv1, 3);
+                vst1q_f32(yt_row + m, yt);
+            }
+        }
+    }
+    for (; k < K; k++) {
+        const float *xt_col = t->Xt + (size_t)k * M_pad;
+        for (int n = n_start; n < n_end; n++) {
+            float *yt_row = t->Yt + (size_t)n * M_pad;
+            uint32_t bits = ((uint32_t)t->W_bf16[(size_t)n * K + k]) << 16;
+            float wk; memcpy(&wk, &bits, 4);
+            float32x4_t wv = vdupq_n_f32(wk);
+            for (int m = 0; m < M_pad; m += 4) {
+                float32x4_t yt = vld1q_f32(yt_row + m);
+                yt = vfmaq_f32(yt, vld1q_f32(xt_col + m), wv);
+                vst1q_f32(yt_row + m, yt);
+            }
+        }
+    }
+#else
+    for (; k < K; k++) {
+        const float *xt_col = t->Xt + (size_t)k * M_pad;
+        for (int n = n_start; n < n_end; n++) {
+            uint32_t bits = ((uint32_t)t->W_bf16[(size_t)n * K + k]) << 16;
+            float wk; memcpy(&wk, &bits, 4);
+            float *yt_row = t->Yt + (size_t)n * M_pad;
+            for (int m = 0; m < M_pad; m++)
+                yt_row[m] += wk * xt_col[m];
+        }
+    }
+#endif
+}
+
+/* Transpose X[M,K] → Xt[K, M_pad] (zero-padded to multiple of 4) */
+static void transpose_pad(float *Xt, const float *X, int M, int K, int M_pad) {
+    if (M_pad > M) {
+        /* Zero the padding columns for all K rows */
+        for (int k = 0; k < K; k++) {
+            for (int m = M; m < M_pad; m++) {
+                Xt[(size_t)k * M_pad + m] = 0.0f;
+            }
+        }
+    }
+    for (int m = 0; m < M; m++) {
+        for (int k = 0; k < K; k++) {
+            Xt[(size_t)k * M_pad + m] = X[(size_t)m * K + k];
+        }
+    }
+}
+
+/* Transpose Yt[N, M_pad] → Y[M, N] */
+static void transpose_back(float *Y, const float *Yt, int M, int N, int M_pad) {
+    for (int m = 0; m < M; m++) {
+        for (int n = 0; n < N; n++) {
+            Y[(size_t)m * N + n] = Yt[(size_t)n * M_pad + m];
+        }
+    }
+}
+
+/* Batched FP32 GEMM: Y[M,N] = X[M,K] @ W[N,K]^T + bias[N] */
+static void f32_gemm_batched(float *Y, const float *X, const float *W,
+                              const float *bias, int M, int K, int N) {
+    int M_pad = (M + 3) & ~3; /* round up to multiple of 4 */
+
+    float *Xt = (float *)malloc((size_t)K * M_pad * sizeof(float));
+    float *Yt = (float *)malloc((size_t)N * M_pad * sizeof(float));
+
+    transpose_pad(Xt, X, M, K, M_pad);
+
+    f32_gemm_task_t task = { Yt, Xt, W, bias, M_pad, K, N };
+    if (tp.n_threads <= 1) {
+        f32_gemm_worker(0, 1, &task);
+    } else {
+        parallel_for(f32_gemm_worker, &task);
+    }
+
+    transpose_back(Y, Yt, M, N, M_pad);
+
+    free(Xt);
+    free(Yt);
+}
+
+/* Batched BF16 GEMM: Y[M,N] = X[M,K] @ W_bf16[N,K]^T + bias[N] */
+static void bf16_gemm_batched(float *Y, const float *X, const uint16_t *W_bf16,
+                               const float *bias, int M, int K, int N) {
+    int M_pad = (M + 3) & ~3;
+
+    float *Xt = (float *)malloc((size_t)K * M_pad * sizeof(float));
+    float *Yt = (float *)malloc((size_t)N * M_pad * sizeof(float));
+
+    transpose_pad(Xt, X, M, K, M_pad);
+
+    bf16_gemm_task_t task = { Yt, Xt, W_bf16, bias, M_pad, K, N };
+    if (tp.n_threads <= 1) {
+        bf16_gemm_worker(0, 1, &task);
+    } else {
+        parallel_for(bf16_gemm_worker, &task);
+    }
+
+    transpose_back(Y, Yt, M, N, M_pad);
+
+    free(Xt);
+    free(Yt);
+}
+
 /* ========================================================================
  * Matrix Operations
  * ======================================================================== */
@@ -181,14 +464,10 @@ void qwen_matmul_t(float *C, const float *A, const float *B, int M, int K, int N
     cblas_sgemm(CblasRowMajor, CblasNoTrans, CblasTrans,
                 M, N, K, 1.0f, A, K, B, K, 0.0f, C, N);
 #else
-    for (int m = 0; m < M; m++) {
-        for (int n = 0; n < N; n++) {
-            float sum = 0.0f;
-            for (int k = 0; k < K; k++) {
-                sum += A[m * K + k] * B[n * K + k];
-            }
-            C[m * N + n] = sum;
-        }
+    if (M > 1) {
+        f32_gemm_batched(C, A, B, NULL, M, K, N);
+    } else {
+        f32_matvec_threaded(C, A, B, NULL, K, N);
     }
 #endif
 }
@@ -208,17 +487,10 @@ void qwen_linear(float *y, const float *x, const float *W, const float *b,
         }
     }
 #else
-    for (int s = 0; s < seq_len; s++) {
-        const float *x_row = x + s * in_dim;
-        float *y_row = y + s * out_dim;
-        for (int o = 0; o < out_dim; o++) {
-            const float *w_row = W + o * in_dim;
-            float sum = (b != NULL) ? b[o] : 0.0f;
-            for (int i = 0; i < in_dim; i++) {
-                sum += x_row[i] * w_row[i];
-            }
-            y_row[o] = sum;
-        }
+    if (seq_len > 1) {
+        f32_gemm_batched(y, x, W, b, seq_len, in_dim, out_dim);
+    } else {
+        f32_matvec_threaded(y, x, W, b, in_dim, out_dim);
     }
 #endif
 }
@@ -228,107 +500,6 @@ void qwen_linear_nobias(float *y, const float *x, const float *W,
     qwen_linear(y, x, W, NULL, seq_len, in_dim, out_dim);
 }
 
-/* Convert bf16 buffer to f32 buffer */
-static void bf16_to_f32_buf(float *dst, const uint16_t *src, size_t n) {
-    uint32_t *d = (uint32_t *)(void *)dst;
-    for (size_t i = 0; i < n; i++)
-        d[i] = ((uint32_t)src[i]) << 16;
-}
-
-/* Reusable scratch buffer for bf16->f32 conversion */
-static float *bf16_scratch = NULL;
-static size_t bf16_scratch_cap = 0;
-
-static float *bf16_get_scratch(size_t n) {
-    if (n > bf16_scratch_cap) {
-        free(bf16_scratch);
-        bf16_scratch = (float *)malloc(n * sizeof(float));
-        bf16_scratch_cap = bf16_scratch ? n : 0;
-    }
-    return bf16_scratch;
-}
-
-typedef struct {
-    const uint16_t *src;
-    size_t n;
-    float *dst_f32;
-} bf16_cache_entry_t;
-
-static bf16_cache_entry_t *bf16_cache = NULL;
-static int bf16_cache_len = 0;
-static int bf16_cache_cap = 0;
-static size_t bf16_cache_bytes = 0;
-static size_t bf16_cache_limit_bytes = 0;
-static int bf16_cache_limit_init = 0;
-
-static void bf16_cache_init_limit(void) {
-    if (bf16_cache_limit_init) return;
-    bf16_cache_limit_init = 1;
-
-    /* Default OFF. Override with QWEN_BF16_CACHE_MB=<n> to enable. */
-    unsigned long long mb = 0;
-    const char *env = getenv("QWEN_BF16_CACHE_MB");
-    if (env && env[0] != '\0') {
-        char *end = NULL;
-        unsigned long long v = strtoull(env, &end, 10);
-        if (end != env) mb = v;
-    }
-    bf16_cache_limit_bytes = (size_t)(mb * 1024ULL * 1024ULL);
-
-    if (qwen_verbose >= 2) {
-        fprintf(stderr, "BF16 cache: limit=%llu MB\n", mb);
-    }
-}
-
-static const float *bf16_get_cached_f32(const uint16_t *src, size_t n) {
-    bf16_cache_init_limit();
-
-    for (int i = 0; i < bf16_cache_len; i++) {
-        if (bf16_cache[i].src == src && bf16_cache[i].n == n) {
-            return bf16_cache[i].dst_f32;
-        }
-    }
-
-    if (bf16_cache_limit_bytes == 0) return NULL;
-
-    size_t bytes = n * sizeof(float);
-    if (bytes > bf16_cache_limit_bytes) return NULL;
-    if (bf16_cache_bytes + bytes > bf16_cache_limit_bytes) return NULL;
-
-    float *dst = (float *)malloc(bytes);
-    if (!dst) return NULL;
-    bf16_to_f32_buf(dst, src, n);
-
-    if (bf16_cache_len == bf16_cache_cap) {
-        int new_cap = bf16_cache_cap > 0 ? bf16_cache_cap * 2 : 256;
-        bf16_cache_entry_t *tmp = (bf16_cache_entry_t *)realloc(
-            bf16_cache, (size_t)new_cap * sizeof(bf16_cache_entry_t));
-        if (!tmp) {
-            free(dst);
-            return NULL;
-        }
-        bf16_cache = tmp;
-        bf16_cache_cap = new_cap;
-    }
-
-    bf16_cache[bf16_cache_len].src = src;
-    bf16_cache[bf16_cache_len].n = n;
-    bf16_cache[bf16_cache_len].dst_f32 = dst;
-    bf16_cache_len++;
-    bf16_cache_bytes += bytes;
-    return dst;
-}
-
-static const float *bf16_get_f32_view(const uint16_t *src, size_t n) {
-    const float *cached = bf16_get_cached_f32(src, n);
-    if (cached) return cached;
-
-    float *scratch = bf16_get_scratch(n);
-    if (!scratch) return NULL;
-    bf16_to_f32_buf(scratch, src, n);
-    return scratch;
-}
-
 /*
  * Fused BF16 matvec: y[out_dim] = W_bf16[out_dim, in_dim] @ x[in_dim] + bias
  * Processes 2 output rows at a time to amortize x vector loads.
@@ -336,6 +507,14 @@ static const float *bf16_get_f32_view(const uint16_t *src, size_t n) {
 static void bf16_matvec_fused(float *y, const float *x, const uint16_t *W_bf16,
                                const float *bias, int in_dim, int out_dim) {
     qwen_bf16_matvec_fused_impl(y, x, W_bf16, bias, in_dim, out_dim);
+}
+
+/*
+ * Fused FP32 matvec: y[out_dim] = W[out_dim, in_dim] @ x[in_dim] + bias
+ */
+static void f32_matvec_fused(float *y, const float *x, const float *W,
+                              const float *bias, int in_dim, int out_dim) {
+    qwen_f32_matvec_fused_impl(y, x, W, bias, in_dim, out_dim);
 }
 
 /* Threaded matvec: split output rows across threads */
@@ -370,6 +549,40 @@ static void bf16_matvec_threaded(float *y, const float *x, const uint16_t *W_bf1
     }
     matvec_task_t task = { y, x, W_bf16, bias, in_dim, out_dim };
     parallel_for(matvec_worker, &task);
+}
+
+/* Threaded FP32 matvec: split output rows across threads */
+typedef struct {
+    float *y;
+    const float *x;
+    const float *W;
+    const float *bias;
+    int in_dim;
+    int out_dim;
+} f32_matvec_task_t;
+
+static void f32_matvec_worker(int tid, int n_threads, void *arg) {
+    f32_matvec_task_t *t = (f32_matvec_task_t *)arg;
+    int chunk = (t->out_dim + n_threads - 1) / n_threads;
+    int start = tid * chunk;
+    int end = start + chunk;
+    if (end > t->out_dim) end = t->out_dim;
+    if (start >= end) return;
+
+    f32_matvec_fused(t->y + start, t->x,
+                     t->W + (size_t)start * t->in_dim,
+                     t->bias ? t->bias + start : NULL,
+                     t->in_dim, end - start);
+}
+
+static void f32_matvec_threaded(float *y, const float *x, const float *W,
+                                 const float *bias, int in_dim, int out_dim) {
+    if (tp.n_threads <= 1) {
+        f32_matvec_fused(y, x, W, bias, in_dim, out_dim);
+        return;
+    }
+    f32_matvec_task_t task = { y, x, W, bias, in_dim, out_dim };
+    parallel_for(f32_matvec_worker, &task);
 }
 
 typedef struct {
@@ -461,26 +674,20 @@ void qwen_linear_nobias_bf16_qkv(float *q, float *k, float *v, const float *x,
 
 void qwen_linear_nobias_bf16(float *y, const float *x, const uint16_t *W_bf16,
                               int seq_len, int in_dim, int out_dim) {
-    if (seq_len == 1) {
+    if (seq_len > 1) {
+        bf16_gemm_batched(y, x, W_bf16, NULL, seq_len, in_dim, out_dim);
+    } else {
         bf16_matvec_threaded(y, x, W_bf16, NULL, in_dim, out_dim);
-        return;
     }
-    size_t n = (size_t)out_dim * in_dim;
-    const float *W_f32 = bf16_get_f32_view(W_bf16, n);
-    if (!W_f32) return;
-    qwen_linear_nobias(y, x, W_f32, seq_len, in_dim, out_dim);
 }
 
 void qwen_linear_bf16(float *y, const float *x, const uint16_t *W_bf16,
                       const float *b, int seq_len, int in_dim, int out_dim) {
-    if (seq_len == 1) {
+    if (seq_len > 1) {
+        bf16_gemm_batched(y, x, W_bf16, b, seq_len, in_dim, out_dim);
+    } else {
         bf16_matvec_threaded(y, x, W_bf16, b, in_dim, out_dim);
-        return;
     }
-    size_t n = (size_t)out_dim * in_dim;
-    const float *W_f32 = bf16_get_f32_view(W_bf16, n);
-    if (!W_f32) return;
-    qwen_linear(y, x, W_f32, b, seq_len, in_dim, out_dim);
 }
 
 /* Find argmax over a range of output rows [start, end).
@@ -544,14 +751,446 @@ int qwen_argmax_matvec_bf16(const float *x, const uint16_t *W_bf16,
 
 void qwen_matmul_t_bf16(float *C, const float *A, const uint16_t *B_bf16,
                          int M, int K, int N) {
-    if (M == 1) {
-        bf16_matvec_threaded(C, A, B_bf16, NULL, K, N);
+    if (M > 1) {
+        bf16_gemm_batched(C, A, B_bf16, NULL, M, K, N);
     } else {
-        size_t n = (size_t)N * K;
-        const float *B_f32 = bf16_get_f32_view(B_bf16, n);
-        if (!B_f32) return;
-        qwen_matmul_t(C, A, B_f32, M, K, N);
+        bf16_matvec_threaded(C, A, B_bf16, NULL, K, N);
     }
+}
+
+/* ========================================================================
+ * Q8_0 Quantized Weight Operations
+ * ======================================================================== */
+
+/* Forward declarations */
+static void q8_matvec_threaded(float *y, const float *x, const block_q8_0 *W_q8,
+                                const float *bias, int in_dim, int out_dim);
+
+/* GEMM workspace: pre-allocated, lazily grown, never shrunk.
+ * Eliminates ~650 malloc/free per inference (~325 GEMM calls × 2). */
+static struct {
+    block_q8_0 *x_q8t;     /* [n_blocks * M_pad] transposed quantized input */
+    float *yt;              /* [N * M_pad] transposed output */
+    size_t x_q8t_cap;      /* allocated block_q8_0 count */
+    size_t yt_cap;          /* allocated float count */
+} gemm_ws = {0};
+
+static void gemm_ws_ensure(int n_blocks, int M_pad, int N) {
+    size_t need_q8 = (size_t)n_blocks * M_pad;
+    if (need_q8 > gemm_ws.x_q8t_cap) {
+        free(gemm_ws.x_q8t);
+        gemm_ws.x_q8t = (block_q8_0 *)malloc(need_q8 * sizeof(block_q8_0));
+        gemm_ws.x_q8t_cap = need_q8;
+    }
+    size_t need_yt = (size_t)N * M_pad;
+    if (need_yt > gemm_ws.yt_cap) {
+        free(gemm_ws.yt);
+        gemm_ws.yt = (float *)malloc(need_yt * sizeof(float));
+        gemm_ws.yt_cap = need_yt;
+    }
+}
+
+void qwen_gemm_workspace_free(void) {
+    free(gemm_ws.x_q8t); gemm_ws.x_q8t = NULL; gemm_ws.x_q8t_cap = 0;
+    free(gemm_ws.yt);    gemm_ws.yt = NULL;    gemm_ws.yt_cap = 0;
+}
+
+/* Q8_0 INT8 GEMM worker: INT8×INT8 dot products via vdotq_s32.
+ * X_q8t: [n_blocks, M_pad] (transposed quantized input)
+ * W_q8:  [N, n_blocks] (quantized weights)
+ * Yt:    [N, M_pad] (output, pre-initialized with bias) */
+typedef struct {
+    float *Yt;                  /* [N, M_pad] */
+    const block_q8_0 *X_q8t;   /* [n_blocks, M_pad] */
+    const block_q8_0 *W_q8;    /* [N, n_blocks] */
+    int M_pad, N, n_blocks;
+} q8_gemm_task_t;
+
+static void q8_gemm_worker(int tid, int n_threads, void *arg) {
+    q8_gemm_task_t *t = (q8_gemm_task_t *)arg;
+    int chunk = (t->N + n_threads - 1) / n_threads;
+    int n_start = tid * chunk;
+    int n_end = n_start + chunk;
+    if (n_end > t->N) n_end = t->N;
+    if (n_start >= n_end) return;
+
+    int M_pad = t->M_pad;
+    int n_blocks = t->n_blocks;
+
+    /* K-outer, N-middle, M-inner by 4 */
+#if defined(__ARM_NEON) && defined(__ARM_FEATURE_DOTPROD)
+    for (int kb = 0; kb < n_blocks; kb++) {
+        const block_q8_0 *x_col = t->X_q8t + (size_t)kb * M_pad;
+
+        for (int n = n_start; n < n_end; n++) {
+            float *yt_row = t->Yt + (size_t)n * M_pad;
+            const block_q8_0 *wb = &t->W_q8[(size_t)n * n_blocks + kb];
+            float w_scale = wb->scale;
+
+            int8x16_t w_lo = vld1q_s8(wb->qs);
+            int8x16_t w_hi = vld1q_s8(wb->qs + 16);
+
+            for (int m = 0; m < M_pad; m += 4) {
+                const block_q8_0 *xb0 = &x_col[m];
+                const block_q8_0 *xb1 = &x_col[m + 1];
+                const block_q8_0 *xb2 = &x_col[m + 2];
+                const block_q8_0 *xb3 = &x_col[m + 3];
+
+                /* INT8 dot products: 32 elements = 2 × vdotq_s32 per token */
+                int32x4_t d0 = vdotq_s32(vdupq_n_s32(0), w_lo, vld1q_s8(xb0->qs));
+                d0 = vdotq_s32(d0, w_hi, vld1q_s8(xb0->qs + 16));
+                int32x4_t d1 = vdotq_s32(vdupq_n_s32(0), w_lo, vld1q_s8(xb1->qs));
+                d1 = vdotq_s32(d1, w_hi, vld1q_s8(xb1->qs + 16));
+                int32x4_t d2 = vdotq_s32(vdupq_n_s32(0), w_lo, vld1q_s8(xb2->qs));
+                d2 = vdotq_s32(d2, w_hi, vld1q_s8(xb2->qs + 16));
+                int32x4_t d3 = vdotq_s32(vdupq_n_s32(0), w_lo, vld1q_s8(xb3->qs));
+                d3 = vdotq_s32(d3, w_hi, vld1q_s8(xb3->qs + 16));
+
+                /* Horizontal sum: vpaddq_s32 pairs */
+                int32x4_t p01 = vpaddq_s32(d0, d1);   /* [sum0_lo, sum0_hi, sum1_lo, sum1_hi] */
+                int32x4_t p23 = vpaddq_s32(d2, d3);
+                int32x4_t all4 = vpaddq_s32(p01, p23); /* [sum0, sum1, sum2, sum3] */
+
+                /* Scale: result = w_scale * x_scale[i] * int_dot[i] */
+                float32x4_t dots_f = vcvtq_f32_s32(all4);
+                float32x4_t xs = {xb0->scale, xb1->scale, xb2->scale, xb3->scale};
+                float32x4_t scaled = vmulq_f32(vmulq_n_f32(dots_f, w_scale), xs);
+
+                float32x4_t acc = vld1q_f32(yt_row + m);
+                vst1q_f32(yt_row + m, vaddq_f32(acc, scaled));
+            }
+        }
+    }
+#elif defined(__ARM_NEON)
+    /* NEON fallback without dotprod: use vmovl_s8 + vmlal_s16 */
+    for (int kb = 0; kb < n_blocks; kb++) {
+        const block_q8_0 *x_col = t->X_q8t + (size_t)kb * M_pad;
+
+        for (int n = n_start; n < n_end; n++) {
+            float *yt_row = t->Yt + (size_t)n * M_pad;
+            const block_q8_0 *wb = &t->W_q8[(size_t)n * n_blocks + kb];
+            float w_scale = wb->scale;
+
+            for (int m = 0; m < M_pad; m += 4) {
+                const block_q8_0 *xb0 = &x_col[m];
+                const block_q8_0 *xb1 = &x_col[m + 1];
+                const block_q8_0 *xb2 = &x_col[m + 2];
+                const block_q8_0 *xb3 = &x_col[m + 3];
+
+                /* Compute dot products using widening multiply-accumulate */
+                int32x4_t sum0 = vdupq_n_s32(0), sum1 = vdupq_n_s32(0);
+                int32x4_t sum2 = vdupq_n_s32(0), sum3 = vdupq_n_s32(0);
+
+                for (int j = 0; j < QK8_0; j += 8) {
+                    int8x8_t wq = vld1_s8(wb->qs + j);
+                    int16x8_t wq16 = vmovl_s8(wq);
+                    int16x4_t wq_lo = vget_low_s16(wq16);
+                    int16x4_t wq_hi = vget_high_s16(wq16);
+
+                    int16x8_t x0_16 = vmovl_s8(vld1_s8(xb0->qs + j));
+                    sum0 = vmlal_s16(sum0, wq_lo, vget_low_s16(x0_16));
+                    sum0 = vmlal_s16(sum0, wq_hi, vget_high_s16(x0_16));
+
+                    int16x8_t x1_16 = vmovl_s8(vld1_s8(xb1->qs + j));
+                    sum1 = vmlal_s16(sum1, wq_lo, vget_low_s16(x1_16));
+                    sum1 = vmlal_s16(sum1, wq_hi, vget_high_s16(x1_16));
+
+                    int16x8_t x2_16 = vmovl_s8(vld1_s8(xb2->qs + j));
+                    sum2 = vmlal_s16(sum2, wq_lo, vget_low_s16(x2_16));
+                    sum2 = vmlal_s16(sum2, wq_hi, vget_high_s16(x2_16));
+
+                    int16x8_t x3_16 = vmovl_s8(vld1_s8(xb3->qs + j));
+                    sum3 = vmlal_s16(sum3, wq_lo, vget_low_s16(x3_16));
+                    sum3 = vmlal_s16(sum3, wq_hi, vget_high_s16(x3_16));
+                }
+
+                int32x4_t p01 = vpaddq_s32(sum0, sum1);
+                int32x4_t p23 = vpaddq_s32(sum2, sum3);
+                int32x4_t all4 = vpaddq_s32(p01, p23);
+
+                float32x4_t dots_f = vcvtq_f32_s32(all4);
+                float32x4_t xs = {xb0->scale, xb1->scale, xb2->scale, xb3->scale};
+                float32x4_t scaled = vmulq_f32(vmulq_n_f32(dots_f, w_scale), xs);
+
+                float32x4_t acc = vld1q_f32(yt_row + m);
+                vst1q_f32(yt_row + m, vaddq_f32(acc, scaled));
+            }
+        }
+    }
+#else
+    /* Scalar fallback */
+    for (int kb = 0; kb < n_blocks; kb++) {
+        const block_q8_0 *x_col = t->X_q8t + (size_t)kb * M_pad;
+
+        for (int n = n_start; n < n_end; n++) {
+            float *yt_row = t->Yt + (size_t)n * M_pad;
+            const block_q8_0 *wb = &t->W_q8[(size_t)n * n_blocks + kb];
+            float w_scale = wb->scale;
+
+            for (int m = 0; m < M_pad; m++) {
+                const block_q8_0 *xb = &x_col[m];
+                int32_t dot = 0;
+                for (int j = 0; j < QK8_0; j++)
+                    dot += (int32_t)wb->qs[j] * (int32_t)xb->qs[j];
+                yt_row[m] += w_scale * xb->scale * (float)dot;
+            }
+        }
+    }
+#endif
+}
+
+/* Batched Q8_0 GEMM: Y[M,N] = X[M,K] @ W_q8[N,K/32 blocks]^T + bias[N]
+ * Uses INT8 dot products: quantizes X to Q8_0, then vdotq_s32 for GEMM. */
+static void q8_gemm_batched(float *Y, const float *X, const block_q8_0 *W_q8,
+                              const float *bias, int M, int K, int N) {
+    int M_pad = (M + 3) & ~3;
+    int n_blocks = K / QK8_0;
+
+    gemm_ws_ensure(n_blocks, M_pad, N);
+    quantize_f32_rows_transpose_q8(X, gemm_ws.x_q8t, M, K, M_pad);
+
+    /* Initialize Yt with bias (or zero) */
+    for (int n = 0; n < N; n++) {
+        float b = bias ? bias[n] : 0.0f;
+        float *yt_row = gemm_ws.yt + (size_t)n * M_pad;
+        for (int m = 0; m < M_pad; m++)
+            yt_row[m] = (m < M) ? b : 0.0f;
+    }
+
+    q8_gemm_task_t task = { gemm_ws.yt, gemm_ws.x_q8t, W_q8, M_pad, N, n_blocks };
+    if (tp.n_threads <= 1) {
+        q8_gemm_worker(0, 1, &task);
+    } else {
+        parallel_for(q8_gemm_worker, &task);
+    }
+
+    transpose_back(Y, gemm_ws.yt, M, N, M_pad);
+}
+
+/* Q8_0 Threaded MatVec: quantize x once, then dispatch to threads */
+typedef struct {
+    float *y;
+    const block_q8_0 *x_q8;
+    const block_q8_0 *W_q8;
+    const float *bias;
+    int n_blocks;
+    int out_dim;
+} q8_matvec_task_t;
+
+static void q8_matvec_fused(float *y, const block_q8_0 *x_q8, const block_q8_0 *W_q8,
+                              const float *bias, int n_blocks, int out_dim) {
+    qwen_q8_matvec_fused_impl(y, x_q8, W_q8, bias, n_blocks, out_dim);
+}
+
+static void q8_matvec_worker(int tid, int n_threads, void *arg) {
+    q8_matvec_task_t *t = (q8_matvec_task_t *)arg;
+    int chunk = (t->out_dim + n_threads - 1) / n_threads;
+    int start = tid * chunk;
+    int end = start + chunk;
+    if (end > t->out_dim) end = t->out_dim;
+    if (start >= end) return;
+
+    q8_matvec_fused(t->y + start, t->x_q8,
+                     t->W_q8 + (size_t)start * t->n_blocks,
+                     t->bias ? t->bias + start : NULL,
+                     t->n_blocks, end - start);
+}
+
+static void q8_matvec_threaded(float *y, const float *x, const block_q8_0 *W_q8,
+                                const float *bias, int in_dim, int out_dim) {
+    int n_blocks = in_dim / QK8_0;
+
+    /* Quantize input x to Q8_0 once, reused for all output rows */
+    block_q8_0 *x_q8 = (block_q8_0 *)malloc((size_t)n_blocks * sizeof(block_q8_0));
+    quantize_f32_to_q8_0(x, x_q8, in_dim);
+
+    if (tp.n_threads <= 1) {
+        q8_matvec_fused(y, x_q8, W_q8, bias, n_blocks, out_dim);
+    } else {
+        q8_matvec_task_t task = { y, x_q8, W_q8, bias, n_blocks, out_dim };
+        parallel_for(q8_matvec_worker, &task);
+    }
+
+    free(x_q8);
+}
+
+/* Q8_0 QKV fused matvec for single-token decoder */
+typedef struct {
+    float *q;
+    float *k;
+    float *v;
+    const block_q8_0 *x_q8;
+    const block_q8_0 *Wq_q8;
+    const block_q8_0 *Wk_q8;
+    const block_q8_0 *Wv_q8;
+    int n_blocks;
+    int q_dim;
+    int kv_dim;
+    int total_dim;
+} q8_qkv_matvec_task_t;
+
+static void q8_qkv_matvec_worker(int tid, int n_threads, void *arg) {
+    q8_qkv_matvec_task_t *t = (q8_qkv_matvec_task_t *)arg;
+    int chunk = (t->total_dim + n_threads - 1) / n_threads;
+    int start = tid * chunk;
+    int end = start + chunk;
+    if (end > t->total_dim) end = t->total_dim;
+    if (start >= end) return;
+
+    int q_end = t->q_dim;
+    int k_end = q_end + t->kv_dim;
+    int v_end = k_end + t->kv_dim;
+
+    if (start < q_end) {
+        int s = start;
+        int e = end < q_end ? end : q_end;
+        if (s < e) {
+            q8_matvec_fused(t->q + s, t->x_q8,
+                             t->Wq_q8 + (size_t)s * t->n_blocks,
+                             NULL, t->n_blocks, e - s);
+        }
+    }
+
+    if (end > q_end && start < k_end) {
+        int s = start > q_end ? start - q_end : 0;
+        int e_abs = end < k_end ? end : k_end;
+        int e = e_abs - q_end;
+        if (s < e) {
+            q8_matvec_fused(t->k + s, t->x_q8,
+                             t->Wk_q8 + (size_t)s * t->n_blocks,
+                             NULL, t->n_blocks, e - s);
+        }
+    }
+
+    if (end > k_end && start < v_end) {
+        int s = start > k_end ? start - k_end : 0;
+        int e_abs = end < v_end ? end : v_end;
+        int e = e_abs - k_end;
+        if (s < e) {
+            q8_matvec_fused(t->v + s, t->x_q8,
+                             t->Wv_q8 + (size_t)s * t->n_blocks,
+                             NULL, t->n_blocks, e - s);
+        }
+    }
+}
+
+void qwen_linear_nobias_q8_qkv(float *q, float *k, float *v, const float *x,
+                                const block_q8_0 *Wq_q8,
+                                const block_q8_0 *Wk_q8,
+                                const block_q8_0 *Wv_q8,
+                                int in_dim, int q_dim, int kv_dim) {
+    int n_blocks = in_dim / QK8_0;
+
+    /* Quantize x once, shared across Q/K/V */
+    block_q8_0 *x_q8 = (block_q8_0 *)malloc((size_t)n_blocks * sizeof(block_q8_0));
+    quantize_f32_to_q8_0(x, x_q8, in_dim);
+
+    if (tp.n_threads <= 1) {
+        q8_matvec_fused(q, x_q8, Wq_q8, NULL, n_blocks, q_dim);
+        q8_matvec_fused(k, x_q8, Wk_q8, NULL, n_blocks, kv_dim);
+        q8_matvec_fused(v, x_q8, Wv_q8, NULL, n_blocks, kv_dim);
+        free(x_q8);
+        return;
+    }
+
+    q8_qkv_matvec_task_t task = {
+        .q = q,
+        .k = k,
+        .v = v,
+        .x_q8 = x_q8,
+        .Wq_q8 = Wq_q8,
+        .Wk_q8 = Wk_q8,
+        .Wv_q8 = Wv_q8,
+        .n_blocks = n_blocks,
+        .q_dim = q_dim,
+        .kv_dim = kv_dim,
+        .total_dim = q_dim + 2 * kv_dim,
+    };
+    parallel_for(q8_qkv_matvec_worker, &task);
+    free(x_q8);
+}
+
+void qwen_linear_nobias_q8(float *y, const float *x, const block_q8_0 *W_q8,
+                            int seq_len, int in_dim, int out_dim) {
+    if (seq_len > 1) {
+        q8_gemm_batched(y, x, W_q8, NULL, seq_len, in_dim, out_dim);
+    } else {
+        q8_matvec_threaded(y, x, W_q8, NULL, in_dim, out_dim);
+    }
+}
+
+void qwen_linear_q8(float *y, const float *x, const block_q8_0 *W_q8,
+                    const float *b, int seq_len, int in_dim, int out_dim) {
+    if (seq_len > 1) {
+        q8_gemm_batched(y, x, W_q8, b, seq_len, in_dim, out_dim);
+    } else {
+        q8_matvec_threaded(y, x, W_q8, b, in_dim, out_dim);
+    }
+}
+
+/* Fused QKV GEMM: quantize input once, run Q/K/V projections sharing the
+ * quantized input. Saves 2× redundant quantizations for encoder/prefill. */
+static void q8_gemm_batched_with_q8t(float *Y, const block_q8_0 *X_q8t,
+                                       const block_q8_0 *W_q8, const float *bias,
+                                       int M, int M_pad, int n_blocks, int N) {
+    /* Initialize Yt with bias (or zero) */
+    size_t yt_need = (size_t)N * M_pad;
+    if (yt_need > gemm_ws.yt_cap) {
+        free(gemm_ws.yt);
+        gemm_ws.yt = (float *)malloc(yt_need * sizeof(float));
+        gemm_ws.yt_cap = yt_need;
+    }
+
+    for (int n = 0; n < N; n++) {
+        float b = bias ? bias[n] : 0.0f;
+        float *yt_row = gemm_ws.yt + (size_t)n * M_pad;
+        for (int m = 0; m < M_pad; m++)
+            yt_row[m] = (m < M) ? b : 0.0f;
+    }
+
+    q8_gemm_task_t task = { gemm_ws.yt, X_q8t, W_q8, M_pad, N, n_blocks };
+    if (tp.n_threads <= 1) {
+        q8_gemm_worker(0, 1, &task);
+    } else {
+        parallel_for(q8_gemm_worker, &task);
+    }
+
+    transpose_back(Y, gemm_ws.yt, M, N, M_pad);
+}
+
+void qwen_linear_q8_qkv_batched(
+    float *q, float *k, float *v,
+    const float *x,
+    const block_q8_0 *Wq_q8, const float *bq,
+    const block_q8_0 *Wk_q8, const float *bk,
+    const block_q8_0 *Wv_q8, const float *bv,
+    int seq_len, int in_dim, int q_dim, int kv_dim
+) {
+    /* seq_len=1: use existing matvec QKV path */
+    if (seq_len <= 1) {
+        if (bq || bk || bv) {
+            /* Encoder path with biases: separate matvec calls */
+            q8_matvec_threaded(q, x, Wq_q8, bq, in_dim, q_dim);
+            q8_matvec_threaded(k, x, Wk_q8, bk, in_dim, kv_dim);
+            q8_matvec_threaded(v, x, Wv_q8, bv, in_dim, kv_dim);
+        } else {
+            qwen_linear_nobias_q8_qkv(q, k, v, x, Wq_q8, Wk_q8, Wv_q8,
+                                        in_dim, q_dim, kv_dim);
+        }
+        return;
+    }
+
+    int M_pad = (seq_len + 3) & ~3;
+    int n_blocks = in_dim / QK8_0;
+
+    /* Quantize input once */
+    gemm_ws_ensure(n_blocks, M_pad, q_dim > kv_dim ? q_dim : kv_dim);
+    quantize_f32_rows_transpose_q8(x, gemm_ws.x_q8t, seq_len, in_dim, M_pad);
+
+    /* Run Q/K/V GEMMs sharing the quantized input */
+    q8_gemm_batched_with_q8t(q, gemm_ws.x_q8t, Wq_q8, bq, seq_len, M_pad, n_blocks, q_dim);
+    q8_gemm_batched_with_q8t(k, gemm_ws.x_q8t, Wk_q8, bk, seq_len, M_pad, n_blocks, kv_dim);
+    q8_gemm_batched_with_q8t(v, gemm_ws.x_q8t, Wv_q8, bv, seq_len, M_pad, n_blocks, kv_dim);
 }
 
 /* ========================================================================
@@ -589,6 +1228,117 @@ static void im2col(const float *in, float *cols,
     }
 }
 
+typedef struct {
+    float *out;
+    const float *weight;
+    const float *cols;
+    const float *bias;
+    int c_out;
+    int patch_size;
+    int spatial_out;
+} conv2d_gemm_task_t;
+
+static void conv2d_gemm_worker(int tid, int n_threads, void *arg) {
+    conv2d_gemm_task_t *t = (conv2d_gemm_task_t *)arg;
+    int chunk = (t->c_out + n_threads - 1) / n_threads;
+    int oc_start = tid * chunk;
+    int oc_end = oc_start + chunk;
+    if (oc_end > t->c_out) oc_end = t->c_out;
+    if (oc_start >= oc_end) return;
+
+    int patch_size = t->patch_size;
+    int spatial_out = t->spatial_out;
+    const float *cols = t->cols;
+    const float *weight = t->weight;
+
+    /* Initialize all output channels with bias */
+    for (int oc = oc_start; oc < oc_end; oc++) {
+        float *out_row = t->out + (size_t)oc * spatial_out;
+        float b = t->bias ? t->bias[oc] : 0.0f;
+        int s = 0;
+#ifdef __ARM_NEON
+        float32x4_t bv = vdupq_n_f32(b);
+        for (; s + 3 < spatial_out; s += 4)
+            vst1q_f32(out_row + s, bv);
+#endif
+        for (; s < spatial_out; s++)
+            out_row[s] = b;
+    }
+
+    /* p-outer, oc-inner: each cols group is loaded from DRAM once and reused
+     * for all output channels.  cols total (e.g. 13.8MB) is read once instead
+     * of c_out times (480×13.8MB = 6.6GB).  Each thread's output block
+     * (~384KB) stays in L2. */
+#ifdef __ARM_NEON
+    int p = 0;
+    for (; p + 7 < patch_size; p += 8) {
+        const float *cr0 = cols + (size_t)(p + 0) * spatial_out;
+        const float *cr1 = cols + (size_t)(p + 1) * spatial_out;
+        const float *cr2 = cols + (size_t)(p + 2) * spatial_out;
+        const float *cr3 = cols + (size_t)(p + 3) * spatial_out;
+        const float *cr4 = cols + (size_t)(p + 4) * spatial_out;
+        const float *cr5 = cols + (size_t)(p + 5) * spatial_out;
+        const float *cr6 = cols + (size_t)(p + 6) * spatial_out;
+        const float *cr7 = cols + (size_t)(p + 7) * spatial_out;
+
+        for (int oc = oc_start; oc < oc_end; oc++) {
+            const float *w_row = weight + (size_t)oc * patch_size;
+            float *out_row = t->out + (size_t)oc * spatial_out;
+            float32x4_t wv0 = vld1q_f32(w_row + p);
+            float32x4_t wv1 = vld1q_f32(w_row + p + 4);
+
+            int s = 0;
+            for (; s + 3 < spatial_out; s += 4) {
+                float32x4_t acc = vld1q_f32(out_row + s);
+                acc = vfmaq_laneq_f32(acc, vld1q_f32(cr0 + s), wv0, 0);
+                acc = vfmaq_laneq_f32(acc, vld1q_f32(cr1 + s), wv0, 1);
+                acc = vfmaq_laneq_f32(acc, vld1q_f32(cr2 + s), wv0, 2);
+                acc = vfmaq_laneq_f32(acc, vld1q_f32(cr3 + s), wv0, 3);
+                acc = vfmaq_laneq_f32(acc, vld1q_f32(cr4 + s), wv1, 0);
+                acc = vfmaq_laneq_f32(acc, vld1q_f32(cr5 + s), wv1, 1);
+                acc = vfmaq_laneq_f32(acc, vld1q_f32(cr6 + s), wv1, 2);
+                acc = vfmaq_laneq_f32(acc, vld1q_f32(cr7 + s), wv1, 3);
+                vst1q_f32(out_row + s, acc);
+            }
+            for (; s < spatial_out; s++) {
+                out_row[s] += w_row[p+0] * cr0[s] + w_row[p+1] * cr1[s]
+                           +  w_row[p+2] * cr2[s] + w_row[p+3] * cr3[s]
+                           +  w_row[p+4] * cr4[s] + w_row[p+5] * cr5[s]
+                           +  w_row[p+6] * cr6[s] + w_row[p+7] * cr7[s];
+            }
+        }
+    }
+    /* Tail: remaining p values */
+    for (; p < patch_size; p++) {
+        const float *cr = cols + (size_t)p * spatial_out;
+        for (int oc = oc_start; oc < oc_end; oc++) {
+            float wp = weight[(size_t)oc * patch_size + p];
+            float *out_row = t->out + (size_t)oc * spatial_out;
+            int s = 0;
+            float32x4_t wpv = vdupq_n_f32(wp);
+            for (; s + 3 < spatial_out; s += 4) {
+                float32x4_t acc = vld1q_f32(out_row + s);
+                acc = vfmaq_f32(acc, vld1q_f32(cr + s), wpv);
+                vst1q_f32(out_row + s, acc);
+            }
+            for (; s < spatial_out; s++)
+                out_row[s] += wp * cr[s];
+        }
+    }
+#else
+    /* Scalar fallback: p-outer, oc-inner */
+    for (int p = 0; p < patch_size; p++) {
+        const float *cr = cols + (size_t)p * spatial_out;
+        for (int oc = oc_start; oc < oc_end; oc++) {
+            float wp = weight[(size_t)oc * patch_size + p];
+            float *out_row = t->out + (size_t)oc * spatial_out;
+            for (int s = 0; s < spatial_out; s++)
+                out_row[s] += wp * cr[s];
+        }
+    }
+#endif
+}
+
 void qwen_conv2d(float *out, const float *in, const float *weight, const float *bias,
                  int c_in, int c_out, int h_in, int w_in,
                  int kh, int kw, int stride, int padding) {
@@ -607,20 +1357,7 @@ void qwen_conv2d(float *out, const float *in, const float *weight, const float *
                 c_out, spatial_out, patch_size,
                 1.0f, weight, patch_size, cols, spatial_out,
                 0.0f, out, spatial_out);
-#else
-    for (int oc = 0; oc < c_out; oc++) {
-        for (int s = 0; s < spatial_out; s++) {
-            float sum = 0.0f;
-            for (int p = 0; p < patch_size; p++) {
-                sum += weight[oc * patch_size + p] * cols[p * spatial_out + s];
-            }
-            out[oc * spatial_out + s] = sum;
-        }
-    }
-#endif
-
     free(cols);
-
     /* Add bias */
     if (bias) {
         for (int oc = 0; oc < c_out; oc++) {
@@ -631,6 +1368,15 @@ void qwen_conv2d(float *out, const float *in, const float *weight, const float *
             }
         }
     }
+#else
+    /* NEON-vectorized GEMM with bias fused in, parallelized over output channels */
+    conv2d_gemm_task_t task = {
+        .out = out, .weight = weight, .cols = cols, .bias = bias,
+        .c_out = c_out, .patch_size = patch_size, .spatial_out = spatial_out
+    };
+    parallel_for(conv2d_gemm_worker, &task);
+    free(cols);
+#endif
 }
 
 /* ========================================================================
@@ -1000,13 +1746,13 @@ static inline void qwen_vec_scale_add(float *dst, const float *src, float correc
     qwen_vec_scale_add_impl(dst, src, correction, n);
 }
 
-void qwen_bidirectional_attention(float *out, const float *Q, const float *K,
-                                   const float *V, int seq __attribute__((unused)),
-                                   int n_heads, int head_dim, float scale,
-                                   const int *window_starts, int n_windows) {
+static void qwen_bidirectional_attention_heads(float *out, const float *Q, const float *K,
+                                                const float *V, int n_heads, int head_dim,
+                                                float scale, const int *window_starts,
+                                                int n_windows, int head_start, int head_end) {
     int hidden = n_heads * head_dim;
 
-    for (int h = 0; h < n_heads; h++) {
+    for (int h = head_start; h < head_end; h++) {
         for (int w = 0; w < n_windows; w++) {
             int ws = window_starts[w];
             int we = window_starts[w + 1];
@@ -1045,6 +1791,49 @@ void qwen_bidirectional_attention(float *out, const float *Q, const float *K,
             }
         }
     }
+}
+
+typedef struct {
+    float *out;
+    const float *Q;
+    const float *K;
+    const float *V;
+    int n_heads;
+    int head_dim;
+    float scale;
+    const int *window_starts;
+    int n_windows;
+} bidir_attn_task_t;
+
+static void bidir_attn_worker(int tid, int n_threads, void *arg) {
+    bidir_attn_task_t *t = (bidir_attn_task_t *)arg;
+    int chunk = (t->n_heads + n_threads - 1) / n_threads;
+    int h0 = tid * chunk;
+    int h1 = h0 + chunk;
+    if (h1 > t->n_heads) h1 = t->n_heads;
+    if (h0 >= h1) return;
+
+    qwen_bidirectional_attention_heads(t->out, t->Q, t->K, t->V,
+                                        t->n_heads, t->head_dim, t->scale,
+                                        t->window_starts, t->n_windows, h0, h1);
+}
+
+void qwen_bidirectional_attention(float *out, const float *Q, const float *K,
+                                   const float *V, int seq __attribute__((unused)),
+                                   int n_heads, int head_dim, float scale,
+                                   const int *window_starts, int n_windows) {
+    if (tp.n_threads > 1 && n_heads >= 2) {
+        bidir_attn_task_t task = {
+            .out = out, .Q = Q, .K = K, .V = V,
+            .n_heads = n_heads, .head_dim = head_dim, .scale = scale,
+            .window_starts = window_starts, .n_windows = n_windows
+        };
+        parallel_for(bidir_attn_worker, &task);
+        return;
+    }
+
+    qwen_bidirectional_attention_heads(out, Q, K, V, n_heads, head_dim, scale,
+                                        window_starts, n_windows, 0, n_heads);
 }
 
 static void qwen_causal_attention_heads(float *out, const float *Q, const float *K,

@@ -43,6 +43,7 @@ public class VoiceService extends Service {
     public static native void nativeResetAsr();
     public static native void nativeFreeModel();
     public static native void nativeTestWav(String wavPath);
+    public static native void nativeTestWavStream(String wavPath);
 
     private static VoiceService sInstance;
     private AudioRecord audioRecord;

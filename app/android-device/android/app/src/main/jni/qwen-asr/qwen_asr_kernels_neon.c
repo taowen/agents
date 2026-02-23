@@ -115,6 +115,287 @@ void qwen_bf16_matvec_fused_neon(float *y, const float *x, const uint16_t *W_bf1
     }
 }
 
+void qwen_q8_matvec_fused_neon(float *y, const block_q8_0 *x_q8,
+                                const block_q8_0 *W_q8, const float *bias,
+                                int n_blocks, int out_dim) {
+    int o = 0;
+
+    /* Process 2 output rows at a time */
+    for (; o + 1 < out_dim; o += 2) {
+        const block_q8_0 *w0 = W_q8 + (size_t)o * n_blocks;
+        const block_q8_0 *w1 = W_q8 + (size_t)(o + 1) * n_blocks;
+        float s0 = bias ? bias[o] : 0.0f;
+        float s1 = bias ? bias[o + 1] : 0.0f;
+
+        int b = 0;
+        for (; b + 1 < n_blocks; b += 2) {
+            /* Block b */
+            float xs0 = x_q8[b].scale;
+            int8x16_t xv0_lo = vld1q_s8(x_q8[b].qs);
+            int8x16_t xv0_hi = vld1q_s8(x_q8[b].qs + 16);
+
+            float ws0_0 = w0[b].scale;
+            int8x16_t wv0_0_lo = vld1q_s8(w0[b].qs);
+            int8x16_t wv0_0_hi = vld1q_s8(w0[b].qs + 16);
+
+            float ws1_0 = w1[b].scale;
+            int8x16_t wv1_0_lo = vld1q_s8(w1[b].qs);
+            int8x16_t wv1_0_hi = vld1q_s8(w1[b].qs + 16);
+
+#ifdef __ARM_FEATURE_DOTPROD
+            int32x4_t d0_0 = vdotq_s32(vdupq_n_s32(0), wv0_0_lo, xv0_lo);
+            d0_0 = vdotq_s32(d0_0, wv0_0_hi, xv0_hi);
+            int32x4_t d1_0 = vdotq_s32(vdupq_n_s32(0), wv1_0_lo, xv0_lo);
+            d1_0 = vdotq_s32(d1_0, wv1_0_hi, xv0_hi);
+#else
+            /* Fallback without dotprod: widen to int16 and multiply */
+            int32x4_t d0_0 = vdupq_n_s32(0);
+            int32x4_t d1_0 = vdupq_n_s32(0);
+            int16x8_t xp0, wp0, wp1;
+            xp0 = vmovl_s8(vget_low_s8(xv0_lo));
+            wp0 = vmovl_s8(vget_low_s8(wv0_0_lo));
+            wp1 = vmovl_s8(vget_low_s8(wv1_0_lo));
+            d0_0 = vmlal_s16(d0_0, vget_low_s16(wp0), vget_low_s16(xp0));
+            d0_0 = vmlal_s16(d0_0, vget_high_s16(wp0), vget_high_s16(xp0));
+            d1_0 = vmlal_s16(d1_0, vget_low_s16(wp1), vget_low_s16(xp0));
+            d1_0 = vmlal_s16(d1_0, vget_high_s16(wp1), vget_high_s16(xp0));
+            xp0 = vmovl_s8(vget_high_s8(xv0_lo));
+            wp0 = vmovl_s8(vget_high_s8(wv0_0_lo));
+            wp1 = vmovl_s8(vget_high_s8(wv1_0_lo));
+            d0_0 = vmlal_s16(d0_0, vget_low_s16(wp0), vget_low_s16(xp0));
+            d0_0 = vmlal_s16(d0_0, vget_high_s16(wp0), vget_high_s16(xp0));
+            d1_0 = vmlal_s16(d1_0, vget_low_s16(wp1), vget_low_s16(xp0));
+            d1_0 = vmlal_s16(d1_0, vget_high_s16(wp1), vget_high_s16(xp0));
+            xp0 = vmovl_s8(vget_low_s8(xv0_hi));
+            wp0 = vmovl_s8(vget_low_s8(wv0_0_hi));
+            wp1 = vmovl_s8(vget_low_s8(wv1_0_hi));
+            d0_0 = vmlal_s16(d0_0, vget_low_s16(wp0), vget_low_s16(xp0));
+            d0_0 = vmlal_s16(d0_0, vget_high_s16(wp0), vget_high_s16(xp0));
+            d1_0 = vmlal_s16(d1_0, vget_low_s16(wp1), vget_low_s16(xp0));
+            d1_0 = vmlal_s16(d1_0, vget_high_s16(wp1), vget_high_s16(xp0));
+            xp0 = vmovl_s8(vget_high_s8(xv0_hi));
+            wp0 = vmovl_s8(vget_high_s8(wv0_0_hi));
+            wp1 = vmovl_s8(vget_high_s8(wv1_0_hi));
+            d0_0 = vmlal_s16(d0_0, vget_low_s16(wp0), vget_low_s16(xp0));
+            d0_0 = vmlal_s16(d0_0, vget_high_s16(wp0), vget_high_s16(xp0));
+            d1_0 = vmlal_s16(d1_0, vget_low_s16(wp1), vget_low_s16(xp0));
+            d1_0 = vmlal_s16(d1_0, vget_high_s16(wp1), vget_high_s16(xp0));
+#endif
+            s0 += ws0_0 * xs0 * (float)vaddvq_s32(d0_0);
+            s1 += ws1_0 * xs0 * (float)vaddvq_s32(d1_0);
+
+            /* Block b+1 */
+            float xs1 = x_q8[b + 1].scale;
+            int8x16_t xv1_lo = vld1q_s8(x_q8[b + 1].qs);
+            int8x16_t xv1_hi = vld1q_s8(x_q8[b + 1].qs + 16);
+
+            float ws0_1 = w0[b + 1].scale;
+            int8x16_t wv0_1_lo = vld1q_s8(w0[b + 1].qs);
+            int8x16_t wv0_1_hi = vld1q_s8(w0[b + 1].qs + 16);
+
+            float ws1_1 = w1[b + 1].scale;
+            int8x16_t wv1_1_lo = vld1q_s8(w1[b + 1].qs);
+            int8x16_t wv1_1_hi = vld1q_s8(w1[b + 1].qs + 16);
+
+#ifdef __ARM_FEATURE_DOTPROD
+            int32x4_t d0_1 = vdotq_s32(vdupq_n_s32(0), wv0_1_lo, xv1_lo);
+            d0_1 = vdotq_s32(d0_1, wv0_1_hi, xv1_hi);
+            int32x4_t d1_1 = vdotq_s32(vdupq_n_s32(0), wv1_1_lo, xv1_lo);
+            d1_1 = vdotq_s32(d1_1, wv1_1_hi, xv1_hi);
+#else
+            int32x4_t d0_1 = vdupq_n_s32(0);
+            int32x4_t d1_1 = vdupq_n_s32(0);
+            xp0 = vmovl_s8(vget_low_s8(xv1_lo));
+            wp0 = vmovl_s8(vget_low_s8(wv0_1_lo));
+            wp1 = vmovl_s8(vget_low_s8(wv1_1_lo));
+            d0_1 = vmlal_s16(d0_1, vget_low_s16(wp0), vget_low_s16(xp0));
+            d0_1 = vmlal_s16(d0_1, vget_high_s16(wp0), vget_high_s16(xp0));
+            d1_1 = vmlal_s16(d1_1, vget_low_s16(wp1), vget_low_s16(xp0));
+            d1_1 = vmlal_s16(d1_1, vget_high_s16(wp1), vget_high_s16(xp0));
+            xp0 = vmovl_s8(vget_high_s8(xv1_lo));
+            wp0 = vmovl_s8(vget_high_s8(wv0_1_lo));
+            wp1 = vmovl_s8(vget_high_s8(wv1_1_lo));
+            d0_1 = vmlal_s16(d0_1, vget_low_s16(wp0), vget_low_s16(xp0));
+            d0_1 = vmlal_s16(d0_1, vget_high_s16(wp0), vget_high_s16(xp0));
+            d1_1 = vmlal_s16(d1_1, vget_low_s16(wp1), vget_low_s16(xp0));
+            d1_1 = vmlal_s16(d1_1, vget_high_s16(wp1), vget_high_s16(xp0));
+            xp0 = vmovl_s8(vget_low_s8(xv1_hi));
+            wp0 = vmovl_s8(vget_low_s8(wv0_1_hi));
+            wp1 = vmovl_s8(vget_low_s8(wv1_1_hi));
+            d0_1 = vmlal_s16(d0_1, vget_low_s16(wp0), vget_low_s16(xp0));
+            d0_1 = vmlal_s16(d0_1, vget_high_s16(wp0), vget_high_s16(xp0));
+            d1_1 = vmlal_s16(d1_1, vget_low_s16(wp1), vget_low_s16(xp0));
+            d1_1 = vmlal_s16(d1_1, vget_high_s16(wp1), vget_high_s16(xp0));
+            xp0 = vmovl_s8(vget_high_s8(xv1_hi));
+            wp0 = vmovl_s8(vget_high_s8(wv0_1_hi));
+            wp1 = vmovl_s8(vget_high_s8(wv1_1_hi));
+            d0_1 = vmlal_s16(d0_1, vget_low_s16(wp0), vget_low_s16(xp0));
+            d0_1 = vmlal_s16(d0_1, vget_high_s16(wp0), vget_high_s16(xp0));
+            d1_1 = vmlal_s16(d1_1, vget_low_s16(wp1), vget_low_s16(xp0));
+            d1_1 = vmlal_s16(d1_1, vget_high_s16(wp1), vget_high_s16(xp0));
+#endif
+            s0 += ws0_1 * xs1 * (float)vaddvq_s32(d0_1);
+            s1 += ws1_1 * xs1 * (float)vaddvq_s32(d1_1);
+        }
+
+        /* Handle remaining block */
+        for (; b < n_blocks; b++) {
+            float xs = x_q8[b].scale;
+            int8x16_t xv_lo = vld1q_s8(x_q8[b].qs);
+            int8x16_t xv_hi = vld1q_s8(x_q8[b].qs + 16);
+
+            float ws0 = w0[b].scale;
+            int8x16_t wv0_lo = vld1q_s8(w0[b].qs);
+            int8x16_t wv0_hi = vld1q_s8(w0[b].qs + 16);
+
+            float ws1 = w1[b].scale;
+            int8x16_t wv1_lo = vld1q_s8(w1[b].qs);
+            int8x16_t wv1_hi = vld1q_s8(w1[b].qs + 16);
+
+#ifdef __ARM_FEATURE_DOTPROD
+            int32x4_t d0 = vdotq_s32(vdupq_n_s32(0), wv0_lo, xv_lo);
+            d0 = vdotq_s32(d0, wv0_hi, xv_hi);
+            int32x4_t d1 = vdotq_s32(vdupq_n_s32(0), wv1_lo, xv_lo);
+            d1 = vdotq_s32(d1, wv1_hi, xv_hi);
+#else
+            int32x4_t d0 = vdupq_n_s32(0);
+            int32x4_t d1 = vdupq_n_s32(0);
+            for (int j = 0; j < 32; j += 8) {
+                int8x8_t xq = vld1_s8(x_q8[b].qs + j);
+                int16x8_t xq16 = vmovl_s8(xq);
+                int16x8_t wq0_16 = vmovl_s8(vld1_s8(w0[b].qs + j));
+                int16x8_t wq1_16 = vmovl_s8(vld1_s8(w1[b].qs + j));
+                d0 = vmlal_s16(d0, vget_low_s16(wq0_16), vget_low_s16(xq16));
+                d0 = vmlal_s16(d0, vget_high_s16(wq0_16), vget_high_s16(xq16));
+                d1 = vmlal_s16(d1, vget_low_s16(wq1_16), vget_low_s16(xq16));
+                d1 = vmlal_s16(d1, vget_high_s16(wq1_16), vget_high_s16(xq16));
+            }
+#endif
+            s0 += ws0 * xs * (float)vaddvq_s32(d0);
+            s1 += ws1 * xs * (float)vaddvq_s32(d1);
+        }
+
+        y[o] = s0;
+        y[o + 1] = s1;
+    }
+
+    /* Handle remaining odd row */
+    for (; o < out_dim; o++) {
+        const block_q8_0 *w0 = W_q8 + (size_t)o * n_blocks;
+        float sum = bias ? bias[o] : 0.0f;
+
+        for (int b = 0; b < n_blocks; b++) {
+            float xs = x_q8[b].scale;
+            int8x16_t xv_lo = vld1q_s8(x_q8[b].qs);
+            int8x16_t xv_hi = vld1q_s8(x_q8[b].qs + 16);
+            float ws = w0[b].scale;
+            int8x16_t wv_lo = vld1q_s8(w0[b].qs);
+            int8x16_t wv_hi = vld1q_s8(w0[b].qs + 16);
+
+#ifdef __ARM_FEATURE_DOTPROD
+            int32x4_t d = vdotq_s32(vdupq_n_s32(0), wv_lo, xv_lo);
+            d = vdotq_s32(d, wv_hi, xv_hi);
+#else
+            int32x4_t d = vdupq_n_s32(0);
+            for (int j = 0; j < 32; j += 8) {
+                int8x8_t xq = vld1_s8(x_q8[b].qs + j);
+                int16x8_t xq16 = vmovl_s8(xq);
+                int16x8_t wq16 = vmovl_s8(vld1_s8(w0[b].qs + j));
+                d = vmlal_s16(d, vget_low_s16(wq16), vget_low_s16(xq16));
+                d = vmlal_s16(d, vget_high_s16(wq16), vget_high_s16(xq16));
+            }
+#endif
+            sum += ws * xs * (float)vaddvq_s32(d);
+        }
+        y[o] = sum;
+    }
+}
+
+void qwen_f32_matvec_fused_neon(float *y, const float *x, const float *W,
+                                const float *bias, int in_dim, int out_dim) {
+    int o = 0;
+
+    /* Process 2 output rows at a time, 32 elements/iter, 8 accumulators */
+    for (; o + 1 < out_dim; o += 2) {
+        const float *w0 = W + (size_t)o * in_dim;
+        const float *w1 = W + (size_t)(o + 1) * in_dim;
+        float s0 = bias ? bias[o] : 0.0f;
+        float s1 = bias ? bias[o + 1] : 0.0f;
+
+        float32x4_t a0 = vdupq_n_f32(0.0f), a1 = vdupq_n_f32(0.0f);
+        float32x4_t a2 = vdupq_n_f32(0.0f), a3 = vdupq_n_f32(0.0f);
+        float32x4_t b0 = vdupq_n_f32(0.0f), b1 = vdupq_n_f32(0.0f);
+        float32x4_t b2 = vdupq_n_f32(0.0f), b3 = vdupq_n_f32(0.0f);
+        int k = 0;
+
+        for (; k + 32 <= in_dim; k += 32) {
+            float32x4_t x0 = vld1q_f32(x + k);
+            float32x4_t x1 = vld1q_f32(x + k + 4);
+            float32x4_t x2 = vld1q_f32(x + k + 8);
+            float32x4_t x3 = vld1q_f32(x + k + 12);
+            float32x4_t x4 = vld1q_f32(x + k + 16);
+            float32x4_t x5 = vld1q_f32(x + k + 20);
+            float32x4_t x6 = vld1q_f32(x + k + 24);
+            float32x4_t x7 = vld1q_f32(x + k + 28);
+
+            a0 = vfmaq_f32(a0, vld1q_f32(w0 + k), x0);
+            a1 = vfmaq_f32(a1, vld1q_f32(w0 + k + 4), x1);
+            a2 = vfmaq_f32(a2, vld1q_f32(w0 + k + 8), x2);
+            a3 = vfmaq_f32(a3, vld1q_f32(w0 + k + 12), x3);
+            a0 = vfmaq_f32(a0, vld1q_f32(w0 + k + 16), x4);
+            a1 = vfmaq_f32(a1, vld1q_f32(w0 + k + 20), x5);
+            a2 = vfmaq_f32(a2, vld1q_f32(w0 + k + 24), x6);
+            a3 = vfmaq_f32(a3, vld1q_f32(w0 + k + 28), x7);
+
+            b0 = vfmaq_f32(b0, vld1q_f32(w1 + k), x0);
+            b1 = vfmaq_f32(b1, vld1q_f32(w1 + k + 4), x1);
+            b2 = vfmaq_f32(b2, vld1q_f32(w1 + k + 8), x2);
+            b3 = vfmaq_f32(b3, vld1q_f32(w1 + k + 12), x3);
+            b0 = vfmaq_f32(b0, vld1q_f32(w1 + k + 16), x4);
+            b1 = vfmaq_f32(b1, vld1q_f32(w1 + k + 20), x5);
+            b2 = vfmaq_f32(b2, vld1q_f32(w1 + k + 24), x6);
+            b3 = vfmaq_f32(b3, vld1q_f32(w1 + k + 28), x7);
+        }
+        for (; k + 8 <= in_dim; k += 8) {
+            float32x4_t x0 = vld1q_f32(x + k);
+            float32x4_t x1 = vld1q_f32(x + k + 4);
+            a0 = vfmaq_f32(a0, vld1q_f32(w0 + k), x0);
+            a1 = vfmaq_f32(a1, vld1q_f32(w0 + k + 4), x1);
+            b0 = vfmaq_f32(b0, vld1q_f32(w1 + k), x0);
+            b1 = vfmaq_f32(b1, vld1q_f32(w1 + k + 4), x1);
+        }
+        s0 += vaddvq_f32(vaddq_f32(vaddq_f32(a0, a2), vaddq_f32(a1, a3)));
+        s1 += vaddvq_f32(vaddq_f32(vaddq_f32(b0, b2), vaddq_f32(b1, b3)));
+
+        for (; k < in_dim; k++) {
+            s0 += w0[k] * x[k];
+            s1 += w1[k] * x[k];
+        }
+        y[o] = s0;
+        y[o + 1] = s1;
+    }
+
+    /* Handle remaining odd row */
+    for (; o < out_dim; o++) {
+        const float *w_row = W + (size_t)o * in_dim;
+        float sum = bias ? bias[o] : 0.0f;
+        int k = 0;
+
+        float32x4_t acc0 = vdupq_n_f32(0.0f);
+        float32x4_t acc1 = vdupq_n_f32(0.0f);
+        for (; k + 8 <= in_dim; k += 8) {
+            acc0 = vfmaq_f32(acc0, vld1q_f32(w_row + k), vld1q_f32(x + k));
+            acc1 = vfmaq_f32(acc1, vld1q_f32(w_row + k + 4), vld1q_f32(x + k + 4));
+        }
+        sum += vaddvq_f32(vaddq_f32(acc0, acc1));
+
+        for (; k < in_dim; k++) {
+            sum += w_row[k] * x[k];
+        }
+        y[o] = sum;
+    }
+}
+
 void qwen_argmax_bf16_range_neon(const float *x, const uint16_t *W_bf16,
                                  int in_dim, int start, int end,
                                  int *best_out, float *best_val_out) {
