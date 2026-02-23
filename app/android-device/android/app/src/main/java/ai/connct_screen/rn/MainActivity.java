@@ -738,4 +738,26 @@ public class MainActivity extends AppCompatActivity implements DeviceConnection.
             updateSendButton();
         });
     }
+
+    @Override
+    public void onUnauthorized(String agentType) {
+        handler.post(() -> {
+            Log.w(TAG, "Token rejected (401) from " + agentType + ", clearing credentials");
+            // Clear stored token
+            apiKey = null;
+            getSharedPreferences(PREFS_NAME, Context.MODE_PRIVATE).edit().clear().apply();
+            // Disconnect both agents
+            DeviceConnection.getInstance("app").disconnect();
+            DeviceConnection.getInstance("browser").disconnect();
+            // Reset connection status
+            appConnected = false;
+            browserConnected = false;
+            updateSpinnerItems();
+            // Show login screen
+            viewFlipper.setDisplayedChild(0);
+            loginBtn.setVisibility(View.VISIBLE);
+            deviceCodePanel.setVisibility(View.GONE);
+            loginErrorPanel.setVisibility(View.GONE);
+        });
+    }
 }

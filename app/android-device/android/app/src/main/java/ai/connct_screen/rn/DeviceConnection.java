@@ -36,6 +36,7 @@ public class DeviceConnection {
     public interface Listener {
         void onConnectionStatusChanged(String agentType, boolean connected);
         void onTaskDone(String agentType, String result);
+        void onUnauthorized(String agentType);
     }
 
     private static final Map<String, DeviceConnection> instances = new HashMap<>();
@@ -189,7 +190,12 @@ public class DeviceConnection {
                         + " secsSinceLastPing=" + secsSincePing, t);
                 connected = false;
                 notifyConnectionStatus(false);
-                scheduleReconnect();
+                if (response != null && response.code() == 401) {
+                    Log.w(TAG, "[" + agentType + "] Token rejected (401), notifying unauthorized");
+                    notifyUnauthorized();
+                } else {
+                    scheduleReconnect();
+                }
             }
         });
     }
@@ -361,6 +367,13 @@ public class DeviceConnection {
         Listener l = listener;
         if (l != null) {
             l.onTaskDone(agentType, result);
+        }
+    }
+
+    private void notifyUnauthorized() {
+        Listener l = listener;
+        if (l != null) {
+            l.onUnauthorized(agentType);
         }
     }
 }
