@@ -98,102 +98,104 @@ npx wrangler d1 execute ai-chat-db --remote --command "SELECT name FROM sqlite_m
 
 ## Sentry error monitoring
 
-The project integrates `@sentry/cloudflare` for error tracking and performance tracing. Set the `SENTRY_DSN` secret via `wrangler secret put SENTRY_DSN` to enable it.
+Server: `@sentry/cloudflare` (Worker + DO). Client: `@sentry/react`. Enable by setting `SENTRY_DSN` via `wrangler secret put SENTRY_DSN`.
 
 ### Setup
 
-Create an auth token at **Sentry Settings > Auth Tokens**, then save it locally:
+Save an auth token locally for API queries:
 
 ```bash
 # app/ai-chat/.env.sentry (git-ignored)
 SENTRY_AUTH_TOKEN=sntryu_xxx
-SENTRY_ORG=txom
-SENTRY_PROJECT=cloudflare-worker
-SENTRY_BASE_URL=https://us.sentry.io
 ```
 
-### Diagnostic workflow
-
-When you see a 500 error or unexpected behavior:
-
-**Step 1: List recent unresolved issues**
+All `curl` examples below assume `SENTRY_AUTH_TOKEN` is set. Shell-based usage:
 
 ```bash
-source app/ai-chat/.env.sentry
-curl -s "https://us.sentry.io/api/0/projects/txom/cloudflare-worker/issues/?query=is:unresolved&sort=date&limit=10" \
-  -H "Authorization: Bearer $SENTRY_AUTH_TOKEN" | jq '.[] | {id, title, lastSeen, count}'
+export SENTRY_AUTH_TOKEN=$(grep SENTRY_AUTH_TOKEN app/ai-chat/.env.sentry | cut -d= -f2)
 ```
 
-**Step 2: Get the latest event for a specific issue**
+The Sentry API base for all commands is:
 
-Copy the `id` from step 1 and fetch the full event:
+```
+https://us.sentry.io/api/0/projects/txom/cloudflare-worker
+```
+
+### Look up a bug report
+
+In-app "Report Bug" creates two Sentry issues per report — one server-side (`@sentry/cloudflare`, has full context) and one client-side (`@sentry/react`, for correlation only). Both are tagged with `report_id`.
+
+**Important**: Sentry issue search does **not** support free text. You must use the `report_id:` tag prefix:
+
+```bash
+# Find issues for a bug report
+curl -s "https://us.sentry.io/api/0/projects/txom/cloudflare-worker/issues/?query=report_id:BUG-MLYD2QVH-928A" \
+  -H "Authorization: Bearer $SENTRY_AUTH_TOKEN" | jq '.[] | {id, title, lastSeen}'
+```
+
+Get the full event (use `/events/latest/`, not `/events/` which only returns summaries):
 
 ```bash
 curl -s "https://us.sentry.io/api/0/issues/{issue_id}/events/latest/" \
   -H "Authorization: Bearer $SENTRY_AUTH_TOKEN" | jq '{
-    message: .message,
-    exception: [.entries[] | select(.type == "exception") | .data.values[] | {type, value}],
-    request: .request,
-    tags: [.tags[] | select(.key == "url" or .key == "transaction" or .key == "user_id" or .key == "session_uuid")]
+    bug_report: .contexts.bug_report,
+    recent_messages: .contexts.recent_messages.messages,
+    tags: [.tags[] | select(.key == "report_id" or .key == "user_id" or .key == "session_uuid")]
   }'
 ```
 
-**Step 3: Check breadcrumbs for context**
+Server-side bug report event structure:
+
+| Location | Content |
+|----------|---------|
+| `contexts.bug_report` | `{description, reportId, sessionUuid, userId}` |
+| `contexts.recent_messages.messages` | Last 10 D1 chat messages (path + text preview) |
+| `entries[type=request]` | HTTP request (method, url, headers) |
+| `tags` | `report_id`, `user_id`, `session_uuid`, `url`, `browser`, `os` |
+
+`recent_messages` comes from D1 (`files` table, `/.chat/` prefix). The authoritative message store is the DO's internal SQLite (`cf_ai_chat_agent_messages`), read via `/get-messages`.
+
+### Investigate errors
+
+List recent unresolved issues:
+
+```bash
+curl -s "https://us.sentry.io/api/0/projects/txom/cloudflare-worker/issues/?query=is:unresolved&sort=date&limit=10" \
+  -H "Authorization: Bearer $SENTRY_AUTH_TOKEN" | jq '.[] | {id, title, level, lastSeen, count}'
+```
+
+Get exception + stack trace for an issue:
+
+```bash
+curl -s "https://us.sentry.io/api/0/issues/{issue_id}/events/latest/" \
+  -H "Authorization: Bearer $SENTRY_AUTH_TOKEN" | jq '[.entries[] | select(.type == "exception") | .data.values[] | {type, value}]'
+```
+
+Get breadcrumbs (console logs, fetch calls leading up to the error):
 
 ```bash
 curl -s "https://us.sentry.io/api/0/issues/{issue_id}/events/latest/" \
   -H "Authorization: Bearer $SENTRY_AUTH_TOKEN" | jq '[.entries[] | select(.type == "breadcrumbs") | .data.values[-10:][]]'
 ```
 
-**Step 4: Look up a user-submitted bug report by ID**
+Error events have `entries` of type `exception`, `breadcrumbs`, `debugmeta`. Useful tags on DO errors: `do_id`, `user_id`, `session_uuid`.
 
-Bug reports (submitted via the in-app "Report Bug" button) are captured as Sentry warnings with a `report_id` tag. To find one:
+### Instrumentation coverage
 
-```bash
-# Search by bug report ID (e.g. BUG-MLVVNHVW-506F)
-curl -s "https://us.sentry.io/api/0/projects/txom/cloudflare-worker/issues/?query=BUG-MLVVNHVW-506F" \
-  -H "Authorization: Bearer $SENTRY_AUTH_TOKEN" | jq '.[] | {id, title, lastSeen}'
-```
+| Source | How | Notes |
+|--------|-----|-------|
+| DO errors | `instrumentDurableObjectWithSentry` | Automatic — exceptions, breadcrumbs, traces |
+| Worker Hono routes | `Sentry.withSentry` top-level wrapper | Uncaught exceptions in sub-routers may be swallowed by Hono — add explicit `Sentry.captureException(e)` in `try/catch` |
+| Client | `@sentry/react` init + `ErrorBoundary` | Browser errors + manual `captureMessage` for bug reports |
+| Real-time logs | `npx wrangler tail --format json` | Useful when Sentry doesn't capture the error |
 
-Then fetch the full event to see the bug description, session ID, user ID, and recent D1 chat messages:
+### Common issues
 
-```bash
-curl -s "https://us.sentry.io/api/0/issues/{issue_id}/events/" \
-  -H "Authorization: Bearer $SENTRY_AUTH_TOKEN" | jq '.[0].contexts'
-```
-
-Key contexts in a bug report event:
-
-| Context | Fields |
-|---------|--------|
-| `bug_report` | `description`, `reportId`, `sessionUuid`, `userId` |
-| `recent_messages` | Last 10 chat messages from D1 (path + text preview) |
-
-Note: `recent_messages` comes from D1 (`files` table, `/.chat/` prefix) — this is a fire-and-forget copy. The authoritative message store is the Durable Object's internal SQLite (`cf_ai_chat_agent_messages` table), which is what the `/get-messages` endpoint reads.
-
-### Common patterns
-
-| Symptom | Likely cause |
-|---------|-------------|
-| `SqlError: Durable Object reset because its code was updated` | Transient — DOs restart after deploy, safe to ignore |
-| 500 on API routes with no Sentry issue | Error not captured — add `try/catch` + `Sentry.captureException(e)` to the handler |
-| `tryN.baseDelayMs.baseDelayMs` | DO retry loop hitting the reset window after deploy |
-| `D1_ERROR: no such table: <name>: SQLITE_ERROR` | D1 schema out of sync — new table in `schema.sql` but never applied to remote. Fix: `npx wrangler d1 execute ai-chat-db --remote --file schema.sql` |
-
-### Limitations
-
-- **Worker-level Hono route errors** may not appear in Sentry unless explicitly captured with `Sentry.captureException()` inside a `try/catch` block. The Sentry middleware wraps the top-level fetch but uncaught exceptions in sub-routers can sometimes be swallowed by Hono's error handling.
-- **DO errors** are instrumented via `instrumentDurableObjectWithSentry` and appear automatically.
-- **`wrangler tail`** (`npx wrangler tail --format json`) shows real-time `console.log`/`console.error` output. Useful when Sentry doesn't capture the error.
-
-### Key fields in the event response
-
-| Field | What it tells you |
-|-------|-------------------|
-| `entries[type=exception].data.values` | Exception chain with stack traces |
-| `entries[type=breadcrumbs].data.values` | Chronological log of console, fetch, and schedule events leading up to the error |
-| `contexts.trace` | Distributed trace ID for correlating spans |
-| `tags` | Environment, handler status, runtime info |
+| Symptom | Cause |
+|---------|-------|
+| `Durable Object reset because its code was updated` | Transient after deploy, safe to ignore |
+| 500 with no Sentry issue | Error swallowed by Hono — add `try/catch` + `Sentry.captureException(e)` |
+| `D1_ERROR: no such table` | Schema not applied — run `npx wrangler d1 execute ai-chat-db --remote --file schema.sql` |
 
 ## Self-testing API endpoints
 
