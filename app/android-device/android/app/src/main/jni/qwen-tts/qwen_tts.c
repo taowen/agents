@@ -2379,8 +2379,22 @@ int qwen_tts_generate_stream(
     double t_gen = time_ms();
     ctx->perf_subtalker_ms = 0.0;
 
-    /* If chunk_size <= 0, decode only at the end (batch mode) */
+    /* chunk_size > 0: incremental mode (per-token decode + callback)
+     * chunk_size == 0: batch mode (decode all at EOS) */
     int effective_chunk = (chunk_size > 0) ? chunk_size : 0;
+
+    /* Initialize incremental codec decode state for streaming mode */
+    qwen_tts_codec_stream_state_t *codec_state = NULL;
+    if (effective_chunk > 0) {
+        codec_state = qwen_tts_codec_stream_init(ctx);
+        if (!codec_state) {
+            fprintf(stderr, "Error: failed to init incremental codec state\n");
+            free(all_codes); free(generated_tokens); free(logits); free(next_embed);
+            free(emb_tmp); free(suppress_tokens); free(trailing_text);
+            free(tts_pad_proj); free(tts_bos_proj); free(tts_eos_proj); free(text_tokens);
+            return -1;
+        }
+    }
 
     for (int step = 0; step < max_tokens; step++) {
         if (step == 0) {
@@ -2423,33 +2437,41 @@ int qwen_tts_generate_stream(
 
             memcpy(all_codes + n_generated * num_groups, codes, num_groups * sizeof(int));
             n_generated++;
+
+            /* Incremental decode: process this token immediately */
+            if (codec_state) {
+                int n_audio = 0;
+                float *audio = qwen_tts_codec_decode_step(ctx, codec_state,
+                    all_codes + (n_generated - 1) * num_groups, &n_audio);
+                if (audio && n_audio > 0) {
+                    prev_audio_len += n_audio;
+                    if (qwen_tts_verbose >= 1)
+                        fprintf(stderr, "Stream incr: %d samples (%d total, %.2fs) at step %d\n",
+                                n_audio, prev_audio_len,
+                                (float)prev_audio_len / QWEN_TTS_SAMPLE_RATE, step);
+                    int ret = audio_cb(audio, n_audio, userdata);
+                    free(audio);
+                    if (ret != 0) {
+                        aborted = 1;
+                        break;
+                    }
+                } else {
+                    free(audio);
+                }
+            }
         }
 
-        /* Stream decode: on chunk boundary or EOS with remaining tokens */
-        int should_decode = 0;
-        if (effective_chunk > 0 && n_generated > 0) {
-            if (n_generated % effective_chunk == 0) should_decode = 1;
-            if (is_eos && n_generated > prev_decoded_tokens) should_decode = 1;
-        } else if (effective_chunk == 0 && is_eos && n_generated > 0) {
-            should_decode = 1;  /* batch mode: decode all at EOS */
-        }
-
-        if (should_decode) {
+        /* Batch mode: decode all at EOS */
+        if (!codec_state && effective_chunk == 0 && is_eos && n_generated > 0) {
             int n_audio = 0;
             float *audio = qwen_tts_codec_decode(ctx, all_codes, n_generated, &n_audio);
-            prev_decoded_tokens = n_generated;
-            if (audio && n_audio > prev_audio_len) {
-                int new_samples = n_audio - prev_audio_len;
+            if (audio && n_audio > 0) {
                 if (qwen_tts_verbose >= 1)
-                    fprintf(stderr, "Stream chunk: %d new samples (%d total, %.2fs) at step %d\n",
-                            new_samples, n_audio, (float)n_audio / QWEN_TTS_SAMPLE_RATE, step);
-                int ret = audio_cb(audio + prev_audio_len, new_samples, userdata);
+                    fprintf(stderr, "Batch decode: %d samples (%.2fs)\n",
+                            n_audio, (float)n_audio / QWEN_TTS_SAMPLE_RATE);
+                int ret = audio_cb(audio, n_audio, userdata);
                 prev_audio_len = n_audio;
-                if (ret != 0) {
-                    aborted = 1;
-                    free(audio);
-                    break;
-                }
+                if (ret != 0) aborted = 1;
             }
             free(audio);
         }
@@ -2480,6 +2502,12 @@ int qwen_tts_generate_stream(
             double elapsed = time_ms() - t_gen;
             fprintf(stderr, "\r  Token %d (%.1f ms/token)...", n_generated, elapsed / n_generated);
         }
+    }
+
+    /* Clean up incremental state */
+    if (codec_state) {
+        qwen_tts_codec_stream_free(codec_state);
+        codec_state = NULL;
     }
 
     double t_gen_done = time_ms();

@@ -49,7 +49,7 @@ public class TtsDebugReceiver extends BroadcastReceiver {
     public void onReceive(Context context, Intent intent) {
         String cmd = intent.getStringExtra("cmd");
         if (cmd == null || cmd.isEmpty()) {
-            Log.e(TAG, "No cmd provided. Use: --es cmd status|download|load|tokenize|speak|speak_stream|free");
+            Log.e(TAG, "No cmd provided. Use: --es cmd status|download|load|tokenize|speak|speak_stream|verify|free");
             return;
         }
 
@@ -79,6 +79,11 @@ public class TtsDebugReceiver extends BroadcastReceiver {
                         intent.getStringExtra("speaker"),
                         intent.getStringExtra("language"), path,
                         intent.getIntExtra("chunk_size", 10));
+                break;
+            case "verify":
+                doVerify(context, intent.getStringExtra("text"),
+                        intent.getStringExtra("speaker"),
+                        intent.getStringExtra("language"), path);
                 break;
             case "free":
                 doFree();
@@ -382,6 +387,50 @@ public class TtsDebugReceiver extends BroadcastReceiver {
 
             } catch (Exception e) {
                 Log.e(TAG, "speak_stream: failed", e);
+            }
+        }).start();
+    }
+
+    private void doVerify(Context context, String text, String speaker, String language, String path) {
+        if (text == null || text.isEmpty()) {
+            Log.e(TAG, "verify requires --es text <text>");
+            return;
+        }
+        String modelDir = resolveModelDir(context, path);
+        if (modelDir == null) return;
+
+        new Thread(() -> {
+            try {
+                // Load model if needed
+                if (!HermesRuntime.nativeTtsIsLoaded()) {
+                    Log.i(TAG, "verify: loading model...");
+                    long loadStart = System.currentTimeMillis();
+                    boolean ok = HermesRuntime.nativeTtsLoadModel(modelDir);
+                    Log.i(TAG, "verify: load_model=" + ok + " in "
+                            + (System.currentTimeMillis() - loadStart) + "ms");
+                    if (!ok) {
+                        Log.e(TAG, "verify: model load failed");
+                        return;
+                    }
+                }
+
+                // Tokenize
+                ensureTokenizer(modelDir);
+                if (sTokenizer == null) {
+                    Log.e(TAG, "verify: tokenizer load failed");
+                    return;
+                }
+                String tokenIds = sTokenizer.tokenizeForTts(text);
+                Log.i(TAG, "verify: tokenized, running verification...");
+
+                long startMs = System.currentTimeMillis();
+                int result = HermesRuntime.nativeTtsVerifyIncremental(tokenIds, speaker, language);
+                long elapsed = System.currentTimeMillis() - startMs;
+                Log.i(TAG, "verify: result=" + (result == 0 ? "PASS" : "FAIL")
+                        + " in " + elapsed + "ms");
+
+            } catch (Exception e) {
+                Log.e(TAG, "verify: failed", e);
             }
         }).start();
     }

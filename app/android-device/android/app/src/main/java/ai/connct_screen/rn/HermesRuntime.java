@@ -157,6 +157,7 @@ public class HermesRuntime {
                                                 int chunkSize, TtsStreamCallback callback);
     static native boolean nativeTtsIsLoaded();
     static native void nativeTtsFree();
+    static native int nativeTtsVerifyIncremental(String tokenIds, String speaker, String language);
 
     /** Callback interface for streaming TTS audio delivery. */
     public interface TtsStreamCallback {

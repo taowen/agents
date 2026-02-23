@@ -2,7 +2,7 @@
 
 ## Commands
 
-Seven commands via `am broadcast`, results in logcat tags `TtsDebug` / `QwenTTS_JNI` / `BpeTokenizer`.
+Eight commands via `am broadcast`, results in logcat tags `TtsDebug` / `QwenTTS_JNI` / `BpeTokenizer`.
 
 ```bash
 # 1. Check status (model downloaded? loaded? tokenizer ready?)
@@ -28,11 +28,15 @@ adb shell "am broadcast -a ai.connct_screen.rn.TTS_DEBUG -p ai.connct_screen.rn 
   --es cmd speak_stream --es text 'Hello world' --es path /data/local/tmp/qwen-tts-model \
   --ei chunk_size 10"
 
-# 6b. Smaller chunk for faster first audio (more re-decode overhead)
+# 6b. Incremental stream (chunk_size=1 for per-token decode)
 adb shell "am broadcast -a ai.connct_screen.rn.TTS_DEBUG -p ai.connct_screen.rn \
-  --es cmd speak_stream --es text '你好，今天天气怎么样？' --ei chunk_size 5"
+  --es cmd speak_stream --es text '你好，今天天气怎么样？' --ei chunk_size 1"
 
-# 7. Free model memory
+# 7. Verify incremental vs batch decode (compare PCM output)
+adb shell "am broadcast -a ai.connct_screen.rn.TTS_DEBUG -p ai.connct_screen.rn \
+  --es cmd verify --es text 'Hello world' --es path /data/local/tmp/qwen-tts-model"
+
+# 8. Free model memory
 adb shell "am broadcast -a ai.connct_screen.rn.TTS_DEBUG -p ai.connct_screen.rn --es cmd free"
 
 # View results
@@ -56,19 +60,20 @@ download  →  load  →  tokenize  →  generate + play
 - **Play (batch)**: `AudioTrack` in `MODE_STATIC`, blocks until playback completes.
 - **Play (stream)**: `AudioTrack` in `MODE_STREAM`, starts playing immediately, receives chunks via callback.
 
-### Streaming architecture
+### Streaming architecture (incremental codec decode)
 
 ```
-Thread 1 (generate):  talker loop → every chunk_size tokens → codec_decode(all accumulated) → diff → callback
-                                                                                                    ↓
+Thread 1 (generate):  talker loop → each token → codec_decode_step(1 token) → 1920 samples → callback
+                                                                                                ↓
 Java callback:        onAudioChunk(short[]) → AudioTrack.MODE_STREAM.write() → plays immediately
 ```
 
-The codec decoder is **causal**: `decode(N tokens)[0:N]` == `decode(N+M tokens)[0:N]`. This enables a "re-decode + diff" strategy where we decode all accumulated tokens, then send only the new samples.
+The codec decoder is **causal**: each token produces exactly 1920 new samples (80ms at 24kHz) independent of future input. The incremental decode maintains causal conv states, transformer KV cache, and transposed conv overlap buffers to process one token at a time without re-processing previous tokens.
 
-- `chunk_size=5`: TTFA ~3s, total time +~40% overhead from re-decode
-- `chunk_size=10`: TTFA ~5s, total time +~25% overhead
-- `chunk_size=0`: batch mode (decode once at end)
+- `chunk_size > 0`: incremental mode (per-token decode, no re-decode overhead)
+- `chunk_size == 0`: batch mode (decode once at end)
+
+Expected performance: TTFA ~600ms (first token generated + decoded), total ≈ batch time (no O(n²) re-decode).
 
 ### Streaming logcat output
 
@@ -83,7 +88,7 @@ Key metrics:
 - **Total**: Full generation + playback time
 - **Overhead**: Streaming total vs batch total ratio
 
-### Streaming test results (2026-02-23, re-decode strategy)
+### Streaming test results (2026-02-23, re-decode strategy — SUPERSEDED)
 
 **Batch baseline:** "Hello world" → 23 codec tokens, 1.84s audio, **7903ms total**
 
@@ -93,19 +98,83 @@ Key metrics:
 | "Hello world" stream | 10 | **4,442ms** | **19,722ms** | **2.50x** | 3 decodes (10+20+23 tokens) |
 | "Hello world" stream | 5 | **2,832ms** | **25,678ms** | **3.25x** | 5 decodes (5+10+15+20+23 tokens) |
 
-**Result: FAILED — audio is discontinuous.** The re-decode strategy produces audible gaps between chunks because codec decode time >> audio chunk duration:
+**Result: FAILED — audio is discontinuous.** The re-decode strategy was replaced with incremental codec decode.
 
-| Chunk | Tokens decoded | Decode time | Audio produced | Gap before next chunk |
-|-------|---------------|-------------|----------------|-----------------------|
-| 1 (chunk_size=10) | 10 | ~3.1s | 0.80s | ~3.6s silence |
-| 2 | 20 | ~5.7s | 0.80s new | ~5.2s silence |
-| 3 (EOS) | 23 | ~6.8s | 0.24s new | - |
+### Incremental codec decode (implemented, 2026-02-23)
 
-**Root cause:** Re-decode is O(n²) total work. Each codec decode processes *all accumulated tokens* through the full vocoder pipeline (which is 71-81% of decode time). For chunk_size=5 and 23 total tokens:
-- Total codec work: decode(5) + decode(10) + decode(15) + decode(20) + decode(23) = 2.0 + 3.0 + 4.4 + 5.7 + 6.8 = **21.9s**
-- vs batch decode(23) = **4.6s** → 4.8x more codec time
+Replaced re-decode with per-token incremental decode. Each token produces 1920 samples (80ms) using:
+- Causal conv state buffers (pre-conv, ConvNeXt dwconv, vocoder convs, final conv)
+- Transformer KV cache (sliding window=72)
+- Transposed conv overlap buffers (vocoder upsampling blocks)
 
-**Conclusion:** Re-decode streaming is not viable when decode_time >> audio_duration. Need incremental codec decode (maintain KV cache + causal conv state) to avoid re-processing.
+Total state memory: ~553KB (not counting transformer KV cache ~4.5MB already in ctx).
+
+**Test results ("Hello world", 23 tokens, 1.84s audio):**
+
+| Metric | Batch | Re-decode (chunk=10) | Re-decode (chunk=5) | Incremental |
+|--------|-------|---------------------|---------------------|-------------|
+| TTFA | =total | 4,442ms | 2,832ms | **1,421ms** |
+| Total | **9,429ms** | 19,722ms | 25,678ms | **23,962ms** |
+| Audio quality | reference | discontinuous | discontinuous | **discontinuous** |
+| Overhead vs batch | 1.0x | 2.1x | 2.7x | **2.5x** |
+
+**TTFA improved 2-3x** (1,421ms vs 2,832-4,442ms), but total time is still 2.5x batch due to per-token vocoder overhead. Audio remains discontinuous because each token's decode takes ~600-1000ms for 80ms of audio.
+
+**Correctness verification:**
+```bash
+adb shell "am broadcast -a ai.connct_screen.rn.TTS_DEBUG -p ai.connct_screen.rn \
+  --es cmd verify --es text 'Hello world' --es path /data/local/tmp/qwen-tts-model"
+# Result: max_diff=0.012687, mean_diff=0.000179, length_match=yes
+# Max diff is from float precision differences between batch GEMM vs incremental matvec
+```
+
+**Per-step timing breakdown (average over 23 steps):**
+
+| Stage | Time/step | % | Notes |
+|-------|----------|---|-------|
+| RVQ | <1ms | 0% | Codebook lookup, trivial |
+| Pre-conv | 5ms | 0.7% | CausalConv1d(512→1024, k=3), 1 position |
+| Transformer | 1-5ms | 0.5% | 8 layers with KV cache, single token |
+| Upsample | 50-360ms | 20% | Bimodal: 50ms normal, 300ms+ with OS jitter |
+| **Vocoder** | **580-640ms** | **75%** | Dominant bottleneck |
+| — pre-conv | 25-42ms | 4% | CausalConv1d(1024→1536, k=7), 4 positions |
+| — block 0 (8×) | 115-245ms | 18% | dim=768, 32 positions, 3×ResUnit |
+| — block 1 (5×) | 121-162ms | 17% | dim=384, 160 positions, 3×ResUnit |
+| — block 2 (4×) | 96-166ms | 15% | dim=192, 640 positions, 3×ResUnit |
+| — block 3 (3×) | 137-190ms | 22% | dim=96, 1920 positions, 3×ResUnit |
+| — final conv | 1-3ms | 0.3% | CausalConv1d(96→1, k=7), 1920 positions |
+
+**Root cause analysis:**
+
+The incremental `codec_causal_conv_incremental` strategy ("prepend state + batch kernel + extract") is inefficient for small N_new:
+
+1. **Wasted computation**: The batch kernel zero-pads `(K-1)*dilation` positions on the left. For ResUnit block 0 (d=9, k=7, state_len=54, N_new=32), the kernel processes 140 effective positions but only 32 outputs are useful — **77% wasted compute**.
+
+2. **malloc/free overhead**: Each decode step allocates ~20MB of temporary buffers (combined, full_out for each conv). 23 steps = 460MB total allocation traffic.
+
+3. **Memory bandwidth**: Copying state + input into combined buffer, then extracting output, doubles memory traffic vs direct computation.
+
+4. **Cache thrashing**: Many small allocations at varying sizes prevent effective L1/L2 cache reuse.
+
+**Per-token compute budget (vocoder ResUnits only):**
+- Block 0: 3 × ResUnit(768×768×7×32) = 906 MFLOPS
+- Block 1: 3 × ResUnit(384×384×7×160) = 1131 MFLOPS
+- Block 2: 3 × ResUnit(192×192×7×640) = 1131 MFLOPS
+- Block 3: 3 × ResUnit(96×96×7×1920) = 850 MFLOPS
+- **Total: ~4 GFLOPS/token** → at A77 ~20 GFLOPS peak, minimum ~200ms/token
+
+Actual: ~600ms/token → 6.7 GFLOPS effective throughput (33% peak utilization).
+Batch: ~330ms/token → 12.3 GFLOPS effective throughput (62% peak utilization).
+
+**Optimization path for continuous audio (target: < 80ms/token):**
+
+1. **Direct incremental conv kernel** (eliminate prepend strategy): Compute output directly from state + input without concatenation. Removes zero-pad waste (up to 77% for high-dilation layers) and eliminates combined buffer malloc/free. Expected: 2-3x speedup → ~200-300ms/token.
+
+2. **Pre-allocate scratch buffers** in stream state: Allocate max-size buffers once in `codec_stream_init`, reuse across steps. Eliminates ~20MB malloc/free per step. Expected: 10-20% speedup.
+
+3. **INT8 vocoder weights**: Conv weights are F32 (~100MB). INT8 halves memory bandwidth → potential 1.5x speedup on memory-bound layers. Expected: brings total to ~150-200ms/token.
+
+4. **Multi-token batching**: Process N tokens at once (e.g., 5) to amortize per-token overhead. Increases TTFA but improves throughput. At 5 tokens/batch: ~400ms audio per decode, decode time ~1.5s, still discontinuous but better ratio.
 
 ## Model files
 
@@ -379,6 +448,45 @@ Potential vocoder optimizations:
 | `qwen_tts_cache_dir_override` global | `qwen_tts.h`, `qwen_tts.c` | Allows JNI to set writable cache dir before load |
 
 **Android SELinux gotcha:** App process cannot write to `/data/local/tmp/` even if the directory is `chmod 777`. SELinux context prevents cross-domain file creation. Solution: use app's own cache dir (`/data/data/<pkg>/cache/`) via `qwen_tts_cache_dir_override`.
+
+### After optimization round 6 (incremental codec decode, 2026-02-23)
+
+Implemented per-token incremental codec decode to eliminate O(n²) re-decode overhead. Each token is decoded independently using causal conv state buffers, transformer KV cache, and transposed conv overlap buffers.
+
+**Results ("Hello world", 23 tokens → 1.84s audio):**
+
+| Metric | Batch | Incremental stream |
+|--------|-------|--------------------|
+| TTFA | =total | **1,421ms** (was 2,832-4,442ms re-decode) |
+| Total | **9,429ms** | 23,962ms |
+| Per token | 87ms gen + 277ms decode | 87ms gen + **~780ms decode** |
+| Audio continuity | N/A | Still discontinuous (decode >> 80ms audio) |
+
+**Key findings:**
+
+1. **Incremental decode is 2.8x slower than batch per-token** (780ms vs 277ms). The `codec_causal_conv_incremental` "prepend state + batch kernel" strategy wastes 50-77% of computation on zero-padded regions (especially for high-dilation ResUnit conv1 where state_len >> N_new).
+
+2. **Vocoder is 75% of decode step time** (~600ms/step), same as batch. The 4 vocoder blocks each take 100-200ms. The transformer and upsample stages are <5% combined.
+
+3. **TTFA improved 2-3x** over re-decode (1,421ms vs 2,832-4,442ms), but audio is still discontinuous because each 80ms audio chunk takes ~870ms total (87ms gen + 780ms decode) to produce.
+
+4. **Correctness verified**: max_diff=0.013, mean_diff=0.0002 vs batch output. Differences are from float precision (batch GEMM vs incremental matvec, INT8 quantization path differences).
+
+**Changes applied:**
+
+| Change | File(s) | Notes |
+|--------|---------|-------|
+| `qwen_tts_codec_stream_state_t` struct | `qwen_tts.h` | Causal conv states, transformer pos, transconv overlap, ResUnit states |
+| `codec_causal_conv_incremental` | `qwen_tts_codec.c` | Prepend state + batch kernel + extract last N_new |
+| `codec_transconv_incremental` | `qwen_tts_codec.c` | Transposed conv with overlap-add buffer |
+| `codec_transformer_step` | `qwen_tts_codec.c` | Single-token transformer with KV cache, RoPE, LayerScale |
+| `codec_convnext_incremental` | `qwen_tts_codec.c` | ConvNeXt with incremental dwconv state |
+| `vocoder_resunit_incremental` | `qwen_tts_codec.c` | ResUnit with incremental dilated conv state |
+| `qwen_tts_codec_stream_init/free` | `qwen_tts_codec.c` | Allocate/free all state buffers (~553KB) |
+| `qwen_tts_codec_decode_step` | `qwen_tts_codec.c` | Full pipeline: RVQ→preconv→transformer→upsample→vocoder→final |
+| Modified `qwen_tts_generate_stream` | `qwen_tts.c` | chunk_size>0 uses incremental decode, 0 = batch |
+| `nativeTtsVerifyIncremental` JNI | `qwen_tts_jni.c` | Compares batch vs incremental PCM output |
+| `verify` command | `TtsDebugReceiver.java` | End-to-end batch vs incremental comparison |
 
 ## Full test session
 

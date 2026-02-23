@@ -268,6 +268,96 @@ Java_ai_connct_1screen_rn_HermesRuntime_nativeTtsGenerateStream(
     (*env)->DeleteGlobalRef(env, cb_data.callback_ref);
 }
 
+/* Collector callback for verify: accumulates PCM samples */
+typedef struct {
+    float *samples;
+    int n_samples;
+    int capacity;
+} verify_collector_t;
+
+static int verify_audio_cb(const float *samples, int n_samples, void *userdata) {
+    verify_collector_t *col = (verify_collector_t *)userdata;
+    if (col->n_samples + n_samples > col->capacity) {
+        int new_cap = (col->n_samples + n_samples) * 2;
+        col->samples = (float *)realloc(col->samples, new_cap * sizeof(float));
+        col->capacity = new_cap;
+    }
+    memcpy(col->samples + col->n_samples, samples, n_samples * sizeof(float));
+    col->n_samples += n_samples;
+    return 0;
+}
+
+JNIEXPORT jint JNICALL
+Java_ai_connct_1screen_rn_HermesRuntime_nativeTtsVerifyIncremental(
+    JNIEnv *env, jclass cls,
+    jstring jTokenIds, jstring jSpeaker, jstring jLanguage)
+{
+    if (!g_tts_ctx) {
+        LOGE("TTS model not loaded");
+        return -1;
+    }
+
+    const char *token_ids = (*env)->GetStringUTFChars(env, jTokenIds, NULL);
+    const char *speaker = jSpeaker ? (*env)->GetStringUTFChars(env, jSpeaker, NULL) : NULL;
+    const char *language = jLanguage ? (*env)->GetStringUTFChars(env, jLanguage, NULL) : NULL;
+
+    LOGI("TTS verify: comparing batch vs incremental decode");
+
+    /* Use a fixed seed so both runs produce the same codec tokens */
+    g_tts_ctx->sample_seed = 42;
+
+    /* Step 1: Batch generate (chunk_size=0) */
+    LOGI("TTS verify: running batch generate...");
+    verify_collector_t batch_col = {NULL, 0, 0};
+    batch_col.capacity = 48000;
+    batch_col.samples = (float *)malloc(batch_col.capacity * sizeof(float));
+
+    int ret1 = qwen_tts_generate_stream(g_tts_ctx, token_ids, speaker, language,
+                                          0, verify_audio_cb, &batch_col);
+    LOGI("TTS verify: batch returned %d, %d samples", ret1, batch_col.n_samples);
+
+    /* Step 2: Incremental generate (chunk_size=1) with same seed */
+    g_tts_ctx->sample_seed = 42;
+
+    LOGI("TTS verify: running incremental generate...");
+    verify_collector_t incr_col = {NULL, 0, 0};
+    incr_col.capacity = 48000;
+    incr_col.samples = (float *)malloc(incr_col.capacity * sizeof(float));
+
+    int ret2 = qwen_tts_generate_stream(g_tts_ctx, token_ids, speaker, language,
+                                          1, verify_audio_cb, &incr_col);
+    LOGI("TTS verify: incremental returned %d, %d samples", ret2, incr_col.n_samples);
+
+    /* Step 3: Compare */
+    int compare_len = batch_col.n_samples < incr_col.n_samples ?
+                      batch_col.n_samples : incr_col.n_samples;
+    float max_diff = 0.0f;
+    double sum_diff = 0.0;
+    for (int i = 0; i < compare_len; i++) {
+        float d = batch_col.samples[i] - incr_col.samples[i];
+        if (d < 0) d = -d;
+        if (d > max_diff) max_diff = d;
+        sum_diff += d;
+    }
+    float mean_diff = (compare_len > 0) ? (float)(sum_diff / compare_len) : 0.0f;
+
+    int length_match = (batch_col.n_samples == incr_col.n_samples);
+    int pass = (max_diff < 1e-3f && length_match);
+
+    LOGI("TTS verify: batch=%d incr=%d samples, max_diff=%.6f mean_diff=%.6f length_match=%d => %s",
+         batch_col.n_samples, incr_col.n_samples, max_diff, mean_diff, length_match,
+         pass ? "PASS" : "FAIL");
+
+    free(batch_col.samples);
+    free(incr_col.samples);
+
+    (*env)->ReleaseStringUTFChars(env, jTokenIds, token_ids);
+    if (speaker) (*env)->ReleaseStringUTFChars(env, jSpeaker, speaker);
+    if (language) (*env)->ReleaseStringUTFChars(env, jLanguage, language);
+
+    return pass ? 0 : 1;
+}
+
 JNIEXPORT jboolean JNICALL
 Java_ai_connct_1screen_rn_HermesRuntime_nativeTtsIsLoaded(JNIEnv *env, jclass cls) {
     return g_tts_ctx != NULL ? JNI_TRUE : JNI_FALSE;
