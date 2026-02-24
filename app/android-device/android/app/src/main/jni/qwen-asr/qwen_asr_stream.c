@@ -589,6 +589,19 @@ static char *stream_impl(qwen_ctx_t *ctx, const float *samples, int n_samples,
         int is_final = live ? (live_eof && audio_cursor >= audio_n_samples)
                             : (audio_cursor >= audio_n_samples);
 
+        /* Skip cold-start chunks entirely — their decode output is discarded
+         * (candidate_len=0), so the encoder + prefill + decode work is wasted.
+         * Starting fresh at chunk unfixed_chunks with more audio context
+         * produces equivalent results with no wasted computation. */
+        if (chunk_idx < unfixed_chunks && !is_final) {
+            if (qwen_verbose >= 2)
+                fprintf(stderr, "  Cold-start skip: chunk %d (%.1f s audio)\n",
+                        chunk_idx, (float)audio_cursor / QWEN_SAMPLE_RATE);
+            ctx->perf_total_ms += get_time_ms() - chunk_t0;
+            chunk_idx++;
+            continue;
+        }
+
         /* Encoder path:
          * - default: cache completed local-attention windows and re-encode only
          *   the current partial tail window,
