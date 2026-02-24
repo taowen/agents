@@ -101,9 +101,6 @@ typedef struct {
     /* M-RoPE section sizes (3 sections for temporal, height, width) */
     int mrope_section[3];
 
-    /* Q4_K_M quantization config */
-    int use_q4k;                 /* 0=INT8 only, 1=Q4_K for QKV+gate_up (Q4_K_M strategy) */
-
     /* Sub-talker (code predictor) */
     int subtalker_vocab_size;
     int subtalker_hidden;
@@ -153,11 +150,11 @@ typedef struct {
  * ======================================================================== */
 
 typedef struct {
-    /* Self-attention (no bias) - kept as BF16 for mmap */
-    uint16_t *wq_bf16;          /* [num_heads*head_dim, hidden] */
-    uint16_t *wk_bf16;          /* [num_kv_heads*head_dim, hidden] */
-    uint16_t *wv_bf16;          /* [num_kv_heads*head_dim, hidden] */
-    uint16_t *wo_bf16;          /* [hidden, num_heads*head_dim] */
+    /* Q8_0 quantized weights */
+    block_q8_0 *wqkv_q8;       /* [q_dim+kv_dim+kv_dim, hidden] fused QKV */
+    block_q8_0 *wo_q8;         /* [hidden, q_dim] */
+    block_q8_0 *gate_up_q8;    /* [2*intermediate, hidden] fused gate+up */
+    block_q8_0 *down_q8;       /* [hidden, intermediate] */
 
     /* Per-head Q/K RMSNorm */
     float *q_norm_weight;       /* [head_dim] */
@@ -166,44 +163,18 @@ typedef struct {
     /* RMSNorm (no bias) */
     float *input_norm;          /* [hidden] */
     float *post_attn_norm;      /* [hidden] */
-
-    /* SwiGLU MLP (no bias) */
-    uint16_t *gate_bf16;        /* [intermediate, hidden] */
-    uint16_t *up_bf16;          /* [intermediate, hidden] */
-    uint16_t *down_bf16;        /* [hidden, intermediate] */
-
-    /* Fused gate+up for single-token matvec */
-    uint16_t *gate_up_fused_bf16; /* [2*intermediate, hidden] */
-
-    /* Fused Q+K+V projection for single-token matvec */
-    uint16_t *wqkv_fused_bf16;   /* [q_dim+kv_dim+kv_dim, hidden] */
-
-    /* INT8 quantized weights (optional, created at load time) */
-    int8_t *wqkv_int8;           /* [q_dim+kv_dim+kv_dim, hidden] */
-    float  *wqkv_scales;         /* [q_dim+kv_dim+kv_dim] per-row scale */
-    int8_t *gate_up_int8;        /* [2*intermediate, hidden] */
-    float  *gate_up_scales;      /* [2*intermediate] */
-    int8_t *wo_int8;             /* [hidden, q_dim] */
-    float  *wo_scales;           /* [hidden] */
-    int8_t *down_int8;           /* [hidden, intermediate] */
-    float  *down_scales;         /* [hidden] */
-
-    /* Q4_K super-block quantized weights (Q4_K_M: only QKV and gate_up) */
-    block_q4_k *wqkv_q4k;        /* Q4_K for QKV projection, or NULL */
-    block_q4_k *gate_up_q4k;     /* Q4_K for MLP gate+up, or NULL */
-    /* wo and down keep INT8 (Q4_K_M strategy: sensitive layers use higher precision) */
 } qwen_tts_talker_layer_t;
 
 typedef struct {
-    /* Token embeddings */
+    /* Token embeddings (BF16, row-lookup, not matvec) */
     uint16_t *codec_embedding_bf16;   /* [vocab, hidden] */
     uint16_t *text_embedding_bf16;    /* [text_vocab, text_hidden] */
 
     /* Text projection MLP: text_hidden -> text_hidden -> hidden */
-    uint16_t *text_proj_fc1_bf16;     /* [text_hidden, text_hidden] */
-    float    *text_proj_fc1_bias;     /* [text_hidden] */
-    uint16_t *text_proj_fc2_bf16;     /* [hidden, text_hidden] */
-    float    *text_proj_fc2_bias;     /* [hidden] */
+    block_q8_0 *text_proj_fc1_q8;    /* [text_hidden, text_hidden] */
+    float      *text_proj_fc1_bias;   /* [text_hidden] */
+    block_q8_0 *text_proj_fc2_q8;    /* [hidden, text_hidden] */
+    float      *text_proj_fc2_bias;   /* [hidden] */
 
     /* Transformer layers */
     qwen_tts_talker_layer_t layers[QWEN_TTS_MAX_TALKER_LAYERS];
@@ -211,8 +182,8 @@ typedef struct {
     /* Final RMSNorm */
     float *norm;                      /* [hidden] */
 
-    /* Codec head (logit projection, tied or separate) */
-    uint16_t *codec_head_bf16;        /* [vocab, hidden] */
+    /* Codec head (logit projection) */
+    block_q8_0 *codec_head_q8;       /* [vocab, hidden] */
 } qwen_tts_talker_t;
 
 /* ========================================================================
@@ -220,46 +191,28 @@ typedef struct {
  * ======================================================================== */
 
 typedef struct {
-    uint16_t *wq_bf16;
-    uint16_t *wk_bf16;
-    uint16_t *wv_bf16;
-    uint16_t *wo_bf16;
+    /* Q8_0 quantized weights */
+    block_q8_0 *wqkv_q8;       /* [q_dim+kv_dim+kv_dim, hidden] fused QKV */
+    block_q8_0 *wo_q8;         /* [hidden, q_dim] */
+    block_q8_0 *gate_up_q8;    /* [2*intermediate, hidden] fused gate+up */
+    block_q8_0 *down_q8;       /* [hidden, intermediate] */
+
+    /* Per-head Q/K RMSNorm */
     float *q_norm_weight;
     float *k_norm_weight;
+
+    /* RMSNorm (no bias) */
     float *input_norm;
     float *post_attn_norm;
-    uint16_t *gate_bf16;
-    uint16_t *up_bf16;
-    uint16_t *down_bf16;
-    uint16_t *gate_up_fused_bf16;
-
-    /* Fused Q+K+V projection for single-token matvec */
-    uint16_t *wqkv_fused_bf16;   /* [q_dim+kv_dim+kv_dim, hidden] */
-
-    /* INT8 quantized weights (optional, created at load time) */
-    int8_t *wqkv_int8;
-    float  *wqkv_scales;
-    int8_t *gate_up_int8;
-    float  *gate_up_scales;
-    int8_t *wo_int8;
-    float  *wo_scales;
-    int8_t *down_int8;
-    float  *down_scales;
-
-    /* Q4_K super-block quantized weights (full Q4_K for sub-talker) */
-    block_q4_k *wqkv_q4k;
-    block_q4_k *gate_up_q4k;
-    block_q4_k *wo_q4k;         /* Q4_K for wo (sub-talker only; talker keeps INT8) */
-    block_q4_k *down_q4k;       /* Q4_K for down (sub-talker only; talker keeps INT8) */
 } qwen_tts_subtalker_layer_t;
 
 typedef struct {
-    /* 31 codec embeddings (for groups 1-31) */
+    /* 31 codec embeddings (for groups 1-31, BF16 row-lookup) */
     uint16_t *codec_embeddings_bf16[QWEN_TTS_NUM_CODE_GROUPS - 1];  /* each [subtalker_vocab, embedding_dim] */
 
     /* Input projection (talker hidden -> subtalker hidden) */
-    uint16_t *input_proj_bf16;    /* [subtalker_hidden, talker_hidden] or NULL if same dim */
-    float    *input_proj_bias;
+    block_q8_0 *input_proj_q8;   /* [subtalker_hidden, talker_hidden] or NULL if same dim */
+    float      *input_proj_bias;
 
     /* Transformer layers */
     qwen_tts_subtalker_layer_t layers[QWEN_TTS_MAX_SUBTALKER_LAYERS];
@@ -268,7 +221,7 @@ typedef struct {
     float *norm;
 
     /* 31 LM heads (one per code group 1-31) */
-    uint16_t *lm_heads_bf16[QWEN_TTS_NUM_CODE_GROUPS - 1];  /* each [subtalker_vocab, subtalker_hidden] */
+    block_q8_0 *lm_heads_q8[QWEN_TTS_NUM_CODE_GROUPS - 1];  /* each [subtalker_vocab, subtalker_hidden] */
 } qwen_tts_subtalker_t;
 
 /* ========================================================================
@@ -303,26 +256,11 @@ typedef struct {
     float *attn_layer_scale;       /* [hidden] LayerScale */
     float *mlp_layer_scale;        /* [hidden] LayerScale */
 
-    /* Attention (no bias) - F32 originals */
-    float *wq;                     /* [num_heads*head_dim, hidden] */
-    float *wk;                     /* [num_kv_heads*head_dim, hidden] */
-    float *wv;                     /* [num_kv_heads*head_dim, hidden] */
-    float *wo;                     /* [hidden, num_heads*head_dim] */
-
-    /* SwiGLU MLP - F32 originals */
-    float *gate;                   /* [intermediate, hidden] */
-    float *up;                     /* [intermediate, hidden] */
-    float *down;                   /* [hidden, intermediate] */
-
-    /* INT8 quantized weights (optional, created at load time from F32) */
-    int8_t *wqkv_int8;            /* fused [q_dim+kv_dim+kv_dim, hidden] */
-    float  *wqkv_scales;
-    int8_t *gate_up_int8;          /* fused [2*intermediate, hidden] */
-    float  *gate_up_scales;
-    int8_t *wo_int8;               /* [hidden, q_dim] */
-    float  *wo_scales;
-    int8_t *down_int8;             /* [hidden, intermediate] */
-    float  *down_scales;
+    /* Q8_0 quantized weights */
+    block_q8_0 *wqkv_q8;          /* [q_dim+kv_dim+kv_dim, hidden] fused QKV */
+    block_q8_0 *wo_q8;            /* [hidden, q_dim] */
+    block_q8_0 *gate_up_q8;       /* [2*intermediate, hidden] fused gate+up */
+    block_q8_0 *down_q8;          /* [hidden, intermediate] */
 } qwen_tts_codec_transformer_layer_t;
 
 /* ConvNeXt block */

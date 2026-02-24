@@ -1,21 +1,34 @@
 /*
- * qwen_tts_quant.h - Q4_K quantization block definition for Qwen3-TTS
+ * qwen_tts_quant.h - Q8_0 quantization format for Qwen3-TTS
+ *
+ * Q8_0: 32 weights per block, symmetric quantization.
+ * Each block stores a float scale and 32 int8 quantized values.
+ * weight[i] = scale * qs[i]
+ *
+ * Memory: 36 bytes per 32 weights = 1.125 bytes/weight
  */
 
 #ifndef QWEN_TTS_QUANT_H
 #define QWEN_TTS_QUANT_H
 
+#include <stddef.h>
 #include <stdint.h>
 
-#define QK_K 256
-#define Q4K_NUM_SUBS 8   /* QK_K / 32 */
+#define QK8_0 32  /* block size */
 
-typedef struct block_q4_k {
-    float d;               /* 4B: super-block scale */
-    float dmin;            /* 4B: super-block min (asymmetric offset) */
-    uint8_t scales[8];     /* 8B: per-sub-group integer scales (0-255) */
-    uint8_t mins[8];       /* 8B: per-sub-group integer mins (0-255) */
-    uint8_t qs[128];       /* 128B: 256 unsigned int4 [0,15] packed nibbles */
-} block_q4_k;              /* 152 bytes / 256 elements */
+typedef struct {
+    float scale;           /* shared scale factor */
+    int8_t qs[QK8_0];     /* quantized values */
+} block_q8_0;             /* 36 bytes total */
+
+/* Quantize n float32 values to Q8_0 blocks.
+ * n must be a multiple of QK8_0.
+ * dst must have n/QK8_0 blocks allocated. */
+void quantize_f32_to_q8_0(const float *src, block_q8_0 *dst, int n);
+
+/* Quantize n bfloat16 values (stored as uint16_t) to Q8_0 blocks.
+ * n must be a multiple of QK8_0.
+ * dst must have n/QK8_0 blocks allocated. */
+void quantize_bf16_to_q8_0(const uint16_t *src, block_q8_0 *dst, int n);
 
 #endif /* QWEN_TTS_QUANT_H */

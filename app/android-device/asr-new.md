@@ -1,6 +1,6 @@
 # ASR New: Qwen3-ASR-0.6B on Android
 
-Source: `android/app/src/main/jni/qwen-asr/`. All weights Q8_0 quantized, pre-quantized `.qmodel` for instant loading (~1ms via mmap).
+Source: `android/app/src/main/jni/qwen-asr/`. Encoder Q8_0, decoder Q4_K. Pre-quantized `.qmodel` for instant loading (~1ms via mmap).
 
 ## Testing
 
@@ -93,9 +93,9 @@ The biggest single prefill. Root cause: at the 8s boundary, the complete window 
 
 `qwen_gelu` uses scalar `tanhf()`. NEON polynomial approximation (e.g. rational Padé) could cut this by 50-70%. Straightforward implementation, no quality impact.
 
-### 3. Decoder MLP (~50% of per-token cost)
+### 3. ~~Encoder Q4_K~~ (tested, rejected)
 
-Already Q8_0. Q4_K quantization would reduce MLP GEMM bandwidth ~2x but needs quality validation on ASR output. Affects both prefill MLP and per-token decode.
+Tested: encoder Q4_K with padded d_model (896→1024). Batch encoder **+17% slower** (974→1139ms), streaming encoder flat (+30ms). Root cause: encoder uses batched GEMM (seq=100-143 tokens) where compute dominates over bandwidth. Q4_K's complex dequant (4-bit unpack + sub-group corrections) is slower than Q8_0's simple INT8×INT8 SDOT. Plus 14% padding overhead for 0.6B (896→1024). Q4_K only helps bandwidth-bound paths (decoder matvec).
 
 ### 4. Chunk 1 encoder (613ms, no stem cache)
 

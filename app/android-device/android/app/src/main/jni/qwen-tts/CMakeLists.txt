@@ -3,6 +3,7 @@ project(qwen_tts C)
 
 set(QWEN_TTS_SOURCES
     qwen_tts.c
+    qwen_tts_quant.c
     qwen_tts_kernels.c
     qwen_tts_kernels_neon.c
     qwen_tts_kernels_ops.c

@@ -35,60 +35,29 @@ void kernel_rms_norm_inplace(float *x, const float *weight, int dim, float eps);
 /* LayerNorm: out[i] = weight[i] * (x[i] - mean) / sqrt(var + eps) + bias[i] */
 void kernel_layer_norm(float *out, const float *x, const float *weight, const float *bias, int dim, float eps);
 
-/* Matrix-vector multiply: out = A @ x, A is [rows, cols], x is [cols], out is [rows]
- * A stored as BF16 */
-void kernel_matvec_bf16(float *out, const uint16_t *A_bf16, const float *x, int rows, int cols);
+/* Quantize float32 input vector to Q8_0 blocks for matvec.
+ * n must be a multiple of QK8_0.
+ * dst must have n/QK8_0 blocks allocated. */
+void kernel_quantize_x_q8(const float *x, int n, block_q8_0 *dst);
+
+/* Matrix-vector multiply with Q8_0 weights and Q8_0 input:
+ * out[r] = sum_b(W_q8[r*n_blocks+b].scale * x_q8[b].scale * dot(W_q8[r*n_blocks+b].qs, x_q8[b].qs))
+ * W_q8 is [rows, n_blocks] blocks, x_q8 is [n_blocks] blocks. */
+void kernel_matvec_q8(float *out, const block_q8_0 *W_q8, const block_q8_0 *x_q8,
+                       int rows, int n_blocks);
+
+/* Fused SwiGLU with Q8_0 weights:
+ * gate = first `intermediate` rows, up = next `intermediate` rows.
+ * out[i] = silu(gate[i]) * up[i] */
+void kernel_swiglu_matvec_q8(float *out, const block_q8_0 *gate_up_q8,
+                               const block_q8_0 *x_q8, int intermediate, int n_blocks);
 
 /* Matrix-vector multiply: out = A @ x, A is [rows, cols] F32 */
 void kernel_matvec_f32(float *out, const float *A, const float *x, int rows, int cols);
 
-/* Matrix-vector multiply with INT8 weight + per-row scale:
- * out[r] = scale[r] * dot(A_int8[r,:], quantize(x)) */
-void kernel_matvec_int8(float *out, const int8_t *A_int8, const float *scales,
-                         const float *x, int rows, int cols);
-
-/* Quantize x vector to int8 (pre-quantize for reuse across multiple matvecs).
- * x_int8_out must be allocated with at least ((cols+15)&~15) bytes.
- * x_scale_out receives the quantization scale. */
-void kernel_quantize_x_int8(const float *x, int cols, int8_t *x_int8_out, float *x_scale_out);
-
-/* Matrix-vector multiply with pre-quantized x (avoids redundant x quantization).
- * x_int8 and x_scale are from kernel_quantize_x_int8(). */
-void kernel_matvec_int8_pq(float *out, const int8_t *A_int8, const float *scales,
-                            const int8_t *x_int8, float x_scale, int rows, int cols);
-
-/* Matrix-vector multiply with Q4_K super-block quantized weights:
- * blocks: array of block_q4_k, blocks_per_row = cols / QK_K
- * Total blocks = rows * blocks_per_row
- * Uses integer sub-scales to minimize vaddvq_s32 cross-lane reductions.
- */
-void kernel_matvec_q4k(float *out, const block_q4_k *blocks,
-                        const float *x, int rows, int cols);
-
-/* Fused SwiGLU with Q4_K weights (analogous to kernel_swiglu_matvec_int8) */
-void kernel_swiglu_matvec_q4k(float *out, const block_q4_k *gate_up_blocks,
-                                const float *x, int intermediate, int hidden);
-
 /* Matrix-matrix multiply: C = A @ B^T
  * A is [M, K], B is [N, K], C is [M, N] - all F32 */
 void kernel_matmul_f32(float *C, const float *A, const float *B, int M, int N, int K);
-
-/* Matrix-matrix multiply with BF16 weight:
- * C = A @ B^T, A is [M, K] F32, B is [N, K] BF16, C is [M, N] F32 */
-void kernel_matmul_bf16(float *C, const float *A, const uint16_t *B_bf16, int M, int N, int K);
-
-/* Fused gate+up matvec for SwiGLU:
- * gate = A_gate @ x, up = A_up @ x (both BF16)
- * out[i] = silu(gate[i]) * up[i] */
-void kernel_swiglu_matvec_bf16(float *out, const uint16_t *gate_up_fused_bf16,
-                                const float *x, int intermediate, int hidden);
-
-/* Fused gate+up matvec for SwiGLU with INT8 weights:
- * Quantizes x once, computes gate and up via INT8 matvec, applies SiLU(gate)*up.
- * gate_up_int8 is [2*intermediate, hidden], scales is [2*intermediate]. */
-void kernel_swiglu_matvec_int8(float *out, const int8_t *gate_up_int8,
-                                const float *scales, const float *x,
-                                int intermediate, int hidden);
 
 /* SiLU activation: x * sigmoid(x) */
 void kernel_silu_inplace(float *x, int n);

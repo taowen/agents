@@ -165,7 +165,7 @@ static void talker_attention_single(
     /* 1. Input LayerNorm */
     kernel_rms_norm(x_norm, x, layer->input_norm, hidden, eps);
 
-    /* 2. Q, K, V projections (INT4 > INT8 > fused BF16 > separate BF16) */
+    /* 2. Q, K, V projections (Q8_0) */
     {
         int q_dim = num_heads * head_dim;
         int total_rows = q_dim + kv_dim + kv_dim;
@@ -174,27 +174,13 @@ static void talker_attention_single(
             ctx->tk_qkv = (float *)malloc(total_rows * sizeof(float));
             qkv_buf = ctx->tk_qkv;
         }
-        if (layer->wqkv_q4k) {
-            kernel_matvec_q4k(qkv_buf, layer->wqkv_q4k,
-                               x_norm, total_rows, hidden);
-            memcpy(q_buf, qkv_buf, q_dim * sizeof(float));
-            memcpy(k_buf, qkv_buf + q_dim, kv_dim * sizeof(float));
-            memcpy(v_buf, qkv_buf + q_dim + kv_dim, kv_dim * sizeof(float));
-        } else if (layer->wqkv_int8 && layer->wqkv_scales) {
-            kernel_matvec_int8(qkv_buf, layer->wqkv_int8, layer->wqkv_scales, x_norm, total_rows, hidden);
-            memcpy(q_buf, qkv_buf, q_dim * sizeof(float));
-            memcpy(k_buf, qkv_buf + q_dim, kv_dim * sizeof(float));
-            memcpy(v_buf, qkv_buf + q_dim + kv_dim, kv_dim * sizeof(float));
-        } else if (layer->wqkv_fused_bf16) {
-            kernel_matvec_bf16(qkv_buf, layer->wqkv_fused_bf16, x_norm, total_rows, hidden);
-            memcpy(q_buf, qkv_buf, q_dim * sizeof(float));
-            memcpy(k_buf, qkv_buf + q_dim, kv_dim * sizeof(float));
-            memcpy(v_buf, qkv_buf + q_dim + kv_dim, kv_dim * sizeof(float));
-        } else {
-            kernel_matvec_bf16(q_buf, layer->wq_bf16, x_norm, num_heads * head_dim, hidden);
-            kernel_matvec_bf16(k_buf, layer->wk_bf16, x_norm, kv_dim, hidden);
-            kernel_matvec_bf16(v_buf, layer->wv_bf16, x_norm, kv_dim, hidden);
-        }
+        int n_blocks = hidden / QK8_0;
+        block_q8_0 x_q8[n_blocks];
+        kernel_quantize_x_q8(x_norm, hidden, x_q8);
+        kernel_matvec_q8(qkv_buf, layer->wqkv_q8, x_q8, total_rows, n_blocks);
+        memcpy(q_buf, qkv_buf, q_dim * sizeof(float));
+        memcpy(k_buf, qkv_buf + q_dim, kv_dim * sizeof(float));
+        memcpy(v_buf, qkv_buf + q_dim + kv_dim, kv_dim * sizeof(float));
     }
 
     /* 3. QK-Norm: per-head RMSNorm on Q and K */
@@ -274,40 +260,36 @@ static void talker_attention_single(
         }
     }
 
-    /* 7. Output projection (INT8 > BF16, sensitive layer keeps higher precision) */
+    /* 7. Output projection (Q8_0) */
     float *proj_out = x_norm; /* reuse buffer */
-    if (layer->wo_int8 && layer->wo_scales) {
-        kernel_matvec_int8(proj_out, layer->wo_int8, layer->wo_scales, attn_out, hidden, num_heads * head_dim);
-    } else {
-        kernel_matvec_bf16(proj_out, layer->wo_bf16, attn_out, hidden, num_heads * head_dim);
+    {
+        int q_dim = num_heads * head_dim;
+        int n_blocks = q_dim / QK8_0;
+        block_q8_0 attn_q8[n_blocks];
+        kernel_quantize_x_q8(attn_out, q_dim, attn_q8);
+        kernel_matvec_q8(proj_out, layer->wo_q8, attn_q8, hidden, n_blocks);
     }
 
     /* 8. Residual add */
     kernel_add_inplace(x, proj_out, hidden);
 
-    /* 9. Post-attention norm + SwiGLU MLP */
+    /* 9. Post-attention norm + SwiGLU MLP (Q8_0) */
     kernel_rms_norm(x_norm, x, layer->post_attn_norm, hidden, eps);
 
     float *gate_buf = ctx->tk_gate;
-
-    /* Fused SwiGLU MLP (Q4_K > INT8 > BF16) */
-    if (layer->gate_up_q4k) {
-        kernel_swiglu_matvec_q4k(gate_buf, layer->gate_up_q4k,
-                                  x_norm, cfg->talker_intermediate, hidden);
-    } else if (layer->gate_up_int8 && layer->gate_up_scales) {
-        kernel_swiglu_matvec_int8(gate_buf, layer->gate_up_int8, layer->gate_up_scales,
-                                  x_norm, cfg->talker_intermediate, hidden);
-    } else {
-        kernel_swiglu_matvec_bf16(gate_buf, layer->gate_up_fused_bf16, x_norm,
-                                  cfg->talker_intermediate, hidden);
+    {
+        int n_blocks = hidden / QK8_0;
+        block_q8_0 xn_q8[n_blocks];
+        kernel_quantize_x_q8(x_norm, hidden, xn_q8);
+        kernel_swiglu_matvec_q8(gate_buf, layer->gate_up_q8, xn_q8, cfg->talker_intermediate, n_blocks);
     }
 
-    /* down projection (INT8 > BF16, sensitive layer keeps higher precision) */
-    if (layer->down_int8 && layer->down_scales) {
-        kernel_matvec_int8(proj_out, layer->down_int8, layer->down_scales,
-                           gate_buf, hidden, cfg->talker_intermediate);
-    } else {
-        kernel_matvec_bf16(proj_out, layer->down_bf16, gate_buf, hidden, cfg->talker_intermediate);
+    /* down projection (Q8_0) */
+    {
+        int n_blocks = cfg->talker_intermediate / QK8_0;
+        block_q8_0 gate_q8[n_blocks];
+        kernel_quantize_x_q8(gate_buf, cfg->talker_intermediate, gate_q8);
+        kernel_matvec_q8(proj_out, layer->down_q8, gate_q8, hidden, n_blocks);
     }
 
     /* Residual add */
@@ -393,10 +375,22 @@ void qwen_tts_talker_prefill(qwen_tts_ctx_t *ctx, const float *input_embeds, int
             kernel_rms_norm(x_norm + t * hidden, x + t * hidden, l->input_norm, hidden, eps);
         }
 
-        /* 2. Q, K, V projections (batch matmul) */
-        kernel_matmul_bf16(q_all, x_norm, l->wq_bf16, seq_len, num_heads * head_dim, hidden);
-        kernel_matmul_bf16(k_all, x_norm, l->wk_bf16, seq_len, kv_dim, hidden);
-        kernel_matmul_bf16(v_all, x_norm, l->wv_bf16, seq_len, kv_dim, hidden);
+        /* 2. Q, K, V projections (per-token Q8_0 matvec) */
+        {
+            int q_dim = num_heads * head_dim;
+            int total_rows = q_dim + kv_dim + kv_dim;
+            int n_blocks = hidden / QK8_0;
+            float *qkv_tmp = (float *)malloc(total_rows * sizeof(float));
+            for (int t = 0; t < seq_len; t++) {
+                block_q8_0 xn_q8[n_blocks];
+                kernel_quantize_x_q8(x_norm + t * hidden, hidden, xn_q8);
+                kernel_matvec_q8(qkv_tmp, l->wqkv_q8, xn_q8, total_rows, n_blocks);
+                memcpy(q_all + (size_t)t * q_dim, qkv_tmp, q_dim * sizeof(float));
+                memcpy(k_all + (size_t)t * kv_dim, qkv_tmp + q_dim, kv_dim * sizeof(float));
+                memcpy(v_all + (size_t)t * kv_dim, qkv_tmp + q_dim + kv_dim, kv_dim * sizeof(float));
+            }
+            free(qkv_tmp);
+        }
 
         /* 3. QK-Norm per head */
         for (int t = 0; t < seq_len; t++) {
@@ -488,8 +482,16 @@ void qwen_tts_talker_prefill(qwen_tts_ctx_t *ctx, const float *input_embeds, int
             }
         }
 
-        /* 7. Output projection (batch matmul) */
-        kernel_matmul_bf16(x_norm, attn_out, l->wo_bf16, seq_len, hidden, num_heads * head_dim);
+        /* 7. Output projection (per-token Q8_0 matvec) */
+        {
+            int q_dim = num_heads * head_dim;
+            int n_blocks = q_dim / QK8_0;
+            for (int t = 0; t < seq_len; t++) {
+                block_q8_0 attn_q8[n_blocks];
+                kernel_quantize_x_q8(attn_out + (size_t)t * q_dim, q_dim, attn_q8);
+                kernel_matvec_q8(x_norm + (size_t)t * hidden, l->wo_q8, attn_q8, hidden, n_blocks);
+            }
+        }
 
         /* 8. Residual */
         for (int t = 0; t < seq_len; t++)
@@ -499,20 +501,20 @@ void qwen_tts_talker_prefill(qwen_tts_ctx_t *ctx, const float *input_embeds, int
         for (int t = 0; t < seq_len; t++)
             kernel_rms_norm(x_norm + t * hidden, x + t * hidden, l->post_attn_norm, hidden, eps);
 
-        /* Gate + Up projections (batch) */
-        kernel_matmul_bf16(gate_all, x_norm, l->gate_bf16, seq_len, cfg->talker_intermediate, hidden);
-        kernel_matmul_bf16(up_all, x_norm, l->up_bf16, seq_len, cfg->talker_intermediate, hidden);
-
-        /* SiLU(gate) * up */
-        for (int t = 0; t < seq_len; t++) {
-            float *g = gate_all + t * cfg->talker_intermediate;
-            float *u = up_all + t * cfg->talker_intermediate;
-            kernel_silu_inplace(g, cfg->talker_intermediate);
-            kernel_mul_inplace(g, u, cfg->talker_intermediate);
+        /* SwiGLU MLP + down projection (per-token Q8_0) */
+        {
+            int n_blocks_h = hidden / QK8_0;
+            int n_blocks_i = cfg->talker_intermediate / QK8_0;
+            for (int t = 0; t < seq_len; t++) {
+                block_q8_0 xn_q8[n_blocks_h];
+                kernel_quantize_x_q8(x_norm + (size_t)t * hidden, hidden, xn_q8);
+                kernel_swiglu_matvec_q8(gate_all + (size_t)t * cfg->talker_intermediate,
+                                         l->gate_up_q8, xn_q8, cfg->talker_intermediate, n_blocks_h);
+                block_q8_0 gate_q8[n_blocks_i];
+                kernel_quantize_x_q8(gate_all + (size_t)t * cfg->talker_intermediate, cfg->talker_intermediate, gate_q8);
+                kernel_matvec_q8(x_norm + (size_t)t * hidden, l->down_q8, gate_q8, hidden, n_blocks_i);
+            }
         }
-
-        /* Down projection */
-        kernel_matmul_bf16(x_norm, gate_all, l->down_bf16, seq_len, hidden, cfg->talker_intermediate);
 
         /* Residual */
         for (int t = 0; t < seq_len; t++)
@@ -594,8 +596,13 @@ void qwen_tts_talker_forward(qwen_tts_ctx_t *ctx, const float *input_embed, floa
     /* Final norm */
     kernel_rms_norm_inplace(x, ctx->talker.norm, hidden, eps);
 
-    /* Codec head: logits = x @ codec_head^T */
-    kernel_matvec_bf16(logits, ctx->talker.codec_head_bf16, x, cfg->talker_vocab_size, hidden);
+    /* Codec head: logits = x @ codec_head^T (Q8_0) */
+    {
+        int n_blocks = hidden / QK8_0;
+        block_q8_0 x_q8[n_blocks];
+        kernel_quantize_x_q8(x, hidden, x_q8);
+        kernel_matvec_q8(logits, ctx->talker.codec_head_q8, x_q8, cfg->talker_vocab_size, n_blocks);
+    }
 
     ctx->talker_kv_len = pos + 1;
 }
@@ -715,27 +722,15 @@ void qwen_tts_subtalker_generate(
         for (int sl = 0; sl < st_layers; sl++) { \
             qwen_tts_subtalker_layer_t *l = &ctx->subtalker.layers[sl]; \
             kernel_rms_norm(x_norm, x, l->input_norm, st_hidden, eps); \
-            if (l->wqkv_q4k) { \
-                kernel_matvec_q4k(st_qkv_buf, l->wqkv_q4k, \
-                                   x_norm, st_qkv_total, st_hidden); \
-                memcpy(q_buf, st_qkv_buf, st_q_dim * sizeof(float)); \
-                memcpy(k_buf, st_qkv_buf + st_q_dim, st_kv_dim * sizeof(float)); \
-                memcpy(v_buf, st_qkv_buf + st_q_dim + st_kv_dim, st_kv_dim * sizeof(float)); \
-            } else if (l->wqkv_int8 && l->wqkv_scales) { \
-                kernel_matvec_int8(st_qkv_buf, l->wqkv_int8, l->wqkv_scales, x_norm, st_qkv_total, st_hidden); \
-                memcpy(q_buf, st_qkv_buf, st_q_dim * sizeof(float)); \
-                memcpy(k_buf, st_qkv_buf + st_q_dim, st_kv_dim * sizeof(float)); \
-                memcpy(v_buf, st_qkv_buf + st_q_dim + st_kv_dim, st_kv_dim * sizeof(float)); \
-            } else if (l->wqkv_fused_bf16) { \
-                kernel_matvec_bf16(st_qkv_buf, l->wqkv_fused_bf16, x_norm, st_qkv_total, st_hidden); \
-                memcpy(q_buf, st_qkv_buf, st_q_dim * sizeof(float)); \
-                memcpy(k_buf, st_qkv_buf + st_q_dim, st_kv_dim * sizeof(float)); \
-                memcpy(v_buf, st_qkv_buf + st_q_dim + st_kv_dim, st_kv_dim * sizeof(float)); \
-            } else { \
-                kernel_matvec_bf16(q_buf, l->wq_bf16, x_norm, st_heads * st_head_dim, st_hidden); \
-                kernel_matvec_bf16(k_buf, l->wk_bf16, x_norm, st_kv_dim, st_hidden); \
-                kernel_matvec_bf16(v_buf, l->wv_bf16, x_norm, st_kv_dim, st_hidden); \
+            { \
+                int _nb = st_hidden / QK8_0; \
+                block_q8_0 _xq[_nb]; \
+                kernel_quantize_x_q8(x_norm, st_hidden, _xq); \
+                kernel_matvec_q8(st_qkv_buf, l->wqkv_q8, _xq, st_qkv_total, _nb); \
             } \
+            memcpy(q_buf, st_qkv_buf, st_q_dim * sizeof(float)); \
+            memcpy(k_buf, st_qkv_buf + st_q_dim, st_kv_dim * sizeof(float)); \
+            memcpy(v_buf, st_qkv_buf + st_q_dim + st_kv_dim, st_kv_dim * sizeof(float)); \
             for (int h = 0; h < st_heads; h++) \
                 kernel_rms_norm_inplace(q_buf + h * st_head_dim, l->q_norm_weight, st_head_dim, eps); \
             for (int h = 0; h < st_kv_heads; h++) \
@@ -763,37 +758,25 @@ void qwen_tts_subtalker_generate(
                     st_axpy(st_head_dim, w, _v, _o); \
                 } \
             } \
-            if (l->wo_q4k) { \
-                kernel_matvec_q4k(x_norm, l->wo_q4k, attn_out, st_hidden, st_heads * st_head_dim); \
-            } else if (l->wo_int8 && l->wo_scales) { \
-                kernel_matvec_int8(x_norm, l->wo_int8, l->wo_scales, attn_out, st_hidden, st_heads * st_head_dim); \
-            } else { \
-                kernel_matvec_bf16(x_norm, l->wo_bf16, attn_out, st_hidden, st_heads * st_head_dim); \
+            { \
+                int _nb = st_q_dim / QK8_0; \
+                block_q8_0 _aq[_nb]; \
+                kernel_quantize_x_q8(attn_out, st_q_dim, _aq); \
+                kernel_matvec_q8(x_norm, l->wo_q8, _aq, st_hidden, _nb); \
             } \
             kernel_add_inplace(x, x_norm, st_hidden); \
             kernel_rms_norm(x_norm, x, l->post_attn_norm, st_hidden, eps); \
-            float *_gate = st_gate_buf; \
-            float *_up = st_up_buf; \
-            if (l->gate_up_q4k) { \
-                kernel_swiglu_matvec_q4k(_gate, l->gate_up_q4k, \
-                                          x_norm, st_intermediate, st_hidden); \
-            } else if (l->gate_up_int8 && l->gate_up_scales) { \
-                kernel_swiglu_matvec_int8(_gate, l->gate_up_int8, l->gate_up_scales, \
-                                          x_norm, st_intermediate, st_hidden); \
-            } else if (l->gate_up_fused_bf16) { \
-                kernel_swiglu_matvec_bf16(_gate, l->gate_up_fused_bf16, x_norm, st_intermediate, st_hidden); \
-            } else { \
-                kernel_matvec_bf16(_gate, l->gate_bf16, x_norm, st_intermediate, st_hidden); \
-                kernel_matvec_bf16(_up, l->up_bf16, x_norm, st_intermediate, st_hidden); \
-                kernel_silu_inplace(_gate, st_intermediate); \
-                kernel_mul_inplace(_gate, _up, st_intermediate); \
+            { \
+                int _nb = st_hidden / QK8_0; \
+                block_q8_0 _xq[_nb]; \
+                kernel_quantize_x_q8(x_norm, st_hidden, _xq); \
+                kernel_swiglu_matvec_q8(st_gate_buf, l->gate_up_q8, _xq, st_intermediate, _nb); \
             } \
-            if (l->down_q4k) { \
-                kernel_matvec_q4k(x_norm, l->down_q4k, _gate, st_hidden, st_intermediate); \
-            } else if (l->down_int8 && l->down_scales) { \
-                kernel_matvec_int8(x_norm, l->down_int8, l->down_scales, _gate, st_hidden, st_intermediate); \
-            } else { \
-                kernel_matvec_bf16(x_norm, l->down_bf16, _gate, st_hidden, st_intermediate); \
+            { \
+                int _nb = st_intermediate / QK8_0; \
+                block_q8_0 _gq[_nb]; \
+                kernel_quantize_x_q8(st_gate_buf, st_intermediate, _gq); \
+                kernel_matvec_q8(x_norm, l->down_q8, _gq, st_hidden, _nb); \
             } \
             kernel_add_inplace(x, x_norm, st_hidden); \
         } \
@@ -802,8 +785,11 @@ void qwen_tts_subtalker_generate(
     } while(0)
 
     #define ST_PROJECT_INPUT(dst, src, src_dim) do { \
-        if (ctx->subtalker.input_proj_bf16) { \
-            kernel_matvec_bf16(dst, ctx->subtalker.input_proj_bf16, src, st_hidden, src_dim); \
+        if (ctx->subtalker.input_proj_q8) { \
+            int _nb = (src_dim) / QK8_0; \
+            block_q8_0 _sq[_nb]; \
+            kernel_quantize_x_q8(src, src_dim, _sq); \
+            kernel_matvec_q8(dst, ctx->subtalker.input_proj_q8, _sq, st_hidden, _nb); \
             if (ctx->subtalker.input_proj_bias) kernel_add_inplace(dst, ctx->subtalker.input_proj_bias, st_hidden); \
         } else { \
             int copy_dim = (src_dim) < st_hidden ? (src_dim) : st_hidden; \
@@ -824,8 +810,13 @@ void qwen_tts_subtalker_generate(
     ST_PROJECT_INPUT(proj_hidden, embed_buf, talker_hidden_dim);
     ST_FORWARD(proj_hidden, 1);
 
-    /* Generate group 1 from lm_head[0] */
-    kernel_matvec_bf16(logits_buf, ctx->subtalker.lm_heads_bf16[0], x, st_vocab, st_hidden);
+    /* Generate group 1 from lm_head[0] (Q8_0) */
+    {
+        int n_blocks = st_hidden / QK8_0;
+        block_q8_0 x_q8[n_blocks];
+        kernel_quantize_x_q8(x, st_hidden, x_q8);
+        kernel_matvec_q8(logits_buf, ctx->subtalker.lm_heads_q8[0], x_q8, st_vocab, n_blocks);
+    }
     float rng = (float)ctx->sample_seed;
     out_codes[1] = kernel_sample_top_k(logits_buf, st_vocab, ctx->subtalker_top_k,
                                         ctx->subtalker_top_p, ctx->subtalker_temperature, &rng);
@@ -837,7 +828,12 @@ void qwen_tts_subtalker_generate(
                            (size_t)out_codes[g - 1] * talker_hidden_dim, talker_hidden_dim);
         ST_PROJECT_INPUT(proj_hidden, embed_buf, talker_hidden_dim);
         ST_FORWARD(proj_hidden, g);
-        kernel_matvec_bf16(logits_buf, ctx->subtalker.lm_heads_bf16[g - 1], x, st_vocab, st_hidden);
+        {
+            int n_blocks = st_hidden / QK8_0;
+            block_q8_0 x_q8[n_blocks];
+            kernel_quantize_x_q8(x, st_hidden, x_q8);
+            kernel_matvec_q8(logits_buf, ctx->subtalker.lm_heads_q8[g - 1], x_q8, st_vocab, n_blocks);
+        }
         out_codes[g] = kernel_sample_top_k(logits_buf, st_vocab, ctx->subtalker_top_k,
                                             ctx->subtalker_top_p, ctx->subtalker_temperature, &rng);
     }
