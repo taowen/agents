@@ -126,6 +126,17 @@ static void *asr_thread_func(void * /*arg*/) {
 
 extern "C" {
 
+JNIEXPORT void JNICALL
+Java_ai_connct_1screen_rn_VoiceService_nativeSetCacheDir(
+        JNIEnv *env, jclass clazz, jstring cacheDir) {
+    const char *dir = env->GetStringUTFChars(cacheDir, nullptr);
+    if (dir) {
+        qwen_set_cache_dir(dir);
+        LOGI("Cache dir set to: %s", dir);
+        env->ReleaseStringUTFChars(cacheDir, dir);
+    }
+}
+
 JNIEXPORT jboolean JNICALL
 Java_ai_connct_1screen_rn_VoiceService_nativeLoadModel(
         JNIEnv *env, jclass clazz, jstring modelDir, jint nThreads) {

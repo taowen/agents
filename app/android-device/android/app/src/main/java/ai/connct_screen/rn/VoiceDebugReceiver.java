@@ -72,7 +72,9 @@ public class VoiceDebugReceiver extends BroadcastReceiver {
         Log.i(TAG, "Loading model from: " + path);
 
         final String modelPath = path;
+        final String cacheDir = context.getCacheDir().getAbsolutePath();
         new Thread(() -> {
+            VoiceService.nativeSetCacheDir(cacheDir);
             boolean ok = VoiceService.nativeLoadModel(modelPath, 4);
             Log.i(TAG, "load_model result=" + ok);
         }).start();

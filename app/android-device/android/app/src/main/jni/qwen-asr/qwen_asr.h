@@ -262,6 +262,10 @@ typedef struct {
  * API Functions
  * ======================================================================== */
 
+/* Set cache directory for .qcache files (call before qwen_load).
+ * If not set, defaults to model_dir. */
+void qwen_set_cache_dir(const char *dir);
+
 /* Load model from directory */
 qwen_ctx_t *qwen_load(const char *model_dir);
 

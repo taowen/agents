@@ -27,6 +27,21 @@
 int qwen_verbose = 0;
 int qwen_monitor = 0;
 
+/* Global cache directory for .qcache files */
+static char g_cache_dir[512] = {0};
+
+void qwen_set_cache_dir(const char *dir) {
+    if (dir && dir[0]) {
+        snprintf(g_cache_dir, sizeof(g_cache_dir), "%s", dir);
+    } else {
+        g_cache_dir[0] = '\0';
+    }
+}
+
+static const char *get_cache_dir(const qwen_ctx_t *ctx) {
+    return g_cache_dir[0] ? g_cache_dir : ctx->model_dir;
+}
+
 void qwen_set_token_callback(qwen_ctx_t *ctx, qwen_token_cb cb, void *userdata) {
     ctx->token_cb = cb;
     ctx->token_cb_userdata = userdata;
@@ -267,7 +282,7 @@ static uint64_t get_safetensors_size(const char *model_dir) {
 static int save_asr_qcache(qwen_ctx_t *ctx) {
     const qwen_config_t *cfg = &ctx->config;
     char path[1024];
-    snprintf(path, sizeof(path), "%s/model.qcache", ctx->model_dir);
+    snprintf(path, sizeof(path), "%s/model.qcache", get_cache_dir(ctx));
 
     /* Compute per-layer sizes */
     int d = cfg->enc_d_model;
@@ -382,7 +397,7 @@ static int save_asr_qcache(qwen_ctx_t *ctx) {
 static int load_asr_qcache(qwen_ctx_t *ctx) {
     const qwen_config_t *cfg = &ctx->config;
     char path[1024];
-    snprintf(path, sizeof(path), "%s/model.qcache", ctx->model_dir);
+    snprintf(path, sizeof(path), "%s/model.qcache", get_cache_dir(ctx));
 
     int fd = open(path, O_RDONLY);
     if (fd < 0) return -1;

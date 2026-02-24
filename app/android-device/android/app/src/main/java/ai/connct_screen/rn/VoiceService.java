@@ -36,6 +36,7 @@ public class VoiceService extends Service {
 
     // Native methods (implemented in qwen_asr_jni.cpp)
     static { System.loadLibrary("qwenasr_jni"); }
+    public static native void nativeSetCacheDir(String cacheDir);
     public static native boolean nativeLoadModel(String modelDir, int nThreads);
     public static native boolean nativeStartAsr();
     public static native void nativePushAudio(short[] samples, int length);
