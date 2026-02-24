@@ -9,6 +9,11 @@ Source: `android/app/src/main/jni/qwen-asr/`. Encoder Q8_0, decoder Q4_K. Pre-qu
 adb push /home/taowen/qwen-asr/qwen3-asr-0.6b/ /data/local/tmp/qwen3-asr-0.6b/
 adb push /home/taowen/qwen-asr/samples/jfk.wav /data/local/tmp/jfk.wav
 
+# Generate complex Chinese test audio (19.6s, tests long-audio streaming)
+uvx edge-tts --voice zh-CN-YunxiNeural --text "二零二五年三月，人工智能技术取得了重大突破。研究人员在Nature杂志上发表了一篇论文，指出大语言模型的参数量已经突破了一万亿。这项技术不仅改变了搜索引擎的工作方式，还深刻影响了医疗诊断和自动驾驶等领域。" --write-media /tmp/complex_chinese.mp3
+ffmpeg -i /tmp/complex_chinese.mp3 -ar 16000 -ac 1 -sample_fmt s16 /tmp/complex_chinese.wav -y
+adb push /tmp/complex_chinese.wav /data/local/tmp/complex_chinese.wav
+
 # Automated: build → install → batch test → streaming test → performance report
 cd app/android-device && bash scripts/test-asr-new.sh
 
@@ -17,6 +22,7 @@ PKG="ai.connct_screen.rn"
 adb shell "am broadcast -a ${PKG}.VOICE_DEBUG -p ${PKG} --es cmd load_model --es path /data/local/tmp/qwen3-asr-0.6b"
 adb shell "am broadcast -a ${PKG}.VOICE_DEBUG -p ${PKG} --es cmd test_wav --es path /data/local/tmp/jfk.wav"
 adb shell "am broadcast -a ${PKG}.VOICE_DEBUG -p ${PKG} --es cmd test_wav_stream --es path /data/local/tmp/jfk.wav"
+adb shell "am broadcast -a ${PKG}.VOICE_DEBUG -p ${PKG} --es cmd test_wav_stream --es path /data/local/tmp/complex_chinese.wav"
 adb shell "am broadcast -a ${PKG}.VOICE_DEBUG -p ${PKG} --es cmd free_model"
 adb logcat -d | grep -E 'QwenASR|QwenTTS|VoiceDebug' | tail -30
 ```
@@ -26,18 +32,19 @@ adb logcat -d | grep -E 'QwenASR|QwenTTS|VoiceDebug' | tail -30
 - **stderr redirect tag**: TTS/ASR JNI both redirect stderr to logcat. If TTS loads first, ASR output appears under `QwenTTS` tag.
 - **Screen-off throttling**: CPU governor may throttle when screen is off, inflating benchmarks ~25%.
 - **qmodel vs safetensors**: if both present, qmodel is preferred. Delete `model.qmodel` to fall back.
-- **Chinese test audio**: generate with `edge-tts --voice zh-CN-YunxiNeural --text "..." --write-media /tmp/chinese_test.mp3`, convert to 16kHz mono WAV, trim to ≤11s. Push to `/data/local/tmp/chinese_test.wav`. Useful for testing text dedup at chunk boundaries (CJK tokenization differs more across chunks).
+- **Chinese test audio**: generate with `uvx edge-tts --voice zh-CN-YunxiNeural --text "..." --write-media /tmp/chinese_test.mp3`, convert to 16kHz mono WAV with `ffmpeg -i /tmp/chinese_test.mp3 -ar 16000 -ac 1 -sample_fmt s16 /tmp/chinese_test.wav`. Push to `/data/local/tmp/`. No length limit — streaming handles long audio via past text conditioning.
 
 ## Stream Mode Architecture
 
-Audio → 2s chunks. Encoder window = 8s (bidirectional attention). Key mechanisms:
+Audio → 2s chunks. Encoder window = 8s (bidirectional attention). `past_text_conditioning=1` (default). Key mechanisms:
 
 1. **Encoder window cache**: completed 8s windows are cached; only the partial tail is re-encoded each chunk.
 2. **Conv2D stem cache**: the encoder's Conv2D stem (3 layers, ~56% of encoder time) processes each ~1s mel chunk independently. Cached stem outputs are reused across chunks — only the last mel chunk (affected by edge padding) and new chunks are recomputed. Mel normalization uses a locked `global_max` for deterministic caching.
 3. **Cold-start skip**: first 2 "unfixed" chunks are skipped entirely (their decode output is never emitted). First real chunk processes 6s of audio.
-4. **Prefix rollback**: decoder rolls back last K tokens for boundary continuity.
-5. **KV cache reuse**: prefill embeddings are compared row-by-row; matching prefix is skipped via KV cache truncation.
-6. **Text-level dedup**: token-level overlap detection fails when the same text is tokenized differently across chunks (different audio context → different encoder output → different token IDs). A text-level fallback searches for the longest suffix of already-emitted `result` as a substring anywhere in the pending new tokens' decoded text, skipping both the overlap and any boundary artifact tokens (e.g., a misplaced comma before the repeated portion).
+4. **Past text conditioning**: previously decoded tokens (minus rollback) are fed as prefix to the next chunk's decoder. This means `max_new=32` only needs to cover *incremental* text (~6-8 tokens per 2s chunk), not the full transcription from scratch. Critical for audio >11s.
+5. **Prefix rollback**: decoder rolls back last K tokens for boundary continuity.
+6. **KV cache reuse**: prefill embeddings are compared row-by-row; matching prefix is skipped via KV cache truncation.
+7. **Text-level dedup**: token-level overlap detection fails when the same text is tokenized differently across chunks (different audio context → different encoder output → different token IDs). A text-level fallback searches for the longest suffix of already-emitted `result` as a substring anywhere in the pending new tokens' decoded text, skipping both the overlap and any boundary artifact tokens (e.g., a misplaced comma before the repeated portion).
 
 Key split: `qwen_encoder_stem_chunk()` (per-chunk Conv2D) + `qwen_encoder_transformer()` (bidirectional attention). `stream_encode_stem_cached()` manages the cache for both partial and complete window encoding.
 
@@ -53,16 +60,31 @@ Key split: `qwen_encoder_stem_chunk()` (per-chunk Conv2D) + `qwen_encoder_transf
 | Decode | 618ms (20.6 ms/tok) | 30 |
 | **Total** | **2626ms** | — |
 
-### Streaming (4 chunks, cold-start skipped)
+### Streaming (jfk.wav, 4 chunks, cold-start skipped, prefix=on)
 
 | Chunk | Audio | Encoder | Stem cached | Prefill | Decode | Total |
 |-------|-------|---------|-------------|---------|--------|-------|
-| 1 | 0-6s | 613 | 0/6 | 660 | 348 | 1621 |
-| 2 | 0-8s | 515 | 5/8 | 743 | 430 | 1688 |
-| 3 | 8-10s | 252 | 0/2 | 260 | 588 | 1100 |
-| 4 | 8-11s | 292 | 1/3 | 352 | 617 | 1261 |
+| 1 | 0-6s | 583 | 0/6 | 639 | 348 | 1570 |
+| 2 | 0-8s | 470 | 5/8 | 825 | 223 | 1518 |
+| 3 | 0-10s | 232 | 0/2 | 365 | 287 | 884 |
+| 4 | 0-11s | 252 | 1/3 | 488 | 156 | 896 |
 
-**Totals**: Encoder 1672ms (29%) / Prefill 2015ms (36%) / Decode 1983ms (35%) / **Wall 5670ms**. KV reuse 46%.
+**Totals**: Encoder 1537ms (32%) / Prefill 2317ms (48%) / Decode 1014ms (21%) / **Wall 4868ms**. KV reuse 42%.
+
+### Streaming (complex_chinese.wav, 19.6s, 9 chunks, prefix=on)
+
+| Chunk | Audio | Encoder | Stem cached | Prefill (prefix) | Decode | Total |
+|-------|-------|---------|-------------|-------------------|--------|-------|
+| 1 | 0-6s | 600 | 0/6 | 670 (0) | 552 | 1822 |
+| 2 | 0-8s | 485 | 5/8 | 918 (17) | 235 | 1638 |
+| 3 | 0-10s | 200 | 0/2 | 441 (23) | 281 | 922 |
+| 4 | 0-12s | 392 | 1/4 | 704 (31) | 201 | 1297 |
+| 5 | 0-14s | 429 | 3/6 | 945 (35) | 247 | 1621 |
+| 6 | 0-16s | 576 | 5/8 | 1148 (41) | 225 | 1949 |
+| 7 | 0-18s | 215 | 0/2 | 677 (46) | 252 | 1144 |
+| 8 | 0-19.6s | 354 | 1/4 | 898 (52) | 165 | 1417 |
+
+**Totals**: Encoder 3251ms (27%) / Prefill 6401ms (53%) / Decode 2158ms (18%) / **Wall 11810ms**. KV reuse 52.5%.
 
 ### Per-operation breakdown (batch, for profiling reference)
 
@@ -80,6 +102,7 @@ Key split: `qwen_encoder_stem_chunk()` (per-chunk Conv2D) + `qwen_encoder_transf
 | 3 | Source split + cleanup | ~3050ms | — | Split oversized files, removed ~2300 lines dead code |
 | 4 | Stem cache + cold-start skip | 2626ms | **5670ms** | Conv2D stem cache, cold-start chunk skip, encoder split |
 | 5 | Streaming text dedup | — | **5670ms** | Text-level overlap detection fixes cross-chunk repetition |
+| 6 | Past text conditioning | — | **4868ms** | `past_text_conditioning=1`: decoder continues from previous output, fixes content loss on >11s audio, decode tokens/chunk drops from 23-32 to 7-17 |
 
 ## Streaming Text Dedup (Round 5)
 
@@ -112,6 +135,32 @@ The new chunk may produce boundary artifact tokens before the overlap. Searching
 ### Bug fix: emitted_total log
 
 `n_stable_text_tokens` (candidate window size) was logged as `emitted_total` instead of `n_emitted_text_tokens` (actual tokens sent to user). Fixed to show the correct count.
+
+## Past Text Conditioning (Round 6)
+
+### Problem
+
+With `past_text_conditioning=0` and `max_new=32`, each chunk decodes the full transcription from scratch. For audio ≤11s (~30 text tokens), 32 tokens suffice. For longer audio (19.6s, ~59 text tokens), the decoder hits the `max_new` cap before reaching new content. Result: `emitted_total` stalls across chunks, no new text is emitted, eventually recovery reset triggers and drops the middle of the transcription.
+
+Example (19.6s Chinese): chunks 4-8 all produced `emitted_total=24` (identical to chunk 3). After recovery reset, only the tail "影响了医疗诊断和自动驾驶等领域。" was recovered. The middle ~40% of the text was lost.
+
+### Fix
+
+Set `past_text_conditioning=1` (in `qwen_asr.c`). The decoder receives previously generated tokens (minus rollback) as prefix input. With prefix feeding:
+- `max_new=32` only needs to cover incremental text per chunk (~6-8 tokens for 2s of audio)
+- No audio length limit — the prefix grows naturally with the transcription
+- Decode time per chunk drops significantly (7-17 tokens vs 23-32 tokens)
+
+### Impact
+
+| Metric | prefix=off | prefix=on |
+|--------|-----------|-----------|
+| jfk.wav (11s) stream | 5670ms | **4868ms** (−14%) |
+| 19.6s Chinese stream | content loss | **11810ms** (correct) |
+| Decode tokens/chunk | 23-32 | 7-17 |
+| Prefill tokens/chunk | grows with encoder only | grows with encoder + prefix |
+
+Trade-off: prefill sequence is longer (encoder + prefix tokens), so prefill time per chunk increases. But total wall time decreases because decode time drops more than prefill grows.
 
 ## Next Optimization Opportunities
 

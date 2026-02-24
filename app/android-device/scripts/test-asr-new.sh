@@ -15,6 +15,8 @@ ACTION="${PKG}.VOICE_DEBUG"
 MODEL_DIR="/data/local/tmp/qwen3-asr-0.6b"
 WAV_PATH="/data/local/tmp/jfk.wav"
 EXPECTED_PHRASE="ask not what your country can do for you"
+CHINESE_WAV_PATH="/data/local/tmp/complex_chinese.wav"
+CHINESE_EXPECTED="人工智能"
 
 TIMEOUT_LOAD=60
 TIMEOUT_WAV=120
@@ -331,6 +333,50 @@ printf "Decode total:   %5d ms\n" "$TOTAL_DEC_MS"
 printf "Wall time est:  %5d ms\n" "$TOTAL_STREAM_MS"
 
 echo ""
+
+# ── Chinese Streaming Transcription (long audio) ─────────────────────────────
+if adb shell "ls ${CHINESE_WAV_PATH}" &>/dev/null; then
+    echo "--- Streaming Transcription (complex_chinese.wav, 19.6s) ---"
+
+    adb logcat -c
+    adb shell "am broadcast -a ${ACTION} -p ${PKG} --es cmd test_wav_stream --es path ${CHINESE_WAV_PATH}" >/dev/null 2>&1
+
+    ELAPSED=0
+    CN_STREAM_DONE=false
+    while [ $ELAPSED -lt $TIMEOUT_STREAM ]; do
+        sleep 2
+        ELAPSED=$((ELAPSED + 2))
+        if adb logcat -d -s QwenASR_JNI 2>/dev/null | grep -q "nativeTestWavStream: done"; then
+            CN_STREAM_DONE=true; break
+        fi
+    done
+
+    rm -f "$LOGCAT_FILE"
+    adb logcat -d >"$LOGCAT_FILE" 2>/dev/null
+
+    if [ "$CN_STREAM_DONE" = false ]; then
+        fail "Chinese stream timed out (${TIMEOUT_STREAM}s)"; dump_log
+    else
+        pass "Chinese stream inference completed"
+
+        CN_RESULT_LINE=$(grep "nativeTestWavStream: result = " "$LOGCAT_FILE" || true)
+        if [ -z "$CN_RESULT_LINE" ]; then
+            fail "No Chinese stream result found"; dump_log
+        else
+            CN_RESULT_TEXT=$(echo "$CN_RESULT_LINE" | sed 's/.*nativeTestWavStream: result = //')
+            if echo "$CN_RESULT_TEXT" | grep -q "$CHINESE_EXPECTED"; then
+                pass "Contains expected: \"${CN_RESULT_TEXT}\""
+            else
+                fail "Missing '${CHINESE_EXPECTED}': \"${CN_RESULT_TEXT}\""
+            fi
+        fi
+    fi
+
+    echo ""
+else
+    info "Skipping Chinese test (${CHINESE_WAV_PATH} not found on device)"
+    echo ""
+fi
 
 # ── Summary ─────────────────────────────────────────────────────────────────
 if [ "$FAIL" -eq 0 ]; then
