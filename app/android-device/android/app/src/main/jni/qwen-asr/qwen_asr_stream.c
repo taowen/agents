@@ -21,7 +21,7 @@ static int stream_encode_span(qwen_ctx_t *ctx, const float *samples, int n_sampl
     if (n_samples <= 0) return 0;
 
     int mel_frames = 0;
-    float *mel = qwen_mel_spectrogram(samples, n_samples, &mel_frames);
+    float *mel = qwen_mel_spectrogram(samples, n_samples, &mel_frames, NULL);
     if (!mel) return -1;
 
     int seq_len = 0;
@@ -71,6 +71,25 @@ typedef struct {
     float *enc_output; /* [seq_len, dec_hidden] */
 } stream_enc_window_t;
 
+typedef struct {
+    float *stem_output;   /* [n_tokens, d_model] */
+    int n_tokens;
+} stream_stem_entry_t;
+
+static void stream_clear_stem_cache(stream_stem_entry_t *stem_cache,
+                                    int *n_stem_cached,
+                                    float *stem_mel_global_max) {
+    if (stem_cache && n_stem_cached) {
+        for (int i = 0; i < *n_stem_cached; i++) {
+            free(stem_cache[i].stem_output);
+            stem_cache[i].stem_output = NULL;
+        }
+        *n_stem_cached = 0;
+    }
+    if (stem_mel_global_max)
+        *stem_mel_global_max = -1e30f;
+}
+
 static void stream_clear_enc_cache(stream_enc_window_t *enc_cache,
                                    int *n_enc_cache,
                                    int *enc_cache_start,
@@ -89,6 +108,106 @@ static void stream_clear_enc_cache(stream_enc_window_t *enc_cache,
     *enc_cache_start = 0;
     *enc_cached_seq_total = 0;
     *next_window_start = new_start_sample;
+}
+
+/* Encode audio span using stem cache for Conv2D reuse.
+ * Reuses cached Conv2D stem outputs for mel chunks that haven't changed.
+ * Returns encoder output [seq_len, output_dim] (caller owns), or NULL on failure. */
+static float *stream_encode_stem_cached(
+    qwen_ctx_t *ctx, const float *samples, int n_samples,
+    stream_stem_entry_t **stem_cache_ptr, int *n_stem_cached_ptr,
+    int *stem_cache_cap_ptr, float *stem_mel_global_max_ptr,
+    int *out_seq_len, int *out_stem_hits, int *out_stem_total)
+{
+    *out_seq_len = 0;
+    if (out_stem_hits) *out_stem_hits = 0;
+    if (out_stem_total) *out_stem_total = 0;
+    if (n_samples <= 0) return NULL;
+
+    int mel_frames = 0;
+    float *mel = qwen_mel_spectrogram(samples, n_samples, &mel_frames,
+                                       stem_mel_global_max_ptr);
+    if (!mel) return NULL;
+
+    int mel_chunk_size = ctx->config.enc_chunk_size;
+    int n_mel_chunks = (mel_frames + mel_chunk_size - 1) / mel_chunk_size;
+    int d_model = ctx->config.enc_d_model;
+    int stem_hits = 0;
+    stream_stem_entry_t *sc = *stem_cache_ptr;
+    int n_sc = *n_stem_cached_ptr;
+
+    /* Grow cache if needed */
+    if (n_mel_chunks > *stem_cache_cap_ptr) {
+        int new_cap = *stem_cache_cap_ptr > 0 ? *stem_cache_cap_ptr : 8;
+        while (new_cap < n_mel_chunks) new_cap *= 2;
+        stream_stem_entry_t *tmp = (stream_stem_entry_t *)realloc(
+            sc, (size_t)new_cap * sizeof(stream_stem_entry_t));
+        if (tmp) {
+            for (int i = *stem_cache_cap_ptr; i < new_cap; i++) {
+                tmp[i].stem_output = NULL;
+                tmp[i].n_tokens = 0;
+            }
+            sc = tmp;
+            *stem_cache_ptr = sc;
+            *stem_cache_cap_ptr = new_cap;
+        }
+    }
+
+    /* Process each mel chunk with cache */
+    int total_tokens = 0;
+    for (int c = 0; c < n_mel_chunks; c++) {
+        int cs = c * mel_chunk_size;
+        int ce = cs + mel_chunk_size;
+        if (ce > mel_frames) ce = mel_frames;
+        int cw = ce - cs;
+
+        /* Cache hit: all chunks except previously-last are stable
+         * (reflect-padding only affects the tail chunk) */
+        if (c < n_sc - 1 && sc[c].stem_output) {
+            total_tokens += sc[c].n_tokens;
+            stem_hits++;
+        } else {
+            if (c < n_sc && sc[c].stem_output) {
+                free(sc[c].stem_output);
+                sc[c].stem_output = NULL;
+            }
+            int n_tok = 0;
+            float *sout = qwen_encoder_stem_chunk(
+                ctx, mel, mel_frames, cs, cw, &n_tok);
+            sc[c].stem_output = sout;
+            sc[c].n_tokens = n_tok;
+            total_tokens += n_tok;
+        }
+    }
+    /* Free entries beyond current chunk count */
+    for (int c = n_mel_chunks; c < n_sc; c++) {
+        free(sc[c].stem_output);
+        sc[c].stem_output = NULL;
+        sc[c].n_tokens = 0;
+    }
+    *n_stem_cached_ptr = n_mel_chunks;
+
+    /* Concatenate stem outputs */
+    float *stem_x = (float *)calloc(
+        (size_t)total_tokens * d_model, sizeof(float));
+    if (!stem_x) { free(mel); return NULL; }
+    int soff = 0;
+    for (int c = 0; c < n_mel_chunks; c++) {
+        memcpy(stem_x + (size_t)soff * d_model,
+               sc[c].stem_output,
+               (size_t)sc[c].n_tokens * d_model * sizeof(float));
+        soff += sc[c].n_tokens;
+    }
+
+    /* Run transformer (consumes stem_x) */
+    int seq_len = 0;
+    float *enc_out = qwen_encoder_transformer(ctx, stem_x, total_tokens, &seq_len);
+    free(mel);
+
+    *out_seq_len = seq_len;
+    if (out_stem_hits) *out_stem_hits = stem_hits;
+    if (out_stem_total) *out_stem_total = n_mel_chunks;
+    return enc_out;
 }
 
 /* Re-anchor stream text state to a short committed tail so decoding can
@@ -388,6 +507,12 @@ static char *stream_impl(qwen_ctx_t *ctx, const float *samples, int n_samples,
     float *prev_prefill_embeds = NULL;
     int prev_prefill_len = 0;
     int prev_prefill_cap = 0;
+
+    /* Stem cache for partial-window Conv2D reuse */
+    stream_stem_entry_t *stem_cache = NULL;
+    int n_stem_cached = 0;
+    int stem_cache_cap = 0;
+    float stem_mel_global_max = -1e30f;
     int prefill_total_tokens = 0;
     int prefill_reused_tokens = 0;
 
@@ -499,6 +624,7 @@ static char *stream_impl(qwen_ctx_t *ctx, const float *samples, int n_samples,
             }
         } else {
             int enc_failed = 0;
+            int prev_n_enc_cache = n_enc_cache;
 
             while (next_window_start < full_end) {
                 int64_t ws = next_window_start;
@@ -510,14 +636,41 @@ static char *stream_impl(qwen_ctx_t *ctx, const float *samples, int n_samples,
                 }
                 float *win_enc = NULL;
                 int win_seq = 0;
-                if (stream_encode_span(ctx,
-                                       audio_samples + (size_t)ws_local_off,
-                                       enc_window_samples,
-                                       &win_enc, &win_seq) != 0 ||
-                    !win_enc || win_seq <= 0) {
+
+                /* Use stem-cached encoding when cache is available
+                 * (reuses Conv2D outputs from partial window processing) */
+                int win_stem_hits = 0, win_stem_total = 0;
+                if (n_stem_cached > 0) {
+                    win_enc = stream_encode_stem_cached(
+                        ctx, audio_samples + (size_t)ws_local_off,
+                        enc_window_samples,
+                        &stem_cache, &n_stem_cached, &stem_cache_cap,
+                        &stem_mel_global_max,
+                        &win_seq, &win_stem_hits, &win_stem_total);
+                    /* Clear stem cache after encoding complete window
+                     * (next partial window starts from new boundary) */
+                    stream_clear_stem_cache(stem_cache, &n_stem_cached,
+                                            &stem_mel_global_max);
+                } else {
+                    if (stream_encode_span(ctx,
+                                           audio_samples + (size_t)ws_local_off,
+                                           enc_window_samples,
+                                           &win_enc, &win_seq) != 0) {
+                        win_enc = NULL;
+                    }
+                }
+
+                if (!win_enc || win_seq <= 0) {
                     free(win_enc);
                     enc_failed = 1;
                     break;
+                }
+
+                if (qwen_verbose >= 2 && win_stem_total > 0) {
+                    fprintf(stderr,
+                            "  Stem cache: %d/%d chunks cached, %d recomputed\n",
+                            win_stem_hits, win_stem_total,
+                            win_stem_total - win_stem_hits);
                 }
 
                 if (n_enc_cache == enc_cache_cap) {
@@ -542,6 +695,7 @@ static char *stream_impl(qwen_ctx_t *ctx, const float *samples, int n_samples,
                 next_window_start += enc_window_samples;
             }
 
+            /* Partial window: use stem cache for Conv2D reuse */
             float *partial_enc = NULL;
             int partial_seq = 0;
             if (!enc_failed && full_end < audio_cursor) {
@@ -550,13 +704,22 @@ static char *stream_impl(qwen_ctx_t *ctx, const float *samples, int n_samples,
                 if (partial_samples64 > INT_MAX || partial_off64 < 0 ||
                     partial_off64 + partial_samples64 > local_n_samples) {
                     enc_failed = 1;
-                } else if (stream_encode_span(ctx,
-                                       audio_samples + (size_t)partial_off64,
-                                       (int)partial_samples64,
-                                       &partial_enc, &partial_seq) != 0) {
-                    free(partial_enc);
-                    partial_enc = NULL;
-                    enc_failed = 1;
+                } else {
+                    int partial_stem_hits = 0, partial_stem_total = 0;
+                    partial_enc = stream_encode_stem_cached(
+                        ctx, audio_samples + (size_t)partial_off64,
+                        (int)partial_samples64,
+                        &stem_cache, &n_stem_cached, &stem_cache_cap,
+                        &stem_mel_global_max,
+                        &partial_seq, &partial_stem_hits, &partial_stem_total);
+                    if (!partial_enc) enc_failed = 1;
+
+                    if (qwen_verbose >= 2 && partial_stem_total > 0) {
+                        fprintf(stderr,
+                                "  Stem cache: %d/%d chunks cached, %d recomputed\n",
+                                partial_stem_hits, partial_stem_total,
+                                partial_stem_total - partial_stem_hits);
+                    }
                 }
             }
 
@@ -770,8 +933,14 @@ static char *stream_impl(qwen_ctx_t *ctx, const float *samples, int n_samples,
         t0 = get_time_ms();
         int n_generated = 0;
 
+        /* Cold-start: minimal decode during unfixed chunks (results are discarded).
+         * 5 tokens is enough to detect language + <asr_text>. */
+        int effective_max_new = max_new_tokens;
+        if (chunk_idx < unfixed_chunks)
+            effective_max_new = 5;
+
         /* Collect ALL generated tokens (including language, <asr_text>, etc.) */
-        int *chunk_tokens = (int *)malloc((size_t)max_new_tokens * sizeof(int));
+        int *chunk_tokens = (int *)malloc((size_t)effective_max_new * sizeof(int));
         if (!chunk_tokens) {
             ctx->perf_total_ms += get_time_ms() - chunk_t0;
             chunk_idx++;
@@ -779,7 +948,7 @@ static char *stream_impl(qwen_ctx_t *ctx, const float *samples, int n_samples,
         }
         int n_chunk_tokens = 0;
 
-        while (n_generated < max_new_tokens) {
+        while (n_generated < effective_max_new) {
             n_generated++;
             if (token == QWEN_TOKEN_ENDOFTEXT || token == QWEN_TOKEN_IM_END) break;
 
@@ -795,7 +964,7 @@ static char *stream_impl(qwen_ctx_t *ctx, const float *samples, int n_samples,
             fprintf(stderr, "  Decode: %d tokens (%.0f ms, %.1f ms/token%s)\n",
                     n_generated, decode_ms,
                     n_generated > 0 ? decode_ms / n_generated : 0,
-                    (n_generated >= max_new_tokens &&
+                    (n_generated >= effective_max_new &&
                      token != QWEN_TOKEN_ENDOFTEXT &&
                      token != QWEN_TOKEN_IM_END) ? ", hit max_new" : "");
         if (qwen_monitor) {
@@ -910,7 +1079,7 @@ static char *stream_impl(qwen_ctx_t *ctx, const float *samples, int n_samples,
                                                       QWEN_STREAM_DEGEN_MAX_PERIOD,
                                                       &tail_period);
             int candidate_advance = candidate_len - n_stable_text_tokens;
-            if (!is_final && n_generated >= max_new_tokens && candidate_advance <= 1) {
+            if (!is_final && n_generated >= effective_max_new && candidate_advance <= 1) {
                 stagnant_chunks++;
             } else {
                 stagnant_chunks = 0;
@@ -944,6 +1113,7 @@ static char *stream_impl(qwen_ctx_t *ctx, const float *samples, int n_samples,
                                        &enc_cached_seq_total,
                                        &next_window_start,
                                        full_end);
+                stream_clear_stem_cache(stem_cache, &n_stem_cached, &stem_mel_global_max);
                 stagnant_chunks = 0;
                 did_recovery_reset = 1;
                 if (qwen_monitor) {
@@ -1042,6 +1212,7 @@ static char *stream_impl(qwen_ctx_t *ctx, const float *samples, int n_samples,
                                            &enc_cached_seq_total,
                                            &next_window_start,
                                            full_end);
+                    stream_clear_stem_cache(stem_cache, &n_stem_cached, &stem_mel_global_max);
                     did_periodic_reset = 1;
                 }
             }
@@ -1089,6 +1260,8 @@ static char *stream_impl(qwen_ctx_t *ctx, const float *samples, int n_samples,
         free(enc_cache[i].enc_output);
     }
     free(enc_cache);
+    stream_clear_stem_cache(stem_cache, &n_stem_cached, &stem_mel_global_max);
+    free(stem_cache);
     if (qwen_verbose >= 2 && prefill_total_tokens > 0) {
         double reuse_pct = 100.0 * (double)prefill_reused_tokens / (double)prefill_total_tokens;
         fprintf(stderr, "  Prefill reuse: %d/%d tokens (%.1f%%)\n",

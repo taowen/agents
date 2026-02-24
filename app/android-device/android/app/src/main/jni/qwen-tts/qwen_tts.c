@@ -10,6 +10,7 @@
  */
 
 #include "qwen_tts.h"
+#include "qwen_tts_internal.h"
 #include "qwen_tts_kernels.h"
 #include "qwen_tts_safetensors.h"
 
@@ -30,7 +31,7 @@ const char *qwen_tts_cache_dir_override = NULL;  /* set before qwen_tts_load() *
  * Timing helpers
  * ======================================================================== */
 
-static double time_ms(void) {
+double qwen_tts_time_ms(void) {
     struct timeval tv;
     gettimeofday(&tv, NULL);
     return tv.tv_sec * 1000.0 + tv.tv_usec / 1000.0;
@@ -1544,7 +1545,7 @@ static void embed_codec_token(qwen_tts_ctx_t *ctx, int token_id, float *out) {
  * ======================================================================== */
 
 qwen_tts_ctx_t *qwen_tts_load(const char *model_dir) {
-    double t0 = time_ms();
+    double t0 = qwen_tts_time_ms();
 
     qwen_tts_ctx_t *ctx = (qwen_tts_ctx_t *)calloc(1, sizeof(qwen_tts_ctx_t));
     if (!ctx) return NULL;
@@ -1611,7 +1612,7 @@ qwen_tts_ctx_t *qwen_tts_load(const char *model_dir) {
 
     kernel_init();
 
-    double t1 = time_ms();
+    double t1 = qwen_tts_time_ms();
     if (qwen_tts_verbose >= 1)
         fprintf(stderr, "Model loaded in %.1f ms\n", t1 - t0);
 
@@ -1846,7 +1847,7 @@ float *qwen_tts_generate(
     int hidden = cfg->talker_hidden;
     int num_groups = cfg->num_code_groups;
 
-    double t_start = time_ms();
+    double t_start = qwen_tts_time_ms();
 
     /* ---- Look up speaker and language IDs ---- */
     int speaker_codec_id = -1;
@@ -1974,13 +1975,13 @@ float *qwen_tts_generate(
     memcpy(trailing_text + (n_trailing - 1) * hidden, tts_eos_proj, hidden * sizeof(float));
 
     /* ---- Prefill ---- */
-    double t_prefill = time_ms();
+    double t_prefill = qwen_tts_time_ms();
 
     /* Reset KV cache */
     ctx->talker_kv_len = 0;
     qwen_tts_talker_prefill(ctx, input_embeds, prefill_len);
 
-    double t_prefill_done = time_ms();
+    double t_prefill_done = qwen_tts_time_ms();
     if (qwen_tts_verbose >= 1)
         fprintf(stderr, "Prefill: %d tokens in %.1f ms\n", prefill_len, t_prefill_done - t_prefill);
 
@@ -2008,7 +2009,7 @@ float *qwen_tts_generate(
         if (i != cfg->codec_eos_id) suppress_tokens[n_suppress++] = i;
     }
 
-    double t_gen = time_ms();
+    double t_gen = qwen_tts_time_ms();
     ctx->perf_subtalker_ms = 0.0;
 
     for (int step = 0; step < max_tokens; step++) {
@@ -2065,9 +2066,9 @@ float *qwen_tts_generate(
 
         /* Generate remaining code groups via sub-talker */
         int codes[QWEN_TTS_NUM_CODE_GROUPS];
-        double t_st = time_ms();
+        double t_st = qwen_tts_time_ms();
         qwen_tts_subtalker_generate(ctx, ctx->tk_x, token, codes);
-        ctx->perf_subtalker_ms += time_ms() - t_st;
+        ctx->perf_subtalker_ms += qwen_tts_time_ms() - t_st;
 
         /* Store all codes */
         memcpy(all_codes + n_generated * num_groups, codes, num_groups * sizeof(int));
@@ -2101,7 +2102,7 @@ float *qwen_tts_generate(
             ctx->progress_cb(step + 1, max_tokens, ctx->progress_cb_userdata);
         }
         if (qwen_tts_verbose >= 1 && (n_generated % 10 == 0)) {
-            double elapsed = time_ms() - t_gen;
+            double elapsed = qwen_tts_time_ms() - t_gen;
             fprintf(stderr, "\r  Token %d (%.1f ms/token)...", n_generated, elapsed / n_generated);
         }
     }
@@ -2111,7 +2112,7 @@ float *qwen_tts_generate(
         stop_step = max_tokens;
     }
 
-    double t_gen_done = time_ms();
+    double t_gen_done = qwen_tts_time_ms();
     ctx->perf_talker_ms = t_gen_done - t_gen;
     ctx->perf_codec_tokens = n_generated;
 
@@ -2160,7 +2161,7 @@ float *qwen_tts_generate(
     }
 
     /* ---- Codec Decode ---- */
-    double t_codec = time_ms();
+    double t_codec = qwen_tts_time_ms();
 
     float *audio = qwen_tts_codec_decode(ctx, all_codes, n_generated, out_samples);
     if (!audio || *out_samples <= 0) {
@@ -2169,7 +2170,7 @@ float *qwen_tts_generate(
         return NULL;
     }
 
-    double t_codec_done = time_ms();
+    double t_codec_done = qwen_tts_time_ms();
     ctx->perf_codec_ms = t_codec_done - t_codec;
     ctx->perf_total_ms = t_codec_done - t_start;
 
@@ -2252,7 +2253,7 @@ int qwen_tts_generate_stream(
     int hidden = cfg->talker_hidden;
     int num_groups = cfg->num_code_groups;
 
-    double t_start = time_ms();
+    double t_start = qwen_tts_time_ms();
 
     /* ---- Look up speaker and language IDs ---- */
     int speaker_codec_id = -1;
@@ -2376,7 +2377,7 @@ int qwen_tts_generate_stream(
 
     int prev_audio_len = 0;    /* samples already sent via callback */
     int prev_decoded_tokens = 0;  /* tokens already decoded */
-    double t_gen = time_ms();
+    double t_gen = qwen_tts_time_ms();
     ctx->perf_subtalker_ms = 0.0;
 
     /* chunk_size > 0: incremental mode (per-token decode + callback)
@@ -2431,9 +2432,9 @@ int qwen_tts_generate_stream(
             generated_tokens[n_generated] = token;
 
             int codes[QWEN_TTS_NUM_CODE_GROUPS];
-            double t_st = time_ms();
+            double t_st = qwen_tts_time_ms();
             qwen_tts_subtalker_generate(ctx, ctx->tk_x, token, codes);
-            ctx->perf_subtalker_ms += time_ms() - t_st;
+            ctx->perf_subtalker_ms += qwen_tts_time_ms() - t_st;
 
             memcpy(all_codes + n_generated * num_groups, codes, num_groups * sizeof(int));
             n_generated++;
@@ -2499,7 +2500,7 @@ int qwen_tts_generate_stream(
         if (ctx->progress_cb)
             ctx->progress_cb(step + 1, max_tokens, ctx->progress_cb_userdata);
         if (qwen_tts_verbose >= 1 && (n_generated % 10 == 0)) {
-            double elapsed = time_ms() - t_gen;
+            double elapsed = qwen_tts_time_ms() - t_gen;
             fprintf(stderr, "\r  Token %d (%.1f ms/token)...", n_generated, elapsed / n_generated);
         }
     }
@@ -2510,7 +2511,7 @@ int qwen_tts_generate_stream(
         codec_state = NULL;
     }
 
-    double t_gen_done = time_ms();
+    double t_gen_done = qwen_tts_time_ms();
     ctx->perf_talker_ms = t_gen_done - t_gen;
     ctx->perf_codec_tokens = n_generated;
     ctx->perf_total_ms = t_gen_done - t_start;

@@ -327,7 +327,8 @@ static void fft_radix2(float *re, float *im, int N) {
     }
 }
 
-float *qwen_mel_spectrogram(const float *samples, int n_samples, int *out_frames) {
+float *qwen_mel_spectrogram(const float *samples, int n_samples, int *out_frames,
+                            float *preset_global_max) {
     int n_freqs = N_FREQ;
     int pad_len = WIN_LENGTH / 2; /* center=True padding (reflect), based on window size */
 
@@ -366,7 +367,8 @@ float *qwen_mel_spectrogram(const float *samples, int n_samples, int *out_frames
     float fft_re[N_FFT];
     float fft_im[N_FFT];
     float power[N_FREQ];
-    float global_max = -1e30f;
+    int use_preset_max = (preset_global_max && *preset_global_max > -1e20f);
+    float global_max = use_preset_max ? *preset_global_max : -1e30f;
 
     for (int t = 0; t < n_frames; t++) {
         int start = t * HOP_LENGTH;
@@ -393,9 +395,13 @@ float *qwen_mel_spectrogram(const float *samples, int n_samples, int *out_frames
             if (sum < 1e-10f) sum = 1e-10f;
             float val = log10f(sum);
             mel_tmp[t * N_MEL + m] = val;
-            if (val > global_max) global_max = val;
+            if (!use_preset_max && val > global_max) global_max = val;
         }
     }
+
+    /* Write back computed global_max if caller wants it */
+    if (preset_global_max && !use_preset_max)
+        *preset_global_max = global_max;
 
     /* Second pass: clamp with dynamic max and normalize.
      * Output layout: [N_MEL, n_frames] for Conv2D compatibility. */

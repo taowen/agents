@@ -27,9 +27,12 @@ float *qwen_read_pcm_stdin(int *out_n_samples);
  * samples: mono float32 at 16kHz
  * n_samples: number of samples
  * out_frames: set to number of mel frames produced
+ * preset_global_max: if non-NULL and *preset_global_max > -1e20f, use as global_max
+ *   (skip max search, still clamp). Otherwise compute normally and write back if non-NULL.
  * Returns: [128, n_frames] mel spectrogram (caller must free)
  * Note: Returns in [mel_bins, frames] layout for Conv2D compatibility. */
-float *qwen_mel_spectrogram(const float *samples, int n_samples, int *out_frames);
+float *qwen_mel_spectrogram(const float *samples, int n_samples, int *out_frames,
+                            float *preset_global_max);
 
 /* Start a reader thread that incrementally fills a live audio buffer from stdin.
  * Detects WAV vs raw s16le. For WAV, requires 16kHz sample rate.

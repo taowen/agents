@@ -15,6 +15,7 @@
  */
 
 #include "qwen_tts.h"
+#include "qwen_tts_internal.h"
 #include "qwen_tts_kernels.h"
 #include <math.h>
 #include <stdlib.h>

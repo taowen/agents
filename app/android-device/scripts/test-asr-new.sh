@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 #
-# ASR Profiling Test — builds, installs, runs batch transcription with
-# per-operation breakdown to identify bottlenecks.
+# ASR Profiling Test — builds, installs, runs batch + streaming transcription
+# with per-operation breakdown to identify bottlenecks.
 #
 # Usage:
 #   cd app/android-device && bash scripts/test-asr-new.sh
@@ -18,6 +18,7 @@ EXPECTED_PHRASE="ask not what your country can do for you"
 
 TIMEOUT_LOAD=60
 TIMEOUT_WAV=120
+TIMEOUT_STREAM=120
 
 # ── Helpers ─────────────────────────────────────────────────────────────────
 PASS=0
@@ -151,8 +152,8 @@ fi
 
 echo ""
 
-# ── Performance Report ──────────────────────────────────────────────────────
-echo "=== Performance Report ==="
+# ── Batch Performance Report ──────────────────────────────────────────────
+echo "=== Batch Performance ==="
 echo ""
 
 # Phase-level timing
@@ -192,6 +193,142 @@ fi
 if [ -n "$DEC_BREAKDOWN" ]; then
     echo "Decode breakdown:   $DEC_BREAKDOWN"
 fi
+
+echo ""
+
+# ── Streaming Transcription ────────────────────────────────────────────────
+echo "--- Streaming Transcription (jfk.wav) ---"
+
+adb logcat -c
+adb shell "am broadcast -a ${ACTION} -p ${PKG} --es cmd test_wav_stream --es path ${WAV_PATH}" >/dev/null 2>&1
+
+ELAPSED=0
+STREAM_DONE=false
+while [ $ELAPSED -lt $TIMEOUT_STREAM ]; do
+    sleep 2
+    ELAPSED=$((ELAPSED + 2))
+    if adb logcat -d -s QwenASR_JNI 2>/dev/null | grep -q "nativeTestWavStream: done"; then
+        STREAM_DONE=true; break
+    fi
+done
+
+rm -f "$LOGCAT_FILE"
+adb logcat -d >"$LOGCAT_FILE" 2>/dev/null
+
+if [ "$STREAM_DONE" = false ]; then fail "Stream timed out (${TIMEOUT_STREAM}s)"; dump_log; exit 1; fi
+
+pass "Stream inference completed"
+
+# Check correctness
+STREAM_RESULT_LINE=$(grep "nativeTestWavStream: result = " "$LOGCAT_FILE" || true)
+if [ -z "$STREAM_RESULT_LINE" ]; then
+    fail "No stream result found"; dump_log
+else
+    STREAM_RESULT_LOWER=$(echo "$STREAM_RESULT_LINE" | tr '[:upper:]' '[:lower:]' | sed 's/[^a-z ]//g')
+    if echo "$STREAM_RESULT_LOWER" | grep -q "$EXPECTED_PHRASE"; then
+        STREAM_RESULT_TEXT=$(echo "$STREAM_RESULT_LINE" | sed 's/.*nativeTestWavStream: result = //')
+        pass "Correct: \"${STREAM_RESULT_TEXT}\""
+    else
+        STREAM_RESULT_TEXT=$(echo "$STREAM_RESULT_LINE" | sed 's/.*nativeTestWavStream: result = //')
+        fail "Mismatch: \"${STREAM_RESULT_TEXT}\""
+    fi
+fi
+
+echo ""
+
+# ── Streaming Performance Report ──────────────────────────────────────────
+echo "=== Streaming Performance ==="
+echo ""
+
+# Extract per-chunk timings from verbose log lines:
+#   "  Encoder: N tokens from 0.0-X.X s (cached windows=W, partial=P.P s, MMM ms)"
+#   "  Stem cache: H/T chunks cached, R recomputed"
+#   "  Prefill: N tokens (P prefix, reused R) (MMM ms)"
+#   "  Decode: N tokens (MMM ms, D.D ms/token...)"
+STREAM_LOG=$(grep -E 'QwenASR' "$LOGCAT_FILE" || true)
+
+# Per-chunk table
+CHUNK_NUM=0
+echo "Chunk | Encoder ms | Stem cached | Prefill ms | Decode ms | Decode toks"
+echo "------+------------+-------------+------------+-----------+------------"
+
+# Parse encoder lines (one per chunk)
+ENC_LINES=$(echo "$STREAM_LOG" | grep -oP 'Encoder: \d+ tokens from .* \d+ ms\)' || true)
+STEM_LINES=$(echo "$STREAM_LOG" | grep -oP 'Stem cache: \d+/\d+ chunks cached, \d+ recomputed' || true)
+PRE_LINES=$(echo "$STREAM_LOG" | grep -oP 'Prefill: \d+ tokens \(\d+ prefix, reused \d+\) \(\d+ ms\)' || true)
+DEC_LINES=$(echo "$STREAM_LOG" | grep -oP 'Decode: \d+ tokens \(\d+ ms' || true)
+
+# Convert to arrays
+mapfile -t ENC_ARR <<< "$ENC_LINES"
+mapfile -t STEM_ARR <<< "$STEM_LINES"
+mapfile -t PRE_ARR <<< "$PRE_LINES"
+mapfile -t DEC_ARR <<< "$DEC_LINES"
+
+STEM_IDX=0
+for i in "${!ENC_ARR[@]}"; do
+    [ -z "${ENC_ARR[$i]}" ] && continue
+    CHUNK_NUM=$((i + 1))
+
+    ENC_MS=$(echo "${ENC_ARR[$i]}" | grep -oP '\d+(?= ms\))' || echo "?")
+
+    # Stem cache info (only present for chunks with partial windows)
+    STEM_INFO="-"
+    if [ $STEM_IDX -lt ${#STEM_ARR[@]} ] && [ -n "${STEM_ARR[$STEM_IDX]:-}" ]; then
+        # Check if this stem line comes before the next encoder line
+        STEM_INFO=$(echo "${STEM_ARR[$STEM_IDX]}" | grep -oP '\d+/\d+' || echo "-")
+        STEM_IDX=$((STEM_IDX + 1))
+    fi
+
+    PRE_MS="?"
+    if [ -n "${PRE_ARR[$i]:-}" ]; then
+        PRE_MS=$(echo "${PRE_ARR[$i]}" | grep -oP '\d+(?= ms\))' || echo "?")
+    fi
+
+    DEC_MS="?"
+    DEC_TOKS="?"
+    if [ -n "${DEC_ARR[$i]:-}" ]; then
+        DEC_MS=$(echo "${DEC_ARR[$i]}" | grep -oP '\(\K\d+' || echo "?")
+        DEC_TOKS=$(echo "${DEC_ARR[$i]}" | grep -oP 'Decode: \K\d+' || echo "?")
+    fi
+
+    printf "  %2d  | %10s | %11s | %10s | %9s | %s\n" \
+        "$CHUNK_NUM" "$ENC_MS" "$STEM_INFO" "$PRE_MS" "$DEC_MS" "$DEC_TOKS"
+done
+
+echo ""
+
+# Prefill reuse summary
+REUSE_LINE=$(echo "$STREAM_LOG" | grep -oP 'Prefill reuse: \K.*' || true)
+if [ -n "$REUSE_LINE" ]; then
+    echo "Prefill reuse: $REUSE_LINE"
+fi
+
+# Total wall time estimate: sum of all per-chunk times
+TOTAL_ENC_MS=0
+TOTAL_PRE_MS=0
+TOTAL_DEC_MS=0
+for i in "${!ENC_ARR[@]}"; do
+    [ -z "${ENC_ARR[$i]}" ] && continue
+    ms=$(echo "${ENC_ARR[$i]}" | grep -oP '\d+(?= ms\))' || echo "0")
+    TOTAL_ENC_MS=$((TOTAL_ENC_MS + ms))
+done
+for i in "${!PRE_ARR[@]}"; do
+    [ -z "${PRE_ARR[$i]}" ] && continue
+    ms=$(echo "${PRE_ARR[$i]}" | grep -oP '\d+(?= ms\))' || echo "0")
+    TOTAL_PRE_MS=$((TOTAL_PRE_MS + ms))
+done
+for i in "${!DEC_ARR[@]}"; do
+    [ -z "${DEC_ARR[$i]}" ] && continue
+    ms=$(echo "${DEC_ARR[$i]}" | grep -oP '\(\K\d+' || echo "0")
+    TOTAL_DEC_MS=$((TOTAL_DEC_MS + ms))
+done
+TOTAL_STREAM_MS=$((TOTAL_ENC_MS + TOTAL_PRE_MS + TOTAL_DEC_MS))
+
+echo ""
+printf "Encoder total:  %5d ms\n" "$TOTAL_ENC_MS"
+printf "Prefill total:  %5d ms\n" "$TOTAL_PRE_MS"
+printf "Decode total:   %5d ms\n" "$TOTAL_DEC_MS"
+printf "Wall time est:  %5d ms\n" "$TOTAL_STREAM_MS"
 
 echo ""
 

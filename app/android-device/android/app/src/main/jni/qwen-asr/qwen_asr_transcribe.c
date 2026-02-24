@@ -204,7 +204,7 @@ char *transcribe_segment(qwen_ctx_t *ctx, const float *samples,
     /* ---- Mel spectrogram ---- */
     double t0 = get_time_ms();
     int mel_frames = 0;
-    float *mel = qwen_mel_spectrogram(samples, n_samples, &mel_frames);
+    float *mel = qwen_mel_spectrogram(samples, n_samples, &mel_frames, NULL);
     if (!mel) return NULL;
     double mel_ms = get_time_ms() - t0;
 

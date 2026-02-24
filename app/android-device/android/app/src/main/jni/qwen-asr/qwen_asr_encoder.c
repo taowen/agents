@@ -182,11 +182,93 @@ int qwen_encoder_load(qwen_encoder_t *enc, multi_safetensors_t *ms,
 }
 
 /* ========================================================================
- * Forward Pass
+ * Forward Pass (split into stem_chunk + transformer)
  * ======================================================================== */
 
-float *qwen_encoder_forward(qwen_ctx_t *ctx, const float *mel, int mel_frames,
-                             int *out_seq_len) {
+/* Compute number of tokens produced by a mel chunk of given width */
+int qwen_encoder_stem_tokens(int chunk_w) {
+    int w1 = (chunk_w + 2 - 3) / 2 + 1;
+    int w2 = (w1 + 2 - 3) / 2 + 1;
+    int w3 = (w2 + 2 - 3) / 2 + 1;
+    return w3;
+}
+
+/* Process one mel chunk through Conv2D stem -> reshape -> project -> sinusoidal PE.
+ * mel: [128, mel_frames], chunk_start: starting frame index, chunk_w: chunk width in frames.
+ * Returns [out_n_tokens, d_model] float array (caller owns). */
+float *qwen_encoder_stem_chunk(qwen_ctx_t *ctx, const float *mel, int mel_frames,
+                                int chunk_start, int chunk_w, int *out_n_tokens) {
+    qwen_encoder_t *enc = &ctx->encoder;
+    int d_model = ctx->config.enc_d_model;
+
+    /* Extract chunk mel: [128, chunk_w] */
+    float *chunk_mel = (float *)malloc(128 * chunk_w * sizeof(float));
+    for (int m = 0; m < 128; m++) {
+        memcpy(chunk_mel + m * chunk_w, mel + m * mel_frames + chunk_start,
+               chunk_w * sizeof(float));
+    }
+
+    /* Conv2D layer 1: [1, 128, chunk_w] -> [480, 64, w1] */
+    int h1 = (128 + 2 - 3) / 2 + 1; /* 64 */
+    int w1 = (chunk_w + 2 - 3) / 2 + 1;
+    float *c1 = (float *)malloc(QWEN_CONV_HIDDEN * h1 * w1 * sizeof(float));
+    qwen_conv2d(c1, chunk_mel, enc->conv1_weight, enc->conv1_bias,
+                 1, QWEN_CONV_HIDDEN, 128, chunk_w, 3, 3, 2, 1);
+    qwen_gelu(c1, QWEN_CONV_HIDDEN * h1 * w1);
+    free(chunk_mel);
+
+    /* Conv2D layer 2: [480, 64, w1] -> [480, 32, w2] */
+    int h2 = (h1 + 2 - 3) / 2 + 1; /* 32 */
+    int w2 = (w1 + 2 - 3) / 2 + 1;
+    float *c2 = (float *)malloc(QWEN_CONV_HIDDEN * h2 * w2 * sizeof(float));
+    qwen_conv2d(c2, c1, enc->conv2_weight, enc->conv2_bias,
+                 QWEN_CONV_HIDDEN, QWEN_CONV_HIDDEN, h1, w1, 3, 3, 2, 1);
+    qwen_gelu(c2, QWEN_CONV_HIDDEN * h2 * w2);
+    free(c1);
+
+    /* Conv2D layer 3: [480, 32, w2] -> [480, 16, w3] */
+    int h3 = (h2 + 2 - 3) / 2 + 1; /* 16 */
+    int w3 = (w2 + 2 - 3) / 2 + 1;
+    float *c3 = (float *)malloc(QWEN_CONV_HIDDEN * h3 * w3 * sizeof(float));
+    qwen_conv2d(c3, c2, enc->conv3_weight, enc->conv3_bias,
+                 QWEN_CONV_HIDDEN, QWEN_CONV_HIDDEN, h2, w2, 3, 3, 2, 1);
+    qwen_gelu(c3, QWEN_CONV_HIDDEN * h3 * w3);
+    free(c2);
+
+    /* Reshape [480, 16, w3] -> [w3, 480*16=7680] then project to d_model */
+    int conv_proj_dim = QWEN_CONV_HIDDEN * h3; /* 480 * 16 = 7680 */
+    float *reshaped = (float *)malloc(w3 * conv_proj_dim * sizeof(float));
+    for (int t = 0; t < w3; t++) {
+        for (int ch = 0; ch < QWEN_CONV_HIDDEN; ch++) {
+            for (int f = 0; f < h3; f++) {
+                reshaped[t * conv_proj_dim + ch * h3 + f] =
+                    c3[ch * h3 * w3 + f * w3 + t];
+            }
+        }
+    }
+    free(c3);
+
+    /* Project: [w3, 7680] -> [w3, d_model] (no bias, Q8_0 weights) */
+    float *projected = (float *)malloc(w3 * d_model * sizeof(float));
+    qwen_linear_nobias_q8(projected, reshaped, enc->conv_out_weight_q8,
+                           w3, conv_proj_dim, d_model);
+    free(reshaped);
+
+    /* Add per-chunk sinusoidal position embeddings (starting from pos 0) */
+    float *pe = (float *)malloc(w3 * d_model * sizeof(float));
+    qwen_sinusoidal_pe(pe, w3, d_model);
+    qwen_add_inplace(projected, pe, w3 * d_model);
+    free(pe);
+
+    *out_n_tokens = w3;
+    return projected;
+}
+
+/* Run transformer layers + final projection on concatenated stem outputs.
+ * stem_x: [total_tokens, d_model] -- consumed (freed internally).
+ * Returns [total_tokens, output_dim] (caller owns). */
+float *qwen_encoder_transformer(qwen_ctx_t *ctx, float *stem_x, int total_tokens,
+                                 int *out_seq_len) {
     const qwen_config_t *cfg = &ctx->config;
     qwen_encoder_t *enc = &ctx->encoder;
 
@@ -198,113 +280,9 @@ float *qwen_encoder_forward(qwen_ctx_t *ctx, const float *mel, int mel_frames,
     int chunk_size = cfg->enc_chunk_size;          /* 100 */
     int n_window_infer = cfg->enc_n_window_infer;  /* 800 */
 
-
-    /* ---- Per-chunk Conv2D stem ---- */
-    /* mel: [128, mel_frames] (already in Conv2D-friendly layout)
-     * Process chunks of chunk_size frames, each producing tokens_per_chunk tokens */
-    int n_chunks = (mel_frames + chunk_size - 1) / chunk_size;
-    int tokens_per_chunk = 0; /* computed from first chunk */
-
-    /* First: determine output tokens per chunk from a full chunk */
-    {
-        int w = chunk_size;
-        int w1 = (w + 2 * 1 - 3) / 2 + 1;
-        int w2 = (w1 + 2 * 1 - 3) / 2 + 1;
-        int w3 = (w2 + 2 * 1 - 3) / 2 + 1;
-        tokens_per_chunk = w3; /* 13 for chunk_size=100 */
-    }
-
-    /* Collect all chunks' output tokens */
-    int total_tokens = 0;
-
-    /* Pre-calculate total tokens */
-    for (int c = 0; c < n_chunks; c++) {
-        int start = c * chunk_size;
-        int end = start + chunk_size;
-        if (end > mel_frames) end = mel_frames;
-        int chunk_w = end - start;
-        int w1 = (chunk_w + 2 - 3) / 2 + 1;
-        int w2 = (w1 + 2 - 3) / 2 + 1;
-        int w3 = (w2 + 2 - 3) / 2 + 1;
-        total_tokens += w3;
-    }
-
-
-    /* Allocate main sequence buffer: [total_tokens, d_model] */
-    float *x = (float *)calloc((size_t)total_tokens * d_model, sizeof(float));
-    int token_offset = 0;
-
-    /* Process each chunk through Conv2D + reshape + project + sinusoidal PE */
-    for (int c = 0; c < n_chunks; c++) {
-        int start = c * chunk_size;
-        int end = start + chunk_size;
-        if (end > mel_frames) end = mel_frames;
-        int chunk_w = end - start;
-
-        /* Extract chunk mel: [128, chunk_w] */
-        float *chunk_mel = (float *)malloc(128 * chunk_w * sizeof(float));
-        for (int m = 0; m < 128; m++) {
-            memcpy(chunk_mel + m * chunk_w, mel + m * mel_frames + start,
-                   chunk_w * sizeof(float));
-        }
-
-        /* Conv2D layer 1: [1, 128, chunk_w] -> [480, 64, w1] */
-        int h1 = (128 + 2 - 3) / 2 + 1; /* 64 */
-        int w1 = (chunk_w + 2 - 3) / 2 + 1;
-        float *c1 = (float *)malloc(QWEN_CONV_HIDDEN * h1 * w1 * sizeof(float));
-        qwen_conv2d(c1, chunk_mel, enc->conv1_weight, enc->conv1_bias,
-                     1, QWEN_CONV_HIDDEN, 128, chunk_w, 3, 3, 2, 1);
-        qwen_gelu(c1, QWEN_CONV_HIDDEN * h1 * w1);
-        free(chunk_mel);
-
-        /* Conv2D layer 2: [480, 64, w1] -> [480, 32, w2] */
-        int h2 = (h1 + 2 - 3) / 2 + 1; /* 32 */
-        int w2 = (w1 + 2 - 3) / 2 + 1;
-        float *c2 = (float *)malloc(QWEN_CONV_HIDDEN * h2 * w2 * sizeof(float));
-        qwen_conv2d(c2, c1, enc->conv2_weight, enc->conv2_bias,
-                     QWEN_CONV_HIDDEN, QWEN_CONV_HIDDEN, h1, w1, 3, 3, 2, 1);
-        qwen_gelu(c2, QWEN_CONV_HIDDEN * h2 * w2);
-        free(c1);
-
-        /* Conv2D layer 3: [480, 32, w2] -> [480, 16, w3] */
-        int h3 = (h2 + 2 - 3) / 2 + 1; /* 16 */
-        int w3 = (w2 + 2 - 3) / 2 + 1;
-        float *c3 = (float *)malloc(QWEN_CONV_HIDDEN * h3 * w3 * sizeof(float));
-        qwen_conv2d(c3, c2, enc->conv3_weight, enc->conv3_bias,
-                     QWEN_CONV_HIDDEN, QWEN_CONV_HIDDEN, h2, w2, 3, 3, 2, 1);
-        qwen_gelu(c3, QWEN_CONV_HIDDEN * h3 * w3);
-        free(c2);
-
-        /* Reshape [480, 16, w3] -> [w3, 480*16=7680] then project to d_model */
-        int conv_proj_dim = QWEN_CONV_HIDDEN * h3; /* 480 * 16 = 7680 */
-        float *reshaped = (float *)malloc(w3 * conv_proj_dim * sizeof(float));
-        for (int t = 0; t < w3; t++) {
-            for (int ch = 0; ch < QWEN_CONV_HIDDEN; ch++) {
-                for (int f = 0; f < h3; f++) {
-                    reshaped[t * conv_proj_dim + ch * h3 + f] =
-                        c3[ch * h3 * w3 + f * w3 + t];
-                }
-            }
-        }
-        free(c3);
-
-        /* Project: [w3, 7680] -> [w3, d_model] (no bias, Q8_0 weights) */
-        float *projected = x + (size_t)token_offset * d_model;
-        qwen_linear_nobias_q8(projected, reshaped, enc->conv_out_weight_q8,
-                               w3, conv_proj_dim, d_model);
-        free(reshaped);
-
-        /* Add per-chunk sinusoidal position embeddings (starting from pos 0) */
-        float *pe = (float *)malloc(w3 * d_model * sizeof(float));
-        qwen_sinusoidal_pe(pe, w3, d_model);
-        qwen_add_inplace(projected, pe, w3 * d_model);
-        free(pe);
-
-        token_offset += w3;
-    }
+    int tokens_per_chunk = qwen_encoder_stem_tokens(chunk_size);
 
     /* ---- Build attention window boundaries ---- */
-    /* Window size = tokens_per_chunk * (n_window_infer / chunk_size) */
     int window_token_size = tokens_per_chunk * (n_window_infer / chunk_size);
     int n_windows = (total_tokens + window_token_size - 1) / window_token_size;
     int *window_starts = (int *)malloc((n_windows + 1) * sizeof(int));
@@ -313,8 +291,8 @@ float *qwen_encoder_forward(qwen_ctx_t *ctx, const float *mel, int mel_frames,
     }
     window_starts[n_windows] = total_tokens;
 
-
     /* ---- Transformer layers ---- */
+    float *x = stem_x;
     float *x_norm = (float *)malloc(total_tokens * d_model * sizeof(float));
     float *q = (float *)malloc(total_tokens * d_model * sizeof(float));
     float *k = (float *)malloc(total_tokens * d_model * sizeof(float));
@@ -359,7 +337,6 @@ float *qwen_encoder_forward(qwen_ctx_t *ctx, const float *mel, int mel_frames,
         qwen_linear_q8(ffn_out, ffn_mid, l->fc2_weight_q8, l->fc2_bias,
                          total_tokens, ffn_dim, d_model);
         qwen_add_inplace(x, ffn_out, total_tokens * d_model);
-
     }
 
     /* Final LayerNorm */
@@ -385,4 +362,44 @@ float *qwen_encoder_forward(qwen_ctx_t *ctx, const float *mel, int mel_frames,
 
     *out_seq_len = total_tokens;
     return enc_output;
+}
+
+/* Original combined forward pass, now delegates to stem_chunk + transformer */
+float *qwen_encoder_forward(qwen_ctx_t *ctx, const float *mel, int mel_frames,
+                             int *out_seq_len) {
+    int chunk_size = ctx->config.enc_chunk_size;
+    int d_model = ctx->config.enc_d_model;
+    int n_chunks = (mel_frames + chunk_size - 1) / chunk_size;
+
+    /* Pre-calculate total tokens */
+    int total_tokens = 0;
+    for (int c = 0; c < n_chunks; c++) {
+        int start = c * chunk_size;
+        int end = start + chunk_size;
+        if (end > mel_frames) end = mel_frames;
+        total_tokens += qwen_encoder_stem_tokens(end - start);
+    }
+
+    /* Allocate main sequence buffer: [total_tokens, d_model] */
+    float *x = (float *)calloc((size_t)total_tokens * d_model, sizeof(float));
+    int token_offset = 0;
+
+    /* Process each chunk through stem */
+    for (int c = 0; c < n_chunks; c++) {
+        int start = c * chunk_size;
+        int end = start + chunk_size;
+        if (end > mel_frames) end = mel_frames;
+        int chunk_w = end - start;
+
+        int n_tok = 0;
+        float *stem_out = qwen_encoder_stem_chunk(ctx, mel, mel_frames,
+                                                   start, chunk_w, &n_tok);
+        memcpy(x + (size_t)token_offset * d_model, stem_out,
+               (size_t)n_tok * d_model * sizeof(float));
+        free(stem_out);
+        token_offset += n_tok;
+    }
+
+    /* Run transformer on concatenated stem outputs */
+    return qwen_encoder_transformer(ctx, x, total_tokens, out_seq_len);
 }

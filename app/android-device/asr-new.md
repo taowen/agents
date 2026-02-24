@@ -31,7 +31,7 @@ adb push /home/taowen/qwen-asr/samples/jfk.wav /data/local/tmp/jfk.wav
 cd app/android-device && bash scripts/test-asr-new.sh
 ```
 
-Tests: preflight → build & install → load model → batch (jfk.wav) → performance report with per-operation breakdown.
+Tests: preflight → build & install → load model → batch (jfk.wav) → batch performance → streaming (jfk.wav) → per-chunk streaming performance with stem cache hits.
 
 ### Manual commands
 
@@ -305,3 +305,107 @@ Within normal variance of previous baseline (3151ms). No regression.
 1. **`transpose_back` must be kept** even though `transpose_pad` is dead. Q8 GEMM uses `transpose_back` to convert transposed output `Yt[N, M_pad]` back to row-major `Y[M, N]`. Deleting it breaks the Q8 GEMM path.
 2. **`neon_expf`/`neon_tanhf` are only used in ops** (GELU, SwiGLU, attention softmax). They moved cleanly to `qwen_asr_kernels_ops.c` with no duplication issues.
 3. **Prompt constants are shared across 3 files** (`qwen_asr.c`, `qwen_asr_transcribe.c`, `qwen_asr_stream.c`). Initially left in `qwen_asr.c` which caused build errors. Moved to `qwen_asr_internal.h`.
+
+## Round 4: Streaming Conv2D stem cache + cold-start truncation (7.2s → 7.0s)
+
+### What
+
+Three optimizations targeting streaming mode overhead:
+
+1. **Conv2D stem cache for partial windows**: The encoder's Conv2D stem processes each ~1s mel chunk independently (no cross-chunk interaction). Only the transformer layers use bidirectional attention. By caching Conv2D stem outputs for unchanged mel chunks across streaming steps, redundant computation is skipped.
+
+2. **Stem cache reuse for complete window encoding**: When a partial window (0-6s) becomes a complete window (0-8s), the stem cache entries from partial processing are reused. At chunk 4 (the 8s boundary), 5 out of 8 mel chunks are served from cache.
+
+3. **Cold-start decode truncation**: The first 2 "unfixed" chunks generate tokens that are never emitted. Limiting to 5 tokens (enough for language detection + `<asr_text>`) saves ~300ms.
+
+### Key insight: mel normalization determinism
+
+`qwen_asr_audio.c` uses `(val + 4.0f) / 4.0f` — a fixed linear transform. The only `global_max` dependency is the clamping floor (`min_val = global_max - 8`). Locking `global_max` from the first partial chunk makes mel values deterministic for existing frames, enabling exact Conv2D stem caching.
+
+### Encoder split: stem_chunk + transformer
+
+`qwen_encoder_forward` was split into two functions:
+
+- `qwen_encoder_stem_chunk()` — processes one mel chunk through Conv2D stem → reshape → project → sinusoidal PE. Returns `[n_tokens, d_model]`.
+- `qwen_encoder_transformer()` — runs transformer layers + final projection on concatenated stem outputs. Returns `[total_tokens, output_dim]`.
+
+The original `qwen_encoder_forward` now delegates to these. Batch mode behavior is identical.
+
+### Streaming performance (jfk.wav, 11s)
+
+| Chunk | Encoder ms | Stem cached | Prefill ms | Decode ms | Total |
+|-------|-----------|-------------|-----------|----------|-------|
+| 1 (0-2s) | 254 | 0/2 | 293 | 98 | 645 |
+| 2 (0-4s) | 365 | 1/4 | 422 | 117 | 904 |
+| 3 (0-6s) | 419 | 3/6 | 597 | 359 | 1375 |
+| 4 (0-8s) | **504** | **5/8** | 767 | 444 | **1715** |
+| 5 (8-10s) | 215 | 0/2 | 267 | 592 | 1074 |
+| 6 (8-11s) | 255 | 1/3 | 361 | 632 | 1248 |
+
+| Metric | Value |
+|--------|-------|
+| Encoder total | 2012 ms |
+| Prefill total | 2707 ms |
+| Decode total | 2242 ms |
+| **Wall time** | **6961 ms** |
+| Prefill KV reuse | 41.0% |
+
+### Improvement vs no stem cache
+
+| Metric | Before | After | Delta |
+|--------|--------|-------|-------|
+| Chunk 4 encoder | 815ms | 504ms | **-311ms** (38%) |
+| Chunk 4 stem hits | 0/2 | 5/8 | 5 chunks reused |
+| Chunk 4 total | 2018ms | 1715ms | **under 2s threshold** |
+| Encoder total | 2260ms | 2012ms | -248ms |
+| Wall time | 7166ms | 6961ms | -205ms |
+
+### Files changed
+
+| File | Change |
+|------|--------|
+| `qwen_asr_audio.h` | Added `preset_global_max` parameter to `qwen_mel_spectrogram` |
+| `qwen_asr_audio.c` | Implemented preset global_max: lock on first call, reuse on subsequent |
+| `qwen_asr.h` | Added `qwen_encoder_stem_chunk`, `qwen_encoder_transformer`, `qwen_encoder_stem_tokens` |
+| `qwen_asr_encoder.c` | Split `qwen_encoder_forward` into stem_chunk + transformer |
+| `qwen_asr_stream.c` | Added `stream_encode_stem_cached` helper, stem cache for both partial and complete windows, cold-start decode truncation |
+| `qwen_asr_transcribe.c` | Updated `qwen_mel_spectrogram` caller (pass NULL) |
+
+### Batch performance (unchanged)
+
+| Phase | Time | Tokens |
+|-------|------|--------|
+| Mel | 12ms | — |
+| Encoder | 1045ms | 143 |
+| Prefill | 1093ms | 158 |
+| Decode | 622ms (20.7 ms/tok) | 30 |
+| **Total** | **2772ms** | — |
+
+## Remaining Optimization Opportunities
+
+### Prefill (2707ms, 39% of streaming wall time)
+
+Largest component. KV reuse is only 41% — 59% of prefill tokens are recomputed each chunk. Potential:
+- **Encoder output caching across chunks**: the cached-window encoder outputs don't change between chunks, but their embeddings are still prefilled each time. Could cache decoder KV state for the encoder portion.
+- **Sparse prefill**: skip attention computation for tokens that haven't changed.
+
+### Decode (2242ms, 32% of streaming wall time)
+
+Grows with chunk index as more tokens are generated. Decoder MLP is 52% of per-token cost.
+- **Q4_K decoder weights**: diminishing returns given decode is already ~20ms/token.
+- **Speculative decoding**: use a smaller model for draft tokens.
+
+### Encoder GELU (est. ~200ms)
+
+Scalar `tanhf()`. NEON polynomial approximation could cut this significantly.
+
+## Performance Comparison
+
+| Version | Batch Total | Stream Wall |
+|---------|-------------|-------------|
+| FP32 baseline | 47000ms | — |
+| Q8_0 baseline | 23210ms | — |
+| Q8_0 + Conv2D Q8 GEMM | 3151ms | — |
+| + qmodel (Round 2) | 3383ms | — |
+| + source split (Round 3) | 3048ms | — |
+| **+ stem cache + cold-start (Round 4)** | **2772ms** | **6961ms** |

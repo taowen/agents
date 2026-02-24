@@ -292,6 +292,21 @@ char *qwen_transcribe_stream_live(qwen_ctx_t *ctx, qwen_live_audio_t *live);
 float *qwen_encoder_forward(qwen_ctx_t *ctx, const float *mel, int mel_frames,
                              int *out_seq_len);
 
+/* Process one mel chunk through Conv2D stem -> reshape -> project -> sinusoidal PE.
+ * mel: [128, mel_frames], chunk_start: starting frame index, chunk_w: chunk width in frames.
+ * Returns [out_n_tokens, d_model] float array (caller owns). */
+float *qwen_encoder_stem_chunk(qwen_ctx_t *ctx, const float *mel, int mel_frames,
+                                int chunk_start, int chunk_w, int *out_n_tokens);
+
+/* Run transformer layers + final projection on concatenated stem outputs.
+ * stem_x: [total_tokens, d_model] -- consumed (freed internally).
+ * Returns [total_tokens, output_dim] (caller owns). */
+float *qwen_encoder_transformer(qwen_ctx_t *ctx, float *stem_x, int total_tokens,
+                                 int *out_seq_len);
+
+/* Compute number of tokens produced by a mel chunk of given width */
+int qwen_encoder_stem_tokens(int chunk_w);
+
 /* Decoder prefill (multiple tokens) */
 void qwen_decoder_prefill(qwen_ctx_t *ctx, const float *input_embeds, int seq_len);
 

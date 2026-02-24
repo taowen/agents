@@ -6,6 +6,34 @@
 
 Source: upstream `Qwen3-TTS-C/c/`, backed up to `jni/qwen-tts-old/`.
 
+## Source layout (refactored 2026-02-24)
+
+```
+jni/
+├── CMakeLists.txt              # Top-level: hermesruntime, qwenasr_jni, qwentts (shared JNI lib)
+├── qwen_tts_jni.c              # JNI wrapper (moved out of qwen-tts/)
+└── qwen-tts/
+    ├── CMakeLists.txt           # Own build: qwen_tts_static STATIC library
+    ├── qwen_tts.h               # Public API + types (~480 lines, was 648)
+    ├── qwen_tts_quant.h         # Q4_K block_q4_k struct, QK_K/Q4K_NUM_SUBS defines
+    ├── qwen_tts_internal.h      # Internal cross-module declarations (talker, codec, stream)
+    ├── qwen_tts_kernels.h       # Kernel function declarations
+    ├── qwen_tts_kernels.c       # Norms, activations, element-wise ops (~285 lines, was 1816)
+    ├── qwen_tts_kernels_neon.c  # NEON matvec/matmul: BF16, F32, INT8, Q4K, SwiGLU, dot
+    ├── qwen_tts_kernels_ops.c   # Conv1d, TransConv1d, RoPE, M-RoPE, SnakeBeta, softmax, sampling
+    ├── qwen_tts.c               # Main API: config, weight loading, generate()
+    ├── qwen_tts_talker.c        # Talker transformer forward pass
+    ├── qwen_tts_codec.c         # Codec decoder (tokens → waveform)
+    ├── qwen_tts_safetensors.c   # SafeTensors file loader
+    └── qwen_tts_audio.c         # Audio utilities
+```
+
+Key changes from monolithic structure:
+- **JNI decoupled**: `qwen_tts_jni.c` moved to parent `jni/`, links against `qwen_tts_static`. Engine can be built/tested standalone.
+- **Kernels split 3-way**: `qwen_tts_kernels.c` (norms/activations), `_neon.c` (NEON matvec/matmul), `_ops.c` (conv/rope/sampling).
+- **Headers split**: `qwen_tts_quant.h` (block type), `qwen_tts_internal.h` (cross-module internals), `qwen_tts.h` (public API only).
+- **Own CMakeLists.txt**: platform-aware ARM flags, conditional OpenMP, static library target. Mirrors `qwen-asr/` pattern.
+
 ## Build & deploy
 
 ```bash
@@ -109,6 +137,18 @@ adb shell "am broadcast -a ai.connct_screen.rn.TTS_DEBUG -p ai.connct_screen.rn 
 # Delete qcache (force re-quantization)
 adb shell "run-as ai.connct_screen.rn rm -f cache/model.qcache"
 ```
+
+## Refactor verification (2026-02-24)
+
+Post-refactor build + on-device test. No functional regressions, timings match pre-refactor baselines.
+
+| Test | Tokens | ms/token | Codec | Total | Audio |
+|------|--------|----------|-------|-------|-------|
+| "Hello world" batch | 20 | 84.2 | 3,274ms | 5,366ms | 1.60s |
+| "你好今天天气怎么样" batch | 32 | 81.4 | 4,545ms | 7,517ms | 2.56s |
+| "Hello world" stream chunk=5 | 20 | ~440 | (incr) | 9,194ms | 1.60s |
+
+Model load: 2,588ms (with qcache). All three modes (batch EN, batch CN, streaming) pass.
 
 ## Next steps
 
