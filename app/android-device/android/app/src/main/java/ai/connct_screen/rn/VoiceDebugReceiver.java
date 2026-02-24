@@ -15,6 +15,10 @@ import java.io.File;
  *   # Check status
  *   adb shell "am broadcast -a ai.connct_screen.rn.VOICE_DEBUG -p ai.connct_screen.rn --es cmd status"
  *
+ *   # Download model from ModelScope/HF (runs in background)
+ *   adb shell "am broadcast -a ai.connct_screen.rn.VOICE_DEBUG -p ai.connct_screen.rn --es cmd download_model"
+ *   adb shell "am broadcast -a ai.connct_screen.rn.VOICE_DEBUG -p ai.connct_screen.rn --es cmd download_model --es source HF_MIRROR"
+ *
  *   # Load model (from default path or custom)
  *   adb shell "am broadcast -a ai.connct_screen.rn.VOICE_DEBUG -p ai.connct_screen.rn --es cmd load_model"
  *   adb shell "am broadcast -a ai.connct_screen.rn.VOICE_DEBUG -p ai.connct_screen.rn --es cmd load_model --es path /data/local/tmp/model"
@@ -39,6 +43,9 @@ public class VoiceDebugReceiver extends BroadcastReceiver {
         switch (cmd) {
             case "status":
                 doStatus(context);
+                break;
+            case "download_model":
+                doDownloadModel(context, intent.getStringExtra("source"));
                 break;
             case "load_model":
                 doLoadModel(context, intent.getStringExtra("path"));
@@ -119,6 +126,52 @@ public class VoiceDebugReceiver extends BroadcastReceiver {
             } catch (Exception e) {
                 Log.e(TAG, "test_wav_stream failed", e);
             }
+        }).start();
+    }
+
+    private void doDownloadModel(Context context, String sourceStr) {
+        ModelManager mm = new ModelManager(context);
+
+        if (mm.isModelReady()) {
+            Log.i(TAG, "Model already downloaded at " + mm.getModelDir());
+            return;
+        }
+
+        ModelManager.Source source = ModelManager.Source.MODELSCOPE;
+        if (sourceStr != null) {
+            try {
+                source = ModelManager.Source.valueOf(sourceStr);
+            } catch (IllegalArgumentException e) {
+                Log.e(TAG, "Unknown source: " + sourceStr + ". Use MODELSCOPE or HF_MIRROR");
+                return;
+            }
+        }
+
+        Log.i(TAG, "Starting download from " + source.name());
+        final ModelManager.Source finalSource = source;
+        new Thread(() -> {
+            final int[] lastPct = {-1};
+            mm.download(finalSource, new ModelManager.DownloadListener() {
+            @Override
+            public void onProgress(long downloaded, long total, String currentFile) {
+                int pct = total > 0 ? (int) (downloaded * 100 / total) : 0;
+                if (pct != lastPct[0]) {
+                    lastPct[0] = pct;
+                    Log.i(TAG, "download: " + pct + "% (" + (downloaded >> 20) + "/"
+                            + (total >> 20) + " MB) " + currentFile);
+                }
+            }
+
+            @Override
+            public void onComplete(String modelDir) {
+                Log.i(TAG, "download_model complete: " + modelDir);
+            }
+
+            @Override
+            public void onError(String message) {
+                Log.e(TAG, "download_model failed: " + message);
+            }
+        });
         }).start();
     }
 

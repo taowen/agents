@@ -2,10 +2,35 @@
 
 Source: `android/app/src/main/jni/qwen-asr/`. Encoder Q8_0, decoder Q4_K. Pre-quantized `.qmodel` for instant loading (~1ms via mmap).
 
+## Model Download
+
+Model weights are downloaded at runtime from ModelScope or HF mirror. Native code auto-quantizes BF16→Q8_0/Q4_K on first load and saves `.qcache` for instant subsequent loads.
+
+```bash
+# Download from ModelScope (default, best for China)
+adb shell "am broadcast -a ai.connct_screen.rn.VOICE_DEBUG -p ai.connct_screen.rn --es cmd download_model"
+
+# Download from HF mirror
+adb shell "am broadcast -a ai.connct_screen.rn.VOICE_DEBUG -p ai.connct_screen.rn --es cmd download_model --es source HF_MIRROR"
+
+# Check download/model status
+adb shell "am broadcast -a ai.connct_screen.rn.VOICE_DEBUG -p ai.connct_screen.rn --es cmd status"
+
+# Monitor download progress
+adb logcat -s VoiceDebug ModelManager
+```
+
+Files downloaded (~1.88 GB total):
+- `model.safetensors` (1.876 GB) — raw BF16 weights
+- `vocab.json` (2.78 MB) — tokenizer vocabulary
+- `merges.txt` (1.67 MB) — BPE merges
+
+Stored in app internal storage: `context.getFilesDir()/qwen3-asr-0.6b/`. First `load_model` after download takes extra time for quantization; subsequent loads use mmap'd `.qcache` (~1ms).
+
 ## Testing
 
 ```bash
-# One-time setup: push model + test audio
+# Alt: push model files manually for development
 adb push /home/taowen/qwen-asr/qwen3-asr-0.6b/ /data/local/tmp/qwen3-asr-0.6b/
 adb push /home/taowen/qwen-asr/samples/jfk.wav /data/local/tmp/jfk.wav
 
