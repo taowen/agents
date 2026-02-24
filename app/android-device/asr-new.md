@@ -73,43 +73,59 @@ Audio → 2s chunks. Encoder window = 8s (bidirectional attention). `past_text_c
 
 Key split: `qwen_encoder_stem_chunk()` (per-chunk Conv2D) + `qwen_encoder_transformer()` (bidirectional attention). `stream_encode_stem_cached()` manages the cache for both partial and complete window encoding.
 
-## Current Performance (jfk.wav, 11s, Snapdragon)
+## Current Performance
 
-### Batch
+Profiling output written to `cache/asr_bench.txt` during streaming tests. Read with `adb shell "run-as ai.connct_screen.rn cat cache/asr_bench.txt"`.
 
-| Phase | Time | Tokens |
-|-------|------|--------|
-| Mel | 12ms | — |
-| Encoder | 974ms | 143 |
-| Prefill | 1022ms | 158 |
-| Decode | 618ms (20.6 ms/tok) | 30 |
-| **Total** | **2626ms** | — |
+### Device comparison — Batch (jfk.wav, 11s)
 
-### Streaming (jfk.wav, 4 chunks, cold-start skipped, prefix=on)
+| Phase | Snapdragon 8 Elite | SD865 (OnePlus 8T) | Ratio |
+|-------|--------------------|--------------------|-------|
+| Mel | 12ms | 20ms | 1.7x |
+| Encoder (143 tok) | 974ms | 1305ms | 1.34x |
+| Prefill (158 tok) | 1022ms | 1334ms | 1.31x |
+| Decode (30 tok) | 618ms (20.6 ms/tok) | 1054ms (35.1 ms/tok) | 1.70x |
+| **Total** | **2626ms** | **3713ms** | **1.41x** |
 
-| Chunk | Audio | Encoder | Stem cached | Prefill | Decode | Total |
-|-------|-------|---------|-------------|---------|--------|-------|
-| 1 | 0-6s | 583 | 0/6 | 639 | 348 | 1570 |
-| 2 | 0-8s | 470 | 5/8 | 825 | 223 | 1518 |
-| 3 | 0-10s | 232 | 0/2 | 365 | 287 | 884 |
-| 4 | 0-11s | 252 | 1/3 | 488 | 156 | 896 |
+### Device comparison — Streaming decode ms/tok
 
-**Totals**: Encoder 1537ms (32%) / Prefill 2317ms (48%) / Decode 1014ms (21%) / **Wall 4868ms**. KV reuse 42%.
+SD865 streaming decode degrades much more than 8Elite because the higher baseline (35ms vs 20ms) amplifies KV cache growth:
 
-### Streaming (complex_chinese.wav, 19.6s, 9 chunks, prefix=on)
+| | 8 Elite | SD865 |
+|------|---------|-------|
+| Batch (KV=158) | 20.6 ms/tok | 35.1 ms/tok |
+| Stream chunk 2 (KV~41) | 15.7 ms/tok | 42.9 ms/tok |
+| Stream chunk 8 (KV~141) | 18.8 ms/tok | 91.8 ms/tok |
+| Stream chunk 16 (KV~268) | 19.1 ms/tok | 54.5 ms/tok |
+| Stream avg | ~18 ms/tok | ~80 ms/tok |
+
+On 8Elite, decode per-token barely grows (15→20ms) because the GPU-like bandwidth hides attention cost. On SD865, it grows from 35→90ms because each decode step scans the full KV cache, and the A77 core + LPDDR4X/5 bandwidth saturates earlier.
+
+### Streaming (8 Elite, complex_chinese.wav, 19.6s, chunk=1s, prefix=on)
 
 | Chunk | Audio | Encoder | Stem cached | Prefill (prefix) | Decode | Total |
 |-------|-------|---------|-------------|-------------------|--------|-------|
-| 1 | 0-6s | 600 | 0/6 | 670 (0) | 552 | 1822 |
-| 2 | 0-8s | 485 | 5/8 | 918 (17) | 235 | 1638 |
-| 3 | 0-10s | 200 | 0/2 | 441 (23) | 281 | 922 |
-| 4 | 0-12s | 392 | 1/4 | 704 (31) | 201 | 1297 |
-| 5 | 0-14s | 429 | 3/6 | 945 (35) | 247 | 1621 |
-| 6 | 0-16s | 576 | 5/8 | 1148 (41) | 225 | 1949 |
-| 7 | 0-18s | 215 | 0/2 | 677 (46) | 252 | 1144 |
-| 8 | 0-19.6s | 354 | 1/4 | 898 (52) | 165 | 1417 |
+| 2 | 0-2s | 227 | 0/2 | 272 (0) | 204 | 703 |
+| 3 | 0-3s | 246 | 1/3 | 393 (9) | 82 | 721 |
+| 4 | 0-4s | 293 | 2/4 | 491 (10) | 125 | 909 |
+| 5 | 0-5s | 352 | 3/5 | 560 (13) | 104 | 1016 |
+| 6 | 0-6s | 420 | 4/6 | 706 (15) | 159 | 1285 |
+| 7 | 0-7s | 375 | 5/7 | 836 (19) | 131 | 1342 |
+| 8 | 0-8s | 463 | 6/8 | 937 (22) | 131 | 1531 |
+| 9 | 0-9s | 124 | 0/1 | 358 (25) | 105 | 587 |
+| 10 | 0-10s | 229 | 0/2 | 396 (27) | 194 | 819 |
+| 11 | 0-11s | 323 | 1/3 | 606 (33) | 156 | 1085 |
+| 12 | 0-12s | 299 | 2/4 | 732 (37) | 66 | 1097 |
+| 13 | 0-13s | 399 | 3/5 | 865 (37) | 158 | 1422 |
+| 14 | 0-14s | 368 | 4/6 | 959 (41) | 111 | 1438 |
+| 15 | 0-15s | 399 | 5/7 | 1028 (43) | 113 | 1540 |
+| 16 | 0-16s | 480 | 6/8 | 1182 (45) | 134 | 1796 |
+| 17 | 0-17s | 167 | 0/1 | 582 (48) | 161 | 910 |
+| 18 | 0-18s | 214 | 0/2 | 706 (52) | 115 | 1035 |
+| 19 | 0-19s | 263 | 1/3 | 836 (54) | 95 | 1194 |
+| 20 | 0-19.6s | 271 | 2/4 | 931 (55) | 79 | 1281 |
 
-**Totals**: Encoder 3251ms (27%) / Prefill 6401ms (53%) / Decode 2158ms (18%) / **Wall 11810ms**. KV reuse 52.5%.
+**Totals**: Encoder 5,946ms (27%) / Prefill 13,376ms (61%) / Decode 2,543ms (12%) / **Wall ~21.9s**. KV reuse 51.2%.
 
 ### Per-operation breakdown (batch, for profiling reference)
 
@@ -128,6 +144,7 @@ Key split: `qwen_encoder_stem_chunk()` (per-chunk Conv2D) + `qwen_encoder_transf
 | 4 | Stem cache + cold-start skip | 2626ms | **5670ms** | Conv2D stem cache, cold-start chunk skip, encoder split |
 | 5 | Streaming text dedup | — | **5670ms** | Text-level overlap detection fixes cross-chunk repetition |
 | 6 | Past text conditioning | — | **4868ms** | `past_text_conditioning=1`: decoder continues from previous output, fixes content loss on >11s audio, decode tokens/chunk drops from 23-32 to 7-17 |
+| 7 | ~~Decoder Q4_0~~ (tested, rejected) | 2918ms | ~22.8s | Q4_0 replaces Q4_K: simpler dequant loop but 8x more blocks per row. Batch decode unchanged (20.6 ms/tok), streaming decode +13%, prefill +5%. Net regression. |
 
 ## Streaming Text Dedup (Round 5)
 
@@ -262,6 +279,26 @@ Risk: slightly lower encoder quality for that window. Low risk since partial-7s 
 
 Tested: encoder Q4_K with padded d_model (896→1024). Batch encoder **+17% slower** (974→1139ms), streaming encoder flat (+30ms). Root cause: encoder uses batched GEMM (seq=100-143 tokens) where compute dominates over bandwidth. Q4_K's complex dequant (4-bit unpack + sub-group corrections) is slower than Q8_0's simple INT8×INT8 SDOT. Plus 14% padding overhead for 0.6B (896→1024). Q4_K only helps bandwidth-bound paths (decoder matvec).
 
-### 5. Chunk 1 encoder (613ms, no stem cache)
+### 5. ~~Decoder Q4_0~~ (tested, rejected)
+
+Replaced Q4_K (256-element super-blocks with sub-group scales/mins) with Q4_0 (32-element blocks, single float scale, symmetric quantization). Hypothesis: simpler dequant inner loop (no vzipq_s8, no sub-group scale multiply, no min correction) would speed up bandwidth-bound decoder matvec. Trade-off: +5% bandwidth (0.625 vs 0.594 B/w).
+
+Results on Snapdragon 8 Elite:
+
+| Metric | Q4_K | Q4_0 | Delta |
+|--------|------|------|-------|
+| Batch decode (30 tok) | 618ms (20.6 ms/tok) | 615ms (20.5 ms/tok) | −0.5% (noise) |
+| Stream decode total | 2,543ms | 2,869ms | **+12.8%** |
+| Stream prefill total | 13,376ms | 14,096ms | **+5.4%** |
+| Stream encoder total | 5,946ms | 5,876ms | −1.2% (noise) |
+| Stream wall | ~21.9s | ~22.8s | **+4.1%** |
+
+Root cause: Q4_0 has **8x more blocks per row** (cols/32 vs cols/256). Each block needs its own `d` scale load and loop bookkeeping. In the GEMM prefill path this overhead dominates — the per-block loop runs 8x more iterations for the same data. In the matvec decode path, the simplified dequant (no zip, no sub-group corrections) is offset by the higher per-block overhead and +5% bandwidth.
+
+The 8 Elite has ~22% memory bandwidth utilization during decode — enough headroom that the compute simplification doesn't translate to wall-time improvement. Q4_0 might help on bandwidth-starved devices (SD865, 35 ms/tok baseline), but on 8 Elite it's a net regression.
+
+Transcription quality: identical output on both English (jfk.wav) and Chinese (complex_chinese.wav).
+
+### 6. Chunk 1 encoder (613ms, no stem cache)
 
 Cold-start skip means no stem cache is built for the first real chunk. Running encoder-only (no prefill/decode) during cold-start would cost ~600ms but only save ~200ms at chunk 1. Net loss with current audio length. Might help for longer audio where window reuse is more frequent.

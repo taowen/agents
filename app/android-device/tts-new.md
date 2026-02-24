@@ -168,12 +168,167 @@ Q8_0 quantization on the codec transformer caused audible hoarseness. Codec tran
 
 Codec transformer F32 is ~2x slower but vocoder (conv/transconv, already F32) dominates total codec time. The transformer is only ~30% of codec decode time.
 
+## Codec transformer FP16 weights (2026-02-24)
+
+Codec transformer weight matrices stored as `__fp16*`, computed via `kernel_matvec_f16w` (load FP16 weights → vcvt_f32_f16 → F32 FMA accumulation). Q8_0 kept as fallback. Vocoder stays F32.
+
+**Why not FP16 vocoder:** FP16 vocoder was implemented and tested but was **1.8x slower** than F32 on the target device (Snapdragon, Cortex-A77). The `vfmaq_f16` instruction appears to have lower throughput than `vfmaq_f32` on this core. FP16 vocoder code was reverted.
+
+**Files changed:** `qwen_tts.h` (FP16 fields in codec transformer layer struct), `qwen_tts_kernels.h` + `qwen_tts_kernels_neon.c` (`kernel_matvec_f16w`), `qwen_tts_kernels.c` (FP16 conversion utilities), `qwen_tts.c` (FP16 weight loading + LOAD_F16_CHECK macro), `qwen_tts_codec.c` (FP16 dispatch in codec transformer forward), `CMakeLists.txt` (`+fp16` flag).
+
+**Benchmark: 73 tokens, 5.84s audio (FP16 transformer + F32 vocoder):**
+
+| Stage | Time (ms) | % |
+|-------|-----------|---|
+| Talker + Sub-talker | 3,207 | 26% |
+| Codec transformer | 156 | 1% |
+| Upsample | 763 | 6% |
+| **Vocoder** | **8,093** | **66%** |
+| **Total** | **12,320** | |
+| Realtime factor | 0.47x | |
+
+Vocoder breakdown:
+```
+snake=46.9  transconv=1302.6  conv7=5594.0  conv1=916.3  resadd=25.2
+```
+
+conv7 (causal conv1d k=7 in ResUnits) is 69% of vocoder time. Memory-bandwidth limited: each saxpy pass over output buffer for all (oc × ic × k) combinations = TB-scale memory traffic.
+
+## Next: OpenCL GPU vocoder
+
+**Problem:** vocoder BigVGAN (decoder_dim=1536) is too heavy for mobile CPU. conv7 does `dim² × 7 × length` FMAs per ResUnit × 12 ResUnits. Single-core ARM bandwidth can't keep up.
+
+**Solution:** Offload vocoder to GPU via OpenCL compute.
+
+### Why OpenCL over Vulkan
+
+| | OpenCL | Vulkan Compute |
+|--|--------|---------------|
+| API complexity | Simple C API | Extremely verbose |
+| Code size | ~500-800 lines | ~1500-2000 lines |
+| Kernel language | C99-like | GLSL compute |
+| Android official support | No (but vendors ship drivers) | Yes |
+| Adreno support | Good, `libOpenCL.so` present | Good |
+| Performance | Near Vulkan | Slightly higher ceiling |
+| Debugging | Easy | Hard |
+
+ncnn, MNN, TNN all use OpenCL for mobile GPU inference. Proven approach.
+
+### Architecture
+
+```
+CPU: Talker → Sub-talker → Codec transformer (FP16) → Upsample
+                                                        ↓
+GPU: vocoder pre-conv → 4 blocks × (SnakeBeta + TransConv + 3×ResUnit) → final conv
+                                                        ↓
+CPU: clEnqueueReadBuffer → PCM playback
+```
+
+Only vocoder on GPU. Weights uploaded once at init. All vocoder activations stay in GPU memory (no round-trip per layer).
+
+### Expected speedup
+
+conv1d (groups=1) = GEMM per kernel tap. Block 0: [768,768] @ [768,2336] × 7 taps.
+
+- CPU (Cortex-A77 F32 NEON): 915ms
+- GPU (Adreno, ~1 TFLOPS FP32): ~6ms theoretical, ~30-90ms practical (launch overhead, memory copy)
+- **Expected vocoder: 8,093ms → 300-800ms**
+- **Expected total: 12.3s → 4-5s for 5.84s audio (~1x realtime)**
+
+### Implementation plan
+
+**New files:**
+```
+qwen-tts/
+├── qwen_tts_gpu.h        # GPU context interface (init/free/upload/vocoder_decode)
+├── qwen_tts_gpu_cl.c     # OpenCL runtime: dlopen, device init, kernel compile, buffer mgmt
+└── kernels/
+    ├── conv1d_gemm.cl     # Causal conv1d as GEMM-per-tap
+    ├── transconv.cl       # Transposed conv1d
+    ├── snake_beta.cl      # SnakeBeta activation (polynomial sine)
+    └── elementwise.cl     # add, clamp
+```
+
+**Modified files:**
+- `CMakeLists.txt` — add new sources, `-ldl` for dlopen
+- `qwen_tts.h` — add `qwen_tts_gpu_ctx_t *gpu` to main context
+- `qwen_tts.c` — GPU init at model load, upload vocoder weights
+- `qwen_tts_codec.c` — if GPU available, call `qwen_tts_gpu_vocoder_decode()` instead of CPU vocoder
+
+**OpenCL loading (runtime, no link-time dependency):**
+```c
+void *libcl = dlopen("libOpenCL.so", RTLD_LAZY);
+if (!libcl) { /* fallback to CPU vocoder */ }
+clGetPlatformIDs = dlsym(libcl, "clGetPlatformIDs");
+// ... load all CL functions
+```
+
+**Kernel strategy for conv1d_gemm.cl:**
+- Reshape conv1d (groups=1, k=7) as 7 GEMM calls: `out += W_k @ input_shifted_k`
+- Each GEMM: `[out_ch, length] += [out_ch, in_ch] @ [in_ch, length]`
+- Tile GEMM for local memory: 16×16 tiles, coalesced global reads
+- Fuse bias add into first GEMM call
+
+**Buffer management:**
+- Pre-allocate GPU buffers for max vocoder size at init
+- Ping-pong pattern: 2 activation buffers (like CPU path)
+- Weight buffers: one per conv layer, uploaded once
+
+### Fallback
+
+If `dlopen("libOpenCL.so")` fails or device has no GPU, silently fall back to CPU F32 vocoder. Zero impact on devices without OpenCL.
+
+## Alternative: NPU graph splitting
+
+MNN-style approach: split model into static-shape subgraphs for NPU and dynamic-shape parts for CPU. NPUs (Hexagon DSP on Qualcomm, APU on MediaTek) excel at fixed-shape tensor ops but cannot handle dynamic shapes like attention with growing KV cache.
+
+**Graph splitting strategy:**
+- **NPU-eligible**: Linear (matmul with fixed weights), Conv1d, TransConv1d — static shapes, bulk of compute
+- **CPU-only**: Attention (QKV projection is NPU, but softmax + KV cache concat is CPU), LayerNorm, sampling
+- Compile two shape variants per subgraph: `chunk_size=128` for prefill, `chunk_size=1` for autoregressive decode
+
+**TTS model analysis:**
+
+| Component | NPU eligible ops | CPU-only ops | NPU % (by FLOP) |
+|-----------|-----------------|--------------|------------------|
+| Talker (28 layers) | QKV/O/FFN matmul | Attention, RoPE, norm | ~85% |
+| Sub-talker (5 layers) | QKV/O/FFN matmul | Attention, M-RoPE, norm | ~85% |
+| Codec transformer (8 layers) | QKV/O/FFN matmul | Attention, norm | ~85% |
+| **Vocoder (streaming, 1 token)** | **All conv/transconv** | **SnakeBeta, residual add** | **~95%** |
+
+**Vocoder streaming has 100% fixed shapes** — ideal for NPU. With chunk_size=1 (one codec token at a time), every buffer size is deterministic:
+
+```
+Input:  [1024, 4]     (codebook_dim × pre_upsample)
+Block 0: [1536, 4] → transconv → [768, 32]
+Block 1: [768, 32] → transconv → [384, 160]
+Block 2: [384, 160] → transconv → [192, 640]
+Block 3: [192, 640] → transconv → [96, 1920]
+Output: [1, 1920]    (mono audio samples)
+```
+
+No dynamic shapes anywhere in the vocoder — no sequence length variation, no KV cache growth. Every Conv1d, TransConv1d, and ResUnit operates on fixed dimensions. This means the entire vocoder graph can be compiled as a single NPU subgraph with no CPU fallback needed.
+
+**Comparison with OpenCL:**
+
+| | OpenCL GPU | NPU |
+|--|-----------|-----|
+| Implementation effort | Write kernels from scratch | Use vendor SDK (SNPE/QNN) |
+| Portability | Most Android devices | Qualcomm/MediaTek only |
+| Kernel optimization | Manual tuning needed | Vendor-optimized |
+| Power efficiency | GPU power hungry | NPU very efficient |
+| Latency | Low (direct dispatch) | Higher (graph compilation) |
+
+NPU is better for vocoder (100% static shapes, vendor-optimized), but OpenCL is more portable. Could implement OpenCL first with NPU as a faster backend on supported devices.
+
 ## Next steps
 
-1. ~~**Q8_0 unification**~~ — DONE. Replaced INT8/Q4_K/BF16 with unified Q8_0 for talker/sub-talker.
-2. ~~**Pipelined streaming**~~ — DONE. Batch vocoder on background thread.
-3. ~~**Non-blocking audio callback**~~ — DONE. AudioTrack buffer 4s, USAGE_MEDIA.
-4. ~~**Codec transformer F32**~~ — DONE. Q8_0 caused hoarseness; F32 restores quality.
-5. **Vocoder FP16** — conv weights and activations in FP16 (NEON FMLA), halve bandwidth. Target: vocoder decode < 400ms per 5 tokens (real-time threshold).
-6. **Optimize TransConv** — GEMM-per-tap approach instead of scatter
-7. **Core pinning** — bind talker to big cores, vocoder to little cores for reduced contention
+1. ~~**Q8_0 unification**~~ — DONE.
+2. ~~**Pipelined streaming**~~ — DONE.
+3. ~~**Non-blocking audio callback**~~ — DONE.
+4. ~~**Codec transformer F32**~~ — DONE. Q8_0 caused hoarseness.
+5. ~~**Codec transformer FP16 weights**~~ — DONE. 2x codec decode speedup.
+6. ~~**Vocoder FP16**~~ — REJECTED. 1.8x slower than F32 on target device.
+7. **OpenCL GPU vocoder** — offload vocoder to GPU. Target: vocoder 300-800ms (currently 8,093ms).
+8. **NPU vocoder** — alternative to OpenCL; vocoder streaming path is 100% fixed shapes, ideal for NPU (SNPE/QNN).
+9. **Core pinning** — bind talker to big cores for lower token latency
