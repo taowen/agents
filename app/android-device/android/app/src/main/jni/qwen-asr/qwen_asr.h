@@ -74,24 +74,24 @@ typedef struct {
  * ======================================================================== */
 
 typedef struct {
-    /* Self-attention (ALL have biases) - Q8_0 quantized weights */
-    block_q8_0 *wq_weight_q8;  /* [d_model, d_model/QK8_0 blocks] */
+    /* Self-attention (ALL have biases) - quantized to Q8_0 */
+    block_q8_0 *wq_weight_q8;  /* [d_model, d_model] as Q8_0 blocks */
     float *wq_bias;            /* [d_model] */
-    block_q8_0 *wk_weight_q8;  /* [d_model, d_model/QK8_0 blocks] */
+    block_q8_0 *wk_weight_q8;  /* [d_model, d_model] as Q8_0 blocks */
     float *wk_bias;            /* [d_model] */
-    block_q8_0 *wv_weight_q8;  /* [d_model, d_model/QK8_0 blocks] */
+    block_q8_0 *wv_weight_q8;  /* [d_model, d_model] as Q8_0 blocks */
     float *wv_bias;            /* [d_model] */
-    block_q8_0 *wo_weight_q8;  /* [d_model, d_model/QK8_0 blocks] */
+    block_q8_0 *wo_weight_q8;  /* [d_model, d_model] as Q8_0 blocks */
     float *wo_bias;            /* [d_model] */
 
     /* Pre-attention LayerNorm (with bias) */
     float *attn_norm_weight;   /* [d_model] */
     float *attn_norm_bias;     /* [d_model] */
 
-    /* FFN: GELU(fc1(x)) -> fc2 (ALL have biases) - Q8_0 quantized weights */
-    block_q8_0 *fc1_weight_q8; /* [ffn_dim, d_model/QK8_0 blocks] */
+    /* FFN: GELU(fc1(x)) -> fc2 (ALL have biases) - quantized to Q8_0 */
+    block_q8_0 *fc1_weight_q8; /* [ffn_dim, d_model] as Q8_0 blocks */
     float *fc1_bias;           /* [ffn_dim] */
-    block_q8_0 *fc2_weight_q8; /* [d_model, ffn_dim/QK8_0 blocks] */
+    block_q8_0 *fc2_weight_q8; /* [d_model, ffn_dim] as Q8_0 blocks */
     float *fc2_bias;           /* [d_model] */
 
     /* Pre-FFN LayerNorm (with bias) */
@@ -108,12 +108,8 @@ typedef struct {
     float *conv3_weight;       /* [480, 480, 3, 3] */
     float *conv3_bias;         /* [480] */
 
-    /* Q8_0 quantized conv weights for layers 2&3 (K=4320, multiple of 32) */
-    block_q8_0 *conv2_weight_q8;  /* [480, 4320/32=135 blocks] */
-    block_q8_0 *conv3_weight_q8;  /* [480, 4320/32=135 blocks] */
-
-    /* Conv output projection - Q8_0 quantized */
-    block_q8_0 *conv_out_weight_q8; /* [d_model, 7680/QK8_0 blocks] */
+    /* Conv output projection - quantized to Q8_0 */
+    block_q8_0 *conv_out_weight_q8; /* [d_model, 7680] as Q8_0 blocks */
 
     /* Transformer layers */
     qwen_enc_layer_t layers[QWEN_MAX_ENC_LAYERS];
@@ -122,10 +118,10 @@ typedef struct {
     float *ln_post_weight;     /* [d_model] */
     float *ln_post_bias;       /* [d_model] */
 
-    /* Projection layers - Q8_0 quantized */
-    block_q8_0 *proj1_weight_q8; /* [d_model, d_model/QK8_0 blocks] */
+    /* Projection layers - quantized to Q8_0 */
+    block_q8_0 *proj1_weight_q8; /* [d_model, d_model] as Q8_0 blocks */
     float *proj1_bias;         /* [d_model] */
-    block_q8_0 *proj2_weight_q8; /* [output_dim, d_model/QK8_0 blocks] */
+    block_q8_0 *proj2_weight_q8; /* [output_dim, d_model] as Q8_0 blocks */
     float *proj2_bias;         /* [output_dim] */
 } qwen_encoder_t;
 
@@ -134,11 +130,11 @@ typedef struct {
  * ======================================================================== */
 
 typedef struct {
-    /* Self-attention (NO biases in decoder) - Q4_K quantized */
-    block_q4_K *wq_weight_q4k;  /* [n_heads*head_dim, hidden/QK_K blocks] */
-    block_q4_K *wk_weight_q4k;  /* [n_kv_heads*head_dim, hidden/QK_K blocks] */
-    block_q4_K *wv_weight_q4k;  /* [n_kv_heads*head_dim, hidden/QK_K blocks] */
-    block_q4_K *wo_weight_q4k;  /* [hidden, n_heads*head_dim/QK_K blocks] */
+    /* Self-attention (NO biases in decoder) - quantized to Q8_0 */
+    block_q8_0 *wq_weight_q8;  /* [n_heads*head_dim, hidden] as Q8_0 blocks */
+    block_q8_0 *wk_weight_q8;  /* [n_kv_heads*head_dim, hidden] as Q8_0 blocks */
+    block_q8_0 *wv_weight_q8;  /* [n_kv_heads*head_dim, hidden] as Q8_0 blocks */
+    block_q8_0 *wo_weight_q8;  /* [hidden, n_heads*head_dim] as Q8_0 blocks */
 
     /* Per-head Q/K RMSNorm */
     float *q_norm_weight;      /* [head_dim] = [128] */
@@ -148,15 +144,17 @@ typedef struct {
     float *input_norm;         /* [hidden] */
     float *post_attn_norm;     /* [hidden] */
 
-    /* SwiGLU MLP (NO biases) - Q4_K quantized */
-    block_q4_K *gate_up_fused_q4k; /* [2*intermediate, hidden/QK_K blocks] */
-    block_q4_K *down_weight_q4k;   /* [hidden, intermediate/QK_K blocks] */
+    /* SwiGLU MLP (NO biases) - quantized to Q8_0 */
+    block_q8_0 *down_weight_q8; /* [hidden, intermediate] as Q8_0 blocks */
+
+    /* Fused gate+up weight [2*intermediate, hidden] as Q8_0 blocks */
+    block_q8_0 *gate_up_fused_q8;
 } qwen_dec_layer_t;
 
 typedef struct {
     /* Token embeddings (tied with lm_head) */
-    uint16_t *tok_embeddings_f16; /* [vocab_size, hidden] — F16 mmap for embedding lookup */
-    block_q4_K *tok_embeddings_q4k; /* [vocab_size, hidden/QK_K blocks] — Q4_K for argmax */
+    uint16_t *tok_embeddings_bf16; /* [vocab_size, hidden] - mmap'd BF16 for embedding lookup */
+    block_q8_0 *tok_embeddings_q8; /* [vocab_size * hidden / 32] Q8_0 blocks for argmax */
 
     /* Transformer layers */
     qwen_dec_layer_t layers[QWEN_MAX_DEC_LAYERS];
@@ -182,13 +180,13 @@ typedef struct {
     qwen_encoder_t encoder;
     qwen_decoder_t decoder;
 
-    /* GGUF model file (kept open for mmap — all weight pointers point into this) */
-    void *gguf;                /* gguf_ctx_t* */
+    /* Model files (kept open for mmap) */
+    void *safetensors;         /* multi_safetensors_t* */
     char model_dir[512];
 
-    /* KV cache for decoder */
-    float *kv_cache_k;         /* [layers, max_seq, kv_heads * head_dim] */
-    float *kv_cache_v;
+    /* KV cache for decoder (FP16 for bandwidth savings) */
+    uint16_t *kv_cache_k;     /* [layers, max_seq, kv_heads * head_dim] as FP16 */
+    uint16_t *kv_cache_v;
     int kv_cache_len;
     int kv_cache_max;
 
@@ -242,13 +240,6 @@ typedef struct {
     double perf_audio_ms;          /* input audio duration in milliseconds */
     double perf_encode_ms;         /* mel + encoder time in milliseconds */
     double perf_decode_ms;         /* decoder prefill + decode time in milliseconds */
-
-    /* Per-operation profiling for decode (accumulated across tokens, reset per run) */
-    double prof_dec_qkv_ms;
-    double prof_dec_attn_ms;
-    double prof_dec_mlp_ms;
-    double prof_dec_other_ms;
-    double prof_dec_argmax_ms;
 } qwen_ctx_t;
 
 /* ========================================================================

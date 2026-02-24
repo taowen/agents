@@ -3,16 +3,16 @@ project(qwen_asr C)
 
 set(QWEN_ASR_SOURCES
     qwen_asr.c
+    qwen_asr_quant.c
     qwen_asr_kernels.c
     qwen_asr_kernels_generic.c
     qwen_asr_kernels_neon.c
     qwen_asr_kernels_avx.c
-    qwen_asr_quant.c
     qwen_asr_audio.c
     qwen_asr_encoder.c
     qwen_asr_decoder.c
     qwen_asr_tokenizer.c
-    qwen_asr_gguf.c
+    qwen_asr_safetensors.c
 )
 
 add_library(qwen_asr_static STATIC ${QWEN_ASR_SOURCES})

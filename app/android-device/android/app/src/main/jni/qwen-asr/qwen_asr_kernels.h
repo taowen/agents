@@ -52,6 +52,34 @@ void qwen_linear_nobias_bf16_qkv(float *q, float *k, float *v, const float *x,
 void qwen_matmul_t_bf16(float *C, const float *A, const uint16_t *B_bf16,
                          int M, int K, int N);
 
+/* Q8_0 weight variants */
+void qwen_linear_q8(float *y, const float *x, const block_q8_0 *W_q8,
+                    const float *b, int seq_len, int in_dim, int out_dim);
+
+void qwen_linear_nobias_q8(float *y, const float *x, const block_q8_0 *W_q8,
+                            int seq_len, int in_dim, int out_dim);
+
+/* seq=1 decoder fast path: compute Q/K/V matvecs with one threaded dispatch */
+void qwen_linear_nobias_q8_qkv(float *q, float *k, float *v, const float *x,
+                                const block_q8_0 *Wq_q8,
+                                const block_q8_0 *Wk_q8,
+                                const block_q8_0 *Wv_q8,
+                                int in_dim, int q_dim, int kv_dim);
+
+/* Fused QKV GEMM: quantize input once, compute Q/K/V projections.
+ * Falls back to matvec QKV path when seq_len=1. */
+void qwen_linear_q8_qkv_batched(
+    float *q, float *k, float *v,
+    const float *x,
+    const block_q8_0 *Wq_q8, const float *bq,
+    const block_q8_0 *Wk_q8, const float *bk,
+    const block_q8_0 *Wv_q8, const float *bv,
+    int seq_len, int in_dim, int q_dim, int kv_dim
+);
+
+/* Free GEMM workspace (call from qwen_free) */
+void qwen_gemm_workspace_free(void);
+
 /* ========================================================================
  * 2D Convolution (for audio encoder conv stem)
  * ======================================================================== */
@@ -68,13 +96,6 @@ void qwen_matmul_t_bf16(float *C, const float *A, const uint16_t *B_bf16,
 void qwen_conv2d(float *out, const float *in, const float *weight, const float *bias,
                  int c_in, int c_out, int h_in, int w_in,
                  int kh, int kw, int stride, int padding);
-
-/* Q8_0 Conv2D: uses im2col + Q8_0 GEMM for layers where K is a multiple of 32.
- * weight_q8: [c_out, c_in*kh*kw/QK8_0 blocks] pre-quantized weights */
-void qwen_conv2d_q8(float *out, const float *in,
-                    const block_q8_0 *weight_q8, const float *bias,
-                    int c_in, int c_out, int h_in, int w_in,
-                    int kh, int kw, int stride, int padding);
 
 /* ========================================================================
  * Normalization
@@ -124,11 +145,12 @@ void qwen_bidirectional_attention(float *out, const float *Q, const float *K,
 /*
  * Causal attention with GQA (decoder).
  * Q: [seq_q, n_heads * head_dim]
- * K: [seq_k, n_kv_heads * head_dim]
- * V: [seq_k, n_kv_heads * head_dim]
+ * K_fp16: [seq_k, n_kv_heads * head_dim] as FP16 (uint16_t)
+ * V_fp16: [seq_k, n_kv_heads * head_dim] as FP16 (uint16_t)
  * q_offset: global position of first query (for causal mask)
  */
-void qwen_causal_attention(float *out, const float *Q, const float *K, const float *V,
+void qwen_causal_attention(float *out, const float *Q,
+                            const uint16_t *K_fp16, const uint16_t *V_fp16,
                             int seq_q, int seq_k, int n_heads, int n_kv_heads,
                             int head_dim, float scale, int q_offset);
 
@@ -164,62 +186,21 @@ void qwen_apply_rope_neox(float *x, const float *cos_vals, const float *sin_vals
 int qwen_argmax_matvec_bf16(const float *x, const uint16_t *W_bf16,
                              int in_dim, int out_dim);
 
-/* ========================================================================
- * Q8_0 Quantized Weight Operations
- * ======================================================================== */
-
-/* y = x @ W_q8^T + b: x[seq,in], W_q8[out, in/QK8_0 blocks], b[out], y[seq,out] */
-void qwen_linear_q8(float *y, const float *x, const block_q8_0 *W_q8,
-                    const float *b, int seq_len, int in_dim, int out_dim);
-
-void qwen_linear_nobias_q8(float *y, const float *x, const block_q8_0 *W_q8,
-                            int seq_len, int in_dim, int out_dim);
-
-/* seq=1 decoder fast path: compute Q/K/V matvecs with one threaded dispatch */
-void qwen_linear_nobias_q8_qkv(float *q, float *k, float *v, const float *x,
-                                const block_q8_0 *Wq_q8,
-                                const block_q8_0 *Wk_q8,
-                                const block_q8_0 *Wv_q8,
-                                int in_dim, int q_dim, int kv_dim);
-
-/* Fused QKV GEMM: quantize input once, run Q/K/V projections */
-void qwen_linear_q8_qkv_batched(
-    float *q, float *k, float *v,
-    const float *x,
-    const block_q8_0 *Wq_q8, const float *bq,
-    const block_q8_0 *Wk_q8, const float *bk,
-    const block_q8_0 *Wv_q8, const float *bv,
-    int seq_len, int in_dim, int q_dim, int kv_dim);
-
-/* Streaming Q8 argmax: finds argmax(W_q8 @ x) without materializing full logits */
+/* Q8_0 streaming argmax: finds argmax(W_q8 @ x) using INT8 dot products.
+ * Quantizes x once, then computes dot products against all vocab rows.
+ * Returns the index of the row with highest dot product. */
 int qwen_argmax_matvec_q8(const float *x, const block_q8_0 *W_q8,
                             int in_dim, int out_dim);
 
 /* ========================================================================
- * Q4_K Quantized Weight Operations (decoder)
+ * FP16 Conversion
  * ======================================================================== */
 
-/* y = x @ W_q4k^T + b: x[seq,in], W_q4k[out, in/QK_K blocks], b[out], y[seq,out]
- * Input is quantized to Q8_K at runtime, then Q4_K×Q8_K dot products. */
-void qwen_linear_q4k(float *y, const float *x, const block_q4_K *W_q4k,
-                     const float *b, int seq_len, int in_dim, int out_dim);
+/* Convert FP32 array to FP16 (stored as uint16_t). NEON-accelerated on ARM. */
+void qwen_f32_to_f16(uint16_t *dst, const float *src, int n);
 
-void qwen_linear_nobias_q4k(float *y, const float *x, const block_q4_K *W_q4k,
-                              int seq_len, int in_dim, int out_dim);
-
-/* seq=1 decoder fast path: compute Q/K/V matvecs with one threaded dispatch (Q4_K weights) */
-void qwen_linear_nobias_q4k_qkv(float *q, float *k, float *v, const float *x,
-                                  const block_q4_K *Wq_q4k,
-                                  const block_q4_K *Wk_q4k,
-                                  const block_q4_K *Wv_q4k,
-                                  int in_dim, int q_dim, int kv_dim);
-
-/* Streaming Q4_K argmax: finds argmax(W_q4k @ x) without materializing full logits */
-int qwen_argmax_matvec_q4k(const float *x, const block_q4_K *W_q4k,
-                             int in_dim, int out_dim);
-
-/* Free GEMM workspace buffers */
-void qwen_gemm_workspace_free(void);
+/* Convert FP16 (uint16_t) array to FP32. NEON-accelerated on ARM. */
+void qwen_f16_to_f32(float *dst, const uint16_t *src, int n);
 
 /* ========================================================================
  * Threading

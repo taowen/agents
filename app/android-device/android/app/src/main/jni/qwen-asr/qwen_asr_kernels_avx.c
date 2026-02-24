@@ -350,6 +350,90 @@ void qwen_argmax_bf16_range_avx(const float *x, const uint16_t *W_bf16,
 #endif /* AVX-512F+BW vs AVX2 for bf16 */
 
 /* =====================================================================
+ * FP32 matvec - y[out_dim] = W[out_dim, in_dim] @ x[in_dim] + bias
+ * ===================================================================== */
+
+void qwen_f32_matvec_fused_avx(float *y, const float *x, const float *W,
+                                const float *bias, int in_dim, int out_dim) {
+    int o = 0;
+#if defined(__AVX512F__)
+    for (; o + 1 < out_dim; o += 2) {
+        const float *w0 = W + (size_t)o * in_dim;
+        const float *w1 = W + (size_t)(o + 1) * in_dim;
+        __m512 a0 = _mm512_setzero_ps(), a1 = _mm512_setzero_ps();
+        __m512 b0 = _mm512_setzero_ps(), b1 = _mm512_setzero_ps();
+        int k = 0;
+        for (; k + 32 <= in_dim; k += 32) {
+            __m512 xv0 = _mm512_loadu_ps(x + k);
+            __m512 xv1 = _mm512_loadu_ps(x + k + 16);
+            a0 = _mm512_fmadd_ps(_mm512_loadu_ps(w0 + k), xv0, a0);
+            a1 = _mm512_fmadd_ps(_mm512_loadu_ps(w0 + k + 16), xv1, a1);
+            b0 = _mm512_fmadd_ps(_mm512_loadu_ps(w1 + k), xv0, b0);
+            b1 = _mm512_fmadd_ps(_mm512_loadu_ps(w1 + k + 16), xv1, b1);
+        }
+        for (; k + 16 <= in_dim; k += 16) {
+            __m512 xv = _mm512_loadu_ps(x + k);
+            a0 = _mm512_fmadd_ps(_mm512_loadu_ps(w0 + k), xv, a0);
+            b0 = _mm512_fmadd_ps(_mm512_loadu_ps(w1 + k), xv, b0);
+        }
+        float s0 = _mm512_reduce_add_ps(_mm512_add_ps(a0, a1)) + (bias ? bias[o] : 0.0f);
+        float s1 = _mm512_reduce_add_ps(_mm512_add_ps(b0, b1)) + (bias ? bias[o+1] : 0.0f);
+        for (; k < in_dim; k++) { s0 += w0[k]*x[k]; s1 += w1[k]*x[k]; }
+        y[o] = s0; y[o+1] = s1;
+    }
+    for (; o < out_dim; o++) {
+        const float *w = W + (size_t)o * in_dim;
+        __m512 acc = _mm512_setzero_ps();
+        int k = 0;
+        for (; k + 16 <= in_dim; k += 16)
+            acc = _mm512_fmadd_ps(_mm512_loadu_ps(w + k), _mm512_loadu_ps(x + k), acc);
+        float sum = _mm512_reduce_add_ps(acc) + (bias ? bias[o] : 0.0f);
+        for (; k < in_dim; k++) sum += w[k]*x[k];
+        y[o] = sum;
+    }
+#else
+    for (; o + 1 < out_dim; o += 2) {
+        const float *w0 = W + (size_t)o * in_dim;
+        const float *w1 = W + (size_t)(o + 1) * in_dim;
+        __m256 a0=_mm256_setzero_ps(), a1=_mm256_setzero_ps();
+        __m256 b0=_mm256_setzero_ps(), b1=_mm256_setzero_ps();
+        int k = 0;
+        for (; k + 16 <= in_dim; k += 16) {
+            __m256 xlo = _mm256_loadu_ps(x + k);
+            __m256 xhi = _mm256_loadu_ps(x + k + 8);
+            a0 = _mm256_fmadd_ps(_mm256_loadu_ps(w0 + k), xlo, a0);
+            a1 = _mm256_fmadd_ps(_mm256_loadu_ps(w0 + k + 8), xhi, a1);
+            b0 = _mm256_fmadd_ps(_mm256_loadu_ps(w1 + k), xlo, b0);
+            b1 = _mm256_fmadd_ps(_mm256_loadu_ps(w1 + k + 8), xhi, b1);
+        }
+        a0 = _mm256_add_ps(a0, a1); b0 = _mm256_add_ps(b0, b1);
+        __m128 r0 = _mm_add_ps(_mm256_castps256_ps128(a0), _mm256_extractf128_ps(a0, 1));
+        __m128 r1 = _mm_add_ps(_mm256_castps256_ps128(b0), _mm256_extractf128_ps(b0, 1));
+        r0 = _mm_hadd_ps(r0, r1); r0 = _mm_hadd_ps(r0, r0);
+        float s0 = _mm_cvtss_f32(r0) + (bias ? bias[o] : 0.0f);
+        float s1 = _mm_cvtss_f32(_mm_shuffle_ps(r0,r0,1)) + (bias ? bias[o+1] : 0.0f);
+        for (; k < in_dim; k++) { s0 += w0[k]*x[k]; s1 += w1[k]*x[k]; }
+        y[o] = s0; y[o+1] = s1;
+    }
+    for (; o < out_dim; o++) {
+        const float *w = W + (size_t)o * in_dim;
+        __m256 a0=_mm256_setzero_ps(), a1=_mm256_setzero_ps();
+        int k = 0;
+        for (; k + 16 <= in_dim; k += 16) {
+            a0 = _mm256_fmadd_ps(_mm256_loadu_ps(w+k), _mm256_loadu_ps(x+k), a0);
+            a1 = _mm256_fmadd_ps(_mm256_loadu_ps(w+k+8), _mm256_loadu_ps(x+k+8), a1);
+        }
+        a0 = _mm256_add_ps(a0, a1);
+        __m128 r = _mm_add_ps(_mm256_castps256_ps128(a0), _mm256_extractf128_ps(a0, 1));
+        r = _mm_hadd_ps(r, r); r = _mm_hadd_ps(r, r);
+        float sum = _mm_cvtss_f32(r) + (bias ? bias[o] : 0.0f);
+        for (; k < in_dim; k++) sum += w[k]*x[k];
+        y[o] = sum;
+    }
+#endif
+}
+
+/* =====================================================================
  * f32 attention helpers - AVX2+FMA, with AVX-512F when available
  * (operates on L1-resident head vectors)
  * ===================================================================== */

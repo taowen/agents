@@ -13,13 +13,13 @@
 #if (defined(__AVX512F__) || defined(__AVX2__)) && (defined(__x86_64__) || defined(__i386__) || defined(_M_X64) || defined(_M_IX86))
 #include <immintrin.h>
 #endif
-#if defined(__ARM_NEON) || defined(__aarch64__)
-#include <arm_neon.h>
-#endif
 #ifdef __APPLE__
 #include <sys/sysctl.h>
 #else
 #include <unistd.h>
+#endif
+#ifdef __ARM_NEON
+#include <arm_neon.h>
 #endif
 
 #ifdef USE_BLAS
@@ -160,7 +160,16 @@ static void parallel_for(parallel_fn_t fn, void *arg) {
  * ======================================================================== */
 
 void qwen_add_inplace(float *a, const float *b, int n) {
+#ifdef __ARM_NEON
+    int i = 0;
+    for (; i + 8 <= n; i += 8) {
+        vst1q_f32(a + i, vaddq_f32(vld1q_f32(a + i), vld1q_f32(b + i)));
+        vst1q_f32(a + i + 4, vaddq_f32(vld1q_f32(a + i + 4), vld1q_f32(b + i + 4)));
+    }
+    for (; i < n; i++) a[i] += b[i];
+#else
     for (int i = 0; i < n; i++) a[i] += b[i];
+#endif
 }
 
 void qwen_mul_inplace(float *a, const float *b, int n) {
@@ -175,6 +184,286 @@ void qwen_copy(float *dst, const float *src, int n) {
     memcpy(dst, src, n * sizeof(float));
 }
 
+/* Forward declarations for threaded matvec helpers */
+static void f32_matvec_threaded(float *y, const float *x, const float *W,
+                                 const float *bias, int in_dim, int out_dim);
+static void bf16_matvec_threaded(float *y, const float *x, const uint16_t *W_bf16,
+                                  const float *bias, int in_dim, int out_dim);
+
+/* ========================================================================
+ * Batched GEMM for seq_len > 1
+ *
+ * Problem: per-row matvec re-reads the entire weight matrix for each input
+ * row, leading to M * |W| bytes of DRAM traffic. For M=143, K=N=1280:
+ * 143 * 6.25MB = 894MB, bottlenecked on memory bandwidth.
+ *
+ * Solution: transpose X to Xt[K,M], then for each W row n, accumulate
+ * W[n,k] * Xt[k,:] into Yt[n,:]. Xt fits in L2 (~713KB for M=143, K=1280)
+ * so W is read only once (~6.25MB total) — 128× less memory traffic.
+ * ======================================================================== */
+
+/* FP32 batched GEMM worker: processes a slice of output rows [n_start, n_end) */
+typedef struct {
+    float *Yt;        /* [N, M_pad] transposed output */
+    const float *Xt;  /* [K, M_pad] transposed input */
+    const float *W;   /* [N, K] weight matrix */
+    const float *bias; /* [N] or NULL */
+    int M_pad;        /* padded M (multiple of 4) */
+    int K;
+    int N;
+} f32_gemm_task_t;
+
+static void f32_gemm_worker(int tid, int n_threads, void *arg) {
+    f32_gemm_task_t *t = (f32_gemm_task_t *)arg;
+    int chunk = (t->N + n_threads - 1) / n_threads;
+    int n_start = tid * chunk;
+    int n_end = n_start + chunk;
+    if (n_end > t->N) n_end = t->N;
+    if (n_start >= n_end) return;
+
+    int M_pad = t->M_pad;
+    int K = t->K;
+
+    /* Initialize all Yt rows with bias (or zero) */
+    for (int n = n_start; n < n_end; n++) {
+        float *yt_row = t->Yt + (size_t)n * M_pad;
+        if (t->bias) {
+            float b = t->bias[n];
+#ifdef __ARM_NEON
+            float32x4_t bv = vdupq_n_f32(b);
+            for (int m = 0; m < M_pad; m += 4)
+                vst1q_f32(yt_row + m, bv);
+#else
+            for (int m = 0; m < M_pad; m++) yt_row[m] = b;
+#endif
+        } else {
+            memset(yt_row, 0, M_pad * sizeof(float));
+        }
+    }
+
+    /* K-outer, N-inner: Xt rows loaded once from DRAM, reused for all N.
+     * Thread's Yt block stays in L2 (e.g. 768×160×4 = 480KB). */
+    int k = 0;
+#ifdef __ARM_NEON
+    for (; k + 7 < K; k += 8) {
+        const float *xt0 = t->Xt + (size_t)k * M_pad;
+        const float *xt4 = t->Xt + (size_t)(k + 4) * M_pad;
+
+        for (int n = n_start; n < n_end; n++) {
+            float *yt_row = t->Yt + (size_t)n * M_pad;
+            const float *w_row = t->W + (size_t)n * K;
+            float32x4_t wv0 = vld1q_f32(w_row + k);
+            float32x4_t wv1 = vld1q_f32(w_row + k + 4);
+
+            for (int m = 0; m < M_pad; m += 4) {
+                float32x4_t yt = vld1q_f32(yt_row + m);
+                yt = vfmaq_laneq_f32(yt, vld1q_f32(xt0 + m), wv0, 0);
+                yt = vfmaq_laneq_f32(yt, vld1q_f32(xt0 + M_pad + m), wv0, 1);
+                yt = vfmaq_laneq_f32(yt, vld1q_f32(xt0 + 2*M_pad + m), wv0, 2);
+                yt = vfmaq_laneq_f32(yt, vld1q_f32(xt0 + 3*M_pad + m), wv0, 3);
+                yt = vfmaq_laneq_f32(yt, vld1q_f32(xt4 + m), wv1, 0);
+                yt = vfmaq_laneq_f32(yt, vld1q_f32(xt4 + M_pad + m), wv1, 1);
+                yt = vfmaq_laneq_f32(yt, vld1q_f32(xt4 + 2*M_pad + m), wv1, 2);
+                yt = vfmaq_laneq_f32(yt, vld1q_f32(xt4 + 3*M_pad + m), wv1, 3);
+                vst1q_f32(yt_row + m, yt);
+            }
+        }
+    }
+    for (; k < K; k++) {
+        const float *xt_col = t->Xt + (size_t)k * M_pad;
+        for (int n = n_start; n < n_end; n++) {
+            float *yt_row = t->Yt + (size_t)n * M_pad;
+            float32x4_t wv = vdupq_n_f32(t->W[(size_t)n * K + k]);
+            for (int m = 0; m < M_pad; m += 4) {
+                float32x4_t yt = vld1q_f32(yt_row + m);
+                yt = vfmaq_f32(yt, vld1q_f32(xt_col + m), wv);
+                vst1q_f32(yt_row + m, yt);
+            }
+        }
+    }
+#else
+    for (; k < K; k++) {
+        const float *xt_col = t->Xt + (size_t)k * M_pad;
+        for (int n = n_start; n < n_end; n++) {
+            float wk = t->W[(size_t)n * K + k];
+            float *yt_row = t->Yt + (size_t)n * M_pad;
+            for (int m = 0; m < M_pad; m++)
+                yt_row[m] += wk * xt_col[m];
+        }
+    }
+#endif
+}
+
+/* BF16 batched GEMM worker */
+typedef struct {
+    float *Yt;
+    const float *Xt;
+    const uint16_t *W_bf16;
+    const float *bias;
+    int M_pad;
+    int K;
+    int N;
+} bf16_gemm_task_t;
+
+static void bf16_gemm_worker(int tid, int n_threads, void *arg) {
+    bf16_gemm_task_t *t = (bf16_gemm_task_t *)arg;
+    int chunk = (t->N + n_threads - 1) / n_threads;
+    int n_start = tid * chunk;
+    int n_end = n_start + chunk;
+    if (n_end > t->N) n_end = t->N;
+    if (n_start >= n_end) return;
+
+    int M_pad = t->M_pad;
+    int K = t->K;
+
+    /* Initialize all Yt rows with bias (or zero) */
+    for (int n = n_start; n < n_end; n++) {
+        float *yt_row = t->Yt + (size_t)n * M_pad;
+        if (t->bias) {
+            float b = t->bias[n];
+#ifdef __ARM_NEON
+            float32x4_t bv = vdupq_n_f32(b);
+            for (int m = 0; m < M_pad; m += 4)
+                vst1q_f32(yt_row + m, bv);
+#else
+            for (int m = 0; m < M_pad; m++) yt_row[m] = b;
+#endif
+        } else {
+            memset(yt_row, 0, M_pad * sizeof(float));
+        }
+    }
+
+    /* K-outer, N-inner: Xt rows loaded once, reused for all N rows.
+     * Thread's Yt block stays in L2. */
+    int k = 0;
+#ifdef __ARM_NEON
+    for (; k + 7 < K; k += 8) {
+        const float *xt0 = t->Xt + (size_t)k * M_pad;
+        const float *xt4 = t->Xt + (size_t)(k + 4) * M_pad;
+
+        for (int n = n_start; n < n_end; n++) {
+            float *yt_row = t->Yt + (size_t)n * M_pad;
+            const uint16_t *w_row = t->W_bf16 + (size_t)n * K;
+            uint16x8_t raw = vld1q_u16(w_row + k);
+            float32x4_t wv0 = vreinterpretq_f32_u32(
+                vshlq_n_u32(vmovl_u16(vget_low_u16(raw)), 16));
+            float32x4_t wv1 = vreinterpretq_f32_u32(
+                vshlq_n_u32(vmovl_u16(vget_high_u16(raw)), 16));
+
+            for (int m = 0; m < M_pad; m += 4) {
+                float32x4_t yt = vld1q_f32(yt_row + m);
+                yt = vfmaq_laneq_f32(yt, vld1q_f32(xt0 + m), wv0, 0);
+                yt = vfmaq_laneq_f32(yt, vld1q_f32(xt0 + M_pad + m), wv0, 1);
+                yt = vfmaq_laneq_f32(yt, vld1q_f32(xt0 + 2*M_pad + m), wv0, 2);
+                yt = vfmaq_laneq_f32(yt, vld1q_f32(xt0 + 3*M_pad + m), wv0, 3);
+                yt = vfmaq_laneq_f32(yt, vld1q_f32(xt4 + m), wv1, 0);
+                yt = vfmaq_laneq_f32(yt, vld1q_f32(xt4 + M_pad + m), wv1, 1);
+                yt = vfmaq_laneq_f32(yt, vld1q_f32(xt4 + 2*M_pad + m), wv1, 2);
+                yt = vfmaq_laneq_f32(yt, vld1q_f32(xt4 + 3*M_pad + m), wv1, 3);
+                vst1q_f32(yt_row + m, yt);
+            }
+        }
+    }
+    for (; k < K; k++) {
+        const float *xt_col = t->Xt + (size_t)k * M_pad;
+        for (int n = n_start; n < n_end; n++) {
+            float *yt_row = t->Yt + (size_t)n * M_pad;
+            uint32_t bits = ((uint32_t)t->W_bf16[(size_t)n * K + k]) << 16;
+            float wk; memcpy(&wk, &bits, 4);
+            float32x4_t wv = vdupq_n_f32(wk);
+            for (int m = 0; m < M_pad; m += 4) {
+                float32x4_t yt = vld1q_f32(yt_row + m);
+                yt = vfmaq_f32(yt, vld1q_f32(xt_col + m), wv);
+                vst1q_f32(yt_row + m, yt);
+            }
+        }
+    }
+#else
+    for (; k < K; k++) {
+        const float *xt_col = t->Xt + (size_t)k * M_pad;
+        for (int n = n_start; n < n_end; n++) {
+            uint32_t bits = ((uint32_t)t->W_bf16[(size_t)n * K + k]) << 16;
+            float wk; memcpy(&wk, &bits, 4);
+            float *yt_row = t->Yt + (size_t)n * M_pad;
+            for (int m = 0; m < M_pad; m++)
+                yt_row[m] += wk * xt_col[m];
+        }
+    }
+#endif
+}
+
+/* Transpose X[M,K] → Xt[K, M_pad] (zero-padded to multiple of 4) */
+static void transpose_pad(float *Xt, const float *X, int M, int K, int M_pad) {
+    if (M_pad > M) {
+        /* Zero the padding columns for all K rows */
+        for (int k = 0; k < K; k++) {
+            for (int m = M; m < M_pad; m++) {
+                Xt[(size_t)k * M_pad + m] = 0.0f;
+            }
+        }
+    }
+    for (int m = 0; m < M; m++) {
+        for (int k = 0; k < K; k++) {
+            Xt[(size_t)k * M_pad + m] = X[(size_t)m * K + k];
+        }
+    }
+}
+
+/* Transpose Yt[N, M_pad] → Y[M, N] */
+static void transpose_back(float *Y, const float *Yt, int M, int N, int M_pad) {
+    for (int m = 0; m < M; m++) {
+        for (int n = 0; n < N; n++) {
+            Y[(size_t)m * N + n] = Yt[(size_t)n * M_pad + m];
+        }
+    }
+}
+
+/* Batched FP32 GEMM: Y[M,N] = X[M,K] @ W[N,K]^T + bias[N] */
+static void f32_gemm_batched(float *Y, const float *X, const float *W,
+                              const float *bias, int M, int K, int N) {
+    int M_pad = (M + 3) & ~3; /* round up to multiple of 4 */
+
+    float *Xt = (float *)malloc((size_t)K * M_pad * sizeof(float));
+    float *Yt = (float *)malloc((size_t)N * M_pad * sizeof(float));
+
+    transpose_pad(Xt, X, M, K, M_pad);
+
+    f32_gemm_task_t task = { Yt, Xt, W, bias, M_pad, K, N };
+    if (tp.n_threads <= 1) {
+        f32_gemm_worker(0, 1, &task);
+    } else {
+        parallel_for(f32_gemm_worker, &task);
+    }
+
+    transpose_back(Y, Yt, M, N, M_pad);
+
+    free(Xt);
+    free(Yt);
+}
+
+/* Batched BF16 GEMM: Y[M,N] = X[M,K] @ W_bf16[N,K]^T + bias[N] */
+static void bf16_gemm_batched(float *Y, const float *X, const uint16_t *W_bf16,
+                               const float *bias, int M, int K, int N) {
+    int M_pad = (M + 3) & ~3;
+
+    float *Xt = (float *)malloc((size_t)K * M_pad * sizeof(float));
+    float *Yt = (float *)malloc((size_t)N * M_pad * sizeof(float));
+
+    transpose_pad(Xt, X, M, K, M_pad);
+
+    bf16_gemm_task_t task = { Yt, Xt, W_bf16, bias, M_pad, K, N };
+    if (tp.n_threads <= 1) {
+        bf16_gemm_worker(0, 1, &task);
+    } else {
+        parallel_for(bf16_gemm_worker, &task);
+    }
+
+    transpose_back(Y, Yt, M, N, M_pad);
+
+    free(Xt);
+    free(Yt);
+}
+
 /* ========================================================================
  * Matrix Operations
  * ======================================================================== */
@@ -184,14 +473,10 @@ void qwen_matmul_t(float *C, const float *A, const float *B, int M, int K, int N
     cblas_sgemm(CblasRowMajor, CblasNoTrans, CblasTrans,
                 M, N, K, 1.0f, A, K, B, K, 0.0f, C, N);
 #else
-    for (int m = 0; m < M; m++) {
-        for (int n = 0; n < N; n++) {
-            float sum = 0.0f;
-            for (int k = 0; k < K; k++) {
-                sum += A[m * K + k] * B[n * K + k];
-            }
-            C[m * N + n] = sum;
-        }
+    if (M > 1) {
+        f32_gemm_batched(C, A, B, NULL, M, K, N);
+    } else {
+        f32_matvec_threaded(C, A, B, NULL, K, N);
     }
 #endif
 }
@@ -211,17 +496,10 @@ void qwen_linear(float *y, const float *x, const float *W, const float *b,
         }
     }
 #else
-    for (int s = 0; s < seq_len; s++) {
-        const float *x_row = x + s * in_dim;
-        float *y_row = y + s * out_dim;
-        for (int o = 0; o < out_dim; o++) {
-            const float *w_row = W + o * in_dim;
-            float sum = (b != NULL) ? b[o] : 0.0f;
-            for (int i = 0; i < in_dim; i++) {
-                sum += x_row[i] * w_row[i];
-            }
-            y_row[o] = sum;
-        }
+    if (seq_len > 1) {
+        f32_gemm_batched(y, x, W, b, seq_len, in_dim, out_dim);
+    } else {
+        f32_matvec_threaded(y, x, W, b, in_dim, out_dim);
     }
 #endif
 }
@@ -231,107 +509,6 @@ void qwen_linear_nobias(float *y, const float *x, const float *W,
     qwen_linear(y, x, W, NULL, seq_len, in_dim, out_dim);
 }
 
-/* Convert bf16 buffer to f32 buffer */
-static void bf16_to_f32_buf(float *dst, const uint16_t *src, size_t n) {
-    uint32_t *d = (uint32_t *)(void *)dst;
-    for (size_t i = 0; i < n; i++)
-        d[i] = ((uint32_t)src[i]) << 16;
-}
-
-/* Reusable scratch buffer for bf16->f32 conversion */
-static float *bf16_scratch = NULL;
-static size_t bf16_scratch_cap = 0;
-
-static float *bf16_get_scratch(size_t n) {
-    if (n > bf16_scratch_cap) {
-        free(bf16_scratch);
-        bf16_scratch = (float *)malloc(n * sizeof(float));
-        bf16_scratch_cap = bf16_scratch ? n : 0;
-    }
-    return bf16_scratch;
-}
-
-typedef struct {
-    const uint16_t *src;
-    size_t n;
-    float *dst_f32;
-} bf16_cache_entry_t;
-
-static bf16_cache_entry_t *bf16_cache = NULL;
-static int bf16_cache_len = 0;
-static int bf16_cache_cap = 0;
-static size_t bf16_cache_bytes = 0;
-static size_t bf16_cache_limit_bytes = 0;
-static int bf16_cache_limit_init = 0;
-
-static void bf16_cache_init_limit(void) {
-    if (bf16_cache_limit_init) return;
-    bf16_cache_limit_init = 1;
-
-    /* Default OFF. Override with QWEN_BF16_CACHE_MB=<n> to enable. */
-    unsigned long long mb = 0;
-    const char *env = getenv("QWEN_BF16_CACHE_MB");
-    if (env && env[0] != '\0') {
-        char *end = NULL;
-        unsigned long long v = strtoull(env, &end, 10);
-        if (end != env) mb = v;
-    }
-    bf16_cache_limit_bytes = (size_t)(mb * 1024ULL * 1024ULL);
-
-    if (qwen_verbose >= 2) {
-        fprintf(stderr, "BF16 cache: limit=%llu MB\n", mb);
-    }
-}
-
-static const float *bf16_get_cached_f32(const uint16_t *src, size_t n) {
-    bf16_cache_init_limit();
-
-    for (int i = 0; i < bf16_cache_len; i++) {
-        if (bf16_cache[i].src == src && bf16_cache[i].n == n) {
-            return bf16_cache[i].dst_f32;
-        }
-    }
-
-    if (bf16_cache_limit_bytes == 0) return NULL;
-
-    size_t bytes = n * sizeof(float);
-    if (bytes > bf16_cache_limit_bytes) return NULL;
-    if (bf16_cache_bytes + bytes > bf16_cache_limit_bytes) return NULL;
-
-    float *dst = (float *)malloc(bytes);
-    if (!dst) return NULL;
-    bf16_to_f32_buf(dst, src, n);
-
-    if (bf16_cache_len == bf16_cache_cap) {
-        int new_cap = bf16_cache_cap > 0 ? bf16_cache_cap * 2 : 256;
-        bf16_cache_entry_t *tmp = (bf16_cache_entry_t *)realloc(
-            bf16_cache, (size_t)new_cap * sizeof(bf16_cache_entry_t));
-        if (!tmp) {
-            free(dst);
-            return NULL;
-        }
-        bf16_cache = tmp;
-        bf16_cache_cap = new_cap;
-    }
-
-    bf16_cache[bf16_cache_len].src = src;
-    bf16_cache[bf16_cache_len].n = n;
-    bf16_cache[bf16_cache_len].dst_f32 = dst;
-    bf16_cache_len++;
-    bf16_cache_bytes += bytes;
-    return dst;
-}
-
-static const float *bf16_get_f32_view(const uint16_t *src, size_t n) {
-    const float *cached = bf16_get_cached_f32(src, n);
-    if (cached) return cached;
-
-    float *scratch = bf16_get_scratch(n);
-    if (!scratch) return NULL;
-    bf16_to_f32_buf(scratch, src, n);
-    return scratch;
-}
-
 /*
  * Fused BF16 matvec: y[out_dim] = W_bf16[out_dim, in_dim] @ x[in_dim] + bias
  * Processes 2 output rows at a time to amortize x vector loads.
@@ -339,6 +516,14 @@ static const float *bf16_get_f32_view(const uint16_t *src, size_t n) {
 static void bf16_matvec_fused(float *y, const float *x, const uint16_t *W_bf16,
                                const float *bias, int in_dim, int out_dim) {
     qwen_bf16_matvec_fused_impl(y, x, W_bf16, bias, in_dim, out_dim);
+}
+
+/*
+ * Fused FP32 matvec: y[out_dim] = W[out_dim, in_dim] @ x[in_dim] + bias
+ */
+static void f32_matvec_fused(float *y, const float *x, const float *W,
+                              const float *bias, int in_dim, int out_dim) {
+    qwen_f32_matvec_fused_impl(y, x, W, bias, in_dim, out_dim);
 }
 
 /* Threaded matvec: split output rows across threads */
@@ -373,6 +558,40 @@ static void bf16_matvec_threaded(float *y, const float *x, const uint16_t *W_bf1
     }
     matvec_task_t task = { y, x, W_bf16, bias, in_dim, out_dim };
     parallel_for(matvec_worker, &task);
+}
+
+/* Threaded FP32 matvec: split output rows across threads */
+typedef struct {
+    float *y;
+    const float *x;
+    const float *W;
+    const float *bias;
+    int in_dim;
+    int out_dim;
+} f32_matvec_task_t;
+
+static void f32_matvec_worker(int tid, int n_threads, void *arg) {
+    f32_matvec_task_t *t = (f32_matvec_task_t *)arg;
+    int chunk = (t->out_dim + n_threads - 1) / n_threads;
+    int start = tid * chunk;
+    int end = start + chunk;
+    if (end > t->out_dim) end = t->out_dim;
+    if (start >= end) return;
+
+    f32_matvec_fused(t->y + start, t->x,
+                     t->W + (size_t)start * t->in_dim,
+                     t->bias ? t->bias + start : NULL,
+                     t->in_dim, end - start);
+}
+
+static void f32_matvec_threaded(float *y, const float *x, const float *W,
+                                 const float *bias, int in_dim, int out_dim) {
+    if (tp.n_threads <= 1) {
+        f32_matvec_fused(y, x, W, bias, in_dim, out_dim);
+        return;
+    }
+    f32_matvec_task_t task = { y, x, W, bias, in_dim, out_dim };
+    parallel_for(f32_matvec_worker, &task);
 }
 
 typedef struct {
@@ -464,26 +683,20 @@ void qwen_linear_nobias_bf16_qkv(float *q, float *k, float *v, const float *x,
 
 void qwen_linear_nobias_bf16(float *y, const float *x, const uint16_t *W_bf16,
                               int seq_len, int in_dim, int out_dim) {
-    if (seq_len == 1) {
+    if (seq_len > 1) {
+        bf16_gemm_batched(y, x, W_bf16, NULL, seq_len, in_dim, out_dim);
+    } else {
         bf16_matvec_threaded(y, x, W_bf16, NULL, in_dim, out_dim);
-        return;
     }
-    size_t n = (size_t)out_dim * in_dim;
-    const float *W_f32 = bf16_get_f32_view(W_bf16, n);
-    if (!W_f32) return;
-    qwen_linear_nobias(y, x, W_f32, seq_len, in_dim, out_dim);
 }
 
 void qwen_linear_bf16(float *y, const float *x, const uint16_t *W_bf16,
                       const float *b, int seq_len, int in_dim, int out_dim) {
-    if (seq_len == 1) {
+    if (seq_len > 1) {
+        bf16_gemm_batched(y, x, W_bf16, b, seq_len, in_dim, out_dim);
+    } else {
         bf16_matvec_threaded(y, x, W_bf16, b, in_dim, out_dim);
-        return;
     }
-    size_t n = (size_t)out_dim * in_dim;
-    const float *W_f32 = bf16_get_f32_view(W_bf16, n);
-    if (!W_f32) return;
-    qwen_linear(y, x, W_f32, b, seq_len, in_dim, out_dim);
 }
 
 /* Find argmax over a range of output rows [start, end).
@@ -545,30 +758,83 @@ int qwen_argmax_matvec_bf16(const float *x, const uint16_t *W_bf16,
     return best;
 }
 
+/* Q8_0 argmax: find argmax(W_q8 @ x) using INT8 dot products */
+static void argmax_q8_range(const block_q8_0 *x_q8, const block_q8_0 *W_q8,
+                              int n_blocks, int start, int end,
+                              int *best_out, float *best_val_out) {
+    qwen_argmax_q8_range_impl(x_q8, W_q8, n_blocks, start, end, best_out, best_val_out);
+}
+
+typedef struct {
+    const block_q8_0 *x_q8;
+    const block_q8_0 *W_q8;
+    int n_blocks;
+    int out_dim;
+    int best_idx[QWEN_MAX_THREADS];
+    float best_val[QWEN_MAX_THREADS];
+} argmax_q8_task_t;
+
+static void argmax_q8_worker(int tid, int n_threads, void *arg) {
+    argmax_q8_task_t *t = (argmax_q8_task_t *)arg;
+    int chunk = (t->out_dim + n_threads - 1) / n_threads;
+    int start = tid * chunk;
+    int end = start + chunk;
+    if (end > t->out_dim) end = t->out_dim;
+    if (start >= end) {
+        t->best_val[tid] = -1e30f;
+        t->best_idx[tid] = 0;
+        return;
+    }
+    argmax_q8_range(t->x_q8, t->W_q8, t->n_blocks, start, end,
+                     &t->best_idx[tid], &t->best_val[tid]);
+}
+
+int qwen_argmax_matvec_q8(const float *x, const block_q8_0 *W_q8,
+                            int in_dim, int out_dim) {
+    int n_blocks = in_dim / QK8_0;
+
+    /* Stack-allocate x_q8: max 64 blocks = 2048 elements, ~2.3KB on stack */
+    block_q8_0 x_q8[64];
+    quantize_f32_to_q8_0(x, x_q8, in_dim);
+
+    int best;
+    float best_val;
+
+    if (tp.n_threads <= 1) {
+        argmax_q8_range(x_q8, W_q8, n_blocks, 0, out_dim, &best, &best_val);
+    } else {
+        argmax_q8_task_t task;
+        task.x_q8 = x_q8;
+        task.W_q8 = W_q8;
+        task.n_blocks = n_blocks;
+        task.out_dim = out_dim;
+        parallel_for(argmax_q8_worker, &task);
+
+        best = task.best_idx[0];
+        best_val = task.best_val[0];
+        for (int i = 1; i < tp.n_threads; i++) {
+            if (task.best_val[i] > best_val) {
+                best_val = task.best_val[i];
+                best = task.best_idx[i];
+            }
+        }
+    }
+
+    return best;
+}
+
 void qwen_matmul_t_bf16(float *C, const float *A, const uint16_t *B_bf16,
                          int M, int K, int N) {
-    if (M == 1) {
-        bf16_matvec_threaded(C, A, B_bf16, NULL, K, N);
+    if (M > 1) {
+        bf16_gemm_batched(C, A, B_bf16, NULL, M, K, N);
     } else {
-        size_t n = (size_t)N * K;
-        const float *B_f32 = bf16_get_f32_view(B_bf16, n);
-        if (!B_f32) return;
-        qwen_matmul_t(C, A, B_f32, M, K, N);
+        bf16_matvec_threaded(C, A, B_bf16, NULL, K, N);
     }
 }
 
 /* ========================================================================
  * Q8_0 Quantized Weight Operations
  * ======================================================================== */
-
-/* Transpose Yt[N, M_pad] → Y[M, N] */
-static void transpose_back(float *Y, const float *Yt, int M, int N, int M_pad) {
-    for (int m = 0; m < M; m++) {
-        for (int n = 0; n < N; n++) {
-            Y[(size_t)m * N + n] = Yt[(size_t)n * M_pad + m];
-        }
-    }
-}
 
 /* Forward declarations */
 static void q8_matvec_threaded(float *y, const float *x, const block_q8_0 *W_q8,
@@ -625,11 +891,15 @@ static void q8_gemm_worker(int tid, int n_threads, void *arg) {
     int M_pad = t->M_pad;
     int n_blocks = t->n_blocks;
 
-    /* N-tiling: tile the N dimension so Yt[Nc, M_pad] fits in L1D (~32KB). */
+    /* N-tiling: tile the N dimension so Yt[Nc, M_pad] fits in L1D (~32KB).
+     * Nc = 32768 / (M_pad * sizeof(float)).
+     * Trade-off: x_col is re-read from L2 for each N-tile, but x_col total
+     * is small (~140KB) and stays in L2. */
     int Nc = 32768 / (M_pad * (int)sizeof(float));
     if (Nc < 4) Nc = 4;
     if (Nc > (n_end - n_start)) Nc = n_end - n_start;
 
+    /* N-tile outer, K-outer, N-inner, M-inner */
 #if defined(__ARM_NEON) && defined(__ARM_FEATURE_DOTPROD)
     for (int n_base = n_start; n_base < n_end; n_base += Nc) {
         int n_tile_end = n_base + Nc;
@@ -762,7 +1032,8 @@ static void q8_gemm_worker(int tid, int n_threads, void *arg) {
 #endif
 }
 
-/* Batched Q8_0 GEMM: Y[M,N] = X[M,K] @ W_q8[N,K/32 blocks]^T + bias[N] */
+/* Batched Q8_0 GEMM: Y[M,N] = X[M,K] @ W_q8[N,K/32 blocks]^T + bias[N]
+ * Uses INT8 dot products: quantizes X to Q8_0, then vdotq_s32 for GEMM. */
 static void q8_gemm_batched(float *Y, const float *X, const block_q8_0 *W_q8,
                               const float *bias, int M, int K, int N) {
     int M_pad = (M + 3) & ~3;
@@ -1015,321 +1286,6 @@ void qwen_linear_q8_qkv_batched(
     q8_gemm_batched_with_q8t(v, gemm_ws.x_q8t, Wv_q8, bv, seq_len, M_pad, n_blocks, kv_dim);
 }
 
-/* Q8_0 argmax: find argmax(W_q8 @ x) using INT8 dot products */
-static void argmax_q8_range(const block_q8_0 *x_q8, const block_q8_0 *W_q8,
-                              int n_blocks, int start, int end,
-                              int *best_out, float *best_val_out) {
-    qwen_argmax_q8_range_impl(x_q8, W_q8, n_blocks, start, end, best_out, best_val_out);
-}
-
-typedef struct {
-    const block_q8_0 *x_q8;
-    const block_q8_0 *W_q8;
-    int n_blocks;
-    int out_dim;
-    int best_idx[QWEN_MAX_THREADS];
-    float best_val[QWEN_MAX_THREADS];
-} argmax_q8_task_t;
-
-static void argmax_q8_worker(int tid, int n_threads, void *arg) {
-    argmax_q8_task_t *t = (argmax_q8_task_t *)arg;
-    int chunk = (t->out_dim + n_threads - 1) / n_threads;
-    int start = tid * chunk;
-    int end = start + chunk;
-    if (end > t->out_dim) end = t->out_dim;
-    if (start >= end) {
-        t->best_val[tid] = -1e30f;
-        t->best_idx[tid] = 0;
-        return;
-    }
-    argmax_q8_range(t->x_q8, t->W_q8, t->n_blocks, start, end,
-                     &t->best_idx[tid], &t->best_val[tid]);
-}
-
-int qwen_argmax_matvec_q8(const float *x, const block_q8_0 *W_q8,
-                            int in_dim, int out_dim) {
-    int n_blocks = in_dim / QK8_0;
-
-    /* Stack-allocate x_q8: max 64 blocks = 2048 elements, ~2.3KB on stack */
-    block_q8_0 x_q8[64];
-    quantize_f32_to_q8_0(x, x_q8, in_dim);
-
-    int best;
-    float best_val;
-
-    if (tp.n_threads <= 1) {
-        argmax_q8_range(x_q8, W_q8, n_blocks, 0, out_dim, &best, &best_val);
-    } else {
-        argmax_q8_task_t task;
-        task.x_q8 = x_q8;
-        task.W_q8 = W_q8;
-        task.n_blocks = n_blocks;
-        task.out_dim = out_dim;
-        parallel_for(argmax_q8_worker, &task);
-
-        best = task.best_idx[0];
-        best_val = task.best_val[0];
-        for (int i = 1; i < tp.n_threads; i++) {
-            if (task.best_val[i] > best_val) {
-                best_val = task.best_val[i];
-                best = task.best_idx[i];
-            }
-        }
-    }
-
-    return best;
-}
-
-/* ========================================================================
- * Q4_K Quantized Weight Operations (decoder, QK_K=256)
- * ======================================================================== */
-
-/* Q4_K matvec dispatch wrappers */
-static void q4k_matvec_fused(float *y, const block_q8_K *x_q8k, const block_q4_K *W_q4k,
-                               const float *bias, int n_blocks_k, int out_dim) {
-    qwen_q4k_q8k_matvec_impl(y, x_q8k, W_q4k, bias, n_blocks_k, out_dim);
-}
-
-typedef struct {
-    float *y;
-    const block_q8_K *x_q8k;
-    const block_q4_K *W_q4k;
-    const float *bias;
-    int n_blocks_k;
-    int out_dim;
-} q4k_matvec_task_t;
-
-static void q4k_matvec_worker(int tid, int n_threads, void *arg) {
-    q4k_matvec_task_t *t = (q4k_matvec_task_t *)arg;
-    int chunk = (t->out_dim + n_threads - 1) / n_threads;
-    int start = tid * chunk;
-    int end = start + chunk;
-    if (end > t->out_dim) end = t->out_dim;
-    if (start >= end) return;
-
-    q4k_matvec_fused(t->y + start, t->x_q8k,
-                      t->W_q4k + (size_t)start * t->n_blocks_k,
-                      t->bias ? t->bias + start : NULL,
-                      t->n_blocks_k, end - start);
-}
-
-static void q4k_matvec_threaded(float *y, const float *x, const block_q4_K *W_q4k,
-                                  const float *bias, int in_dim, int out_dim) {
-    int n_blocks_k = in_dim / QK_K;
-
-    /* Quantize input x to Q8_K once */
-    block_q8_K *x_q8k = (block_q8_K *)malloc((size_t)n_blocks_k * sizeof(block_q8_K));
-    quantize_f32_to_q8_K(x, x_q8k, in_dim);
-
-    if (tp.n_threads <= 1) {
-        q4k_matvec_fused(y, x_q8k, W_q4k, bias, n_blocks_k, out_dim);
-    } else {
-        q4k_matvec_task_t task = { y, x_q8k, W_q4k, bias, n_blocks_k, out_dim };
-        parallel_for(q4k_matvec_worker, &task);
-    }
-
-    free(x_q8k);
-}
-
-void qwen_linear_nobias_q4k(float *y, const float *x, const block_q4_K *W_q4k,
-                              int seq_len, int in_dim, int out_dim) {
-    /* For seq_len > 1, fall back to row-by-row matvec (no batched Q4K GEMM) */
-    if (seq_len > 1) {
-        int n_blocks_k = in_dim / QK_K;
-        block_q8_K *x_q8k = (block_q8_K *)malloc((size_t)n_blocks_k * sizeof(block_q8_K));
-
-        for (int s = 0; s < seq_len; s++) {
-            const float *xs = x + (size_t)s * in_dim;
-            float *ys = y + (size_t)s * out_dim;
-            quantize_f32_to_q8_K(xs, x_q8k, in_dim);
-            q4k_matvec_fused(ys, x_q8k, W_q4k, NULL, n_blocks_k, out_dim);
-        }
-        free(x_q8k);
-    } else {
-        q4k_matvec_threaded(y, x, W_q4k, NULL, in_dim, out_dim);
-    }
-}
-
-void qwen_linear_q4k(float *y, const float *x, const block_q4_K *W_q4k,
-                     const float *b, int seq_len, int in_dim, int out_dim) {
-    if (seq_len > 1) {
-        int n_blocks_k = in_dim / QK_K;
-        block_q8_K *x_q8k = (block_q8_K *)malloc((size_t)n_blocks_k * sizeof(block_q8_K));
-
-        for (int s = 0; s < seq_len; s++) {
-            const float *xs = x + (size_t)s * in_dim;
-            float *ys = y + (size_t)s * out_dim;
-            quantize_f32_to_q8_K(xs, x_q8k, in_dim);
-            q4k_matvec_fused(ys, x_q8k, W_q4k, b, n_blocks_k, out_dim);
-        }
-        free(x_q8k);
-    } else {
-        q4k_matvec_threaded(y, x, W_q4k, b, in_dim, out_dim);
-    }
-}
-
-/* Q4_K QKV fused matvec for single-token decoder */
-typedef struct {
-    float *q;
-    float *k;
-    float *v;
-    const block_q8_K *x_q8k;
-    const block_q4_K *Wq_q4k;
-    const block_q4_K *Wk_q4k;
-    const block_q4_K *Wv_q4k;
-    int n_blocks_k;
-    int q_dim;
-    int kv_dim;
-    int total_dim;
-} q4k_qkv_matvec_task_t;
-
-static void q4k_qkv_matvec_worker(int tid, int n_threads, void *arg) {
-    q4k_qkv_matvec_task_t *t = (q4k_qkv_matvec_task_t *)arg;
-    int chunk = (t->total_dim + n_threads - 1) / n_threads;
-    int start = tid * chunk;
-    int end = start + chunk;
-    if (end > t->total_dim) end = t->total_dim;
-    if (start >= end) return;
-
-    int q_end = t->q_dim;
-    int k_end = q_end + t->kv_dim;
-    int v_end = k_end + t->kv_dim;
-
-    if (start < q_end) {
-        int s = start;
-        int e = end < q_end ? end : q_end;
-        if (s < e) {
-            q4k_matvec_fused(t->q + s, t->x_q8k,
-                              t->Wq_q4k + (size_t)s * t->n_blocks_k,
-                              NULL, t->n_blocks_k, e - s);
-        }
-    }
-
-    if (end > q_end && start < k_end) {
-        int s = start > q_end ? start - q_end : 0;
-        int e_abs = end < k_end ? end : k_end;
-        int e = e_abs - q_end;
-        if (s < e) {
-            q4k_matvec_fused(t->k + s, t->x_q8k,
-                              t->Wk_q4k + (size_t)s * t->n_blocks_k,
-                              NULL, t->n_blocks_k, e - s);
-        }
-    }
-
-    if (end > k_end && start < v_end) {
-        int s = start > k_end ? start - k_end : 0;
-        int e_abs = end < v_end ? end : v_end;
-        int e = e_abs - k_end;
-        if (s < e) {
-            q4k_matvec_fused(t->v + s, t->x_q8k,
-                              t->Wv_q4k + (size_t)s * t->n_blocks_k,
-                              NULL, t->n_blocks_k, e - s);
-        }
-    }
-}
-
-void qwen_linear_nobias_q4k_qkv(float *q, float *k, float *v, const float *x,
-                                  const block_q4_K *Wq_q4k,
-                                  const block_q4_K *Wk_q4k,
-                                  const block_q4_K *Wv_q4k,
-                                  int in_dim, int q_dim, int kv_dim) {
-    int n_blocks_k = in_dim / QK_K;
-
-    /* Quantize x once, shared across Q/K/V */
-    block_q8_K *x_q8k = (block_q8_K *)malloc((size_t)n_blocks_k * sizeof(block_q8_K));
-    quantize_f32_to_q8_K(x, x_q8k, in_dim);
-
-    if (tp.n_threads <= 1) {
-        q4k_matvec_fused(q, x_q8k, Wq_q4k, NULL, n_blocks_k, q_dim);
-        q4k_matvec_fused(k, x_q8k, Wk_q4k, NULL, n_blocks_k, kv_dim);
-        q4k_matvec_fused(v, x_q8k, Wv_q4k, NULL, n_blocks_k, kv_dim);
-        free(x_q8k);
-        return;
-    }
-
-    q4k_qkv_matvec_task_t task = {
-        .q = q,
-        .k = k,
-        .v = v,
-        .x_q8k = x_q8k,
-        .Wq_q4k = Wq_q4k,
-        .Wk_q4k = Wk_q4k,
-        .Wv_q4k = Wv_q4k,
-        .n_blocks_k = n_blocks_k,
-        .q_dim = q_dim,
-        .kv_dim = kv_dim,
-        .total_dim = q_dim + 2 * kv_dim,
-    };
-    parallel_for(q4k_qkv_matvec_worker, &task);
-    free(x_q8k);
-}
-
-/* Q4_K argmax */
-static void argmax_q4k_range(const block_q8_K *x_q8k, const block_q4_K *W_q4k,
-                               int n_blocks_k, int start, int end,
-                               int *best_out, float *best_val_out) {
-    qwen_argmax_q4k_range_impl(x_q8k, W_q4k, n_blocks_k, start, end, best_out, best_val_out);
-}
-
-typedef struct {
-    const block_q8_K *x_q8k;
-    const block_q4_K *W_q4k;
-    int n_blocks_k;
-    int out_dim;
-    int best_idx[QWEN_MAX_THREADS];
-    float best_val[QWEN_MAX_THREADS];
-} argmax_q4k_task_t;
-
-static void argmax_q4k_worker(int tid, int n_threads, void *arg) {
-    argmax_q4k_task_t *t = (argmax_q4k_task_t *)arg;
-    int chunk = (t->out_dim + n_threads - 1) / n_threads;
-    int start = tid * chunk;
-    int end = start + chunk;
-    if (end > t->out_dim) end = t->out_dim;
-    if (start >= end) {
-        t->best_val[tid] = -1e30f;
-        t->best_idx[tid] = 0;
-        return;
-    }
-    argmax_q4k_range(t->x_q8k, t->W_q4k, t->n_blocks_k, start, end,
-                      &t->best_idx[tid], &t->best_val[tid]);
-}
-
-int qwen_argmax_matvec_q4k(const float *x, const block_q4_K *W_q4k,
-                             int in_dim, int out_dim) {
-    int n_blocks_k = in_dim / QK_K;
-
-    /* Allocate x_q8k: for dec_hidden=1024, n_blocks_k=4, 4*292=1168 bytes */
-    block_q8_K *x_q8k = (block_q8_K *)malloc((size_t)n_blocks_k * sizeof(block_q8_K));
-    quantize_f32_to_q8_K(x, x_q8k, in_dim);
-
-    int best;
-    float best_val;
-
-    if (tp.n_threads <= 1) {
-        argmax_q4k_range(x_q8k, W_q4k, n_blocks_k, 0, out_dim, &best, &best_val);
-    } else {
-        argmax_q4k_task_t task;
-        task.x_q8k = x_q8k;
-        task.W_q4k = W_q4k;
-        task.n_blocks_k = n_blocks_k;
-        task.out_dim = out_dim;
-        parallel_for(argmax_q4k_worker, &task);
-
-        best = task.best_idx[0];
-        best_val = task.best_val[0];
-        for (int i = 1; i < tp.n_threads; i++) {
-            if (task.best_val[i] > best_val) {
-                best_val = task.best_val[i];
-                best = task.best_idx[i];
-            }
-        }
-    }
-
-    free(x_q8k);
-    return best;
-}
-
 /* ========================================================================
  * 2D Convolution (im2col + BLAS sgemm)
  * ======================================================================== */
@@ -1365,6 +1321,117 @@ static void im2col(const float *in, float *cols,
     }
 }
 
+typedef struct {
+    float *out;
+    const float *weight;
+    const float *cols;
+    const float *bias;
+    int c_out;
+    int patch_size;
+    int spatial_out;
+} conv2d_gemm_task_t;
+
+static void conv2d_gemm_worker(int tid, int n_threads, void *arg) {
+    conv2d_gemm_task_t *t = (conv2d_gemm_task_t *)arg;
+    int chunk = (t->c_out + n_threads - 1) / n_threads;
+    int oc_start = tid * chunk;
+    int oc_end = oc_start + chunk;
+    if (oc_end > t->c_out) oc_end = t->c_out;
+    if (oc_start >= oc_end) return;
+
+    int patch_size = t->patch_size;
+    int spatial_out = t->spatial_out;
+    const float *cols = t->cols;
+    const float *weight = t->weight;
+
+    /* Initialize all output channels with bias */
+    for (int oc = oc_start; oc < oc_end; oc++) {
+        float *out_row = t->out + (size_t)oc * spatial_out;
+        float b = t->bias ? t->bias[oc] : 0.0f;
+        int s = 0;
+#ifdef __ARM_NEON
+        float32x4_t bv = vdupq_n_f32(b);
+        for (; s + 3 < spatial_out; s += 4)
+            vst1q_f32(out_row + s, bv);
+#endif
+        for (; s < spatial_out; s++)
+            out_row[s] = b;
+    }
+
+    /* p-outer, oc-inner: each cols group is loaded from DRAM once and reused
+     * for all output channels.  cols total (e.g. 13.8MB) is read once instead
+     * of c_out times (480×13.8MB = 6.6GB).  Each thread's output block
+     * (~384KB) stays in L2. */
+#ifdef __ARM_NEON
+    int p = 0;
+    for (; p + 7 < patch_size; p += 8) {
+        const float *cr0 = cols + (size_t)(p + 0) * spatial_out;
+        const float *cr1 = cols + (size_t)(p + 1) * spatial_out;
+        const float *cr2 = cols + (size_t)(p + 2) * spatial_out;
+        const float *cr3 = cols + (size_t)(p + 3) * spatial_out;
+        const float *cr4 = cols + (size_t)(p + 4) * spatial_out;
+        const float *cr5 = cols + (size_t)(p + 5) * spatial_out;
+        const float *cr6 = cols + (size_t)(p + 6) * spatial_out;
+        const float *cr7 = cols + (size_t)(p + 7) * spatial_out;
+
+        for (int oc = oc_start; oc < oc_end; oc++) {
+            const float *w_row = weight + (size_t)oc * patch_size;
+            float *out_row = t->out + (size_t)oc * spatial_out;
+            float32x4_t wv0 = vld1q_f32(w_row + p);
+            float32x4_t wv1 = vld1q_f32(w_row + p + 4);
+
+            int s = 0;
+            for (; s + 3 < spatial_out; s += 4) {
+                float32x4_t acc = vld1q_f32(out_row + s);
+                acc = vfmaq_laneq_f32(acc, vld1q_f32(cr0 + s), wv0, 0);
+                acc = vfmaq_laneq_f32(acc, vld1q_f32(cr1 + s), wv0, 1);
+                acc = vfmaq_laneq_f32(acc, vld1q_f32(cr2 + s), wv0, 2);
+                acc = vfmaq_laneq_f32(acc, vld1q_f32(cr3 + s), wv0, 3);
+                acc = vfmaq_laneq_f32(acc, vld1q_f32(cr4 + s), wv1, 0);
+                acc = vfmaq_laneq_f32(acc, vld1q_f32(cr5 + s), wv1, 1);
+                acc = vfmaq_laneq_f32(acc, vld1q_f32(cr6 + s), wv1, 2);
+                acc = vfmaq_laneq_f32(acc, vld1q_f32(cr7 + s), wv1, 3);
+                vst1q_f32(out_row + s, acc);
+            }
+            for (; s < spatial_out; s++) {
+                out_row[s] += w_row[p+0] * cr0[s] + w_row[p+1] * cr1[s]
+                           +  w_row[p+2] * cr2[s] + w_row[p+3] * cr3[s]
+                           +  w_row[p+4] * cr4[s] + w_row[p+5] * cr5[s]
+                           +  w_row[p+6] * cr6[s] + w_row[p+7] * cr7[s];
+            }
+        }
+    }
+    /* Tail: remaining p values */
+    for (; p < patch_size; p++) {
+        const float *cr = cols + (size_t)p * spatial_out;
+        for (int oc = oc_start; oc < oc_end; oc++) {
+            float wp = weight[(size_t)oc * patch_size + p];
+            float *out_row = t->out + (size_t)oc * spatial_out;
+            int s = 0;
+            float32x4_t wpv = vdupq_n_f32(wp);
+            for (; s + 3 < spatial_out; s += 4) {
+                float32x4_t acc = vld1q_f32(out_row + s);
+                acc = vfmaq_f32(acc, vld1q_f32(cr + s), wpv);
+                vst1q_f32(out_row + s, acc);
+            }
+            for (; s < spatial_out; s++)
+                out_row[s] += wp * cr[s];
+        }
+    }
+#else
+    /* Scalar fallback: p-outer, oc-inner */
+    for (int p = 0; p < patch_size; p++) {
+        const float *cr = cols + (size_t)p * spatial_out;
+        for (int oc = oc_start; oc < oc_end; oc++) {
+            float wp = weight[(size_t)oc * patch_size + p];
+            float *out_row = t->out + (size_t)oc * spatial_out;
+            for (int s = 0; s < spatial_out; s++)
+                out_row[s] += wp * cr[s];
+        }
+    }
+#endif
+}
+
 void qwen_conv2d(float *out, const float *in, const float *weight, const float *bias,
                  int c_in, int c_out, int h_in, int w_in,
                  int kh, int kw, int stride, int padding) {
@@ -1383,20 +1450,7 @@ void qwen_conv2d(float *out, const float *in, const float *weight, const float *
                 c_out, spatial_out, patch_size,
                 1.0f, weight, patch_size, cols, spatial_out,
                 0.0f, out, spatial_out);
-#else
-    for (int oc = 0; oc < c_out; oc++) {
-        for (int s = 0; s < spatial_out; s++) {
-            float sum = 0.0f;
-            for (int p = 0; p < patch_size; p++) {
-                sum += weight[oc * patch_size + p] * cols[p * spatial_out + s];
-            }
-            out[oc * spatial_out + s] = sum;
-        }
-    }
-#endif
-
     free(cols);
-
     /* Add bias */
     if (bias) {
         for (int oc = 0; oc < c_out; oc++) {
@@ -1407,61 +1461,15 @@ void qwen_conv2d(float *out, const float *in, const float *weight, const float *
             }
         }
     }
-}
-
-/*
- * im2col_transposed: Unroll input patches into row-major [spatial_out, patch_size].
- * This is the transposed layout vs im2col's [patch_size, spatial_out], suitable
- * for feeding directly into qwen_linear_q8 as X[M, K].
- */
-static void im2col_transposed(const float *in, float *cols_t,
-                               int c_in, int h_in, int w_in,
-                               int kh, int kw, int stride, int padding,
-                               int h_out, int w_out) {
-    int patch_size = c_in * kh * kw;
-    for (int oh = 0; oh < h_out; oh++) {
-        for (int ow = 0; ow < w_out; ow++) {
-            float *row = cols_t + (oh * w_out + ow) * patch_size;
-            for (int ic = 0; ic < c_in; ic++) {
-                for (int ki = 0; ki < kh; ki++) {
-                    int ih = oh * stride - padding + ki;
-                    for (int kj = 0; kj < kw; kj++) {
-                        int iw = ow * stride - padding + kj;
-                        int p = (ic * kh + ki) * kw + kj;
-                        if (ih >= 0 && ih < h_in && iw >= 0 && iw < w_in)
-                            row[p] = in[ic * h_in * w_in + ih * w_in + iw];
-                        else
-                            row[p] = 0.0f;
-                    }
-                }
-            }
-        }
-    }
-}
-
-void qwen_conv2d_q8(float *out, const float *in,
-                    const block_q8_0 *weight_q8, const float *bias,
-                    int c_in, int c_out, int h_in, int w_in,
-                    int kh, int kw, int stride, int padding) {
-    int h_out = (h_in + 2 * padding - kh) / stride + 1;
-    int w_out = (w_in + 2 * padding - kw) / stride + 1;
-    int patch_size = c_in * kh * kw;
-    int spatial_out = h_out * w_out;
-
-    /* 1. im2col transposed: [spatial_out, patch_size] */
-    float *cols_t = (float *)malloc((size_t)spatial_out * patch_size * sizeof(float));
-    im2col_transposed(in, cols_t, c_in, h_in, w_in, kh, kw, stride, padding, h_out, w_out);
-
-    /* 2. Q8_0 GEMM: out_t[spatial_out, c_out] = cols_t[spatial_out, patch_size] @ W_q8[c_out, patch_size]^T + bias */
-    float *out_t = (float *)malloc((size_t)spatial_out * c_out * sizeof(float));
-    qwen_linear_q8(out_t, cols_t, weight_q8, bias, spatial_out, patch_size, c_out);
-    free(cols_t);
-
-    /* 3. Transpose: out_t[spatial_out, c_out] -> out[c_out, spatial_out] */
-    for (int c = 0; c < c_out; c++)
-        for (int s = 0; s < spatial_out; s++)
-            out[c * spatial_out + s] = out_t[s * c_out + c];
-    free(out_t);
+#else
+    /* NEON-vectorized GEMM with bias fused in, parallelized over output channels */
+    conv2d_gemm_task_t task = {
+        .out = out, .weight = weight, .cols = cols, .bias = bias,
+        .c_out = c_out, .patch_size = patch_size, .spatial_out = spatial_out
+    };
+    parallel_for(conv2d_gemm_worker, &task);
+    free(cols);
+#endif
 }
 
 /* ========================================================================
@@ -1493,6 +1501,16 @@ void qwen_layer_norm(float *out, const float *x, const float *weight, const floa
         sum128 = _mm_hadd_ps(sum128, sum128);
         sum128 = _mm_hadd_ps(sum128, sum128);
         float mean = _mm_cvtss_f32(sum128);
+        for (; i < hidden; i++) mean += x_row[i];
+#elif defined(__ARM_NEON)
+        float32x4_t sumv0 = vdupq_n_f32(0.0f);
+        float32x4_t sumv1 = vdupq_n_f32(0.0f);
+        int i = 0;
+        for (; i + 8 <= hidden; i += 8) {
+            sumv0 = vaddq_f32(sumv0, vld1q_f32(x_row + i));
+            sumv1 = vaddq_f32(sumv1, vld1q_f32(x_row + i + 4));
+        }
+        float mean = vaddvq_f32(vaddq_f32(sumv0, sumv1));
         for (; i < hidden; i++) mean += x_row[i];
 #else
         float mean = 0.0f;
@@ -1526,6 +1544,22 @@ void qwen_layer_norm(float *out, const float *x, const float *weight, const floa
         acc128 = _mm_hadd_ps(acc128, acc128);
         acc128 = _mm_hadd_ps(acc128, acc128);
         float var = _mm_cvtss_f32(acc128);
+        for (; j < hidden; j++) {
+            float d = x_row[j] - mean;
+            var += d * d;
+        }
+#elif defined(__ARM_NEON)
+        float32x4_t meanv = vdupq_n_f32(mean);
+        float32x4_t accv0 = vdupq_n_f32(0.0f);
+        float32x4_t accv1 = vdupq_n_f32(0.0f);
+        int j = 0;
+        for (; j + 8 <= hidden; j += 8) {
+            float32x4_t d0 = vsubq_f32(vld1q_f32(x_row + j), meanv);
+            float32x4_t d1 = vsubq_f32(vld1q_f32(x_row + j + 4), meanv);
+            accv0 = vfmaq_f32(accv0, d0, d0);
+            accv1 = vfmaq_f32(accv1, d1, d1);
+        }
+        float var = vaddvq_f32(vaddq_f32(accv0, accv1));
         for (; j < hidden; j++) {
             float d = x_row[j] - mean;
             var += d * d;
@@ -1570,6 +1604,23 @@ void qwen_layer_norm(float *out, const float *x, const float *weight, const floa
         for (; k < hidden; k++) {
             out_row[k] = (x_row[k] - mean) * inv_std * weight[k] + bias[k];
         }
+#elif defined(__ARM_NEON)
+        float32x4_t meanv2 = vdupq_n_f32(mean);
+        float32x4_t invv = vdupq_n_f32(inv_std);
+        int k = 0;
+        for (; k + 8 <= hidden; k += 8) {
+            float32x4_t vx0 = vsubq_f32(vld1q_f32(x_row + k), meanv2);
+            float32x4_t vw0 = vld1q_f32(weight + k);
+            float32x4_t vb0 = vld1q_f32(bias + k);
+            float32x4_t vx1 = vsubq_f32(vld1q_f32(x_row + k + 4), meanv2);
+            float32x4_t vw1 = vld1q_f32(weight + k + 4);
+            float32x4_t vb1 = vld1q_f32(bias + k + 4);
+            vst1q_f32(out_row + k, vaddq_f32(vmulq_f32(vmulq_f32(vx0, invv), vw0), vb0));
+            vst1q_f32(out_row + k + 4, vaddq_f32(vmulq_f32(vmulq_f32(vx1, invv), vw1), vb1));
+        }
+        for (; k < hidden; k++) {
+            out_row[k] = (x_row[k] - mean) * inv_std * weight[k] + bias[k];
+        }
 #else
         for (int i = 0; i < hidden; i++) {
             out_row[i] = (x_row[i] - mean) * inv_std * weight[i] + bias[i];
@@ -1605,6 +1656,18 @@ void qwen_rms_norm(float *out, const float *x, const float *weight,
         acc128 = _mm_hadd_ps(acc128, acc128);
         float sum_sq = _mm_cvtss_f32(acc128);
         for (; i < hidden; i++) sum_sq += x_row[i] * x_row[i];
+#elif defined(__ARM_NEON)
+        float32x4_t accv0 = vdupq_n_f32(0.0f);
+        float32x4_t accv1 = vdupq_n_f32(0.0f);
+        int i = 0;
+        for (; i + 8 <= hidden; i += 8) {
+            float32x4_t v0 = vld1q_f32(x_row + i);
+            float32x4_t v1 = vld1q_f32(x_row + i + 4);
+            accv0 = vfmaq_f32(accv0, v0, v0);
+            accv1 = vfmaq_f32(accv1, v1, v1);
+        }
+        float sum_sq = vaddvq_f32(vaddq_f32(accv0, accv1));
+        for (; i < hidden; i++) sum_sq += x_row[i] * x_row[i];
 #else
         float sum_sq = 0.0f;
         for (int i = 0; i < hidden; i++) {
@@ -1629,6 +1692,18 @@ void qwen_rms_norm(float *out, const float *x, const float *weight,
             __m256 vx = _mm256_loadu_ps(x_row + j);
             __m256 vw = _mm256_loadu_ps(weight + j);
             _mm256_storeu_ps(out_row + j, _mm256_mul_ps(_mm256_mul_ps(vx, vw), scale));
+        }
+        for (; j < hidden; j++) out_row[j] = x_row[j] * rms_inv * weight[j];
+#elif defined(__ARM_NEON)
+        float32x4_t scalev = vdupq_n_f32(rms_inv);
+        int j = 0;
+        for (; j + 8 <= hidden; j += 8) {
+            float32x4_t vx0 = vld1q_f32(x_row + j);
+            float32x4_t vw0 = vld1q_f32(weight + j);
+            float32x4_t vx1 = vld1q_f32(x_row + j + 4);
+            float32x4_t vw1 = vld1q_f32(weight + j + 4);
+            vst1q_f32(out_row + j, vmulq_f32(vmulq_f32(vx0, vw0), scalev));
+            vst1q_f32(out_row + j + 4, vmulq_f32(vmulq_f32(vx1, vw1), scalev));
         }
         for (; j < hidden; j++) out_row[j] = x_row[j] * rms_inv * weight[j];
 #else
@@ -1668,6 +1743,18 @@ void qwen_rms_norm_per_head(float *x, const float *weight,
             acc128 = _mm_hadd_ps(acc128, acc128);
             float sum_sq = _mm_cvtss_f32(acc128);
             for (; d < head_dim; d++) sum_sq += vec[d] * vec[d];
+#elif defined(__ARM_NEON)
+            float32x4_t accv0 = vdupq_n_f32(0.0f);
+            float32x4_t accv1 = vdupq_n_f32(0.0f);
+            int d = 0;
+            for (; d + 8 <= head_dim; d += 8) {
+                float32x4_t v0 = vld1q_f32(vec + d);
+                float32x4_t v1 = vld1q_f32(vec + d + 4);
+                accv0 = vfmaq_f32(accv0, v0, v0);
+                accv1 = vfmaq_f32(accv1, v1, v1);
+            }
+            float sum_sq = vaddvq_f32(vaddq_f32(accv0, accv1));
+            for (; d < head_dim; d++) sum_sq += vec[d] * vec[d];
 #else
             float sum_sq = 0.0f;
             for (int d = 0; d < head_dim; d++) {
@@ -1694,6 +1781,18 @@ void qwen_rms_norm_per_head(float *x, const float *weight,
                 _mm256_storeu_ps(vec + j, _mm256_mul_ps(_mm256_mul_ps(v, w), scale));
             }
             for (; j < head_dim; j++) vec[j] = vec[j] * rms_inv * weight[j];
+#elif defined(__ARM_NEON)
+            float32x4_t scalev = vdupq_n_f32(rms_inv);
+            int j = 0;
+            for (; j + 8 <= head_dim; j += 8) {
+                float32x4_t v0 = vld1q_f32(vec + j);
+                float32x4_t w0 = vld1q_f32(weight + j);
+                float32x4_t v1 = vld1q_f32(vec + j + 4);
+                float32x4_t w1 = vld1q_f32(weight + j + 4);
+                vst1q_f32(vec + j, vmulq_f32(vmulq_f32(v0, w0), scalev));
+                vst1q_f32(vec + j + 4, vmulq_f32(vmulq_f32(v1, w1), scalev));
+            }
+            for (; j < head_dim; j++) vec[j] = vec[j] * rms_inv * weight[j];
 #else
             for (int d = 0; d < head_dim; d++) {
                 vec[d] = vec[d] * rms_inv * weight[d];
@@ -1707,6 +1806,40 @@ void qwen_rms_norm_per_head(float *x, const float *weight,
  * Activation Functions
  * ======================================================================== */
 
+#ifdef __ARM_NEON
+/* NEON fast expf: 7th-order polynomial, max error ~1e-5 */
+static inline float32x4_t neon_expf(float32x4_t x) {
+    /* Clamp to [-88, 88] to avoid overflow */
+    x = vmaxq_f32(x, vdupq_n_f32(-88.0f));
+    x = vminq_f32(x, vdupq_n_f32(88.0f));
+    /* exp(x) = 2^(x / ln2) = 2^(n + f) where n = round(x/ln2), f = fractional */
+    float32x4_t log2e = vdupq_n_f32(1.44269504089f);
+    float32x4_t t = vmulq_f32(x, log2e);
+    float32x4_t n = vrndnq_f32(t);  /* round to nearest int */
+    float32x4_t f = vsubq_f32(t, n);  /* fractional part in [-0.5, 0.5] */
+    /* 2^f ≈ polynomial in f (minimax on [-0.5, 0.5]) */
+    float32x4_t p = vdupq_n_f32(1.535336188e-4f);
+    p = vfmaq_f32(vdupq_n_f32(1.339887440e-3f), p, f);
+    p = vfmaq_f32(vdupq_n_f32(9.618437357e-3f), p, f);
+    p = vfmaq_f32(vdupq_n_f32(5.550332471e-2f), p, f);
+    p = vfmaq_f32(vdupq_n_f32(2.402264791e-1f), p, f);
+    p = vfmaq_f32(vdupq_n_f32(6.931472028e-1f), p, f);
+    p = vfmaq_f32(vdupq_n_f32(1.0f), p, f);
+    /* Scale by 2^n: reinterpret n as exponent bits */
+    int32x4_t ni = vcvtq_s32_f32(n);
+    int32x4_t exp_bits = vshlq_n_s32(vaddq_s32(ni, vdupq_n_s32(127)), 23);
+    return vmulq_f32(p, vreinterpretq_f32_s32(exp_bits));
+}
+
+static inline float32x4_t neon_tanhf(float32x4_t x) {
+    /* tanh(x) = 1 - 2 / (1 + exp(2x)) */
+    float32x4_t two_x = vaddq_f32(x, x);
+    float32x4_t e2x = neon_expf(two_x);
+    float32x4_t one = vdupq_n_f32(1.0f);
+    return vsubq_f32(one, vdivq_f32(vdupq_n_f32(2.0f), vaddq_f32(one, e2x)));
+}
+#endif /* __ARM_NEON */
+
 void qwen_silu(float *x, int n) {
     for (int i = 0; i < n; i++) {
         float val = x[i];
@@ -1715,12 +1848,33 @@ void qwen_silu(float *x, int n) {
 }
 
 void qwen_gelu(float *x, int n) {
+#ifdef __ARM_NEON
+    const float32x4_t half = vdupq_n_f32(0.5f);
+    const float32x4_t coeff = vdupq_n_f32(0.7978845608028654f);
+    const float32x4_t c3 = vdupq_n_f32(0.044715f);
+    const float32x4_t one = vdupq_n_f32(1.0f);
+    int i = 0;
+    for (; i + 3 < n; i += 4) {
+        float32x4_t v = vld1q_f32(x + i);
+        float32x4_t v3 = vmulq_f32(vmulq_f32(v, v), v);
+        float32x4_t inner = vmulq_f32(coeff, vfmaq_f32(v, c3, v3));
+        float32x4_t t = neon_tanhf(inner);
+        vst1q_f32(x + i, vmulq_f32(half, vmulq_f32(v, vaddq_f32(one, t))));
+    }
+    for (; i < n; i++) {
+        float val = x[i];
+        float x3 = val * val * val;
+        float inner = 0.7978845608028654f * (val + 0.044715f * x3);
+        x[i] = 0.5f * val * (1.0f + tanhf(inner));
+    }
+#else
     for (int i = 0; i < n; i++) {
         float val = x[i];
         float x3 = val * val * val;
         float inner = 0.7978845608028654f * (val + 0.044715f * x3);
         x[i] = 0.5f * val * (1.0f + tanhf(inner));
     }
+#endif
 }
 
 typedef struct {
@@ -1754,6 +1908,24 @@ static void swiglu_worker(int tid, int n_threads, void *arg) {
                 float u = gu[2 * j + 1];
                 o[j] = (g / (1.0f + o[j])) * u;
             }
+#elif defined(__ARM_NEON)
+            /* NEON SiLU: process 4 gate-up pairs at a time */
+            int j = 0;
+            float32x4_t one = vdupq_n_f32(1.0f);
+            for (; j + 3 < inter; j += 4) {
+                float32x4x2_t gu4 = vld2q_f32(gu + 2 * j);
+                float32x4_t g = gu4.val[0];
+                float32x4_t u = gu4.val[1];
+                float32x4_t neg_g = vnegq_f32(g);
+                float32x4_t silu = vdivq_f32(g, vaddq_f32(one, neon_expf(neg_g)));
+                vst1q_f32(o + j, vmulq_f32(silu, u));
+            }
+            for (; j < inter; j++) {
+                float g = gu[2 * j];
+                float u = gu[2 * j + 1];
+                g = g / (1.0f + expf(-g));
+                o[j] = g * u;
+            }
 #else
             for (int j = 0; j < inter; j++) {
                 float g = gu[2 * j];
@@ -1763,13 +1935,34 @@ static void swiglu_worker(int tid, int n_threads, void *arg) {
             }
 #endif
         } else {
-            /* In-place mode (decode seq=1): keep single-pass scalar to avoid alias hazards. */
+            /* In-place mode (decode seq=1): gate_up is interleaved [g0,u0,g1,u1,...],
+             * out writes to front half. out[j] reads from 2j,2j+1 (2j >= j for j>=1),
+             * so forward order is safe. */
+#ifdef __ARM_NEON
+            int j = 0;
+            float32x4_t one = vdupq_n_f32(1.0f);
+            for (; j + 3 < inter; j += 4) {
+                float32x4x2_t gu4 = vld2q_f32(gu + 2 * j);
+                float32x4_t g = gu4.val[0];
+                float32x4_t u = gu4.val[1];
+                float32x4_t neg_g = vnegq_f32(g);
+                float32x4_t silu = vdivq_f32(g, vaddq_f32(one, neon_expf(neg_g)));
+                vst1q_f32(o + j, vmulq_f32(silu, u));
+            }
+            for (; j < inter; j++) {
+                float g = gu[2 * j];
+                float u = gu[2 * j + 1];
+                g = g / (1.0f + expf(-g));
+                o[j] = g * u;
+            }
+#else
             for (int j = 0; j < inter; j++) {
                 float g = gu[2 * j];
                 float u = gu[2 * j + 1];
                 g = g / (1.0f + expf(-g)); /* SiLU */
                 o[j] = g * u;
             }
+#endif
         }
     }
 }
@@ -1809,6 +2002,190 @@ void qwen_softmax(float *x, int rows, int cols) {
 }
 
 /* ========================================================================
+ * FP16 Conversion
+ * ======================================================================== */
+
+/* Scalar FP32→FP16 fallback using IEEE 754 bit manipulation */
+static inline uint16_t f32_to_f16_scalar(float v) {
+    union { float f; uint32_t u; } bits;
+    bits.f = v;
+    uint32_t w = bits.u;
+    uint32_t sign = (w >> 16) & 0x8000;
+    int exp = (int)((w >> 23) & 0xff) - 127 + 15;
+    uint32_t frac = (w >> 13) & 0x3ff;
+    if (exp <= 0) return (uint16_t)sign;
+    if (exp >= 31) return (uint16_t)(sign | 0x7c00);
+    return (uint16_t)(sign | ((uint32_t)exp << 10) | frac);
+}
+
+static inline float f16_to_f32_scalar(uint16_t h) {
+    uint32_t sign = ((uint32_t)h & 0x8000) << 16;
+    uint32_t exp = ((uint32_t)h >> 10) & 0x1f;
+    uint32_t frac = (uint32_t)h & 0x3ff;
+    if (exp == 0) {
+        if (frac == 0) { union { uint32_t u; float f; } r; r.u = sign; return r.f; }
+        /* denorm */
+        exp = 1;
+        while (!(frac & 0x400)) { frac <<= 1; exp--; }
+        frac &= 0x3ff;
+        exp = (127 - 15 + exp);
+    } else if (exp == 31) {
+        exp = 255;
+    } else {
+        exp = exp - 15 + 127;
+    }
+    union { uint32_t u; float f; } r;
+    r.u = sign | (exp << 23) | (frac << 13);
+    return r.f;
+}
+
+void qwen_f32_to_f16(uint16_t *dst, const float *src, int n) {
+#ifdef __ARM_NEON
+    int i = 0;
+    for (; i + 8 <= n; i += 8) {
+        float32x4_t lo = vld1q_f32(src + i);
+        float32x4_t hi = vld1q_f32(src + i + 4);
+        float16x4_t lo16 = vcvt_f16_f32(lo);
+        float16x4_t hi16 = vcvt_f16_f32(hi);
+        vst1_u16(dst + i, vreinterpret_u16_f16(lo16));
+        vst1_u16(dst + i + 4, vreinterpret_u16_f16(hi16));
+    }
+    for (; i + 4 <= n; i += 4) {
+        float32x4_t v = vld1q_f32(src + i);
+        float16x4_t v16 = vcvt_f16_f32(v);
+        vst1_u16(dst + i, vreinterpret_u16_f16(v16));
+    }
+    for (; i < n; i++) {
+        dst[i] = f32_to_f16_scalar(src[i]);
+    }
+#else
+    for (int i = 0; i < n; i++) {
+        dst[i] = f32_to_f16_scalar(src[i]);
+    }
+#endif
+}
+
+void qwen_f16_to_f32(float *dst, const uint16_t *src, int n) {
+#ifdef __ARM_NEON
+    int i = 0;
+    for (; i + 8 <= n; i += 8) {
+        float16x4_t lo16 = vreinterpret_f16_u16(vld1_u16(src + i));
+        float16x4_t hi16 = vreinterpret_f16_u16(vld1_u16(src + i + 4));
+        vst1q_f32(dst + i, vcvt_f32_f16(lo16));
+        vst1q_f32(dst + i + 4, vcvt_f32_f16(hi16));
+    }
+    for (; i + 4 <= n; i += 4) {
+        float16x4_t v16 = vreinterpret_f16_u16(vld1_u16(src + i));
+        vst1q_f32(dst + i, vcvt_f32_f16(v16));
+    }
+    for (; i < n; i++) {
+        dst[i] = f16_to_f32_scalar(src[i]);
+    }
+#else
+    for (int i = 0; i < n; i++) {
+        dst[i] = f16_to_f32_scalar(src[i]);
+    }
+#endif
+}
+
+/* Mixed-precision dot product: dot(fp32_a, fp16_b) with on-the-fly conversion */
+static inline float qwen_dot_f32_f16(const float *a, const uint16_t *b_fp16, int n) {
+#ifdef __ARM_NEON
+    float32x4_t acc0 = vdupq_n_f32(0.0f);
+    float32x4_t acc1 = vdupq_n_f32(0.0f);
+    int d = 0;
+    for (; d + 8 <= n; d += 8) {
+        float32x4_t a0 = vld1q_f32(a + d);
+        float32x4_t a1 = vld1q_f32(a + d + 4);
+        float16x4_t b16_0 = vreinterpret_f16_u16(vld1_u16(b_fp16 + d));
+        float16x4_t b16_1 = vreinterpret_f16_u16(vld1_u16(b_fp16 + d + 4));
+        float32x4_t b0 = vcvt_f32_f16(b16_0);
+        float32x4_t b1 = vcvt_f32_f16(b16_1);
+        acc0 = vfmaq_f32(acc0, a0, b0);
+        acc1 = vfmaq_f32(acc1, a1, b1);
+    }
+    for (; d + 4 <= n; d += 4) {
+        float32x4_t a0 = vld1q_f32(a + d);
+        float16x4_t b16 = vreinterpret_f16_u16(vld1_u16(b_fp16 + d));
+        acc0 = vfmaq_f32(acc0, a0, vcvt_f32_f16(b16));
+    }
+    float sum = vaddvq_f32(vaddq_f32(acc0, acc1));
+    for (; d < n; d++) {
+        sum += a[d] * f16_to_f32_scalar(b_fp16[d]);
+    }
+    return sum;
+#else
+    float sum = 0.0f;
+    for (int d = 0; d < n; d++) {
+        sum += a[d] * f16_to_f32_scalar(b_fp16[d]);
+    }
+    return sum;
+#endif
+}
+
+/* dst += alpha * src_fp16 (with on-the-fly FP16→FP32 conversion) */
+static inline void qwen_vec_axpy_f16_inplace(float *dst, const uint16_t *src_fp16,
+                                               float alpha, int n) {
+#ifdef __ARM_NEON
+    float32x4_t va = vdupq_n_f32(alpha);
+    int d = 0;
+    for (; d + 8 <= n; d += 8) {
+        float32x4_t d0 = vld1q_f32(dst + d);
+        float32x4_t d1 = vld1q_f32(dst + d + 4);
+        float16x4_t s16_0 = vreinterpret_f16_u16(vld1_u16(src_fp16 + d));
+        float16x4_t s16_1 = vreinterpret_f16_u16(vld1_u16(src_fp16 + d + 4));
+        float32x4_t s0 = vcvt_f32_f16(s16_0);
+        float32x4_t s1 = vcvt_f32_f16(s16_1);
+        vst1q_f32(dst + d, vfmaq_f32(d0, s0, va));
+        vst1q_f32(dst + d + 4, vfmaq_f32(d1, s1, va));
+    }
+    for (; d + 4 <= n; d += 4) {
+        float32x4_t d0 = vld1q_f32(dst + d);
+        float16x4_t s16 = vreinterpret_f16_u16(vld1_u16(src_fp16 + d));
+        vst1q_f32(dst + d, vfmaq_f32(d0, vcvt_f32_f16(s16), va));
+    }
+    for (; d < n; d++) {
+        dst[d] += alpha * f16_to_f32_scalar(src_fp16[d]);
+    }
+#else
+    for (int d = 0; d < n; d++) {
+        dst[d] += alpha * f16_to_f32_scalar(src_fp16[d]);
+    }
+#endif
+}
+
+/* dst = dst * correction + src_fp16 (scale-add with FP16 source) */
+static inline void qwen_vec_scale_add_f16(float *dst, const uint16_t *src_fp16,
+                                            float correction, int n) {
+#ifdef __ARM_NEON
+    float32x4_t vc = vdupq_n_f32(correction);
+    int d = 0;
+    for (; d + 8 <= n; d += 8) {
+        float32x4_t d0 = vld1q_f32(dst + d);
+        float32x4_t d1 = vld1q_f32(dst + d + 4);
+        float16x4_t s16_0 = vreinterpret_f16_u16(vld1_u16(src_fp16 + d));
+        float16x4_t s16_1 = vreinterpret_f16_u16(vld1_u16(src_fp16 + d + 4));
+        float32x4_t s0 = vcvt_f32_f16(s16_0);
+        float32x4_t s1 = vcvt_f32_f16(s16_1);
+        vst1q_f32(dst + d, vfmaq_f32(s0, d0, vc));
+        vst1q_f32(dst + d + 4, vfmaq_f32(s1, d1, vc));
+    }
+    for (; d + 4 <= n; d += 4) {
+        float32x4_t d0 = vld1q_f32(dst + d);
+        float16x4_t s16 = vreinterpret_f16_u16(vld1_u16(src_fp16 + d));
+        vst1q_f32(dst + d, vfmaq_f32(vcvt_f32_f16(s16), d0, vc));
+    }
+    for (; d < n; d++) {
+        dst[d] = dst[d] * correction + f16_to_f32_scalar(src_fp16[d]);
+    }
+#else
+    for (int d = 0; d < n; d++) {
+        dst[d] = dst[d] * correction + f16_to_f32_scalar(src_fp16[d]);
+    }
+#endif
+}
+
+/* ========================================================================
  * Attention Operations
  * ======================================================================== */
 
@@ -1831,13 +2208,16 @@ static inline void qwen_vec_scale_add(float *dst, const float *src, float correc
     qwen_vec_scale_add_impl(dst, src, correction, n);
 }
 
-void qwen_bidirectional_attention(float *out, const float *Q, const float *K,
-                                   const float *V, int seq __attribute__((unused)),
-                                   int n_heads, int head_dim, float scale,
-                                   const int *window_starts, int n_windows) {
+/* Max scores buffer size for 2-pass attention (stack allocated) */
+#define ATTN_MAX_KEYS 2048
+
+static void qwen_bidirectional_attention_heads(float *out, const float *Q, const float *K,
+                                                const float *V, int n_heads, int head_dim,
+                                                float scale, const int *window_starts,
+                                                int n_windows, int head_start, int head_end) {
     int hidden = n_heads * head_dim;
 
-    for (int h = 0; h < n_heads; h++) {
+    for (int h = head_start; h < head_end; h++) {
         for (int w = 0; w < n_windows; w++) {
             int ws = window_starts[w];
             int we = window_starts[w + 1];
@@ -1845,41 +2225,102 @@ void qwen_bidirectional_attention(float *out, const float *Q, const float *K,
             for (int i = ws; i < we; i++) {
                 const float *q_row = Q + i * hidden + h * head_dim;
                 float *o_row = out + i * hidden + h * head_dim;
+                int n_keys = we - ws;
+                float scores[ATTN_MAX_KEYS];
 
-                /* Online softmax */
+                /* Pass 1: compute all scores and find max */
                 float max_score = -1e30f;
-                float sum_exp = 0.0f;
-                for (int d = 0; d < head_dim; d++) o_row[d] = 0.0f;
-
-                for (int j = ws; j < we; j++) {
-                    const float *k_row = K + j * hidden + h * head_dim;
-                    const float *v_row = V + j * hidden + h * head_dim;
-
-                    float score = qwen_dot_f32(q_row, k_row, head_dim) * scale;
-
-                    if (score > max_score) {
-                        float correction = expf(max_score - score);
-                        sum_exp = sum_exp * correction + 1.0f;
-                        qwen_vec_scale_add(o_row, v_row, correction, head_dim);
-                        max_score = score;
-                    } else {
-                        float wt = expf(score - max_score);
-                        sum_exp += wt;
-                        qwen_vec_axpy_inplace(o_row, v_row, wt, head_dim);
-                    }
+                for (int j = 0; j < n_keys; j++) {
+                    const float *k_row = K + (ws + j) * hidden + h * head_dim;
+                    scores[j] = qwen_dot_f32(q_row, k_row, head_dim) * scale;
+                    if (scores[j] > max_score) max_score = scores[j];
                 }
 
-                if (sum_exp > 0.0f) {
-                    float inv_sum = 1.0f / sum_exp;
-                    qwen_vec_scale_inplace(o_row, inv_sum, head_dim);
+                /* Pass 2: NEON batch exp and accumulate weights */
+                float sum_exp = 0.0f;
+#ifdef __ARM_NEON
+                {
+                    float32x4_t vmax = vdupq_n_f32(max_score);
+                    float32x4_t vsum = vdupq_n_f32(0.0f);
+                    int j = 0;
+                    for (; j + 4 <= n_keys; j += 4) {
+                        float32x4_t s = vld1q_f32(scores + j);
+                        float32x4_t e = neon_expf(vsubq_f32(s, vmax));
+                        vst1q_f32(scores + j, e);
+                        vsum = vaddq_f32(vsum, e);
+                    }
+                    sum_exp = vaddvq_f32(vsum);
+                    for (; j < n_keys; j++) {
+                        scores[j] = expf(scores[j] - max_score);
+                        sum_exp += scores[j];
+                    }
+                }
+#else
+                for (int j = 0; j < n_keys; j++) {
+                    scores[j] = expf(scores[j] - max_score);
+                    sum_exp += scores[j];
+                }
+#endif
+
+                /* Pass 3: weighted V sum */
+                float inv_sum = (sum_exp > 0.0f) ? 1.0f / sum_exp : 0.0f;
+                for (int d = 0; d < head_dim; d++) o_row[d] = 0.0f;
+                for (int j = 0; j < n_keys; j++) {
+                    const float *v_row = V + (ws + j) * hidden + h * head_dim;
+                    qwen_vec_axpy_inplace(o_row, v_row, scores[j] * inv_sum, head_dim);
                 }
             }
         }
     }
 }
 
-static void qwen_causal_attention_heads(float *out, const float *Q, const float *K,
-                                        const float *V, int seq_q, int seq_k,
+typedef struct {
+    float *out;
+    const float *Q;
+    const float *K;
+    const float *V;
+    int n_heads;
+    int head_dim;
+    float scale;
+    const int *window_starts;
+    int n_windows;
+} bidir_attn_task_t;
+
+static void bidir_attn_worker(int tid, int n_threads, void *arg) {
+    bidir_attn_task_t *t = (bidir_attn_task_t *)arg;
+    int chunk = (t->n_heads + n_threads - 1) / n_threads;
+    int h0 = tid * chunk;
+    int h1 = h0 + chunk;
+    if (h1 > t->n_heads) h1 = t->n_heads;
+    if (h0 >= h1) return;
+
+    qwen_bidirectional_attention_heads(t->out, t->Q, t->K, t->V,
+                                        t->n_heads, t->head_dim, t->scale,
+                                        t->window_starts, t->n_windows, h0, h1);
+}
+
+void qwen_bidirectional_attention(float *out, const float *Q, const float *K,
+                                   const float *V, int seq __attribute__((unused)),
+                                   int n_heads, int head_dim, float scale,
+                                   const int *window_starts, int n_windows) {
+    if (tp.n_threads > 1 && n_heads >= 2) {
+        bidir_attn_task_t task = {
+            .out = out, .Q = Q, .K = K, .V = V,
+            .n_heads = n_heads, .head_dim = head_dim, .scale = scale,
+            .window_starts = window_starts, .n_windows = n_windows
+        };
+        parallel_for(bidir_attn_worker, &task);
+        return;
+    }
+
+    qwen_bidirectional_attention_heads(out, Q, K, V, n_heads, head_dim, scale,
+                                        window_starts, n_windows, 0, n_heads);
+}
+
+static void qwen_causal_attention_heads(float *out, const float *Q,
+                                        const uint16_t *K_fp16,
+                                        const uint16_t *V_fp16,
+                                        int seq_q, int seq_k,
                                         int n_heads, int n_kv_heads, int head_dim,
                                         float scale, int q_offset,
                                         int head_start, int head_end) {
@@ -1897,31 +2338,48 @@ static void qwen_causal_attention_heads(float *out, const float *Q, const float 
             int k_end = global_pos + 1;
             if (k_end > seq_k) k_end = seq_k;
 
+            float scores[ATTN_MAX_KEYS];
+
+            /* Pass 1: compute all scores and find max */
             float max_score = -1e30f;
-            float sum_exp = 0.0f;
-            for (int d = 0; d < head_dim; d++) o_row[d] = 0.0f;
-
             for (int j = 0; j < k_end; j++) {
-                const float *k_row = K + j * kv_hidden + kv_h * head_dim;
-                const float *v_row = V + j * kv_hidden + kv_h * head_dim;
-
-                float score = qwen_dot_f32(q_row, k_row, head_dim) * scale;
-
-                if (score > max_score) {
-                    float correction = expf(max_score - score);
-                    sum_exp = sum_exp * correction + 1.0f;
-                    qwen_vec_scale_add(o_row, v_row, correction, head_dim);
-                    max_score = score;
-                } else {
-                    float wt = expf(score - max_score);
-                    sum_exp += wt;
-                    qwen_vec_axpy_inplace(o_row, v_row, wt, head_dim);
-                }
+                const uint16_t *k_row = K_fp16 + j * kv_hidden + kv_h * head_dim;
+                scores[j] = qwen_dot_f32_f16(q_row, k_row, head_dim) * scale;
+                if (scores[j] > max_score) max_score = scores[j];
             }
 
-            if (sum_exp > 0.0f) {
-                float inv_sum = 1.0f / sum_exp;
-                qwen_vec_scale_inplace(o_row, inv_sum, head_dim);
+            /* Pass 2: NEON batch exp and accumulate weights */
+            float sum_exp = 0.0f;
+#ifdef __ARM_NEON
+            {
+                float32x4_t vmax = vdupq_n_f32(max_score);
+                float32x4_t vsum = vdupq_n_f32(0.0f);
+                int j = 0;
+                for (; j + 4 <= k_end; j += 4) {
+                    float32x4_t s = vld1q_f32(scores + j);
+                    float32x4_t e = neon_expf(vsubq_f32(s, vmax));
+                    vst1q_f32(scores + j, e);
+                    vsum = vaddq_f32(vsum, e);
+                }
+                sum_exp = vaddvq_f32(vsum);
+                for (; j < k_end; j++) {
+                    scores[j] = expf(scores[j] - max_score);
+                    sum_exp += scores[j];
+                }
+            }
+#else
+            for (int j = 0; j < k_end; j++) {
+                scores[j] = expf(scores[j] - max_score);
+                sum_exp += scores[j];
+            }
+#endif
+
+            /* Pass 3: weighted V sum */
+            float inv_sum = (sum_exp > 0.0f) ? 1.0f / sum_exp : 0.0f;
+            for (int d = 0; d < head_dim; d++) o_row[d] = 0.0f;
+            for (int j = 0; j < k_end; j++) {
+                const uint16_t *v_row = V_fp16 + j * kv_hidden + kv_h * head_dim;
+                qwen_vec_axpy_f16_inplace(o_row, v_row, scores[j] * inv_sum, head_dim);
             }
         }
     }
@@ -1930,8 +2388,8 @@ static void qwen_causal_attention_heads(float *out, const float *Q, const float 
 typedef struct {
     float *out;
     const float *Q;
-    const float *K;
-    const float *V;
+    const uint16_t *K_fp16;
+    const uint16_t *V_fp16;
     int seq_q, seq_k;
     int n_heads, n_kv_heads;
     int head_dim;
@@ -1947,17 +2405,18 @@ static void causal_attn_worker(int tid, int n_threads, void *arg) {
     if (h1 > t->n_heads) h1 = t->n_heads;
     if (h0 >= h1) return;
 
-    qwen_causal_attention_heads(t->out, t->Q, t->K, t->V,
+    qwen_causal_attention_heads(t->out, t->Q, t->K_fp16, t->V_fp16,
                                 t->seq_q, t->seq_k, t->n_heads, t->n_kv_heads,
                                 t->head_dim, t->scale, t->q_offset, h0, h1);
 }
 
-void qwen_causal_attention(float *out, const float *Q, const float *K, const float *V,
+void qwen_causal_attention(float *out, const float *Q,
+                            const uint16_t *K_fp16, const uint16_t *V_fp16,
                             int seq_q, int seq_k, int n_heads, int n_kv_heads,
                             int head_dim, float scale, int q_offset) {
     if (tp.n_threads > 1 && n_heads >= 2 && (seq_q >= 2 || seq_k >= 128)) {
         causal_attn_task_t task = {
-            .out = out, .Q = Q, .K = K, .V = V,
+            .out = out, .Q = Q, .K_fp16 = K_fp16, .V_fp16 = V_fp16,
             .seq_q = seq_q, .seq_k = seq_k,
             .n_heads = n_heads, .n_kv_heads = n_kv_heads,
             .head_dim = head_dim, .scale = scale, .q_offset = q_offset
@@ -1966,7 +2425,7 @@ void qwen_causal_attention(float *out, const float *Q, const float *K, const flo
         return;
     }
 
-    qwen_causal_attention_heads(out, Q, K, V,
+    qwen_causal_attention_heads(out, Q, K_fp16, V_fp16,
                                 seq_q, seq_k, n_heads, n_kv_heads,
                                 head_dim, scale, q_offset, 0, n_heads);
 }
@@ -2058,6 +2517,26 @@ void qwen_apply_rope_neox(float *x, const float *cos_vals, const float *sin_vals
                 __m256 new2 = _mm256_fmadd_ps(x2, cc, _mm256_mul_ps(x1, ss));
                 _mm256_storeu_ps(vec + d, new1);
                 _mm256_storeu_ps(vec + half + d, new2);
+            }
+            for (; d < half; d++) {
+                float x1 = vec[d];
+                float x2 = vec[half + d];
+                vec[d]        = x1 * c[d]        + (-x2) * sn[d];
+                vec[half + d] = x2 * c[half + d] + x1 * sn[half + d];
+            }
+#elif defined(__ARM_NEON)
+            int d = 0;
+            for (; d + 4 <= half; d += 4) {
+                float32x4_t x1 = vld1q_f32(vec + d);
+                float32x4_t x2 = vld1q_f32(vec + half + d);
+                float32x4_t cc = vld1q_f32(c + d);
+                float32x4_t ss = vld1q_f32(sn + d);
+                float32x4_t cc2 = vld1q_f32(c + half + d);
+                float32x4_t ss2 = vld1q_f32(sn + half + d);
+                /* new1 = x1 * cos - x2 * sin */
+                vst1q_f32(vec + d, vsubq_f32(vmulq_f32(x1, cc), vmulq_f32(x2, ss)));
+                /* new2 = x2 * cos2 + x1 * sin2 */
+                vst1q_f32(vec + half + d, vfmaq_f32(vmulq_f32(x2, cc2), x1, ss2));
             }
             for (; d < half; d++) {
                 float x1 = vec[d];

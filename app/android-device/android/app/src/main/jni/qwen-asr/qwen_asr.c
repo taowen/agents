@@ -7,7 +7,7 @@
 
 #include "qwen_asr.h"
 #include "qwen_asr_kernels.h"
-#include "qwen_asr_gguf.h"
+#include "qwen_asr_safetensors.h"
 #include "qwen_asr_audio.h"
 #include "qwen_asr_tokenizer.h"
 #include <stdio.h>
@@ -17,10 +17,6 @@
 #include <math.h>
 #include <limits.h>
 #include <sys/time.h>
-#include <unistd.h>
-#include <fcntl.h>
-#include <sys/stat.h>
-#include <sys/mman.h>
 
 /* Global verbose flag */
 int qwen_verbose = 0;
@@ -123,200 +119,73 @@ int qwen_set_force_language(qwen_ctx_t *ctx, const char *language) {
 }
 
 /* ========================================================================
- * Internal: encoder conv quantization (still needed for runtime Q8_0)
+ * Internal load functions (defined in encoder/decoder .c files)
  * ======================================================================== */
+
+extern int qwen_encoder_load(qwen_encoder_t *enc, multi_safetensors_t *ms,
+                              const qwen_config_t *cfg);
+extern int qwen_decoder_load(qwen_decoder_t *dec, multi_safetensors_t *ms,
+                              const qwen_config_t *cfg);
 
 /* ========================================================================
- * Config from GGUF KV Metadata
+ * Config Detection
  * ======================================================================== */
 
-static int load_config_from_gguf(qwen_ctx_t *ctx, gguf_ctx_t *gf) {
+/* Detect model variant from config.json or heuristics */
+static int detect_config(qwen_ctx_t *ctx) {
     qwen_config_t *cfg = &ctx->config;
-    uint32_t u;
 
-    /* Read all model dimensions from GGUF KV metadata */
-    if (gguf_get_u32(gf, "qwen_asr.enc_d_model", &u) == 0)     cfg->enc_d_model = (int)u;
-    if (gguf_get_u32(gf, "qwen_asr.enc_layers", &u) == 0)       cfg->enc_layers = (int)u;
-    if (gguf_get_u32(gf, "qwen_asr.enc_heads", &u) == 0)        cfg->enc_heads = (int)u;
-    if (gguf_get_u32(gf, "qwen_asr.enc_head_dim", &u) == 0)     cfg->enc_head_dim = (int)u;
-    if (gguf_get_u32(gf, "qwen_asr.enc_ffn_dim", &u) == 0)      cfg->enc_ffn_dim = (int)u;
-    if (gguf_get_u32(gf, "qwen_asr.enc_output_dim", &u) == 0)   cfg->enc_output_dim = (int)u;
-    if (gguf_get_u32(gf, "qwen_asr.dec_hidden", &u) == 0)       cfg->dec_hidden = (int)u;
-    if (gguf_get_u32(gf, "qwen_asr.dec_layers", &u) == 0)       cfg->dec_layers = (int)u;
-    if (gguf_get_u32(gf, "qwen_asr.dec_heads", &u) == 0)        cfg->dec_heads = (int)u;
-    if (gguf_get_u32(gf, "qwen_asr.dec_kv_heads", &u) == 0)     cfg->dec_kv_heads = (int)u;
-    if (gguf_get_u32(gf, "qwen_asr.dec_head_dim", &u) == 0)     cfg->dec_head_dim = (int)u;
-    if (gguf_get_u32(gf, "qwen_asr.dec_intermediate", &u) == 0) cfg->dec_intermediate = (int)u;
-    if (gguf_get_u32(gf, "qwen_asr.vocab_size", &u) == 0)       cfg->vocab_size = (int)u;
-    else cfg->vocab_size = QWEN_VOCAB_SIZE;
+    /* Try to detect from number of shards:
+     * 1.7B has 2 shards, 0.6B has 1 shard
+     * But we can also check a specific weight shape. */
 
-    /* Common derived parameters */
+    /* Check if thinker.audio_tower.layers.17 exists (0.6B has 18 layers, 1.7B has 24) */
+    multi_safetensors_t *ms = (multi_safetensors_t *)ctx->safetensors;
+
+    /* Check for layer 18 (0-indexed) in encoder - if it exists, it's 1.7B */
+    const safetensor_t *test = multi_safetensors_find(ms,
+        "thinker.audio_tower.layers.18.self_attn.q_proj.weight", NULL);
+
+    if (test) {
+        /* 1.7B model */
+        cfg->enc_d_model = 1024;
+        cfg->enc_layers = 24;
+        cfg->enc_heads = 16;
+        cfg->enc_head_dim = 64;
+        cfg->enc_ffn_dim = 4096;
+        cfg->enc_output_dim = 2048;
+        cfg->dec_hidden = 2048;
+        cfg->dec_layers = 28;
+        cfg->dec_heads = 16;
+        cfg->dec_kv_heads = 8;
+        cfg->dec_head_dim = 128;
+        cfg->dec_intermediate = 6144;
+        if (qwen_verbose >= 1) fprintf(stderr, "Detected: Qwen3-ASR-1.7B\n");
+    } else {
+        /* 0.6B model */
+        cfg->enc_d_model = 896;
+        cfg->enc_layers = 18;
+        cfg->enc_heads = 14;
+        cfg->enc_head_dim = 64;
+        cfg->enc_ffn_dim = 3584;
+        cfg->enc_output_dim = 1024;
+        cfg->dec_hidden = 1024;
+        cfg->dec_layers = 28;
+        cfg->dec_heads = 16;
+        cfg->dec_kv_heads = 8;
+        cfg->dec_head_dim = 128;
+        cfg->dec_intermediate = 3072;
+        if (qwen_verbose >= 1) fprintf(stderr, "Detected: Qwen3-ASR-0.6B\n");
+    }
+
+    /* Common parameters */
     cfg->enc_n_window = 50;
     cfg->enc_n_window_infer = 800;
-    cfg->enc_chunk_size = cfg->enc_n_window * 2;
-    cfg->enc_conv_proj_dim = QWEN_CONV_HIDDEN * 16;
+    cfg->enc_chunk_size = cfg->enc_n_window * 2; /* 100 */
+    cfg->enc_conv_proj_dim = QWEN_CONV_HIDDEN * 16; /* 7680 */
+    cfg->vocab_size = QWEN_VOCAB_SIZE;
     cfg->dec_rms_norm_eps = 1e-6f;
     cfg->dec_rope_theta = 1e6f;
-
-    if (qwen_verbose >= 1) {
-        const char *variant = (cfg->enc_layers > 18) ? "1.7B" : "0.6B";
-        fprintf(stderr, "GGUF config: Qwen3-ASR-%s (enc=%d dec=%d)\n",
-                variant, cfg->enc_d_model, cfg->dec_hidden);
-    }
-
-    return 0;
-}
-
-/* ========================================================================
- * GGUF Model Loading (mmap, zero-copy for all weights)
- * ======================================================================== */
-
-/* Helper: find a GGUF tensor and return typed pointer, or NULL */
-#define GGUF_PTR(gf, name, type) \
-    ({ gguf_tensor_t *_t = gguf_find(gf, name); \
-       _t ? (type *)_t->data : NULL; })
-
-static int load_weights_from_gguf(qwen_ctx_t *ctx, gguf_ctx_t *gf) {
-    const qwen_config_t *cfg = &ctx->config;
-    qwen_encoder_t *enc = &ctx->encoder;
-    qwen_decoder_t *dec = &ctx->decoder;
-    char name[512];
-
-    /* --- Encoder conv stem (F32) --- */
-    enc->conv1_weight = GGUF_PTR(gf, "enc.conv1.weight", float);
-    enc->conv1_bias   = GGUF_PTR(gf, "enc.conv1.bias", float);
-    enc->conv2_weight = GGUF_PTR(gf, "enc.conv2.weight", float);
-    enc->conv2_bias   = GGUF_PTR(gf, "enc.conv2.bias", float);
-    enc->conv3_weight = GGUF_PTR(gf, "enc.conv3.weight", float);
-    enc->conv3_bias   = GGUF_PTR(gf, "enc.conv3.bias", float);
-    if (!enc->conv1_weight || !enc->conv2_weight || !enc->conv3_weight) {
-        fprintf(stderr, "qwen_load: missing encoder conv weights\n");
-        return -1;
-    }
-
-    /* Runtime Q8_0 quantization of conv2/conv3 for GEMM (small, ~2MB each) */
-    {
-        int conv_k = QWEN_CONV_HIDDEN * QWEN_CONV_KERNEL * QWEN_CONV_KERNEL;
-        int conv_n_elements = QWEN_CONV_HIDDEN * conv_k;
-        int conv_n_blocks = conv_n_elements / QK8_0;
-
-        enc->conv2_weight_q8 = (block_q8_0 *)malloc((size_t)conv_n_blocks * sizeof(block_q8_0));
-        quantize_f32_to_q8_0(enc->conv2_weight, enc->conv2_weight_q8, conv_n_elements);
-
-        enc->conv3_weight_q8 = (block_q8_0 *)malloc((size_t)conv_n_blocks * sizeof(block_q8_0));
-        quantize_f32_to_q8_0(enc->conv3_weight, enc->conv3_weight_q8, conv_n_elements);
-    }
-
-    /* Conv output projection (Q8_0 in GGUF) */
-    enc->conv_out_weight_q8 = GGUF_PTR(gf, "enc.conv_out.weight", block_q8_0);
-    if (!enc->conv_out_weight_q8) { fprintf(stderr, "qwen_load: missing enc.conv_out.weight\n"); return -1; }
-
-    /* --- Encoder layers (Q8_0 weights, F32 biases/norms) --- */
-    for (int i = 0; i < cfg->enc_layers; i++) {
-        qwen_enc_layer_t *l = &enc->layers[i];
-
-        snprintf(name, sizeof(name), "enc.layers.%d.attn.q.weight", i);
-        l->wq_weight_q8 = GGUF_PTR(gf, name, block_q8_0);
-        snprintf(name, sizeof(name), "enc.layers.%d.attn.q.bias", i);
-        l->wq_bias = GGUF_PTR(gf, name, float);
-        snprintf(name, sizeof(name), "enc.layers.%d.attn.k.weight", i);
-        l->wk_weight_q8 = GGUF_PTR(gf, name, block_q8_0);
-        snprintf(name, sizeof(name), "enc.layers.%d.attn.k.bias", i);
-        l->wk_bias = GGUF_PTR(gf, name, float);
-        snprintf(name, sizeof(name), "enc.layers.%d.attn.v.weight", i);
-        l->wv_weight_q8 = GGUF_PTR(gf, name, block_q8_0);
-        snprintf(name, sizeof(name), "enc.layers.%d.attn.v.bias", i);
-        l->wv_bias = GGUF_PTR(gf, name, float);
-        snprintf(name, sizeof(name), "enc.layers.%d.attn.o.weight", i);
-        l->wo_weight_q8 = GGUF_PTR(gf, name, block_q8_0);
-        snprintf(name, sizeof(name), "enc.layers.%d.attn.o.bias", i);
-        l->wo_bias = GGUF_PTR(gf, name, float);
-
-        snprintf(name, sizeof(name), "enc.layers.%d.attn_norm.weight", i);
-        l->attn_norm_weight = GGUF_PTR(gf, name, float);
-        snprintf(name, sizeof(name), "enc.layers.%d.attn_norm.bias", i);
-        l->attn_norm_bias = GGUF_PTR(gf, name, float);
-
-        snprintf(name, sizeof(name), "enc.layers.%d.ffn.fc1.weight", i);
-        l->fc1_weight_q8 = GGUF_PTR(gf, name, block_q8_0);
-        snprintf(name, sizeof(name), "enc.layers.%d.ffn.fc1.bias", i);
-        l->fc1_bias = GGUF_PTR(gf, name, float);
-        snprintf(name, sizeof(name), "enc.layers.%d.ffn.fc2.weight", i);
-        l->fc2_weight_q8 = GGUF_PTR(gf, name, block_q8_0);
-        snprintf(name, sizeof(name), "enc.layers.%d.ffn.fc2.bias", i);
-        l->fc2_bias = GGUF_PTR(gf, name, float);
-
-        snprintf(name, sizeof(name), "enc.layers.%d.ffn_norm.weight", i);
-        l->ffn_norm_weight = GGUF_PTR(gf, name, float);
-        snprintf(name, sizeof(name), "enc.layers.%d.ffn_norm.bias", i);
-        l->ffn_norm_bias = GGUF_PTR(gf, name, float);
-
-        if (!l->wq_weight_q8 || !l->wk_weight_q8 || !l->wv_weight_q8 || !l->wo_weight_q8) {
-            fprintf(stderr, "qwen_load: missing encoder layer %d weights\n", i);
-            return -1;
-        }
-    }
-
-    enc->ln_post_weight = GGUF_PTR(gf, "enc.ln_post.weight", float);
-    enc->ln_post_bias   = GGUF_PTR(gf, "enc.ln_post.bias", float);
-    enc->proj1_weight_q8 = GGUF_PTR(gf, "enc.proj1.weight", block_q8_0);
-    enc->proj1_bias      = GGUF_PTR(gf, "enc.proj1.bias", float);
-    enc->proj2_weight_q8 = GGUF_PTR(gf, "enc.proj2.weight", block_q8_0);
-    enc->proj2_bias      = GGUF_PTR(gf, "enc.proj2.bias", float);
-    if (!enc->ln_post_weight || !enc->proj1_weight_q8 || !enc->proj2_weight_q8) {
-        fprintf(stderr, "qwen_load: missing encoder post-layers\n");
-        return -1;
-    }
-
-    /* --- Decoder --- */
-    /* Token embeddings: F16 for lookup, Q4_K for argmax */
-    dec->tok_embeddings_f16 = GGUF_PTR(gf, "dec.tok_emb.f16", uint16_t);
-    dec->tok_embeddings_q4k = GGUF_PTR(gf, "dec.tok_emb.q4k", block_q4_K);
-    if (!dec->tok_embeddings_f16 || !dec->tok_embeddings_q4k) {
-        fprintf(stderr, "qwen_load: missing decoder token embeddings\n");
-        return -1;
-    }
-
-    /* Decoder layers (Q4_K weights, F32 norms) */
-    for (int i = 0; i < cfg->dec_layers; i++) {
-        qwen_dec_layer_t *l = &dec->layers[i];
-
-        snprintf(name, sizeof(name), "dec.layers.%d.attn.q.weight", i);
-        l->wq_weight_q4k = GGUF_PTR(gf, name, block_q4_K);
-        snprintf(name, sizeof(name), "dec.layers.%d.attn.k.weight", i);
-        l->wk_weight_q4k = GGUF_PTR(gf, name, block_q4_K);
-        snprintf(name, sizeof(name), "dec.layers.%d.attn.v.weight", i);
-        l->wv_weight_q4k = GGUF_PTR(gf, name, block_q4_K);
-        snprintf(name, sizeof(name), "dec.layers.%d.attn.o.weight", i);
-        l->wo_weight_q4k = GGUF_PTR(gf, name, block_q4_K);
-
-        snprintf(name, sizeof(name), "dec.layers.%d.attn.q_norm.weight", i);
-        l->q_norm_weight = GGUF_PTR(gf, name, float);
-        snprintf(name, sizeof(name), "dec.layers.%d.attn.k_norm.weight", i);
-        l->k_norm_weight = GGUF_PTR(gf, name, float);
-
-        snprintf(name, sizeof(name), "dec.layers.%d.input_norm.weight", i);
-        l->input_norm = GGUF_PTR(gf, name, float);
-        snprintf(name, sizeof(name), "dec.layers.%d.post_attn_norm.weight", i);
-        l->post_attn_norm = GGUF_PTR(gf, name, float);
-
-        snprintf(name, sizeof(name), "dec.layers.%d.mlp.gate_up.weight", i);
-        l->gate_up_fused_q4k = GGUF_PTR(gf, name, block_q4_K);
-        snprintf(name, sizeof(name), "dec.layers.%d.mlp.down.weight", i);
-        l->down_weight_q4k = GGUF_PTR(gf, name, block_q4_K);
-
-        if (!l->wq_weight_q4k || !l->wk_weight_q4k || !l->wv_weight_q4k || !l->wo_weight_q4k ||
-            !l->gate_up_fused_q4k || !l->down_weight_q4k) {
-            fprintf(stderr, "qwen_load: missing decoder layer %d weights\n", i);
-            return -1;
-        }
-    }
-
-    dec->norm = GGUF_PTR(gf, "dec.norm.weight", float);
-    if (!dec->norm) {
-        fprintf(stderr, "qwen_load: missing decoder final norm\n");
-        return -1;
-    }
 
     return 0;
 }
@@ -330,34 +199,42 @@ qwen_ctx_t *qwen_load(const char *model_dir) {
     if (!ctx) return NULL;
     snprintf(ctx->model_dir, sizeof(ctx->model_dir), "%s", model_dir);
 
-    /* Open GGUF model file */
-    char gguf_path[1024];
-    snprintf(gguf_path, sizeof(gguf_path), "%s/model.gguf", model_dir);
-
+    /* Open safetensors (multi-shard) */
     if (qwen_verbose >= 1)
-        fprintf(stderr, "Loading model from %s\n", gguf_path);
+        fprintf(stderr, "Loading model from %s\n", model_dir);
 
-    gguf_ctx_t *gf = gguf_open(gguf_path);
-    if (!gf) {
-        fprintf(stderr, "qwen_load: cannot open %s\n", gguf_path);
+    multi_safetensors_t *ms = multi_safetensors_open(model_dir);
+    if (!ms) {
+        fprintf(stderr, "qwen_load: cannot open safetensors in %s\n", model_dir);
         free(ctx);
         return NULL;
     }
-    ctx->gguf = gf;
+    ctx->safetensors = ms;
 
-    /* Read config from GGUF KV metadata */
-    load_config_from_gguf(ctx, gf);
+    /* Detect model configuration */
+    detect_config(ctx);
 
-    /* Load all weights (pointers into mmap) */
-    if (load_weights_from_gguf(ctx, gf) != 0) {
-        fprintf(stderr, "qwen_load: failed to load weights from GGUF\n");
+    /* Load encoder weights */
+    if (qwen_verbose >= 1) fprintf(stderr, "Loading encoder weights...\n");
+    if (qwen_encoder_load(&ctx->encoder, ms, &ctx->config) != 0) {
+        fprintf(stderr, "qwen_load: failed to load encoder\n");
         qwen_free(ctx);
         return NULL;
     }
 
-    /* Default transcription mode */
+    /* Load decoder weights */
+    if (qwen_verbose >= 1) fprintf(stderr, "Loading decoder weights...\n");
+    if (qwen_decoder_load(&ctx->decoder, ms, &ctx->config) != 0) {
+        fprintf(stderr, "qwen_load: failed to load decoder\n");
+        qwen_free(ctx);
+        return NULL;
+    }
+
+    /* Default transcription mode: full-audio offline decode (no splitting). */
     ctx->segment_sec = 0.0f;
     ctx->search_sec = 3.0f;
+
+    /* Default streaming parameters */
     ctx->stream_chunk_sec = 2.0f;
     ctx->stream_rollback = 5;
     ctx->stream_unfixed_chunks = 2;
@@ -365,10 +242,7 @@ qwen_ctx_t *qwen_load(const char *model_dir) {
     ctx->past_text_conditioning = 0;
     ctx->skip_silence = 0;
 
-    if (qwen_verbose >= 1) {
-        fprintf(stderr, "Model loaded (GGUF, %.1f MB mmap).\n",
-                (double)gf->mmap_size / (1024.0 * 1024.0));
-    }
+    if (qwen_verbose >= 1) fprintf(stderr, "Model loaded.\n");
     return ctx;
 }
 
@@ -379,18 +253,44 @@ qwen_ctx_t *qwen_load(const char *model_dir) {
 void qwen_free(qwen_ctx_t *ctx) {
     if (!ctx) return;
 
-    /* Free runtime-quantized conv weights (only things we malloc'd) */
-    free(ctx->encoder.conv2_weight_q8);
-    free(ctx->encoder.conv3_weight_q8);
+    #define FREE0(p) do { free(p); (p) = NULL; } while (0)
 
-    /* Close GGUF (munmaps all weight data) */
-    if (ctx->gguf) {
-        gguf_close((gguf_ctx_t *)ctx->gguf);
-        ctx->gguf = NULL;
+    /* Encoder conv stem */
+    FREE0(ctx->encoder.conv1_weight); FREE0(ctx->encoder.conv1_bias);
+    FREE0(ctx->encoder.conv2_weight); FREE0(ctx->encoder.conv2_bias);
+    FREE0(ctx->encoder.conv3_weight); FREE0(ctx->encoder.conv3_bias);
+    FREE0(ctx->encoder.conv_out_weight_q8);
+
+    /* Encoder layers (weights are Q8_0, all allocated) */
+    for (int i = 0; i < ctx->config.enc_layers; i++) {
+        qwen_enc_layer_t *l = &ctx->encoder.layers[i];
+        FREE0(l->wq_weight_q8); FREE0(l->wq_bias);
+        FREE0(l->wk_weight_q8); FREE0(l->wk_bias);
+        FREE0(l->wv_weight_q8); FREE0(l->wv_bias);
+        FREE0(l->wo_weight_q8); FREE0(l->wo_bias);
+        FREE0(l->attn_norm_weight); FREE0(l->attn_norm_bias);
+        FREE0(l->fc1_weight_q8); FREE0(l->fc1_bias);
+        FREE0(l->fc2_weight_q8); FREE0(l->fc2_bias);
+        FREE0(l->ffn_norm_weight); FREE0(l->ffn_norm_bias);
     }
+    FREE0(ctx->encoder.ln_post_weight); FREE0(ctx->encoder.ln_post_bias);
+    FREE0(ctx->encoder.proj1_weight_q8); FREE0(ctx->encoder.proj1_bias);
+    FREE0(ctx->encoder.proj2_weight_q8); FREE0(ctx->encoder.proj2_bias);
 
-    /* Free GEMM workspace */
-    qwen_gemm_workspace_free();
+    /* Decoder layers (Q8_0 weights are all malloc'd, must be freed) */
+    for (int i = 0; i < ctx->config.dec_layers; i++) {
+        qwen_dec_layer_t *l = &ctx->decoder.layers[i];
+        FREE0(l->wq_weight_q8); FREE0(l->wk_weight_q8);
+        FREE0(l->wv_weight_q8); FREE0(l->wo_weight_q8);
+        FREE0(l->q_norm_weight); FREE0(l->k_norm_weight);
+        FREE0(l->input_norm); FREE0(l->post_attn_norm);
+        FREE0(l->down_weight_q8);
+        FREE0(l->gate_up_fused_q8);
+    }
+    FREE0(ctx->decoder.norm);
+    FREE0(ctx->decoder.tok_embeddings_q8);
+
+    #undef FREE0
 
     /* KV cache */
     free(ctx->kv_cache_k);
@@ -413,11 +313,19 @@ void qwen_free(qwen_ctx_t *ctx) {
     free(ctx->rope_cache_cos); free(ctx->rope_cache_sin);
     free(ctx->rope_inv_freq);
 
+    /* GEMM workspace */
+    qwen_gemm_workspace_free();
+
     /* Prompt/language options */
     free(ctx->prompt);
     free(ctx->force_language);
     free(ctx->prompt_tokens);
     free(ctx->force_prompt_tokens);
+
+    /* Close safetensors */
+    if (ctx->safetensors) {
+        multi_safetensors_close((multi_safetensors_t *)ctx->safetensors);
+    }
 
     free(ctx);
 }
@@ -448,12 +356,13 @@ static const int PROMPT_SUFFIX_BASE[] = {
 #define PREFIX_TAIL_LEN 6
 #define SUFFIX_BASE_LEN 6
 
-/* Convert a single token embedding from f16 to f32 */
-static void tok_embed_f16_to_f32(float *dst, const uint16_t *tok_emb_f16,
-                                 int token_id, int dim) {
-    const uint16_t *src = tok_emb_f16 + (size_t)token_id * dim;
+/* Convert a single token embedding from bf16 to f32 */
+static void tok_embed_bf16_to_f32(float *dst, const uint16_t *tok_emb_bf16,
+                                  int token_id, int dim) {
+    const uint16_t *src = tok_emb_bf16 + (size_t)token_id * dim;
     for (int i = 0; i < dim; i++) {
-        dst[i] = fp16_to_fp32(src[i]);
+        uint32_t f32_bits = ((uint32_t)src[i]) << 16;
+        memcpy(&dst[i], &f32_bits, sizeof(float));
     }
 }
 
@@ -737,24 +646,24 @@ static char *transcribe_segment(qwen_ctx_t *ctx, const float *samples,
     /* Embed prefix head: <|im_start|>system\n */
     int off = 0;
     for (int i = 0; i < PREFIX_HEAD_LEN; i++) {
-        tok_embed_f16_to_f32(input_embeds + off * dim,
-                              ctx->decoder.tok_embeddings_f16,
+        tok_embed_bf16_to_f32(input_embeds + off * dim,
+                              ctx->decoder.tok_embeddings_bf16,
                               PROMPT_PREFIX_HEAD[i], dim);
         off++;
     }
 
     /* Embed optional prompt text (system content) */
     for (int i = 0; i < ctx->n_prompt_tokens; i++) {
-        tok_embed_f16_to_f32(input_embeds + off * dim,
-                              ctx->decoder.tok_embeddings_f16,
+        tok_embed_bf16_to_f32(input_embeds + off * dim,
+                              ctx->decoder.tok_embeddings_bf16,
                               ctx->prompt_tokens[i], dim);
         off++;
     }
 
     /* Embed prefix tail: <|im_end|>\n<|im_start|>user\n<|audio_start|> */
     for (int i = 0; i < PREFIX_TAIL_LEN; i++) {
-        tok_embed_f16_to_f32(input_embeds + off * dim,
-                              ctx->decoder.tok_embeddings_f16,
+        tok_embed_bf16_to_f32(input_embeds + off * dim,
+                              ctx->decoder.tok_embeddings_bf16,
                               PROMPT_PREFIX_TAIL[i], dim);
         off++;
     }
@@ -770,15 +679,15 @@ static char *transcribe_segment(qwen_ctx_t *ctx, const float *samples,
     /* Embed suffix base: <|audio_end|><|im_end|>\n<|im_start|>assistant\n */
     int suffix_off = prefix_len + enc_seq_len;
     for (int i = 0; i < SUFFIX_BASE_LEN; i++) {
-        tok_embed_f16_to_f32(input_embeds + (suffix_off + i) * dim,
-                              ctx->decoder.tok_embeddings_f16,
+        tok_embed_bf16_to_f32(input_embeds + (suffix_off + i) * dim,
+                              ctx->decoder.tok_embeddings_bf16,
                               PROMPT_SUFFIX_BASE[i], dim);
     }
 
     /* Optional forced-language suffix: "language X" + <asr_text> */
     for (int i = 0; i < ctx->n_force_prompt_tokens; i++) {
-        tok_embed_f16_to_f32(input_embeds + (suffix_off + SUFFIX_BASE_LEN + i) * dim,
-                              ctx->decoder.tok_embeddings_f16,
+        tok_embed_bf16_to_f32(input_embeds + (suffix_off + SUFFIX_BASE_LEN + i) * dim,
+                              ctx->decoder.tok_embeddings_bf16,
                               ctx->force_prompt_tokens[i], dim);
     }
 
@@ -787,13 +696,13 @@ static char *transcribe_segment(qwen_ctx_t *ctx, const float *samples,
      * restarts from a new ASR span instead of terminating immediately. */
     int past_off = suffix_off + suffix_len;
     for (int i = 0; i < n_past_tokens; i++) {
-        tok_embed_f16_to_f32(input_embeds + (past_off + i) * dim,
-                              ctx->decoder.tok_embeddings_f16,
+        tok_embed_bf16_to_f32(input_embeds + (past_off + i) * dim,
+                              ctx->decoder.tok_embeddings_bf16,
                               past_tokens[i], dim);
     }
     if (n_past_tokens > 0) {
-        tok_embed_f16_to_f32(input_embeds + (past_off + n_past_tokens) * dim,
-                              ctx->decoder.tok_embeddings_f16,
+        tok_embed_bf16_to_f32(input_embeds + (past_off + n_past_tokens) * dim,
+                              ctx->decoder.tok_embeddings_bf16,
                               QWEN_TOKEN_ASR_TEXT, dim);
     }
 
@@ -813,13 +722,6 @@ static char *transcribe_segment(qwen_ctx_t *ctx, const float *samples,
         fprintf(stderr, "  Prefill: %d tokens (%.0f ms)\n", total_seq, prefill_ms);
 
     /* ---- Autoregressive decode ---- */
-    /* Reset per-token profiling accumulators */
-    ctx->prof_dec_qkv_ms = 0;
-    ctx->prof_dec_attn_ms = 0;
-    ctx->prof_dec_mlp_ms = 0;
-    ctx->prof_dec_other_ms = 0;
-    ctx->prof_dec_argmax_ms = 0;
-
     t0 = get_time_ms();
     int max_tokens = 2048;
     int n_generated = 0;
@@ -859,7 +761,7 @@ static char *transcribe_segment(qwen_ctx_t *ctx, const float *samples,
         }
 
         /* Embed and generate next token */
-        tok_embed_f16_to_f32(tmp_embed, ctx->decoder.tok_embeddings_f16, token, dim);
+        tok_embed_bf16_to_f32(tmp_embed, ctx->decoder.tok_embeddings_bf16, token, dim);
         token = qwen_decoder_forward(ctx, tmp_embed);
     }
 
@@ -868,12 +770,6 @@ static char *transcribe_segment(qwen_ctx_t *ctx, const float *samples,
         fprintf(stderr, "  Decode: %d tokens (%.0f ms, %.1f ms/token)\n",
                 n_generated, decode_ms,
                 n_generated > 0 ? decode_ms / n_generated : 0);
-
-    if (qwen_verbose >= 3) {
-        fprintf(stderr, "  Decode breakdown: qkv=%.0f attn=%.0f mlp=%.0f argmax=%.0f ms\n",
-                ctx->prof_dec_qkv_ms, ctx->prof_dec_attn_ms,
-                ctx->prof_dec_mlp_ms, ctx->prof_dec_argmax_ms);
-    }
 
     free(tmp_embed);
 
@@ -1815,20 +1711,20 @@ static char *stream_impl(qwen_ctx_t *ctx, const float *samples, int n_samples,
 
         int off = 0;
         for (int i = 0; i < PREFIX_HEAD_LEN; i++) {
-            tok_embed_f16_to_f32(input_embeds + off * dim,
-                                  ctx->decoder.tok_embeddings_f16,
+            tok_embed_bf16_to_f32(input_embeds + off * dim,
+                                  ctx->decoder.tok_embeddings_bf16,
                                   PROMPT_PREFIX_HEAD[i], dim);
             off++;
         }
         for (int i = 0; i < ctx->n_prompt_tokens; i++) {
-            tok_embed_f16_to_f32(input_embeds + off * dim,
-                                  ctx->decoder.tok_embeddings_f16,
+            tok_embed_bf16_to_f32(input_embeds + off * dim,
+                                  ctx->decoder.tok_embeddings_bf16,
                                   ctx->prompt_tokens[i], dim);
             off++;
         }
         for (int i = 0; i < PREFIX_TAIL_LEN; i++) {
-            tok_embed_f16_to_f32(input_embeds + off * dim,
-                                  ctx->decoder.tok_embeddings_f16,
+            tok_embed_bf16_to_f32(input_embeds + off * dim,
+                                  ctx->decoder.tok_embeddings_bf16,
                                   PROMPT_PREFIX_TAIL[i], dim);
             off++;
         }
@@ -1841,19 +1737,19 @@ static char *stream_impl(qwen_ctx_t *ctx, const float *samples, int n_samples,
 
         int suffix_off = prefix_len + enc_seq_len;
         for (int i = 0; i < SUFFIX_BASE_LEN; i++)
-            tok_embed_f16_to_f32(input_embeds + (suffix_off + i) * dim,
-                                  ctx->decoder.tok_embeddings_f16,
+            tok_embed_bf16_to_f32(input_embeds + (suffix_off + i) * dim,
+                                  ctx->decoder.tok_embeddings_bf16,
                                   PROMPT_SUFFIX_BASE[i], dim);
 
         for (int i = 0; i < ctx->n_force_prompt_tokens; i++)
-            tok_embed_f16_to_f32(input_embeds + (suffix_off + SUFFIX_BASE_LEN + i) * dim,
-                                  ctx->decoder.tok_embeddings_f16,
+            tok_embed_bf16_to_f32(input_embeds + (suffix_off + SUFFIX_BASE_LEN + i) * dim,
+                                  ctx->decoder.tok_embeddings_bf16,
                                   ctx->force_prompt_tokens[i], dim);
 
         int text_off = suffix_off + suffix_len;
         for (int i = 0; i < n_prefix_tokens; i++)
-            tok_embed_f16_to_f32(input_embeds + (text_off + i) * dim,
-                                  ctx->decoder.tok_embeddings_f16,
+            tok_embed_bf16_to_f32(input_embeds + (text_off + i) * dim,
+                                  ctx->decoder.tok_embeddings_bf16,
                                   raw_tokens[prefix_offset + i], dim);
 
         /* ---- Decoder prefill + first token ---- */
@@ -1935,7 +1831,7 @@ static char *stream_impl(qwen_ctx_t *ctx, const float *samples, int n_samples,
 
             chunk_tokens[n_chunk_tokens++] = token;
 
-            tok_embed_f16_to_f32(tmp_embed, ctx->decoder.tok_embeddings_f16, token, dim);
+            tok_embed_bf16_to_f32(tmp_embed, ctx->decoder.tok_embeddings_bf16, token, dim);
             token = qwen_decoder_forward(ctx, tmp_embed);
         }
 

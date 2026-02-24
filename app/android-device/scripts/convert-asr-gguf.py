@@ -131,44 +131,54 @@ def quantize_f32_to_q4_K(data: np.ndarray) -> bytes:
             q_scales[j] = min(63, int(np.round(scales[j] * inv_max_scale)))
             q_mins[j] = min(63, int(np.round(mins[j] * inv_max_min)))
 
-        # Pack scales/mins into 12 bytes (K_SCALE_SIZE)
-        # Layout from ggml: lower 4 bits in first 4 bytes, upper 2 bits packed later
+        # Pack scales/mins into 12 bytes (ggml standard layout)
+        # scales[0..3]: lower 6 bits = scale[0..3]
+        # scales[4..7]: lower 6 bits = min[0..3]
+        # For j >= 4: upper 2 bits stored in bits 6-7 of scales[j-4] and scales[j]
+        # scales[8..11]: lower 4 bits = scale[4..7] lower 4, upper 4 bits = min[4..7] lower 4
         packed_scales = bytearray(12)
-        # Bytes 0-3: lower nibbles of scales[0..3] | lower nibbles of mins[0..3]
-        packed_scales[0] = (q_scales[0] & 0x3F) | ((q_mins[0] & 0x3F) << 6) & 0xFF
-        packed_scales[1] = ((q_mins[0] >> 2) & 0x0F) | ((q_scales[1] & 0x3F) << 4) & 0xFF
-        packed_scales[2] = ((q_scales[1] >> 4) & 0x03) | ((q_mins[1] & 0x3F) << 2) & 0xFF
-        packed_scales[3] = (q_scales[2] & 0x3F) | ((q_mins[2] & 0x3F) << 6) & 0xFF
-        packed_scales[4] = ((q_mins[2] >> 2) & 0x0F) | ((q_scales[3] & 0x3F) << 4) & 0xFF
-        packed_scales[5] = ((q_scales[3] >> 4) & 0x03) | ((q_mins[3] & 0x3F) << 2) & 0xFF
-        packed_scales[6] = (q_scales[4] & 0x3F) | ((q_mins[4] & 0x3F) << 6) & 0xFF
-        packed_scales[7] = ((q_mins[4] >> 2) & 0x0F) | ((q_scales[5] & 0x3F) << 4) & 0xFF
-        packed_scales[8] = ((q_scales[5] >> 4) & 0x03) | ((q_mins[5] & 0x3F) << 2) & 0xFF
-        packed_scales[9] = (q_scales[6] & 0x3F) | ((q_mins[6] & 0x3F) << 6) & 0xFF
-        packed_scales[10] = ((q_mins[6] >> 2) & 0x0F) | ((q_scales[7] & 0x3F) << 4) & 0xFF
-        packed_scales[11] = ((q_scales[7] >> 4) & 0x03) | ((q_mins[7] & 0x3F) << 2) & 0xFF
+        for j in range(8):
+            ls = int(q_scales[j])
+            lm = int(q_mins[j])
+            if j < 4:
+                packed_scales[j] = ls
+                packed_scales[j + 4] = lm
+            else:
+                packed_scales[j + 4] = (ls & 0xF) | ((lm & 0xF) << 4)
+                packed_scales[j - 4] |= ((ls >> 4) << 6)
+                packed_scales[j - 0] |= ((lm >> 4) << 6)
 
-        # Quantize the 256 elements to 4-bit
+        # Quantize the 256 elements to 4-bit using unpacked scales
+        L = [0] * QK_K
         d_val = float(d)
         dmin_val = float(dmin)
-        qs = bytearray(QK_K // 2)  # 128 bytes
-
         for j in range(8):
-            sc = d_val * q_scales[j]
-            mn = dmin_val * q_mins[j]
+            # Unpack scale/min for this sub-block (same as get_scale_min_k4)
+            if j < 4:
+                sc = packed_scales[j] & 63
+                mn = packed_scales[j + 4] & 63
+            else:
+                sc = (packed_scales[j + 4] & 0xF) | ((packed_scales[j - 4] >> 6) << 4)
+                mn = (packed_scales[j + 4] >> 4)  | ((packed_scales[j]     >> 6) << 4)
+            dd = d_val * sc
+            dm = dmin_val * mn
             for l in range(32):
                 idx = j * 32 + l
                 val = block[idx]
-                if sc > 0:
-                    q = int(np.round((val + mn) / sc))
+                if dd > 0:
+                    q = int(np.round((val + dm) / dd))
                 else:
                     q = 0
-                q = max(0, min(15, q))
-                byte_idx = idx // 2
-                if idx % 2 == 0:
-                    qs[byte_idx] = q
-                else:
-                    qs[byte_idx] |= (q << 4)
+                L[idx] = max(0, min(15, q))
+
+        # Pack nibbles in ggml layout: each 64-element group stores
+        # byte[k] = L[k] | (L[k+32] << 4) for k in 0..31
+        qs = bytearray(QK_K // 2)  # 128 bytes
+        qi = 0
+        for j in range(0, QK_K, 64):
+            for l in range(32):
+                qs[qi + l] = L[j + l] | (L[j + l + 32] << 4)
+            qi += 32
 
         # Pack the super-block: [fp16 d] [fp16 dmin] [12B scales] [128B quants]
         result += struct.pack('<e', float(d))

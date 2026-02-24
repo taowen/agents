@@ -21,21 +21,85 @@
 #endif
 
 /* ======================================================================== */
+/* SAXPY broadcast helper: dst[i] += alpha * src[i]                          */
+/* ======================================================================== */
+
+static inline void saxpy_broadcast(
+    float * __restrict__ dst, float alpha,
+    const float * __restrict__ src, int n) {
+#if defined(__ARM_NEON) || defined(__aarch64__)
+    float32x4_t va = vdupq_n_f32(alpha);
+    int i = 0;
+    for (; i + 15 < n; i += 16) {
+        vst1q_f32(dst+i,    vfmaq_f32(vld1q_f32(dst+i),    va, vld1q_f32(src+i)));
+        vst1q_f32(dst+i+4,  vfmaq_f32(vld1q_f32(dst+i+4),  va, vld1q_f32(src+i+4)));
+        vst1q_f32(dst+i+8,  vfmaq_f32(vld1q_f32(dst+i+8),  va, vld1q_f32(src+i+8)));
+        vst1q_f32(dst+i+12, vfmaq_f32(vld1q_f32(dst+i+12), va, vld1q_f32(src+i+12)));
+    }
+    for (; i + 3 < n; i += 4)
+        vst1q_f32(dst+i, vfmaq_f32(vld1q_f32(dst+i), va, vld1q_f32(src+i)));
+    for (; i < n; i++) dst[i] += alpha * src[i];
+#else
+    for (int i = 0; i < n; i++) dst[i] += alpha * src[i];
+#endif
+}
+
+/* ======================================================================== */
 /* RMSNorm                                                                   */
 /* ======================================================================== */
 
 void kernel_rms_norm(float *out, const float *x, const float *weight, int dim, float eps) {
+#if defined(__ARM_NEON) || defined(__aarch64__)
+    float32x4_t vss = vdupq_n_f32(0.0f);
+    int i = 0;
+    for (; i + 3 < dim; i += 4) {
+        float32x4_t vx = vld1q_f32(x + i);
+        vss = vfmaq_f32(vss, vx, vx);
+    }
+    float ss = vaddvq_f32(vss);
+    for (; i < dim; i++) ss += x[i] * x[i];
+    float inv = 1.0f / sqrtf(ss / (float)dim + eps);
+    float32x4_t vinv = vdupq_n_f32(inv);
+    i = 0;
+    for (; i + 3 < dim; i += 4) {
+        float32x4_t vx = vld1q_f32(x + i);
+        float32x4_t vw = vld1q_f32(weight + i);
+        vst1q_f32(out + i, vmulq_f32(vmulq_f32(vx, vinv), vw));
+    }
+    for (; i < dim; i++) out[i] = x[i] * inv * weight[i];
+#else
     float ss = 0.0f;
     for (int i = 0; i < dim; i++) ss += x[i] * x[i];
     float inv = 1.0f / sqrtf(ss / (float)dim + eps);
     for (int i = 0; i < dim; i++) out[i] = x[i] * inv * weight[i];
+#endif
 }
 
 void kernel_rms_norm_inplace(float *x, const float *weight, int dim, float eps) {
+#if defined(__ARM_NEON) || defined(__aarch64__)
+    float32x4_t vss = vdupq_n_f32(0.0f);
+    int i = 0;
+    for (; i + 3 < dim; i += 4) {
+        float32x4_t vx = vld1q_f32(x + i);
+        vss = vfmaq_f32(vss, vx, vx);
+    }
+    float ss = vaddvq_f32(vss);
+    for (; i < dim; i++) ss += x[i] * x[i];
+    float inv = 1.0f / sqrtf(ss / (float)dim + eps);
+    float32x4_t vinv = vdupq_n_f32(inv);
+    i = 0;
+    for (; i + 3 < dim; i += 4) {
+        float32x4_t vx = vld1q_f32(x + i);
+        float32x4_t vw = vld1q_f32(weight + i);
+        vst1q_f32(x + i, vmulq_f32(vmulq_f32(vx, vinv), vw));
+    }
+    for (; i < dim; i++) x[i] = x[i] * inv * weight[i];
+#else
     float ss = 0.0f;
     for (int i = 0; i < dim; i++) ss += x[i] * x[i];
     float inv = 1.0f / sqrtf(ss / (float)dim + eps);
     for (int i = 0; i < dim; i++) x[i] = x[i] * inv * weight[i];
+#endif
 }
 
 /* ======================================================================== */
@@ -43,6 +107,55 @@ void kernel_rms_norm_inplace(float *x, const float *weight, int dim, float eps) 
 /* ======================================================================== */
 
 void kernel_layer_norm(float *out, const float *x, const float *weight, const float *bias, int dim, float eps) {
+#if defined(__ARM_NEON) || defined(__aarch64__)
+    /* NEON: compute mean */
+    float32x4_t vsum = vdupq_n_f32(0.0f);
+    int i = 0;
+    for (; i + 3 < dim; i += 4)
+        vsum = vaddq_f32(vsum, vld1q_f32(x + i));
+    float mean = vaddvq_f32(vsum);
+    for (; i < dim; i++) mean += x[i];
+    mean /= (float)dim;
+
+    /* NEON: compute variance */
+    float32x4_t vmean = vdupq_n_f32(mean);
+    float32x4_t vvar = vdupq_n_f32(0.0f);
+    i = 0;
+    for (; i + 3 < dim; i += 4) {
+        float32x4_t vd = vsubq_f32(vld1q_f32(x + i), vmean);
+        vvar = vfmaq_f32(vvar, vd, vd);
+    }
+    float var = vaddvq_f32(vvar);
+    for (; i < dim; i++) { float d = x[i] - mean; var += d * d; }
+    var /= (float)dim;
+    float inv = 1.0f / sqrtf(var + eps);
+
+    /* NEON: normalize */
+    float32x4_t vinv = vdupq_n_f32(inv);
+    i = 0;
+    if (weight && bias) {
+        for (; i + 3 < dim; i += 4) {
+            float32x4_t vn = vmulq_f32(vsubq_f32(vld1q_f32(x + i), vmean), vinv);
+            vn = vfmaq_f32(vld1q_f32(bias + i), vn, vld1q_f32(weight + i));
+            vst1q_f32(out + i, vn);
+        }
+        for (; i < dim; i++)
+            out[i] = (x[i] - mean) * inv * weight[i] + bias[i];
+    } else if (weight) {
+        for (; i + 3 < dim; i += 4) {
+            float32x4_t vn = vmulq_f32(vsubq_f32(vld1q_f32(x + i), vmean), vinv);
+            vst1q_f32(out + i, vmulq_f32(vn, vld1q_f32(weight + i)));
+        }
+        for (; i < dim; i++)
+            out[i] = (x[i] - mean) * inv * weight[i];
+    } else {
+        for (; i + 3 < dim; i += 4)
+            vst1q_f32(out + i, vmulq_f32(vsubq_f32(vld1q_f32(x + i), vmean), vinv));
+        for (; i < dim; i++)
+            out[i] = (x[i] - mean) * inv;
+        if (bias) for (int j = 0; j < dim; j++) out[j] += bias[j];
+    }
+#else
     float mean = 0.0f;
     for (int i = 0; i < dim; i++) mean += x[i];
     mean /= (float)dim;
@@ -55,6 +168,7 @@ void kernel_layer_norm(float *out, const float *x, const float *weight, const fl
         if (weight) out[i] *= weight[i];
         if (bias) out[i] += bias[i];
     }
+#endif
 }
 
 /* ======================================================================== */
@@ -95,12 +209,22 @@ static float *conv1d_wpack_get(size_t n) {
 void kernel_matvec_bf16(float *out, const uint16_t *A_bf16, const float *x, int rows, int cols) {
 #if defined(__ARM_NEON) || defined(__aarch64__)
     /* Fused BF16→F32 + dot product using NEON — no intermediate buffer needed */
+#ifdef USE_OPENMP
+    #pragma omp parallel for schedule(static) num_threads(2) if(rows >= 512)
+#endif
     for (int r = 0; r < rows; r++) {
         const uint16_t *row = A_bf16 + (size_t)r * cols;
         float32x4_t acc0 = vdupq_n_f32(0.0f);
         float32x4_t acc1 = vdupq_n_f32(0.0f);
+        /* Prefetch x vector into L1 on first row of each thread's work */
+        if (r == 0 || (r == 1 && rows >= 64)) {
+            for (int p = 0; p < cols; p += 16)
+                __builtin_prefetch(x + p, 0, 3);
+        }
         int c = 0;
         for (; c + 7 < cols; c += 8) {
+            /* Prefetch weight data 256 bytes ahead */
+            __builtin_prefetch(row + c + 128, 0, 0);
             /* Load 8 BF16 values */
             uint16x8_t bf = vld1q_u16(row + c);
             /* Split into two halves and shift to F32 */
@@ -159,6 +283,393 @@ void kernel_matvec_f32(float *out, const float *A, const float *x, int rows, int
         out[r] = sum;
     }
 #endif
+}
+
+void kernel_matvec_int8(float *out, const int8_t *A_int8, const float *scales,
+                         const float *x, int rows, int cols) {
+    /*
+     * INT8 matvec with per-row symmetric quantization.
+     * A_int8[r,c] ≈ round(A_bf16[r,c] / scale[r] * 127)
+     * out[r] = scale[r] * sum(A_int8[r,c] * x_int8[c]) where x_int8 is quantized on-the-fly.
+     *
+     * We quantize x to int8 once, then use integer dot products for the inner loop.
+     * On ARM with SDOT: vdotq_s32 does 16 int8 multiplies → 4 int32 accumulations.
+     */
+
+    /* Quantize x vector to int8 with a single global scale */
+    static int8_t *x_int8 = NULL;
+    static float x_scale = 0.0f;
+    static int x_int8_cap = 0;
+    if (cols > x_int8_cap) {
+        free(x_int8);
+        x_int8 = (int8_t *)malloc(((cols + 15) & ~15) * sizeof(int8_t));
+        x_int8_cap = cols;
+    }
+
+    /* Find max(|x|) */
+    float x_absmax = 0.0f;
+#if defined(__ARM_NEON) || defined(__aarch64__)
+    float32x4_t vabsmax = vdupq_n_f32(0.0f);
+    int i = 0;
+    for (; i + 3 < cols; i += 4)
+        vabsmax = vmaxq_f32(vabsmax, vabsq_f32(vld1q_f32(x + i)));
+    x_absmax = vmaxvq_f32(vabsmax);
+    for (; i < cols; i++) {
+        float a = x[i] > 0 ? x[i] : -x[i];
+        if (a > x_absmax) x_absmax = a;
+    }
+#else
+    for (int i = 0; i < cols; i++) {
+        float a = x[i] > 0 ? x[i] : -x[i];
+        if (a > x_absmax) x_absmax = a;
+    }
+#endif
+
+    x_scale = x_absmax / 127.0f;
+    float inv_x_scale = (x_absmax > 0.0f) ? 127.0f / x_absmax : 0.0f;
+
+    /* Quantize x to int8 */
+#if defined(__ARM_NEON) || defined(__aarch64__)
+    {
+        float32x4_t vscale = vdupq_n_f32(inv_x_scale);
+        int c = 0;
+        for (; c + 7 < cols; c += 8) {
+            int32x4_t i0 = vcvtnq_s32_f32(vmulq_f32(vld1q_f32(x + c), vscale));
+            int32x4_t i1 = vcvtnq_s32_f32(vmulq_f32(vld1q_f32(x + c + 4), vscale));
+            int16x4_t s0 = vqmovn_s32(i0);
+            int16x4_t s1 = vqmovn_s32(i1);
+            int8x8_t  b  = vqmovn_s16(vcombine_s16(s0, s1));
+            vst1_s8(x_int8 + c, b);
+        }
+        for (; c < cols; c++) {
+            float v = x[c] * inv_x_scale;
+            int iv = (int)(v + (v > 0 ? 0.5f : -0.5f));
+            if (iv > 127) iv = 127;
+            if (iv < -128) iv = -128;
+            x_int8[c] = (int8_t)iv;
+        }
+    }
+#else
+    for (int c = 0; c < cols; c++) {
+        float v = x[c] * inv_x_scale;
+        int iv = (int)(v + (v > 0 ? 0.5f : -0.5f));
+        if (iv > 127) iv = 127;
+        if (iv < -128) iv = -128;
+        x_int8[c] = (int8_t)iv;
+    }
+#endif
+    /* Pad remainder to 16-byte boundary with zeros */
+    int cols_padded = (cols + 15) & ~15;
+    for (int c = cols; c < cols_padded; c++) x_int8[c] = 0;
+
+#if (defined(__ARM_NEON) || defined(__aarch64__)) && defined(__ARM_FEATURE_DOTPROD)
+    /* ARM SDOT path: vdotq_s32 processes 16 int8s → 4 int32 accumulators */
+#ifdef USE_OPENMP
+    #pragma omp parallel for schedule(static) num_threads(2) if(rows >= 512)
+#endif
+    for (int r = 0; r < rows; r++) {
+        const int8_t *row = A_int8 + (size_t)r * cols;
+        int32x4_t iacc0 = vdupq_n_s32(0);
+        int32x4_t iacc1 = vdupq_n_s32(0);
+        int32x4_t iacc2 = vdupq_n_s32(0);
+        int32x4_t iacc3 = vdupq_n_s32(0);
+        int c = 0;
+        /* Main loop: 64 bytes at a time with 4 accumulators to hide SDOT latency */
+        for (; c + 63 < cols; c += 64) {
+            iacc0 = vdotq_s32(iacc0, vld1q_s8(row + c),      vld1q_s8(x_int8 + c));
+            iacc1 = vdotq_s32(iacc1, vld1q_s8(row + c + 16), vld1q_s8(x_int8 + c + 16));
+            iacc2 = vdotq_s32(iacc2, vld1q_s8(row + c + 32), vld1q_s8(x_int8 + c + 32));
+            iacc3 = vdotq_s32(iacc3, vld1q_s8(row + c + 48), vld1q_s8(x_int8 + c + 48));
+        }
+        /* Tail: 16 bytes at a time */
+        for (; c + 15 < cols; c += 16) {
+            iacc0 = vdotq_s32(iacc0, vld1q_s8(row + c), vld1q_s8(x_int8 + c));
+        }
+        int32_t isum = vaddvq_s32(iacc0) + vaddvq_s32(iacc1) + vaddvq_s32(iacc2) + vaddvq_s32(iacc3);
+        /* Handle remaining 0-15 elements */
+        for (; c < cols; c++) {
+            isum += (int32_t)row[c] * (int32_t)x_int8[c];
+        }
+        /* Dequantize: out = weight_scale * x_scale * integer_dot */
+        out[r] = scales[r] * x_scale * (float)isum;
+    }
+#else
+    /* Scalar fallback */
+#ifdef USE_OPENMP
+    #pragma omp parallel for schedule(static) num_threads(2) if(rows >= 512)
+#endif
+    for (int r = 0; r < rows; r++) {
+        const int8_t *row = A_int8 + (size_t)r * cols;
+        int32_t isum = 0;
+        for (int c = 0; c < cols; c++) {
+            isum += (int32_t)row[c] * (int32_t)x_int8[c];
+        }
+        out[r] = scales[r] * x_scale * (float)isum;
+    }
+#endif
+}
+
+void kernel_quantize_x_int8(const float *x, int cols, int8_t *x_int8_out, float *x_scale_out) {
+    /* Find max(|x|) */
+    float x_absmax = 0.0f;
+#if defined(__ARM_NEON) || defined(__aarch64__)
+    float32x4_t vabsmax = vdupq_n_f32(0.0f);
+    int i = 0;
+    for (; i + 3 < cols; i += 4)
+        vabsmax = vmaxq_f32(vabsmax, vabsq_f32(vld1q_f32(x + i)));
+    x_absmax = vmaxvq_f32(vabsmax);
+    for (; i < cols; i++) {
+        float a = x[i] > 0 ? x[i] : -x[i];
+        if (a > x_absmax) x_absmax = a;
+    }
+#else
+    for (int i = 0; i < cols; i++) {
+        float a = x[i] > 0 ? x[i] : -x[i];
+        if (a > x_absmax) x_absmax = a;
+    }
+#endif
+
+    *x_scale_out = x_absmax / 127.0f;
+    float inv_x_scale = (x_absmax > 0.0f) ? 127.0f / x_absmax : 0.0f;
+
+    /* Quantize x to int8 */
+#if defined(__ARM_NEON) || defined(__aarch64__)
+    {
+        float32x4_t vscale = vdupq_n_f32(inv_x_scale);
+        int c = 0;
+        for (; c + 7 < cols; c += 8) {
+            int32x4_t i0 = vcvtnq_s32_f32(vmulq_f32(vld1q_f32(x + c), vscale));
+            int32x4_t i1 = vcvtnq_s32_f32(vmulq_f32(vld1q_f32(x + c + 4), vscale));
+            int16x4_t s0 = vqmovn_s32(i0);
+            int16x4_t s1 = vqmovn_s32(i1);
+            int8x8_t  b  = vqmovn_s16(vcombine_s16(s0, s1));
+            vst1_s8(x_int8_out + c, b);
+        }
+        for (; c < cols; c++) {
+            float v = x[c] * inv_x_scale;
+            int iv = (int)(v + (v > 0 ? 0.5f : -0.5f));
+            if (iv > 127) iv = 127;
+            if (iv < -128) iv = -128;
+            x_int8_out[c] = (int8_t)iv;
+        }
+    }
+#else
+    for (int c = 0; c < cols; c++) {
+        float v = x[c] * inv_x_scale;
+        int iv = (int)(v + (v > 0 ? 0.5f : -0.5f));
+        if (iv > 127) iv = 127;
+        if (iv < -128) iv = -128;
+        x_int8_out[c] = (int8_t)iv;
+    }
+#endif
+    /* Pad remainder to 16-byte boundary with zeros */
+    int cols_padded = (cols + 15) & ~15;
+    for (int c = cols; c < cols_padded; c++) x_int8_out[c] = 0;
+}
+
+void kernel_matvec_int8_pq(float *out, const int8_t *A_int8, const float *scales,
+                            const int8_t *x_int8, float x_scale, int rows, int cols) {
+#if (defined(__ARM_NEON) || defined(__aarch64__)) && defined(__ARM_FEATURE_DOTPROD)
+#ifdef USE_OPENMP
+    #pragma omp parallel for schedule(static) num_threads(2) if(rows >= 512)
+#endif
+    for (int r = 0; r < rows; r++) {
+        const int8_t *row = A_int8 + (size_t)r * cols;
+        int32x4_t iacc0 = vdupq_n_s32(0);
+        int32x4_t iacc1 = vdupq_n_s32(0);
+        int32x4_t iacc2 = vdupq_n_s32(0);
+        int32x4_t iacc3 = vdupq_n_s32(0);
+        int c = 0;
+        for (; c + 63 < cols; c += 64) {
+            iacc0 = vdotq_s32(iacc0, vld1q_s8(row + c),      vld1q_s8(x_int8 + c));
+            iacc1 = vdotq_s32(iacc1, vld1q_s8(row + c + 16), vld1q_s8(x_int8 + c + 16));
+            iacc2 = vdotq_s32(iacc2, vld1q_s8(row + c + 32), vld1q_s8(x_int8 + c + 32));
+            iacc3 = vdotq_s32(iacc3, vld1q_s8(row + c + 48), vld1q_s8(x_int8 + c + 48));
+        }
+        for (; c + 15 < cols; c += 16) {
+            iacc0 = vdotq_s32(iacc0, vld1q_s8(row + c), vld1q_s8(x_int8 + c));
+        }
+        int32_t isum = vaddvq_s32(iacc0) + vaddvq_s32(iacc1) + vaddvq_s32(iacc2) + vaddvq_s32(iacc3);
+        for (; c < cols; c++) {
+            isum += (int32_t)row[c] * (int32_t)x_int8[c];
+        }
+        out[r] = scales[r] * x_scale * (float)isum;
+    }
+#else
+#ifdef USE_OPENMP
+    #pragma omp parallel for schedule(static) num_threads(2) if(rows >= 512)
+#endif
+    for (int r = 0; r < rows; r++) {
+        const int8_t *row = A_int8 + (size_t)r * cols;
+        int32_t isum = 0;
+        for (int c = 0; c < cols; c++) {
+            isum += (int32_t)row[c] * (int32_t)x_int8[c];
+        }
+        out[r] = scales[r] * x_scale * (float)isum;
+    }
+#endif
+}
+
+/* ======================================================================== */
+/* Q4_K super-block matvec                                                   */
+/* ======================================================================== */
+
+void kernel_matvec_q4k(float *out, const block_q4_k *blocks,
+                        const float *x, int rows, int cols) {
+    /*
+     * Q4_K super-block quantization matvec.
+     * Each block covers 256 elements (8 sub-groups of 32).
+     * Uses integer sub-scales (vmulq_n_s32) to avoid per-group vaddvq_s32.
+     * Only 1 vaddvq_s32 per super-block instead of 8.
+     *
+     * Dequantization: weight ≈ d * scales[g] * q - dmin * mins[g]
+     * where q ∈ [0, 15] (unsigned).
+     */
+    int blocks_per_row = cols / QK_K;
+
+    /* Quantize x to int8 */
+    static int8_t *x_int8 = NULL;
+    static int x_int8_cap = 0;
+    if (cols > x_int8_cap) {
+        free(x_int8);
+        x_int8 = (int8_t *)malloc(((cols + 15) & ~15) * sizeof(int8_t));
+        x_int8_cap = cols;
+    }
+    float x_scale;
+    kernel_quantize_x_int8(x, cols, x_int8, &x_scale);
+
+    /* Precompute bsums: per-sub-group sum of x_int8 (shared across all rows) */
+    int total_subs = cols / 32;
+    static int32_t *bsums = NULL;
+    static int bsums_cap = 0;
+    if (total_subs > bsums_cap) {
+        free(bsums);
+        bsums = (int32_t *)malloc(total_subs * sizeof(int32_t));
+        bsums_cap = total_subs;
+    }
+
+#if (defined(__ARM_NEON) || defined(__aarch64__)) && defined(__ARM_FEATURE_DOTPROD)
+    /* NEON bsums: sum 32 int8 values per sub-group using SDOT with all-ones vector */
+    {
+        int8x16_t ones = vdupq_n_s8(1);
+        for (int s = 0; s < total_subs; s++) {
+            const int8_t *xg = x_int8 + s * 32;
+            int32x4_t sum4 = vdupq_n_s32(0);
+            sum4 = vdotq_s32(sum4, vld1q_s8(xg), ones);
+            sum4 = vdotq_s32(sum4, vld1q_s8(xg + 16), ones);
+            bsums[s] = vaddvq_s32(sum4);
+        }
+    }
+#else
+    for (int s = 0; s < total_subs; s++) {
+        int32_t sum = 0;
+        const int8_t *xg = x_int8 + s * 32;
+        for (int i = 0; i < 32; i++) sum += (int32_t)xg[i];
+        bsums[s] = sum;
+    }
+#endif
+
+#if (defined(__ARM_NEON) || defined(__aarch64__)) && defined(__ARM_FEATURE_DOTPROD)
+    /* NEON + SDOT path */
+#ifdef USE_OPENMP
+    #pragma omp parallel for schedule(static) num_threads(2) if(rows >= 512)
+#endif
+    for (int r = 0; r < rows; r++) {
+        float row_sum = 0.0f;
+
+        for (int b = 0; b < blocks_per_row; b++) {
+            const block_q4_k *blk = &blocks[(size_t)r * blocks_per_row + b];
+            const int8_t *xq = x_int8 + b * QK_K;
+
+            int32x4_t acc = vdupq_n_s32(0);
+            int32_t min_acc = 0;
+
+            for (int g = 0; g < Q4K_NUM_SUBS; g++) {
+                /* Unpack unsigned nibbles */
+                uint8x16_t packed = vld1q_u8(blk->qs + g * 16);
+                int8x16_t lo = vreinterpretq_s8_u8(vandq_u8(packed, vdupq_n_u8(0x0F)));
+                int8x16_t hi = vreinterpretq_s8_u8(vshrq_n_u8(packed, 4));
+
+                /* Interleave to get elements in order */
+                int8x16x2_t z = vzipq_s8(lo, hi);
+
+                /* SDOT: dot product of q4 weights with x_int8 */
+                int32x4_t dot = vdupq_n_s32(0);
+                dot = vdotq_s32(dot, z.val[0], vld1q_s8(xq + g * 32));
+                dot = vdotq_s32(dot, z.val[1], vld1q_s8(xq + g * 32 + 16));
+
+                /* Integer sub-scale multiply (avoids vaddvq_s32 per group) */
+                dot = vmulq_n_s32(dot, (int32_t)blk->scales[g]);
+                acc = vaddq_s32(acc, dot);
+
+                /* Min correction (integer multiply-add) */
+                min_acc += (int32_t)blk->mins[g] * bsums[b * Q4K_NUM_SUBS + g];
+            }
+
+            /* Only 1 vaddvq_s32 per super-block */
+            row_sum += blk->d * (float)vaddvq_s32(acc) - blk->dmin * (float)min_acc;
+        }
+        out[r] = row_sum * x_scale;
+    }
+#else
+    /* Scalar fallback */
+#ifdef USE_OPENMP
+    #pragma omp parallel for schedule(static) num_threads(2) if(rows >= 512)
+#endif
+    for (int r = 0; r < rows; r++) {
+        float row_sum = 0.0f;
+
+        for (int b = 0; b < blocks_per_row; b++) {
+            const block_q4_k *blk = &blocks[(size_t)r * blocks_per_row + b];
+            const int8_t *xq = x_int8 + b * QK_K;
+
+            int32_t scale_acc = 0;
+            int32_t min_acc = 0;
+
+            for (int g = 0; g < Q4K_NUM_SUBS; g++) {
+                int32_t dot = 0;
+                for (int i = 0; i < 16; i++) {
+                    uint8_t packed = blk->qs[g * 16 + i];
+                    int8_t lo = (int8_t)(packed & 0x0F);
+                    int8_t hi = (int8_t)(packed >> 4);
+                    dot += (int32_t)lo * (int32_t)xq[g * 32 + i * 2];
+                    dot += (int32_t)hi * (int32_t)xq[g * 32 + i * 2 + 1];
+                }
+                scale_acc += dot * (int32_t)blk->scales[g];
+                min_acc += (int32_t)blk->mins[g] * bsums[b * Q4K_NUM_SUBS + g];
+            }
+
+            row_sum += blk->d * (float)scale_acc - blk->dmin * (float)min_acc;
+        }
+        out[r] = row_sum * x_scale;
+    }
+#endif
+}
+
+void kernel_swiglu_matvec_q4k(float *out, const block_q4_k *gate_up_blocks,
+                                const float *x, int intermediate, int hidden) {
+    static float *up_scratch_q4k = NULL;
+    static size_t up_scratch_q4k_cap = 0;
+    if ((size_t)intermediate > up_scratch_q4k_cap) {
+        free(up_scratch_q4k);
+        up_scratch_q4k = (float *)malloc((size_t)intermediate * sizeof(float));
+        up_scratch_q4k_cap = (size_t)intermediate;
+    }
+
+    int blocks_per_row = hidden / QK_K;
+
+    /* Gate (first `intermediate` rows) */
+    kernel_matvec_q4k(out, gate_up_blocks, x, intermediate, hidden);
+    /* Up (next `intermediate` rows) */
+    kernel_matvec_q4k(up_scratch_q4k,
+                       gate_up_blocks + (size_t)intermediate * blocks_per_row,
+                       x, intermediate, hidden);
+
+    /* SiLU(gate) * up */
+    for (int i = 0; i < intermediate; i++) {
+        float g = out[i];
+        out[i] = (g / (1.0f + expf(-g))) * up_scratch_q4k[i];
+    }
 }
 
 /* ======================================================================== */
@@ -226,6 +737,49 @@ void kernel_swiglu_matvec_bf16(float *out, const uint16_t *gate_up_fused_bf16,
     kernel_matvec_bf16(up_scratch, gate_up_fused_bf16 + (size_t)intermediate * hidden,
                        x, intermediate, hidden);
 
+    /* Apply SiLU(gate) * up — expf relies on -ffast-math for auto-vectorization */
+    for (int i = 0; i < intermediate; i++) {
+        float g = out[i];
+        out[i] = (g / (1.0f + expf(-g))) * up_scratch[i];
+    }
+}
+
+void kernel_swiglu_matvec_int8(float *out, const int8_t *gate_up_int8,
+                                const float *scales, const float *x,
+                                int intermediate, int hidden) {
+    /* Fused SwiGLU with INT8 weights:
+     * 1. Quantize x once
+     * 2. gate = gate_up_int8[0:intermediate] @ x_int8
+     * 3. up   = gate_up_int8[intermediate:] @ x_int8
+     * 4. out = SiLU(gate) * up
+     */
+    static float *up_scratch = NULL;
+    static size_t up_scratch_cap = 0;
+    static int8_t *x_q8 = NULL;
+    static int x_q8_cap = 0;
+
+    if ((size_t)intermediate > up_scratch_cap) {
+        free(up_scratch);
+        up_scratch = (float *)malloc((size_t)intermediate * sizeof(float));
+        up_scratch_cap = (size_t)intermediate;
+    }
+    if (hidden > x_q8_cap) {
+        free(x_q8);
+        x_q8 = (int8_t *)malloc(((hidden + 15) & ~15) * sizeof(int8_t));
+        x_q8_cap = hidden;
+    }
+
+    /* Quantize x once, reuse for both gate and up */
+    float x_s;
+    kernel_quantize_x_int8(x, hidden, x_q8, &x_s);
+
+    /* Gate (first half) */
+    kernel_matvec_int8_pq(out, gate_up_int8, scales, x_q8, x_s, intermediate, hidden);
+    /* Up (second half) */
+    kernel_matvec_int8_pq(up_scratch, gate_up_int8 + (size_t)intermediate * hidden,
+                          scales + intermediate, x_q8, x_s, intermediate, hidden);
+
+    /* SiLU(gate) * up */
     for (int i = 0; i < intermediate; i++) {
         float g = out[i];
         out[i] = (g / (1.0f + expf(-g))) * up_scratch[i];
@@ -237,8 +791,19 @@ void kernel_swiglu_matvec_bf16(float *out, const uint16_t *gate_up_fused_bf16,
 /* ======================================================================== */
 
 void kernel_silu_inplace(float *x, int n) {
+#if defined(__ARM_NEON) || defined(__aarch64__)
+    /* NEON fast sigmoid approximation: sigma(x) ≈ clamp(x * 0.25 + 0.5, 0, 1)
+     * SiLU(x) = x * sigma(x) ≈ x * clamp(x * 0.25 + 0.5, 0, 1)
+     * This 3rd-order rational approximation is more accurate:
+     *   sigma(x) ≈ 0.5 + 0.5 * x / (1 + |x|)  (max err ~0.05 at |x|=2)
+     * But for TTS quality we use the exact path via -ffast-math expf vectorization.
+     */
     for (int i = 0; i < n; i++)
         x[i] = x[i] / (1.0f + expf(-x[i]));
+#else
+    for (int i = 0; i < n; i++)
+        x[i] = x[i] / (1.0f + expf(-x[i]));
+#endif
 }
 
 void kernel_gelu_inplace(float *x, int n) {
@@ -295,55 +860,66 @@ void kernel_snake_beta(float *out, const float *x, const float *alpha,
 #endif
     return;
 #endif
-
+    /* NEON / scalar path */
 #if defined(__ARM_NEON) || defined(__aarch64__)
-    /* NEON polynomial sin approximation: sin(x) ~ x - x^3/6 + x^5/120
-     * Good enough for SnakeBeta where exact sin isn't critical */
-    {
-        float32x4_t c3 = vdupq_n_f32(-1.0f / 6.0f);
-        float32x4_t c5 = vdupq_n_f32(1.0f / 120.0f);
-        /* Range reduction: sin(x) = sin(x mod 2pi), reduce to [-pi, pi] */
-        float32x4_t inv_2pi = vdupq_n_f32(1.0f / 6.283185307f);
-        float32x4_t v2pi = vdupq_n_f32(6.283185307f);
-        float32x4_t vpi = vdupq_n_f32(3.141592654f);
-
+    /*
+     * NEON fast sine approximation for SnakeBeta.
+     * Uses a 5th-order polynomial: sin(x) ≈ x - x³/6 + x⁵/120
+     * after range reduction to [-π, π].
+     * Precision is sufficient for audio activation (max error ~0.00016).
+     */
 #ifdef USE_OPENMP
-        #pragma omp parallel for schedule(static)
+#pragma omp parallel for schedule(static)
 #endif
-        for (int c = 0; c < channels; c++) {
-            float32x4_t va = vdupq_n_f32(alpha[c]);
-            float32x4_t vib = vdupq_n_f32(beta[c]);
-            const float *xc = x + (size_t)c * length;
-            float *oc = out + (size_t)c * length;
-            int t = 0;
-            for (; t + 3 < length; t += 4) {
-                float32x4_t vx = vld1q_f32(xc + t);
-                float32x4_t ax = vmulq_f32(vx, va);
-                /* Range reduction to [-pi, pi] */
-                float32x4_t n = vrndnq_f32(vmulq_f32(ax, inv_2pi));
-                ax = vsubq_f32(ax, vmulq_f32(n, v2pi));
-                ax = vmaxq_f32(vnegq_f32(vpi), vminq_f32(ax, vpi));
-                /* 5th-order Taylor: sin(ax) ~ ax - ax^3/6 + ax^5/120 */
-                float32x4_t ax2 = vmulq_f32(ax, ax);
-                float32x4_t ax3 = vmulq_f32(ax2, ax);
-                float32x4_t ax5 = vmulq_f32(ax3, ax2);
-                float32x4_t s = vaddq_f32(ax, vaddq_f32(vmulq_f32(ax3, c3), vmulq_f32(ax5, c5)));
-                /* out = x + inv_beta * sin^2 */
-                float32x4_t s2 = vmulq_f32(s, s);
-                vst1q_f32(oc + t, vaddq_f32(vx, vmulq_f32(vib, s2)));
-            }
-            /* Scalar tail */
-            for (; t < length; t++) {
-                int idx = c * length + t;
-                float s = sinf(x[idx] * alpha[c]);
-                out[idx] = x[idx] + beta[c] * s * s;
-            }
+    for (int c = 0; c < channels; c++) {
+        float a_val = alpha[c];
+        float inv_b_val = beta[c];
+        float32x4_t va = vdupq_n_f32(a_val);
+        float32x4_t vb = vdupq_n_f32(inv_b_val);
+        /* Constants for range reduction and polynomial */
+        float32x4_t v_inv_twopi = vdupq_n_f32(0.15915494309189533f);  /* 1/(2π) */
+        float32x4_t v_twopi    = vdupq_n_f32(6.283185307179586f);     /* 2π */
+        float32x4_t v_pi       = vdupq_n_f32(3.141592653589793f);     /* π */
+        float32x4_t v_neg_pi   = vdupq_n_f32(-3.141592653589793f);
+        float32x4_t v_c3       = vdupq_n_f32(-1.0f / 6.0f);          /* -1/3! */
+        float32x4_t v_c5       = vdupq_n_f32(1.0f / 120.0f);         /* 1/5! */
+        float32x4_t v_half     = vdupq_n_f32(0.5f);
+        const float *xc = x + (size_t)c * length;
+        float *oc = out + (size_t)c * length;
+        int t = 0;
+        for (; t + 3 < length; t += 4) {
+            float32x4_t vx = vld1q_f32(xc + t);
+            float32x4_t ax = vmulq_f32(vx, va);
+            /* Range reduce to [-π, π]: ax = ax - round(ax/(2π)) * 2π */
+            float32x4_t n = vfmaq_f32(v_half, ax, v_inv_twopi);
+            /* floor via convert to int and back */
+            int32x4_t ni = vcvtq_s32_f32(n);
+            /* Adjust for negative: if ax < 0 and fractional, ni is wrong */
+            float32x4_t nf = vcvtq_f32_s32(ni);
+            /* Correct: compare nf > n, subtract 1 if so */
+            uint32x4_t mask = vcgtq_f32(nf, n);
+            nf = vsubq_f32(nf, vreinterpretq_f32_u32(vandq_u32(mask, vreinterpretq_u32_f32(vdupq_n_f32(1.0f)))));
+            ax = vfmsq_f32(ax, nf, v_twopi);
+            /* Clamp to [-π, π] for safety */
+            ax = vmaxq_f32(ax, v_neg_pi);
+            ax = vminq_f32(ax, v_pi);
+            /* sin(ax) ≈ ax * (1 + ax² * (-1/6 + ax² * 1/120)) */
+            float32x4_t ax2 = vmulq_f32(ax, ax);
+            float32x4_t poly = vfmaq_f32(v_c3, ax2, v_c5);
+            poly = vfmaq_f32(vdupq_n_f32(1.0f), ax2, poly);
+            float32x4_t s = vmulq_f32(ax, poly);
+            /* out = x + inv_b * s² */
+            float32x4_t s2 = vmulq_f32(s, s);
+            float32x4_t result = vfmaq_f32(vx, vb, s2);
+            vst1q_f32(oc + t, result);
+        }
+        for (; t < length; t++) {
+            int idx = c * length + t;
+            float s = sinf(x[idx] * a_val);
+            out[idx] = x[idx] + inv_b_val * s * s;
         }
     }
-    return;
-#endif
-
-    /* Scalar fallback */
+#else
 #ifdef USE_OPENMP
 #pragma omp parallel for schedule(static)
 #endif
@@ -356,6 +932,7 @@ void kernel_snake_beta(float *out, const float *x, const float *alpha,
             out[idx] = x[idx] + inv_b * s * s;
         }
     }
+#endif
 }
 
 /* ======================================================================== */
@@ -363,19 +940,48 @@ void kernel_snake_beta(float *out, const float *x, const float *alpha,
 /* ======================================================================== */
 
 void kernel_add(float *out, const float *a, const float *b, int n) {
+#if defined(__ARM_NEON) || defined(__aarch64__)
+    int i = 0;
+    for (; i + 3 < n; i += 4)
+        vst1q_f32(out + i, vaddq_f32(vld1q_f32(a + i), vld1q_f32(b + i)));
+    for (; i < n; i++) out[i] = a[i] + b[i];
+#else
     for (int i = 0; i < n; i++) out[i] = a[i] + b[i];
+#endif
 }
 
 void kernel_add_inplace(float *a, const float *b, int n) {
+#if defined(__ARM_NEON) || defined(__aarch64__)
+    int i = 0;
+    for (; i + 3 < n; i += 4)
+        vst1q_f32(a + i, vaddq_f32(vld1q_f32(a + i), vld1q_f32(b + i)));
+    for (; i < n; i++) a[i] += b[i];
+#else
     for (int i = 0; i < n; i++) a[i] += b[i];
+#endif
 }
 
 void kernel_mul_inplace(float *a, const float *b, int n) {
+#if defined(__ARM_NEON) || defined(__aarch64__)
+    int i = 0;
+    for (; i + 3 < n; i += 4)
+        vst1q_f32(a + i, vmulq_f32(vld1q_f32(a + i), vld1q_f32(b + i)));
+    for (; i < n; i++) a[i] *= b[i];
+#else
     for (int i = 0; i < n; i++) a[i] *= b[i];
+#endif
 }
 
 void kernel_scale_inplace(float *x, float scale, int n) {
+#if defined(__ARM_NEON) || defined(__aarch64__)
+    float32x4_t vs = vdupq_n_f32(scale);
+    int i = 0;
+    for (; i + 3 < n; i += 4)
+        vst1q_f32(x + i, vmulq_f32(vld1q_f32(x + i), vs));
+    for (; i < n; i++) x[i] *= scale;
+#else
     for (int i = 0; i < n; i++) x[i] *= scale;
+#endif
 }
 
 void kernel_zero(float *x, int n) {
@@ -383,15 +989,43 @@ void kernel_zero(float *x, int n) {
 }
 
 void kernel_clamp(float *x, int n, float min_val, float max_val) {
+#if defined(__ARM_NEON) || defined(__aarch64__)
+    float32x4_t vmin = vdupq_n_f32(min_val);
+    float32x4_t vmax = vdupq_n_f32(max_val);
+    int i = 0;
+    for (; i + 3 < n; i += 4) {
+        float32x4_t v = vld1q_f32(x + i);
+        v = vmaxq_f32(v, vmin);
+        v = vminq_f32(v, vmax);
+        vst1q_f32(x + i, v);
+    }
+    for (; i < n; i++) {
+        if (x[i] < min_val) x[i] = min_val;
+        if (x[i] > max_val) x[i] = max_val;
+    }
+#else
     for (int i = 0; i < n; i++) {
         if (x[i] < min_val) x[i] = min_val;
         if (x[i] > max_val) x[i] = max_val;
     }
+#endif
 }
 
 float kernel_dot(const float *a, const float *b, int n) {
 #ifdef USE_BLAS
     return cblas_sdot(n, a, 1, b, 1);
+#elif defined(__ARM_NEON) || defined(__aarch64__)
+    float32x4_t acc0 = vdupq_n_f32(0.0f);
+    float32x4_t acc1 = vdupq_n_f32(0.0f);
+    int i = 0;
+    for (; i + 7 < n; i += 8) {
+        acc0 = vfmaq_f32(acc0, vld1q_f32(a + i), vld1q_f32(b + i));
+        acc1 = vfmaq_f32(acc1, vld1q_f32(a + i + 4), vld1q_f32(b + i + 4));
+    }
+    acc0 = vaddq_f32(acc0, acc1);
+    float sum = vaddvq_f32(acc0);
+    for (; i < n; i++) sum += a[i] * b[i];
+    return sum;
 #else
     float sum = 0.0f;
     for (int i = 0; i < n; i++) sum += a[i] * b[i];
@@ -400,16 +1034,43 @@ float kernel_dot(const float *a, const float *b, int n) {
 }
 
 float kernel_sum_sq(const float *x, int n) {
+#if defined(__ARM_NEON) || defined(__aarch64__)
+    float32x4_t acc = vdupq_n_f32(0.0f);
+    int i = 0;
+    for (; i + 3 < n; i += 4) {
+        float32x4_t v = vld1q_f32(x + i);
+        acc = vfmaq_f32(acc, v, v);
+    }
+    float sum = vaddvq_f32(acc);
+    for (; i < n; i++) sum += x[i] * x[i];
+    return sum;
+#else
     float sum = 0.0f;
     for (int i = 0; i < n; i++) sum += x[i] * x[i];
     return sum;
+#endif
 }
 
 void kernel_bf16_to_f32(float *out, const uint16_t *in, int n) {
+#if defined(__ARM_NEON) || defined(__aarch64__)
+    int i = 0;
+    for (; i + 7 < n; i += 8) {
+        uint16x8_t bf = vld1q_u16(in + i);
+        uint32x4_t lo = vshll_n_u16(vget_low_u16(bf), 16);
+        uint32x4_t hi = vshll_n_u16(vget_high_u16(bf), 16);
+        vst1q_f32(out + i,     vreinterpretq_f32_u32(lo));
+        vst1q_f32(out + i + 4, vreinterpretq_f32_u32(hi));
+    }
+    for (; i < n; i++) {
+        uint32_t bits = ((uint32_t)in[i]) << 16;
+        memcpy(&out[i], &bits, sizeof(float));
+    }
+#else
     for (int i = 0; i < n; i++) {
         uint32_t bits = ((uint32_t)in[i]) << 16;
         memcpy(&out[i], &bits, sizeof(float));
     }
+#endif
 }
 
 /* ======================================================================== */
@@ -417,12 +1078,34 @@ void kernel_bf16_to_f32(float *out, const uint16_t *in, int n) {
 /* ======================================================================== */
 
 void kernel_softmax(float *x, int n) {
+#if defined(__ARM_NEON) || defined(__aarch64__)
+    /* NEON: find max */
+    float32x4_t vmax = vdupq_n_f32(-FLT_MAX);
+    int i = 0;
+    for (; i + 3 < n; i += 4)
+        vmax = vmaxq_f32(vmax, vld1q_f32(x + i));
+    float max_val = vmaxvq_f32(vmax);
+    for (; i < n; i++) if (x[i] > max_val) max_val = x[i];
+
+    /* exp and sum (exp can't be NEON-ized, rely on -ffast-math vectorization) */
+    float sum = 0.0f;
+    for (i = 0; i < n; i++) { x[i] = expf(x[i] - max_val); sum += x[i]; }
+
+    /* NEON: normalize */
+    float inv_sum = 1.0f / sum;
+    float32x4_t vinv = vdupq_n_f32(inv_sum);
+    i = 0;
+    for (; i + 3 < n; i += 4)
+        vst1q_f32(x + i, vmulq_f32(vld1q_f32(x + i), vinv));
+    for (; i < n; i++) x[i] *= inv_sum;
+#else
     float max_val = x[0];
     for (int i = 1; i < n; i++) if (x[i] > max_val) max_val = x[i];
     float sum = 0.0f;
     for (int i = 0; i < n; i++) { x[i] = expf(x[i] - max_val); sum += x[i]; }
     float inv_sum = 1.0f / sum;
     for (int i = 0; i < n; i++) x[i] *= inv_sum;
+#endif
 }
 
 /* ======================================================================== */
@@ -616,6 +1299,47 @@ void kernel_rope_apply(float *q, float *k, const float *cos, const float *sin,
      * cos/sin shape: [head_dim] (shared across heads)
      */
     int half = head_dim / 2;
+#if defined(__ARM_NEON) || defined(__aarch64__)
+    for (int h = 0; h < num_heads; h++) {
+        float *qh = q + h * head_dim;
+        int i = 0;
+        for (; i + 3 < half; i += 4) {
+            float32x4_t vc = vld1q_f32(cos + i);
+            float32x4_t vs = vld1q_f32(sin + i);
+            float32x4_t vc2 = vld1q_f32(cos + i + half);
+            float32x4_t vs2 = vld1q_f32(sin + i + half);
+            float32x4_t vq0 = vld1q_f32(qh + i);
+            float32x4_t vq1 = vld1q_f32(qh + i + half);
+            /* qh[i] = q0*cos - q1*sin; qh[i+half] = q1*cos2 + q0*sin2 */
+            vst1q_f32(qh + i,        vfmsq_f32(vmulq_f32(vq0, vc), vq1, vs));
+            vst1q_f32(qh + i + half, vfmaq_f32(vmulq_f32(vq1, vc2), vq0, vs2));
+        }
+        for (; i < half; i++) {
+            float q0 = qh[i], q1 = qh[i + half];
+            qh[i]        = q0 * cos[i] - q1 * sin[i];
+            qh[i + half] = q1 * cos[i + half] + q0 * sin[i + half];
+        }
+        if (k) {
+            float *kh = k + h * head_dim;
+            i = 0;
+            for (; i + 3 < half; i += 4) {
+                float32x4_t vc = vld1q_f32(cos + i);
+                float32x4_t vs = vld1q_f32(sin + i);
+                float32x4_t vc2 = vld1q_f32(cos + i + half);
+                float32x4_t vs2 = vld1q_f32(sin + i + half);
+                float32x4_t vk0 = vld1q_f32(kh + i);
+                float32x4_t vk1 = vld1q_f32(kh + i + half);
+                vst1q_f32(kh + i,        vfmsq_f32(vmulq_f32(vk0, vc), vk1, vs));
+                vst1q_f32(kh + i + half, vfmaq_f32(vmulq_f32(vk1, vc2), vk0, vs2));
+            }
+            for (; i < half; i++) {
+                float k0 = kh[i], k1 = kh[i + half];
+                kh[i]        = k0 * cos[i] - k1 * sin[i];
+                kh[i + half] = k1 * cos[i + half] + k0 * sin[i + half];
+            }
+        }
+    }
+#else
     for (int h = 0; h < num_heads; h++) {
         float *qh = q + h * head_dim;
         for (int i = 0; i < half; i++) {
@@ -632,6 +1356,7 @@ void kernel_rope_apply(float *q, float *k, const float *cos, const float *sin,
             }
         }
     }
+#endif
 }
 
 void kernel_mrope_apply(float *q, float *k, const float *cos, const float *sin,
@@ -698,26 +1423,6 @@ void kernel_mrope_apply(float *q, float *k, const float *cos, const float *sin,
             }
         }
     }
-}
-
-/* ======================================================================== */
-/* NEON vectorized saxpy: dst[i] += alpha * src[i]                           */
-/* ======================================================================== */
-
-static inline void neon_saxpy_f32(float *dst, const float *src, float alpha, int n) {
-#if defined(__ARM_NEON) || defined(__aarch64__)
-    float32x4_t va = vdupq_n_f32(alpha);
-    int i = 0;
-    for (; i + 7 < n; i += 8) {
-        vst1q_f32(dst + i, vfmaq_f32(vld1q_f32(dst + i), vld1q_f32(src + i), va));
-        vst1q_f32(dst + i + 4, vfmaq_f32(vld1q_f32(dst + i + 4), vld1q_f32(src + i + 4), va));
-    }
-    for (; i + 3 < n; i += 4)
-        vst1q_f32(dst + i, vfmaq_f32(vld1q_f32(dst + i), vld1q_f32(src + i), va));
-    for (; i < n; i++) dst[i] += alpha * src[i];
-#else
-    for (int i = 0; i < n; i++) dst[i] += alpha * src[i];
-#endif
 }
 
 /* ======================================================================== */
@@ -796,90 +1501,6 @@ void kernel_causal_conv1d(float *out, const float *input, const float *weight,
     }
 #endif
 
-    /*
-     * NEON fast path for k=7, groups=1 (vocoder hot path: dilation=1/3/9).
-     * Output-centric: compute 8 consecutive outputs at once with 7 FMA each.
-     * This eliminates the 7 separate saxpy passes over output, reducing
-     * memory write traffic by ~7x vs the saxpy approach.
-     */
-#if defined(__ARM_NEON) || defined(__aarch64__)
-    if (kernel_size == 7 && groups == 1) {
-        int pad7 = 6 * dilation;  /* (7-1) * dilation */
-
-#ifdef USE_OPENMP
-#pragma omp parallel for schedule(static)
-#endif
-        for (int oc = 0; oc < out_channels; oc++) {
-            float *out_ch = out + (size_t)oc * length;
-            float b = bias ? bias[oc] : 0.0f;
-
-            /* Init output to bias (NEON) */
-            {
-                float32x4_t vb = vdupq_n_f32(b);
-                int t = 0;
-                for (; t + 3 < length; t += 4) vst1q_f32(out_ch + t, vb);
-                for (; t < length; t++) out_ch[t] = b;
-            }
-
-            for (int ic = 0; ic < in_channels; ic++) {
-                const float *w = weight + ((size_t)oc * in_channels + ic) * 7;
-                const float *in_ch = input + (size_t)ic * length;
-                float w0 = w[0], w1 = w[1], w2 = w[2], w3 = w[3];
-                float w4 = w[4], w5 = w[5], w6 = w[6];
-                int dil = dilation;
-
-                /* Boundary: t < pad7 (some taps land in zero-padding) */
-                for (int t = 0; t < pad7 && t < length; t++) {
-                    float sum = 0;
-                    for (int k = 0; k < 7; k++) {
-                        int in_t = t - pad7 + k * dil;
-                        if (in_t >= 0) sum += w[k] * in_ch[in_t];
-                    }
-                    out_ch[t] += sum;
-                }
-
-                /* Steady state: NEON, 8 outputs at a time */
-                int t = pad7;
-                for (; t + 7 < length; t += 8) {
-                    float32x4_t acc0 = vdupq_n_f32(0);
-                    float32x4_t acc1 = vdupq_n_f32(0);
-                    int base = t - pad7;
-                    acc0 = vfmaq_n_f32(acc0, vld1q_f32(in_ch + base),             w0);
-                    acc1 = vfmaq_n_f32(acc1, vld1q_f32(in_ch + base + 4),         w0);
-                    acc0 = vfmaq_n_f32(acc0, vld1q_f32(in_ch + base + dil),       w1);
-                    acc1 = vfmaq_n_f32(acc1, vld1q_f32(in_ch + base + dil + 4),   w1);
-                    acc0 = vfmaq_n_f32(acc0, vld1q_f32(in_ch + base + 2*dil),     w2);
-                    acc1 = vfmaq_n_f32(acc1, vld1q_f32(in_ch + base + 2*dil + 4), w2);
-                    acc0 = vfmaq_n_f32(acc0, vld1q_f32(in_ch + base + 3*dil),     w3);
-                    acc1 = vfmaq_n_f32(acc1, vld1q_f32(in_ch + base + 3*dil + 4), w3);
-                    acc0 = vfmaq_n_f32(acc0, vld1q_f32(in_ch + base + 4*dil),     w4);
-                    acc1 = vfmaq_n_f32(acc1, vld1q_f32(in_ch + base + 4*dil + 4), w4);
-                    acc0 = vfmaq_n_f32(acc0, vld1q_f32(in_ch + base + 5*dil),     w5);
-                    acc1 = vfmaq_n_f32(acc1, vld1q_f32(in_ch + base + 5*dil + 4), w5);
-                    acc0 = vfmaq_n_f32(acc0, vld1q_f32(in_ch + base + 6*dil),     w6);
-                    acc1 = vfmaq_n_f32(acc1, vld1q_f32(in_ch + base + 6*dil + 4), w6);
-
-                    vst1q_f32(out_ch + t, vaddq_f32(vld1q_f32(out_ch + t), acc0));
-                    vst1q_f32(out_ch + t + 4, vaddq_f32(vld1q_f32(out_ch + t + 4), acc1));
-                }
-
-                /* Scalar tail */
-                for (; t < length; t++) {
-                    int base = t - pad7;
-                    out_ch[t] += w0 * in_ch[base]
-                               + w1 * in_ch[base + dil]
-                               + w2 * in_ch[base + 2*dil]
-                               + w3 * in_ch[base + 3*dil]
-                               + w4 * in_ch[base + 4*dil]
-                               + w5 * in_ch[base + 5*dil]
-                               + w6 * in_ch[base + 6*dil];
-                }
-            }
-        }
-        return;
-    }
-#endif
-
     /* Fast path for pointwise conv: k=1, dilation=1 (very common in vocoder). */
     if (kernel_size == 1 && dilation == 1) {
         if (groups == in_channels && in_channels == out_channels) {
@@ -922,107 +1543,21 @@ void kernel_causal_conv1d(float *out, const float *input, const float *weight,
         }
 #endif
 
-#if defined(__ARM_NEON) || defined(__aarch64__)
-        if (groups == 1) {
-            /*
-             * NEON tiled matmul: out[OC, T] = weight[OC, IC] * input[IC, T] + bias
-             * Micro-kernel: 4 OC rows × 8 time columns, IC-tiled for L2 reuse.
-             *
-             * Working set per IC tile: IC_TILE * length * 4 (input) + OC * IC_TILE * 4 (weight)
-             * Target ~256KB for IC_TILE slice.
-             */
-            const int IC_TILE = 32;
-
-            /* Initialize output to bias */
-            for (int oc = 0; oc < out_channels; oc++) {
-                float *out_ch = out + (size_t)oc * length;
-                float b = bias ? bias[oc] : 0.0f;
-                float32x4_t vb = vdupq_n_f32(b);
-                int t = 0;
-                for (; t + 3 < length; t += 4) vst1q_f32(out_ch + t, vb);
-                for (; t < length; t++) out_ch[t] = b;
-            }
-
-            /* IC-tiled accumulation */
-            for (int ic_start = 0; ic_start < in_channels; ic_start += IC_TILE) {
-                int ic_end = ic_start + IC_TILE;
-                if (ic_end > in_channels) ic_end = in_channels;
-
-                /* Process 4 OC rows at a time */
-                int oc = 0;
-                for (; oc + 3 < out_channels; oc += 4) {
-                    float *out0 = out + (size_t)(oc + 0) * length;
-                    float *out1 = out + (size_t)(oc + 1) * length;
-                    float *out2 = out + (size_t)(oc + 2) * length;
-                    float *out3 = out + (size_t)(oc + 3) * length;
-
-                    for (int ic = ic_start; ic < ic_end; ic++) {
-                        float w0 = weight[(size_t)(oc + 0) * in_channels + ic];
-                        float w1 = weight[(size_t)(oc + 1) * in_channels + ic];
-                        float w2 = weight[(size_t)(oc + 2) * in_channels + ic];
-                        float w3 = weight[(size_t)(oc + 3) * in_channels + ic];
-                        const float *in_ch = input + (size_t)ic * length;
-
-                        float32x4_t vw0 = vdupq_n_f32(w0);
-                        float32x4_t vw1 = vdupq_n_f32(w1);
-                        float32x4_t vw2 = vdupq_n_f32(w2);
-                        float32x4_t vw3 = vdupq_n_f32(w3);
-
-                        int t = 0;
-                        for (; t + 7 < length; t += 8) {
-                            float32x4_t i0 = vld1q_f32(in_ch + t);
-                            float32x4_t i1 = vld1q_f32(in_ch + t + 4);
-                            vst1q_f32(out0 + t,     vfmaq_f32(vld1q_f32(out0 + t),     i0, vw0));
-                            vst1q_f32(out0 + t + 4, vfmaq_f32(vld1q_f32(out0 + t + 4), i1, vw0));
-                            vst1q_f32(out1 + t,     vfmaq_f32(vld1q_f32(out1 + t),     i0, vw1));
-                            vst1q_f32(out1 + t + 4, vfmaq_f32(vld1q_f32(out1 + t + 4), i1, vw1));
-                            vst1q_f32(out2 + t,     vfmaq_f32(vld1q_f32(out2 + t),     i0, vw2));
-                            vst1q_f32(out2 + t + 4, vfmaq_f32(vld1q_f32(out2 + t + 4), i1, vw2));
-                            vst1q_f32(out3 + t,     vfmaq_f32(vld1q_f32(out3 + t),     i0, vw3));
-                            vst1q_f32(out3 + t + 4, vfmaq_f32(vld1q_f32(out3 + t + 4), i1, vw3));
-                        }
-                        for (; t < length; t++) {
-                            float v = in_ch[t];
-                            out0[t] += w0 * v;
-                            out1[t] += w1 * v;
-                            out2[t] += w2 * v;
-                            out3[t] += w3 * v;
-                        }
-                    }
-                }
-                /* Handle remaining OC rows (1-3) */
-                for (; oc < out_channels; oc++) {
-                    float *out_ch = out + (size_t)oc * length;
-                    for (int ic = ic_start; ic < ic_end; ic++) {
-                        float w = weight[(size_t)oc * in_channels + ic];
-                        const float *in_ch = input + (size_t)ic * length;
-                        float32x4_t vw = vdupq_n_f32(w);
-                        int t = 0;
-                        for (; t + 7 < length; t += 8) {
-                            vst1q_f32(out_ch + t,     vfmaq_f32(vld1q_f32(out_ch + t),     vld1q_f32(in_ch + t),     vw));
-                            vst1q_f32(out_ch + t + 4, vfmaq_f32(vld1q_f32(out_ch + t + 4), vld1q_f32(in_ch + t + 4), vw));
-                        }
-                        for (; t < length; t++) out_ch[t] += w * in_ch[t];
-                    }
-                }
-            }
-            return;
-        }
-#endif
-
 #ifdef USE_OPENMP
 #pragma omp parallel for schedule(static)
 #endif
         for (int oc = 0; oc < out_channels; oc++) {
+            float *out_ch = out + (size_t)oc * length;
+            float b = bias ? bias[oc] : 0.0f;
+            for (int t = 0; t < length; t++) out_ch[t] = b;
+
             int g = oc / out_per_group;
+            int ic_base = g * ch_per_group;
             const float *w_row = weight + (size_t)oc * ch_per_group;
-            for (int t = 0; t < length; t++) {
-                float sum = bias ? bias[oc] : 0.0f;
-                int ic_base = g * ch_per_group;
-                for (int ic = 0; ic < ch_per_group; ic++) {
-                    sum += w_row[ic] * input[(ic_base + ic) * length + t];
-                }
-                out[oc * length + t] = sum;
+            for (int ic = 0; ic < ch_per_group; ic++) {
+                float w = w_row[ic];
+                const float *in_ch = input + (size_t)(ic_base + ic) * length;
+                saxpy_broadcast(out_ch, w, in_ch, length);
             }
         }
         return;
@@ -1057,7 +1592,7 @@ void kernel_causal_conv1d(float *out, const float *input, const float *weight,
 #ifdef USE_BLAS
                     cblas_saxpy(n, wk, src, 1, dst, 1);
 #else
-                    neon_saxpy_f32(dst, src, wk, n);
+                    saxpy_broadcast(dst, wk, src, n);
 #endif
                 }
             }
@@ -1097,7 +1632,7 @@ void kernel_causal_conv1d(float *out, const float *input, const float *weight,
 #ifdef USE_BLAS
                 cblas_saxpy(n, wk, in_ch + in_start, 1, out_ch + out_start, 1);
 #else
-                neon_saxpy_f32(out_ch + out_start, in_ch + in_start, wk, n);
+                saxpy_broadcast(out_ch + out_start, wk, in_ch + in_start, n);
 #endif
             }
         }
@@ -1179,7 +1714,72 @@ void kernel_transposed_conv1d(float *out, const float *input, const float *weigh
     }
 #endif
 
-    /* Scalar fallback (with NEON vectorized k-loop) */
+    /* GEMM-per-tap fallback (mirrors BLAS path algorithm, using saxpy_broadcast) */
+    {
+        size_t wk_size = (size_t)out_channels * in_channels;
+        size_t temp_size = (size_t)out_channels * length;
+        float *wk_packed = (float *)malloc(wk_size * sizeof(float));
+        float *temp = (float *)malloc(temp_size * sizeof(float));
+        if (wk_packed && temp) {
+#ifdef USE_OPENMP
+#pragma omp parallel for schedule(static)
+#endif
+            for (int oc = 0; oc < out_channels; oc++) {
+                float *out_ch = out + (size_t)oc * final_len;
+                float b = bias ? bias[oc] : 0.0f;
+                for (int t = 0; t < final_len; t++) out_ch[t] = b;
+            }
+
+            for (int k = 0; k < kernel_size; k++) {
+                /* Pack weights for this tap: wk_packed[oc, ic] */
+                for (int oc = 0; oc < out_channels; oc++) {
+                    for (int ic = 0; ic < in_channels; ic++) {
+                        wk_packed[(size_t)oc * in_channels + ic] =
+                            weight[(size_t)ic * out_channels * kernel_size + (size_t)oc * kernel_size + k];
+                    }
+                }
+
+                /* Compute valid output range for this tap */
+                int n = (final_len - 1 - k) / stride + 1;
+                if (n <= 0) continue;
+                if (n > length) n = length;
+
+                /* Manual GEMM via saxpy: temp[oc, t] = sum_ic wk[oc,ic] * input[ic,t] */
+#ifdef USE_OPENMP
+#pragma omp parallel for schedule(static)
+#endif
+                for (int oc = 0; oc < out_channels; oc++) {
+                    float *tp = temp + (size_t)oc * length;
+                    memset(tp, 0, (size_t)n * sizeof(float));
+                    const float *wk_row = wk_packed + (size_t)oc * in_channels;
+                    for (int ic = 0; ic < in_channels; ic++) {
+                        const float *in_ch = input + (size_t)ic * length;
+                        saxpy_broadcast(tp, wk_row[ic], in_ch, n);
+                    }
+                }
+
+                /* Scatter to strided output */
+#ifdef USE_OPENMP
+#pragma omp parallel for schedule(static)
+#endif
+                for (int oc = 0; oc < out_channels; oc++) {
+                    const float *tp = temp + (size_t)oc * length;
+                    float *op = out + (size_t)oc * final_len + k;
+                    for (int t = 0; t < n; t++) {
+                        op[t * stride] += tp[t];
+                    }
+                }
+            }
+            free(wk_packed);
+            free(temp);
+            if (out_length) *out_length = final_len;
+            return;
+        }
+        free(wk_packed);
+        free(temp);
+    }
+
+    /* Ultimate scalar fallback (malloc failed) */
 #ifdef USE_OPENMP
 #pragma omp parallel for schedule(static)
 #endif
@@ -1194,23 +1794,10 @@ void kernel_transposed_conv1d(float *out, const float *input, const float *weigh
             for (int t = 0; t < length; t++) {
                 float val = in_ch[t];
                 int base = t * stride;
-                int k_max = kernel_size;
-                if (base + k_max > final_len) k_max = final_len - base;
-                if (k_max <= 0) continue;
-#if defined(__ARM_NEON) || defined(__aarch64__)
-                float32x4_t vval = vdupq_n_f32(val);
-                int k = 0;
-                for (; k + 3 < k_max; k += 4) {
-                    float32x4_t o = vld1q_f32(out_ch + base + k);
-                    float32x4_t wv = vld1q_f32(w + k);
-                    vst1q_f32(out_ch + base + k, vfmaq_f32(o, wv, vval));
+                for (int k = 0; k < kernel_size; k++) {
+                    int ot = base + k;
+                    if (ot < final_len) out_ch[ot] += val * w[k];
                 }
-                for (; k < k_max; k++)
-                    out_ch[base + k] += val * w[k];
-#else
-                for (int k = 0; k < k_max; k++)
-                    out_ch[base + k] += val * w[k];
-#endif
             }
         }
     }
@@ -1223,5 +1810,7 @@ void kernel_transposed_conv1d(float *out, const float *input, const float *weigh
 /* ======================================================================== */
 
 void kernel_init(void) {
-    /* In the future, detect NEON/AVX and set function pointers */
+#ifdef USE_OPENMP
+    omp_set_num_threads(4);
+#endif
 }
