@@ -1171,6 +1171,80 @@ static char *stream_impl(qwen_ctx_t *ctx, const float *samples, int n_samples,
                     }
                 }
 
+                /* Text-level overlap fallback: when the same text is tokenized
+                 * differently across chunks (common when audio context changes),
+                 * the token-level check above misses the overlap.
+                 *
+                 * Search for the longest SUFFIX of result that appears as a
+                 * SUBSTRING anywhere in the pending emission text.  When found
+                 * at offset P in new_text, skip everything up to P+match_len
+                 * (this also drops boundary artifacts like wrong punctuation
+                 * that precede the overlapping portion). */
+                if (emit_start < candidate_len && result_len >= 6) {
+                    size_t new_text_len = 0;
+                    for (int i = emit_start; i < candidate_len; i++) {
+                        const char *p = qwen_tokenizer_decode(tokenizer,
+                                                               stable_text_tokens[i]);
+                        if (p) new_text_len += strlen(p);
+                    }
+                    if (new_text_len >= 6) {
+                        char *new_text = (char *)malloc(new_text_len + 1);
+                        if (new_text) {
+                            size_t noff = 0;
+                            for (int i = emit_start; i < candidate_len; i++) {
+                                const char *p = qwen_tokenizer_decode(tokenizer,
+                                                                       stable_text_tokens[i]);
+                                if (p) {
+                                    size_t pl = strlen(p);
+                                    memcpy(new_text + noff, p, pl);
+                                    noff += pl;
+                                }
+                            }
+                            new_text[noff] = '\0';
+
+                            /* Find longest suffix of result in new_text.
+                             * Min 6 bytes (~2 CJK chars). */
+                            size_t max_suf = noff < result_len ? noff : result_len;
+                            if (max_suf > 256) max_suf = 256;
+                            size_t text_skip = 0; /* bytes to skip from new_text start */
+                            for (size_t slen = max_suf; slen >= 6; slen--) {
+                                const char *rsuf = result + result_len - slen;
+                                for (size_t p = 0; p + slen <= noff; p++) {
+                                    if (memcmp(new_text + p, rsuf, slen) == 0) {
+                                        text_skip = p + slen;
+                                        goto found_text_overlap;
+                                    }
+                                }
+                            }
+                            found_text_overlap:
+
+                            if (text_skip > 0) {
+                                int old_emit_start = emit_start;
+                                size_t chars_consumed = 0;
+                                while (emit_start < candidate_len) {
+                                    const char *piece = qwen_tokenizer_decode(
+                                        tokenizer, stable_text_tokens[emit_start]);
+                                    size_t pl = piece ? strlen(piece) : 0;
+                                    if (chars_consumed + pl <= text_skip) {
+                                        chars_consumed += pl;
+                                        emit_start++;
+                                    } else {
+                                        break;
+                                    }
+                                }
+                                if (qwen_verbose >= 2)
+                                    fprintf(stderr,
+                                        "  Text dedup: %zu bytes overlap, "
+                                        "skipped %d tokens (%zu bytes)\n",
+                                        text_skip,
+                                        emit_start - old_emit_start,
+                                        chars_consumed);
+                            }
+                            free(new_text);
+                        }
+                    }
+                }
+
                 for (int i = emit_start; i < candidate_len; i++) {
                     int tok = stable_text_tokens[i];
                     const char *piece = qwen_tokenizer_decode(tokenizer, tok);
@@ -1241,7 +1315,7 @@ static char *stream_impl(qwen_ctx_t *ctx, const float *samples, int n_samples,
                 fprintf(stderr, "  Periodic reset applied\n");
             }
             fprintf(stderr, "  Commit: candidate=%d tokens, emitted_total=%d\n",
-                    candidate_len, n_stable_text_tokens);
+                    candidate_len, n_emitted_text_tokens);
         }
 
         if (live && use_enc_cache) {

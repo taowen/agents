@@ -406,8 +406,8 @@ static block_q8_0 *quantize_weight_f32(const float *f32, int rows, int cols) {
 #include <unistd.h>
 #endif
 
-#define QCACHE_MAGIC   0x32435151   /* "QQC2" */
-#define QCACHE_VERSION 2
+#define QCACHE_MAGIC   0x33435151   /* "QQC3" */
+#define QCACHE_VERSION 3
 
 typedef struct {
     uint32_t magic;
@@ -496,7 +496,9 @@ static int save_quantized_cache(qwen_tts_ctx_t *ctx) {
     hdr.text_proj_fc1_q8_bytes = q8_bytes(cfg->talker_text_hidden, cfg->talker_text_hidden);
     hdr.text_proj_fc2_q8_bytes = q8_bytes(cfg->talker_hidden, cfg->talker_text_hidden);
     hdr.codec_head_q8_bytes = q8_bytes(cfg->talker_vocab_size, cfg->talker_hidden);
-    hdr.input_proj_q8_bytes = q8_bytes(cfg->subtalker_hidden, cfg->talker_hidden);
+    /* Store 0 for absent optional weights so they stay NULL on load */
+    hdr.input_proj_q8_bytes = ctx->subtalker.input_proj_q8
+        ? q8_bytes(cfg->subtalker_hidden, cfg->talker_hidden) : 0;
     hdr.lm_head_q8_bytes = q8_bytes(cfg->subtalker_vocab_size, cfg->subtalker_hidden);
 
     FILE *f = fopen(path, "wb");
@@ -508,9 +510,9 @@ static int save_quantized_cache(qwen_tts_ctx_t *ctx) {
 
     fwrite(&hdr, sizeof(hdr), 1, f);
 
+    /* Only write data for non-NULL pointers; header byte sizes are 0 for absent weights */
     #define WRITE_Q8(ptr, n_bytes) do { \
-        if (ptr) fwrite(ptr, 1, n_bytes, f); \
-        else { void *z = calloc(1, n_bytes); fwrite(z, 1, n_bytes, f); free(z); } \
+        if ((ptr) && (n_bytes) > 0) fwrite(ptr, 1, n_bytes, f); \
     } while(0)
 
     for (int i = 0; i < cfg->talker_layers; i++) {
@@ -540,7 +542,8 @@ static int save_quantized_cache(qwen_tts_ctx_t *ctx) {
 
     fclose(f);
     if (qwen_tts_verbose >= 1)
-        fprintf(stderr, "Saved quantized cache to %s\n", path);
+        fprintf(stderr, "Saved quantized cache to %s (input_proj: %s)\n",
+                path, ctx->subtalker.input_proj_q8 ? "present" : "absent");
     return 0;
 }
 
@@ -637,7 +640,8 @@ static int load_quantized_cache(qwen_tts_ctx_t *ctx) {
     munmap(mapped, file_size);
 
     if (qwen_tts_verbose >= 1)
-        fprintf(stderr, "Loaded quantized cache from %s\n", path);
+        fprintf(stderr, "Loaded quantized cache from %s (input_proj: %s)\n",
+                path, ctx->subtalker.input_proj_q8 ? "present" : "absent");
     return 0;
 }
 
@@ -1376,8 +1380,9 @@ qwen_tts_ctx_t *qwen_tts_load(const char *model_dir) {
     kernel_init();
 
     double t1 = qwen_tts_time_ms();
-    if (qwen_tts_verbose >= 1)
+    if (qwen_tts_verbose >= 1) {
         fprintf(stderr, "Model loaded in %.1f ms\n", t1 - t0);
+    }
 
     return ctx;
 }

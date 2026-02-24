@@ -24,9 +24,9 @@ adb logcat -d | grep -E 'QwenASR|QwenTTS|VoiceDebug' | tail -30
 ### Gotchas
 
 - **stderr redirect tag**: TTS/ASR JNI both redirect stderr to logcat. If TTS loads first, ASR output appears under `QwenTTS` tag.
-- **OOM on long audio**: test.wav (17.6s) causes SIGKILL. Use jfk.wav (11s).
 - **Screen-off throttling**: CPU governor may throttle when screen is off, inflating benchmarks ~25%.
 - **qmodel vs safetensors**: if both present, qmodel is preferred. Delete `model.qmodel` to fall back.
+- **Chinese test audio**: generate with `edge-tts --voice zh-CN-YunxiNeural --text "..." --write-media /tmp/chinese_test.mp3`, convert to 16kHz mono WAV, trim to ≤11s. Push to `/data/local/tmp/chinese_test.wav`. Useful for testing text dedup at chunk boundaries (CJK tokenization differs more across chunks).
 
 ## Stream Mode Architecture
 
@@ -37,6 +37,7 @@ Audio → 2s chunks. Encoder window = 8s (bidirectional attention). Key mechanis
 3. **Cold-start skip**: first 2 "unfixed" chunks are skipped entirely (their decode output is never emitted). First real chunk processes 6s of audio.
 4. **Prefix rollback**: decoder rolls back last K tokens for boundary continuity.
 5. **KV cache reuse**: prefill embeddings are compared row-by-row; matching prefix is skipped via KV cache truncation.
+6. **Text-level dedup**: token-level overlap detection fails when the same text is tokenized differently across chunks (different audio context → different encoder output → different token IDs). A text-level fallback searches for the longest suffix of already-emitted `result` as a substring anywhere in the pending new tokens' decoded text, skipping both the overlap and any boundary artifact tokens (e.g., a misplaced comma before the repeated portion).
 
 Key split: `qwen_encoder_stem_chunk()` (per-chunk Conv2D) + `qwen_encoder_transformer()` (bidirectional attention). `stream_encode_stem_cached()` manages the cache for both partial and complete window encoding.
 
@@ -78,6 +79,39 @@ Key split: `qwen_encoder_stem_chunk()` (per-chunk Conv2D) + `qwen_encoder_transf
 | 2 | Pre-quantized .qmodel | ~3200ms | — | mmap pre-quantized weights, ~1ms model load |
 | 3 | Source split + cleanup | ~3050ms | — | Split oversized files, removed ~2300 lines dead code |
 | 4 | Stem cache + cold-start skip | 2626ms | **5670ms** | Conv2D stem cache, cold-start chunk skip, encoder split |
+| 5 | Streaming text dedup | — | **5670ms** | Text-level overlap detection fixes cross-chunk repetition |
+
+## Streaming Text Dedup (Round 5)
+
+### Problem
+
+When `past_text_conditioning=0` (default), each chunk decodes independently. At chunk boundaries, the same text can be tokenized differently because the audio context changed (e.g., 6s vs 8s window). The token-level overlap detection (`memcmp` on token IDs) misses these overlaps, causing repeated text in output.
+
+Example (Chinese, 10s audio): chunk N emits "...今天我们要讨论的话题", chunk N+1 decodes "，我们要讨论的话题是：人工智能..." — the token-level LCP diverges early because token IDs differ, so "我们要讨论的话题" gets emitted twice.
+
+### Root cause
+
+The divergence has two components:
+1. **Different tokenization**: same text gets different token IDs when audio context changes (bidirectional attention sees different windows).
+2. **Boundary artifact tokens**: the new chunk may start with "wrong" tokens (e.g., a comma "，" that belongs to the previous segment). These precede the actual overlapping text.
+
+### Fix: suffix-substring search
+
+After the token-level overlap check, decode pending tokens to text (`new_text`). Search for the longest **suffix** of already-emitted `result` that appears as a **substring** anywhere in `new_text`. If found at offset P, skip P + match_len bytes from the start of new_text (dropping both boundary artifacts and the repeated portion).
+
+Key details:
+- Min match: 6 bytes (~2 CJK characters) to avoid false positives
+- Max suffix search: 256 bytes (sufficient for typical boundary overlaps)
+- Token skip: walk emit_start forward until cumulative decoded bytes ≥ text_skip
+- Location: `qwen_asr_stream.c`, between token-level overlap check and emit loop
+
+### Why suffix-of-result, not prefix-of-new_text
+
+The new chunk may produce boundary artifact tokens before the overlap. Searching for a prefix of new_text in result fails because new_text starts with "，" (comma, 3 bytes) which isn't at the end of result. Searching for result's suffix in new_text finds the match at offset 3, correctly skipping the artifact.
+
+### Bug fix: emitted_total log
+
+`n_stable_text_tokens` (candidate window size) was logged as `emitted_total` instead of `n_emitted_text_tokens` (actual tokens sent to user). Fixed to show the correct count.
 
 ## Next Optimization Opportunities
 

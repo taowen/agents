@@ -484,7 +484,7 @@ qwen_ctx_t *qwen_load(const char *model_dir) {
     ctx->stream_rollback = 5;
     ctx->stream_unfixed_chunks = 2;
     ctx->stream_max_new_tokens = 32;
-    ctx->past_text_conditioning = 0;
+    ctx->past_text_conditioning = 1;
     ctx->skip_silence = 0;
 
     if (qwen_verbose >= 1) fprintf(stderr, "Model loaded.\n");
