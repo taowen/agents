@@ -276,30 +276,8 @@ void qwen_free(qwen_ctx_t *ctx);
  * Set cb=NULL to disable. The callback is invoked during transcription. */
 void qwen_set_token_callback(qwen_ctx_t *ctx, qwen_token_cb cb, void *userdata);
 
-/* Set optional system prompt text (UTF-8). Pass NULL or "" to clear.
- * Returns 0 on success, -1 on allocation/encoding errors. */
-int qwen_set_prompt(qwen_ctx_t *ctx, const char *prompt);
-
-/* Set optional forced language. Pass NULL or "" to clear.
- * Returns 0 on success, -1 if language is unsupported. */
-int qwen_set_force_language(qwen_ctx_t *ctx, const char *language);
-
-/* Comma-separated supported language names for --language. */
-const char *qwen_supported_languages_csv(void);
-
-/* Transcribe a WAV file, returns allocated string (caller must free) */
-char *qwen_transcribe(qwen_ctx_t *ctx, const char *wav_path);
-
 /* Transcribe from raw audio samples (mono float32, 16kHz) */
 char *qwen_transcribe_audio(qwen_ctx_t *ctx, const float *samples, int n_samples);
-
-/* Transcribe from stdin (auto-detect WAV or raw s16le) */
-char *qwen_transcribe_stdin(qwen_ctx_t *ctx);
-
-/* Streaming transcription: process audio in chunks with prefix rollback.
- * Re-encodes growing audio and uses previous text as decoder context.
- * Tokens are emitted via the token callback as they become "fixed". */
-char *qwen_transcribe_stream(qwen_ctx_t *ctx, const float *samples, int n_samples);
 
 /* Live streaming transcription from an incrementally-filled audio source.
  * The streaming loop waits for new data instead of terminating at EOF.

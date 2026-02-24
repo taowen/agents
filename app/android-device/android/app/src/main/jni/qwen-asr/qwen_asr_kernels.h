@@ -17,40 +17,10 @@
  * ======================================================================== */
 
 void qwen_add_inplace(float *a, const float *b, int n);
-void qwen_mul_inplace(float *a, const float *b, int n);
-void qwen_scale(float *x, float s, int n);
-void qwen_copy(float *dst, const float *src, int n);
 
 /* ========================================================================
  * Matrix Operations
  * ======================================================================== */
-
-/* C = A @ B^T: A[M,K], B[N,K], C[M,N] */
-void qwen_matmul_t(float *C, const float *A, const float *B, int M, int K, int N);
-
-/* y = x @ W^T + b: x[seq,in], W[out,in], b[out], y[seq,out] */
-void qwen_linear(float *y, const float *x, const float *W, const float *b,
-                 int seq_len, int in_dim, int out_dim);
-
-void qwen_linear_nobias(float *y, const float *x, const float *W,
-                         int seq_len, int in_dim, int out_dim);
-
-/* bf16 weight variants */
-void qwen_linear_bf16(float *y, const float *x, const uint16_t *W_bf16,
-                      const float *b, int seq_len, int in_dim, int out_dim);
-
-void qwen_linear_nobias_bf16(float *y, const float *x, const uint16_t *W_bf16,
-                              int seq_len, int in_dim, int out_dim);
-
-/* seq=1 decoder fast path: compute Q/K/V matvecs with one threaded dispatch */
-void qwen_linear_nobias_bf16_qkv(float *q, float *k, float *v, const float *x,
-                                 const uint16_t *Wq_bf16,
-                                 const uint16_t *Wk_bf16,
-                                 const uint16_t *Wv_bf16,
-                                 int in_dim, int q_dim, int kv_dim);
-
-void qwen_matmul_t_bf16(float *C, const float *A, const uint16_t *B_bf16,
-                         int M, int K, int N);
 
 /* Q8_0 weight variants */
 void qwen_linear_q8(float *y, const float *x, const block_q8_0 *W_q8,
@@ -119,7 +89,6 @@ void qwen_rms_norm_per_head(float *x, const float *weight,
  * Activation Functions
  * ======================================================================== */
 
-void qwen_silu(float *x, int n);
 void qwen_gelu(float *x, int n);
 void qwen_softmax(float *x, int rows, int cols);
 /* out[seq,inter] = SiLU(gate_up[seq,2*inter][:,even]) * gate_up[:,odd] */
@@ -180,17 +149,6 @@ void qwen_compute_rope_neox(float *cos_out, float *sin_out, const int *positions
  */
 void qwen_apply_rope_neox(float *x, const float *cos_vals, const float *sin_vals,
                             int seq, int n_heads, int head_dim);
-
-/* Streaming argmax: finds argmax(W_bf16 @ x) without materializing full logits.
- * Returns the index of the row with highest dot product. */
-int qwen_argmax_matvec_bf16(const float *x, const uint16_t *W_bf16,
-                             int in_dim, int out_dim);
-
-/* Q8_0 streaming argmax: finds argmax(W_q8 @ x) using INT8 dot products.
- * Quantizes x once, then computes dot products against all vocab rows.
- * Returns the index of the row with highest dot product. */
-int qwen_argmax_matvec_q8(const float *x, const block_q8_0 *W_q8,
-                            int in_dim, int out_dim);
 
 /* ========================================================================
  * Q4_K Super-Block Weight Operations

@@ -3,11 +3,12 @@ project(qwen_asr C)
 
 set(QWEN_ASR_SOURCES
     qwen_asr.c
+    qwen_asr_transcribe.c
+    qwen_asr_stream.c
     qwen_asr_quant.c
     qwen_asr_kernels.c
-    qwen_asr_kernels_generic.c
+    qwen_asr_kernels_ops.c
     qwen_asr_kernels_neon.c
-    qwen_asr_kernels_avx.c
     qwen_asr_audio.c
     qwen_asr_encoder.c
     qwen_asr_decoder.c

@@ -225,41 +225,83 @@ Logcat confirms all timestamps identical:
 
 Within normal variance. Inference performance identical — same quantized weights, just pre-computed.
 
-### Conversion
-
-```bash
-cd app/android-device/scripts
-uv venv .venv
-uv pip install safetensors numpy ml-dtypes --python .venv/bin/python
-.venv/bin/python convert-asr-qmodel.py ~/qwen-asr/qwen3-asr-0.6b/ /tmp/model.qmodel
-```
-
-### Upload to R2
-
-Wrangler caps at 300 MB, Cloudflare REST API returns 413 at ~100 MB. Must use R2 S3-compatible multipart upload:
-
-```bash
-export R2_ACCESS_KEY_ID=...
-export R2_SECRET_ACCESS_KEY=...
-npm run upload:asr -w app/android-device -- /tmp
-```
-
-Create R2 S3 API credentials at: `https://dash.cloudflare.com/<account>/r2/api-tokens`
-
 ### Files changed
 
 | File | Change |
 |------|--------|
-| `scripts/convert-asr-qmodel.py` | **New** — Python offline conversion (safetensors → qmodel) |
-| `scripts/upload-asr-model.ts` | **New** — R2 upload via S3 multipart |
-| `scripts/upload-asr-model.sh` | **New** — R2 upload via wrangler (small files only) |
 | `qwen_asr.h` | Added `qmodel_mmap`, `qmodel_mmap_size` to `qwen_ctx_t` |
 | `qwen_asr.c` | Added `qwen_load_qmodel()`, updated `qwen_load()` + `qwen_free()` |
 | `ModelManager.java` | `model.safetensors` → `model.qmodel` in download list |
 
 ### Gotchas
 
-1. **ml-dtypes required** — numpy can't handle bfloat16 from safetensors without it. `TypeError: data type 'bfloat16' not understood`.
-2. **qmodel and safetensors coexist** — if both are present, qmodel is preferred. Delete `model.qmodel` to fall back.
-3. **All weight pointers into mmap** — `qwen_free()` must NOT `free()` individual weight pointers when loaded from qmodel. Only `munmap()` the whole region.
-4. **R2 upload needs S3 credentials** — wrangler and REST API both have size limits below 1.1 GB.
+1. **qmodel and safetensors coexist** — if both are present, qmodel is preferred. Delete `model.qmodel` to fall back.
+2. **All weight pointers into mmap** — `qwen_free()` must NOT `free()` individual weight pointers when loaded from qmodel. Only `munmap()` the whole region.
+
+## Round 3: Source file split & dead code removal
+
+### What
+
+Refactored qwen-asr source: split two oversized files (`qwen_asr.c` 2511 lines, `qwen_asr_kernels.c` 2936 lines) by logical domain, and removed ~2300 lines of dead code. Target is Android ARM64 only, so x86 AVX kernels, generic scalar fallbacks, BF16/F32 weight paths, and CLI-only functions were all dead.
+
+### Result
+
+| File | Before | After |
+|------|--------|-------|
+| `qwen_asr.c` | 2511 | 638 |
+| `qwen_asr_transcribe.c` | — | 658 |
+| `qwen_asr_stream.c` | — | 1117 |
+| `qwen_asr_kernels.c` | 2936 | 1162 |
+| `qwen_asr_kernels_ops.c` | — | 906 |
+| `qwen_asr_kernels_neon.c` | 1182 | 759 |
+| `qwen_asr_kernels_generic.c` | 323 | DELETED |
+| `qwen_asr_kernels_avx.c` | 587 | DELETED |
+
+No file exceeds ~1162 lines. ~2300 lines of dead code removed. Build passes, all 6 test checks pass, transcription matches reference exactly.
+
+### Post-refactor performance (jfk.wav, 11s)
+
+| Phase | Time | Tokens |
+|-------|------|--------|
+| Mel | 26ms | — |
+| Encoder | 1144ms | 143 |
+| Prefill | 1137ms | 158 |
+| Decode | 741ms (24.7 ms/tok) | 30 |
+| **Total** | **3048ms** | — |
+
+Within normal variance of previous baseline (3151ms). No regression.
+
+### What was removed
+
+- **x86 SIMD**: `qwen_asr_kernels_avx.c` (587 lines), all `#ifdef __AVX2__`/`__AVX512F__` blocks in norms/RoPE
+- **Generic scalar fallbacks**: `qwen_asr_kernels_generic.c` (323 lines)
+- **BF16/F32 weight paths**: `bf16_gemm_batched`, `f32_gemm_batched`, `bf16_matvec_*`, `f32_matvec_*`, all BF16/F32 linear/QKV/argmax dispatch — superseded by Q8_0/Q4_K
+- **CLI-only functions**: `qwen_transcribe` (WAV file), `qwen_transcribe_stdin`, `qwen_transcribe_stream` (non-live), `qwen_set_prompt`, `qwen_set_force_language`, language selection infrastructure
+- **Dead activations**: `qwen_silu` (unused), `qwen_mul_inplace`, `qwen_scale`, `qwen_copy`
+
+### What was split
+
+- `qwen_asr.c` → `qwen_asr.c` (load/free/config) + `qwen_asr_transcribe.c` (batch) + `qwen_asr_stream.c` (streaming)
+- `qwen_asr_kernels.c` → `qwen_asr_kernels.c` (thread pool + Q8/Q4K GEMM/matvec + conv2d) + `qwen_asr_kernels_ops.c` (norm, GELU, SwiGLU, softmax, attention, FP16, RoPE)
+
+### New files
+
+| File | Role |
+|------|------|
+| `qwen_asr_internal.h` | Shared declarations + prompt constants for split qwen_asr*.c files |
+| `qwen_asr_transcribe.c` | Batch transcription: silence compaction, segment splitting, `qwen_transcribe_audio` |
+| `qwen_asr_stream.c` | Streaming: encoder cache, rollback, `stream_impl`, `qwen_transcribe_stream_live` |
+| `qwen_asr_kernels_ops.c` | Norms, activations, attention, position embeddings, FP16 conversion |
+
+### Architecture decisions
+
+- **`parallel_for` renamed to `qwen_parallel_for`** and made non-static (was static in `qwen_asr_kernels.c`, now callable from `qwen_asr_kernels_ops.c` via `qwen_asr_kernels_impl.h`).
+- **`qwen_get_n_threads()` added** — ops file needs thread count for conditional parallelization but can't access the static `tp` struct directly.
+- **Prompt constants moved to `qwen_asr_internal.h`** — needed by both transcribe and stream files. Defined as `static const int[]` in the header (each TU gets its own copy, fine for small arrays).
+- **`compact_silence` and `transcribe_segment` made non-static** — shared between transcribe (defines them) and stream (may reference them via internal header).
+
+### Gotchas
+
+1. **`transpose_back` must be kept** even though `transpose_pad` is dead. Q8 GEMM uses `transpose_back` to convert transposed output `Yt[N, M_pad]` back to row-major `Y[M, N]`. Deleting it breaks the Q8 GEMM path.
+2. **`neon_expf`/`neon_tanhf` are only used in ops** (GELU, SwiGLU, attention softmax). They moved cleanly to `qwen_asr_kernels_ops.c` with no duplication issues.
+3. **Prompt constants are shared across 3 files** (`qwen_asr.c`, `qwen_asr_transcribe.c`, `qwen_asr_stream.c`). Initially left in `qwen_asr.c` which caused build errors. Moved to `qwen_asr_internal.h`.
