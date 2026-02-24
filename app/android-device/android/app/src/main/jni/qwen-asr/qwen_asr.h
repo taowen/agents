@@ -130,11 +130,11 @@ typedef struct {
  * ======================================================================== */
 
 typedef struct {
-    /* Self-attention (NO biases in decoder) - quantized to Q8_0 */
-    block_q8_0 *wq_weight_q8;  /* [n_heads*head_dim, hidden] as Q8_0 blocks */
-    block_q8_0 *wk_weight_q8;  /* [n_kv_heads*head_dim, hidden] as Q8_0 blocks */
-    block_q8_0 *wv_weight_q8;  /* [n_kv_heads*head_dim, hidden] as Q8_0 blocks */
-    block_q8_0 *wo_weight_q8;  /* [hidden, n_heads*head_dim] as Q8_0 blocks */
+    /* Self-attention (NO biases in decoder) - quantized to Q4_K */
+    block_q4_k *wq_weight_q4k;  /* [n_heads*head_dim, hidden/QK_K] Q4_K blocks */
+    block_q4_k *wk_weight_q4k;  /* [n_kv_heads*head_dim, hidden/QK_K] Q4_K blocks */
+    block_q4_k *wv_weight_q4k;  /* [n_kv_heads*head_dim, hidden/QK_K] Q4_K blocks */
+    block_q4_k *wo_weight_q4k;  /* [hidden, n_heads*head_dim/QK_K] Q4_K blocks */
 
     /* Per-head Q/K RMSNorm */
     float *q_norm_weight;      /* [head_dim] = [128] */
@@ -144,17 +144,17 @@ typedef struct {
     float *input_norm;         /* [hidden] */
     float *post_attn_norm;     /* [hidden] */
 
-    /* SwiGLU MLP (NO biases) - quantized to Q8_0 */
-    block_q8_0 *down_weight_q8; /* [hidden, intermediate] as Q8_0 blocks */
+    /* SwiGLU MLP (NO biases) - quantized to Q4_K */
+    block_q4_k *down_weight_q4k; /* [hidden, intermediate/QK_K] Q4_K blocks */
 
-    /* Fused gate+up weight [2*intermediate, hidden] as Q8_0 blocks */
-    block_q8_0 *gate_up_fused_q8;
+    /* Fused gate+up weight [2*intermediate, hidden/QK_K] Q4_K blocks */
+    block_q4_k *gate_up_fused_q4k;
 } qwen_dec_layer_t;
 
 typedef struct {
     /* Token embeddings (tied with lm_head) */
     uint16_t *tok_embeddings_bf16; /* [vocab_size, hidden] - mmap'd BF16 for embedding lookup */
-    block_q8_0 *tok_embeddings_q8; /* [vocab_size * hidden / 32] Q8_0 blocks for argmax */
+    block_q4_k *tok_embeddings_q4k; /* [vocab_size * hidden/QK_K] Q4_K blocks for argmax */
 
     /* Transformer layers */
     qwen_dec_layer_t layers[QWEN_MAX_DEC_LAYERS];

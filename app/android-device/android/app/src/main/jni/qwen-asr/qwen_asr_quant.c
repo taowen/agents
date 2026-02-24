@@ -5,6 +5,7 @@
 #include "qwen_asr_quant.h"
 #include <math.h>
 #include <string.h>
+#include <stdlib.h>
 
 #ifdef __ARM_NEON
 #include <arm_neon.h>
@@ -132,6 +133,121 @@ void quantize_bf16_to_q8_0(const uint16_t *src, block_q8_0 *dst, int n) {
             dp->qs[j] = (int8_t)iv;
         }
 #endif
+    }
+}
+
+/* ========================================================================
+ * Q4_K Super-Block Quantization
+ *
+ * Two-level quantization: super-block scale/min (float) + sub-group
+ * integer scales/mins (uint8).
+ * Per super-block (256 elements, 8 sub-groups of 32):
+ *   weight ≈ d * scales[g] * q - dmin * mins[g]  where q ∈ [0, 15]
+ * ======================================================================== */
+
+void quantize_bf16_to_q4k(const uint16_t *bf16, int rows, int cols,
+                            block_q4_k **out_blocks) {
+    if (cols % QK_K != 0) {
+        *out_blocks = NULL;
+        return;
+    }
+
+    int blocks_per_row = cols / QK_K;
+    size_t total_blocks = (size_t)rows * blocks_per_row;
+    *out_blocks = (block_q4_k *)malloc(total_blocks * sizeof(block_q4_k));
+    if (!*out_blocks) return;
+
+    float tmp[QK_K];
+
+    for (int r = 0; r < rows; r++) {
+        const uint16_t *row = bf16 + (size_t)r * cols;
+
+        for (int b = 0; b < blocks_per_row; b++) {
+            block_q4_k *blk = *out_blocks + (size_t)r * blocks_per_row + b;
+            int col_start = b * QK_K;
+
+            /* Convert BF16 block to F32 */
+            for (int i = 0; i < QK_K; i++) {
+                uint32_t bits = ((uint32_t)row[col_start + i]) << 16;
+                memcpy(&tmp[i], &bits, sizeof(float));
+            }
+
+            /* Phase 1: Per sub-group min/max */
+            float per_group_scale[Q4K_NUM_SUBS];
+            float per_group_min[Q4K_NUM_SUBS];
+
+            for (int g = 0; g < Q4K_NUM_SUBS; g++) {
+                float gmin = tmp[g * 32];
+                float gmax = tmp[g * 32];
+                for (int i = 1; i < 32; i++) {
+                    float v = tmp[g * 32 + i];
+                    if (v < gmin) gmin = v;
+                    if (v > gmax) gmax = v;
+                }
+                float range = gmax - gmin;
+                per_group_scale[g] = range / 15.0f;
+                per_group_min[g] = -gmin;
+                if (per_group_min[g] < 0.0f) per_group_min[g] = 0.0f;
+            }
+
+            /* Phase 2: Two-level scale quantization */
+            float max_scale = 0.0f;
+            float max_min = 0.0f;
+            for (int g = 0; g < Q4K_NUM_SUBS; g++) {
+                if (per_group_scale[g] > max_scale) max_scale = per_group_scale[g];
+                if (per_group_min[g] > max_min) max_min = per_group_min[g];
+            }
+
+            float d = max_scale / 255.0f;
+            float dmin = (max_min > 0.0f) ? max_min / 255.0f : 0.0f;
+            blk->d = d;
+            blk->dmin = dmin;
+
+            float inv_d = (d > 0.0f) ? 1.0f / d : 0.0f;
+            float inv_dmin = (dmin > 0.0f) ? 1.0f / dmin : 0.0f;
+
+            for (int g = 0; g < Q4K_NUM_SUBS; g++) {
+                float sv = per_group_scale[g] * inv_d;
+                int si = (int)(sv + 0.5f);
+                if (si > 255) si = 255;
+                if (si < 0) si = 0;
+                blk->scales[g] = (uint8_t)si;
+
+                float mv = per_group_min[g] * inv_dmin;
+                int mi = (int)(mv + 0.5f);
+                if (mi > 255) mi = 255;
+                if (mi < 0) mi = 0;
+                blk->mins[g] = (uint8_t)mi;
+            }
+
+            /* Phase 3: Quantize weights → unsigned int4 [0, 15] and pack */
+            for (int g = 0; g < Q4K_NUM_SUBS; g++) {
+                float eff_scale = d * (float)blk->scales[g];
+                float eff_min = dmin * (float)blk->mins[g];
+                float inv_eff_scale = (eff_scale > 0.0f) ? 1.0f / eff_scale : 0.0f;
+
+                for (int i = 0; i < 16; i++) {
+                    float v0 = tmp[g * 32 + i * 2];
+                    float v1 = tmp[g * 32 + i * 2 + 1];
+
+                    int q0, q1;
+                    if (eff_scale > 0.0f) {
+                        float fq0 = (v0 + eff_min) * inv_eff_scale;
+                        float fq1 = (v1 + eff_min) * inv_eff_scale;
+                        q0 = (int)(fq0 + 0.5f);
+                        q1 = (int)(fq1 + 0.5f);
+                    } else {
+                        q0 = 0;
+                        q1 = 0;
+                    }
+                    if (q0 < 0) q0 = 0; if (q0 > 15) q0 = 15;
+                    if (q1 < 0) q1 = 0; if (q1 > 15) q1 = 15;
+
+                    /* Pack: low nibble = even index, high nibble = odd index */
+                    blk->qs[g * 16 + i] = (uint8_t)(q0 | (q1 << 4));
+                }
+            }
+        }
     }
 }
 

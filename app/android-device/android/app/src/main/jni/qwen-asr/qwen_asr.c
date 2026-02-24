@@ -10,6 +10,7 @@
 #include "qwen_asr_safetensors.h"
 #include "qwen_asr_audio.h"
 #include "qwen_asr_tokenizer.h"
+#include "qwen_asr_quant.h"
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -17,6 +18,10 @@
 #include <math.h>
 #include <limits.h>
 #include <sys/time.h>
+#include <sys/stat.h>
+#include <sys/mman.h>
+#include <fcntl.h>
+#include <unistd.h>
 
 /* Global verbose flag */
 int qwen_verbose = 0;
@@ -191,6 +196,298 @@ static int detect_config(qwen_ctx_t *ctx) {
 }
 
 /* ========================================================================
+ * Pre-quantized Weight Cache (.qcache)
+ *
+ * After first-time BF16→Q4_K/Q8_0 quantization, serialize all quantized
+ * projection weights to a binary cache file. Subsequent loads mmap the
+ * cache, avoiding the expensive quantization step.
+ *
+ * Cache is saved alongside safetensors in model_dir.
+ * Invalidated when safetensors total file size changes.
+ *
+ * Cache format:
+ *   header (asr_qcache_header_t)
+ *   for each encoder layer:
+ *     wq_q8 | wk_q8 | wv_q8 | wo_q8 | fc1_q8 | fc2_q8
+ *   encoder: conv_out_q8 | proj1_q8 | proj2_q8
+ *   for each decoder layer:
+ *     wq_q4k | wk_q4k | wv_q4k | wo_q4k | gate_up_q4k | down_q4k
+ *   decoder: tok_embeddings_q4k
+ * ======================================================================== */
+
+#define ASR_QCACHE_MAGIC   0x31435141  /* "AQC1" */
+#define ASR_QCACHE_VERSION 1
+
+typedef struct {
+    uint32_t magic;
+    uint32_t version;
+    uint64_t source_size;           /* safetensors total file size for validation */
+    uint32_t n_enc_layers;
+    uint32_t n_dec_layers;
+    /* Encoder per-layer Q8_0 sizes */
+    uint32_t enc_wq_q8_bytes;       /* per layer */
+    uint32_t enc_wk_q8_bytes;
+    uint32_t enc_wv_q8_bytes;
+    uint32_t enc_wo_q8_bytes;
+    uint32_t enc_fc1_q8_bytes;
+    uint32_t enc_fc2_q8_bytes;
+    /* Encoder one-time Q8_0 sizes */
+    uint32_t enc_conv_out_q8_bytes;
+    uint32_t enc_proj1_q8_bytes;
+    uint32_t enc_proj2_q8_bytes;
+    /* Decoder per-layer Q4_K sizes */
+    uint32_t dec_wq_q4k_bytes;
+    uint32_t dec_wk_q4k_bytes;
+    uint32_t dec_wv_q4k_bytes;
+    uint32_t dec_wo_q4k_bytes;
+    uint32_t dec_gate_up_q4k_bytes;
+    uint32_t dec_down_q4k_bytes;
+    /* Decoder one-time Q4_K sizes */
+    uint32_t dec_tok_emb_q4k_bytes;
+    uint32_t reserved[3];
+} asr_qcache_header_t;
+
+static uint64_t get_safetensors_size(const char *model_dir) {
+    char path[1024];
+    uint64_t total = 0;
+    struct stat st;
+
+    snprintf(path, sizeof(path), "%s/model.safetensors", model_dir);
+    if (stat(path, &st) == 0) total += (uint64_t)st.st_size;
+
+    for (int i = 1; i <= 10; i++) {
+        snprintf(path, sizeof(path), "%s/model-%05d-of-00002.safetensors", model_dir, i);
+        if (stat(path, &st) == 0) total += (uint64_t)st.st_size;
+        snprintf(path, sizeof(path), "%s/model-%05d-of-00003.safetensors", model_dir, i);
+        if (stat(path, &st) == 0) total += (uint64_t)st.st_size;
+    }
+    return total;
+}
+
+static int save_asr_qcache(qwen_ctx_t *ctx) {
+    const qwen_config_t *cfg = &ctx->config;
+    char path[1024];
+    snprintf(path, sizeof(path), "%s/model.qcache", ctx->model_dir);
+
+    /* Compute per-layer sizes */
+    int d = cfg->enc_d_model;
+    int ffn = cfg->enc_ffn_dim;
+    int enc_d_blocks = d / QK8_0;
+
+    uint32_t enc_wq_q8_bytes = (uint32_t)((size_t)d * enc_d_blocks * sizeof(block_q8_0));
+    uint32_t enc_wk_q8_bytes = enc_wq_q8_bytes;
+    uint32_t enc_wv_q8_bytes = enc_wq_q8_bytes;
+    uint32_t enc_wo_q8_bytes = enc_wq_q8_bytes;
+    uint32_t enc_fc1_q8_bytes = (uint32_t)((size_t)ffn * enc_d_blocks * sizeof(block_q8_0));
+    uint32_t enc_fc2_q8_bytes = (uint32_t)((size_t)d * (ffn / QK8_0) * sizeof(block_q8_0));
+
+    int conv_proj_dim = cfg->enc_conv_proj_dim;
+    uint32_t enc_conv_out_q8_bytes = (uint32_t)((size_t)d * (conv_proj_dim / QK8_0) * sizeof(block_q8_0));
+    uint32_t enc_proj1_q8_bytes = (uint32_t)((size_t)d * enc_d_blocks * sizeof(block_q8_0));
+    uint32_t enc_proj2_q8_bytes = (uint32_t)((size_t)cfg->enc_output_dim * enc_d_blocks * sizeof(block_q8_0));
+
+    int hidden = cfg->dec_hidden;
+    int q_dim = cfg->dec_heads * cfg->dec_head_dim;
+    int kv_dim = cfg->dec_kv_heads * cfg->dec_head_dim;
+    int inter = cfg->dec_intermediate;
+    int h_bpr = hidden / QK_K;  /* blocks per row for hidden dim */
+    int q_bpr = q_dim / QK_K;
+    int i_bpr = inter / QK_K;
+
+    uint32_t dec_wq_q4k_bytes = (uint32_t)((size_t)q_dim * h_bpr * sizeof(block_q4_k));
+    uint32_t dec_wk_q4k_bytes = (uint32_t)((size_t)kv_dim * h_bpr * sizeof(block_q4_k));
+    uint32_t dec_wv_q4k_bytes = (uint32_t)((size_t)kv_dim * h_bpr * sizeof(block_q4_k));
+    uint32_t dec_wo_q4k_bytes = (uint32_t)((size_t)hidden * q_bpr * sizeof(block_q4_k));
+    uint32_t dec_gate_up_q4k_bytes = (uint32_t)((size_t)(2 * inter) * h_bpr * sizeof(block_q4_k));
+    uint32_t dec_down_q4k_bytes = (uint32_t)((size_t)hidden * i_bpr * sizeof(block_q4_k));
+    uint32_t dec_tok_emb_q4k_bytes = (uint32_t)((size_t)cfg->vocab_size * h_bpr * sizeof(block_q4_k));
+
+    /* Build header */
+    asr_qcache_header_t hdr;
+    memset(&hdr, 0, sizeof(hdr));
+    hdr.magic = ASR_QCACHE_MAGIC;
+    hdr.version = ASR_QCACHE_VERSION;
+    hdr.source_size = get_safetensors_size(ctx->model_dir);
+    hdr.n_enc_layers = (uint32_t)cfg->enc_layers;
+    hdr.n_dec_layers = (uint32_t)cfg->dec_layers;
+    hdr.enc_wq_q8_bytes = enc_wq_q8_bytes;
+    hdr.enc_wk_q8_bytes = enc_wk_q8_bytes;
+    hdr.enc_wv_q8_bytes = enc_wv_q8_bytes;
+    hdr.enc_wo_q8_bytes = enc_wo_q8_bytes;
+    hdr.enc_fc1_q8_bytes = enc_fc1_q8_bytes;
+    hdr.enc_fc2_q8_bytes = enc_fc2_q8_bytes;
+    hdr.enc_conv_out_q8_bytes = enc_conv_out_q8_bytes;
+    hdr.enc_proj1_q8_bytes = enc_proj1_q8_bytes;
+    hdr.enc_proj2_q8_bytes = enc_proj2_q8_bytes;
+    hdr.dec_wq_q4k_bytes = dec_wq_q4k_bytes;
+    hdr.dec_wk_q4k_bytes = dec_wk_q4k_bytes;
+    hdr.dec_wv_q4k_bytes = dec_wv_q4k_bytes;
+    hdr.dec_wo_q4k_bytes = dec_wo_q4k_bytes;
+    hdr.dec_gate_up_q4k_bytes = dec_gate_up_q4k_bytes;
+    hdr.dec_down_q4k_bytes = dec_down_q4k_bytes;
+    hdr.dec_tok_emb_q4k_bytes = dec_tok_emb_q4k_bytes;
+
+    FILE *f = fopen(path, "wb");
+    if (!f) {
+        if (qwen_verbose >= 1)
+            fprintf(stderr, "Warning: cannot create qcache at %s\n", path);
+        return -1;
+    }
+
+    fwrite(&hdr, sizeof(hdr), 1, f);
+
+    #define WRITE_OR_ZERO(ptr, nbytes) do { \
+        if (ptr) fwrite(ptr, 1, nbytes, f); \
+        else { void *z = calloc(1, nbytes); fwrite(z, 1, nbytes, f); free(z); } \
+    } while(0)
+
+    /* Write encoder layers */
+    for (int i = 0; i < cfg->enc_layers; i++) {
+        qwen_enc_layer_t *l = &ctx->encoder.layers[i];
+        WRITE_OR_ZERO(l->wq_weight_q8, enc_wq_q8_bytes);
+        WRITE_OR_ZERO(l->wk_weight_q8, enc_wk_q8_bytes);
+        WRITE_OR_ZERO(l->wv_weight_q8, enc_wv_q8_bytes);
+        WRITE_OR_ZERO(l->wo_weight_q8, enc_wo_q8_bytes);
+        WRITE_OR_ZERO(l->fc1_weight_q8, enc_fc1_q8_bytes);
+        WRITE_OR_ZERO(l->fc2_weight_q8, enc_fc2_q8_bytes);
+    }
+
+    /* Write encoder one-time weights */
+    WRITE_OR_ZERO(ctx->encoder.conv_out_weight_q8, enc_conv_out_q8_bytes);
+    WRITE_OR_ZERO(ctx->encoder.proj1_weight_q8, enc_proj1_q8_bytes);
+    WRITE_OR_ZERO(ctx->encoder.proj2_weight_q8, enc_proj2_q8_bytes);
+
+    /* Write decoder layers */
+    for (int i = 0; i < cfg->dec_layers; i++) {
+        qwen_dec_layer_t *l = &ctx->decoder.layers[i];
+        WRITE_OR_ZERO(l->wq_weight_q4k, dec_wq_q4k_bytes);
+        WRITE_OR_ZERO(l->wk_weight_q4k, dec_wk_q4k_bytes);
+        WRITE_OR_ZERO(l->wv_weight_q4k, dec_wv_q4k_bytes);
+        WRITE_OR_ZERO(l->wo_weight_q4k, dec_wo_q4k_bytes);
+        WRITE_OR_ZERO(l->gate_up_fused_q4k, dec_gate_up_q4k_bytes);
+        WRITE_OR_ZERO(l->down_weight_q4k, dec_down_q4k_bytes);
+    }
+
+    /* Write decoder token embeddings Q4_K */
+    WRITE_OR_ZERO(ctx->decoder.tok_embeddings_q4k, dec_tok_emb_q4k_bytes);
+
+    #undef WRITE_OR_ZERO
+
+    fclose(f);
+    if (qwen_verbose >= 1)
+        fprintf(stderr, "Saved quantized cache to %s\n", path);
+    return 0;
+}
+
+static int load_asr_qcache(qwen_ctx_t *ctx) {
+    const qwen_config_t *cfg = &ctx->config;
+    char path[1024];
+    snprintf(path, sizeof(path), "%s/model.qcache", ctx->model_dir);
+
+    int fd = open(path, O_RDONLY);
+    if (fd < 0) return -1;
+
+    struct stat st;
+    if (fstat(fd, &st) != 0) { close(fd); return -1; }
+    size_t file_size = (size_t)st.st_size;
+    if (file_size < sizeof(asr_qcache_header_t)) { close(fd); return -1; }
+
+    void *mapped = mmap(NULL, file_size, PROT_READ, MAP_PRIVATE, fd, 0);
+    close(fd);
+    if (mapped == MAP_FAILED) return -1;
+
+    const asr_qcache_header_t *hdr = (const asr_qcache_header_t *)mapped;
+
+    /* Validate header */
+    if (hdr->magic != ASR_QCACHE_MAGIC || hdr->version != ASR_QCACHE_VERSION) {
+        munmap(mapped, file_size);
+        return -1;
+    }
+    if ((int)hdr->n_enc_layers != cfg->enc_layers ||
+        (int)hdr->n_dec_layers != cfg->dec_layers) {
+        munmap(mapped, file_size);
+        return -1;
+    }
+
+    /* Validate source file size */
+    uint64_t expected_src = get_safetensors_size(ctx->model_dir);
+    if (hdr->source_size != expected_src) {
+        if (qwen_verbose >= 1)
+            fprintf(stderr, "qcache: source size mismatch (cache=%llu, actual=%llu), re-quantizing\n",
+                    (unsigned long long)hdr->source_size, (unsigned long long)expected_src);
+        munmap(mapped, file_size);
+        return -1;
+    }
+
+    /* Validate total file size */
+    size_t enc_per_layer = (size_t)hdr->enc_wq_q8_bytes + hdr->enc_wk_q8_bytes +
+                            hdr->enc_wv_q8_bytes + hdr->enc_wo_q8_bytes +
+                            hdr->enc_fc1_q8_bytes + hdr->enc_fc2_q8_bytes;
+    size_t dec_per_layer = (size_t)hdr->dec_wq_q4k_bytes + hdr->dec_wk_q4k_bytes +
+                            hdr->dec_wv_q4k_bytes + hdr->dec_wo_q4k_bytes +
+                            hdr->dec_gate_up_q4k_bytes + hdr->dec_down_q4k_bytes;
+    size_t expected_size = sizeof(asr_qcache_header_t) +
+                           enc_per_layer * hdr->n_enc_layers +
+                           (size_t)hdr->enc_conv_out_q8_bytes +
+                           hdr->enc_proj1_q8_bytes + hdr->enc_proj2_q8_bytes +
+                           dec_per_layer * hdr->n_dec_layers +
+                           hdr->dec_tok_emb_q4k_bytes;
+    if (file_size < expected_size) {
+        munmap(mapped, file_size);
+        return -1;
+    }
+
+    /* Copy weights from mmap into malloc'd buffers */
+    const uint8_t *ptr = (const uint8_t *)mapped + sizeof(asr_qcache_header_t);
+
+    #define CACHE_COPY(dst, type, n_bytes) do { \
+        if ((n_bytes) > 0) { \
+            dst = (type)malloc(n_bytes); \
+            if (dst) memcpy(dst, ptr, n_bytes); \
+            ptr += (n_bytes); \
+        } \
+    } while(0)
+
+    /* Read encoder layers */
+    for (int i = 0; i < cfg->enc_layers; i++) {
+        qwen_enc_layer_t *l = &ctx->encoder.layers[i];
+        CACHE_COPY(l->wq_weight_q8, block_q8_0 *, hdr->enc_wq_q8_bytes);
+        CACHE_COPY(l->wk_weight_q8, block_q8_0 *, hdr->enc_wk_q8_bytes);
+        CACHE_COPY(l->wv_weight_q8, block_q8_0 *, hdr->enc_wv_q8_bytes);
+        CACHE_COPY(l->wo_weight_q8, block_q8_0 *, hdr->enc_wo_q8_bytes);
+        CACHE_COPY(l->fc1_weight_q8, block_q8_0 *, hdr->enc_fc1_q8_bytes);
+        CACHE_COPY(l->fc2_weight_q8, block_q8_0 *, hdr->enc_fc2_q8_bytes);
+    }
+
+    /* Read encoder one-time weights */
+    CACHE_COPY(ctx->encoder.conv_out_weight_q8, block_q8_0 *, hdr->enc_conv_out_q8_bytes);
+    CACHE_COPY(ctx->encoder.proj1_weight_q8, block_q8_0 *, hdr->enc_proj1_q8_bytes);
+    CACHE_COPY(ctx->encoder.proj2_weight_q8, block_q8_0 *, hdr->enc_proj2_q8_bytes);
+
+    /* Read decoder layers */
+    for (int i = 0; i < cfg->dec_layers; i++) {
+        qwen_dec_layer_t *l = &ctx->decoder.layers[i];
+        CACHE_COPY(l->wq_weight_q4k, block_q4_k *, hdr->dec_wq_q4k_bytes);
+        CACHE_COPY(l->wk_weight_q4k, block_q4_k *, hdr->dec_wk_q4k_bytes);
+        CACHE_COPY(l->wv_weight_q4k, block_q4_k *, hdr->dec_wv_q4k_bytes);
+        CACHE_COPY(l->wo_weight_q4k, block_q4_k *, hdr->dec_wo_q4k_bytes);
+        CACHE_COPY(l->gate_up_fused_q4k, block_q4_k *, hdr->dec_gate_up_q4k_bytes);
+        CACHE_COPY(l->down_weight_q4k, block_q4_k *, hdr->dec_down_q4k_bytes);
+    }
+
+    /* Read decoder token embeddings */
+    CACHE_COPY(ctx->decoder.tok_embeddings_q4k, block_q4_k *, hdr->dec_tok_emb_q4k_bytes);
+
+    #undef CACHE_COPY
+
+    munmap(mapped, file_size);
+
+    if (qwen_verbose >= 1)
+        fprintf(stderr, "Loaded quantized cache from %s\n", path);
+    return 0;
+}
+
+/* ========================================================================
  * Model Loading
  * ======================================================================== */
 
@@ -214,7 +511,13 @@ qwen_ctx_t *qwen_load(const char *model_dir) {
     /* Detect model configuration */
     detect_config(ctx);
 
-    /* Load encoder weights */
+    /* Try loading quantized weight cache */
+    int cache_ok = load_asr_qcache(ctx);
+    if (cache_ok == 0 && qwen_verbose >= 1) {
+        fprintf(stderr, "Loaded quantized cache, skipping quantization\n");
+    }
+
+    /* Load encoder weights (skips quantization for weights already in cache) */
     if (qwen_verbose >= 1) fprintf(stderr, "Loading encoder weights...\n");
     if (qwen_encoder_load(&ctx->encoder, ms, &ctx->config) != 0) {
         fprintf(stderr, "qwen_load: failed to load encoder\n");
@@ -222,12 +525,17 @@ qwen_ctx_t *qwen_load(const char *model_dir) {
         return NULL;
     }
 
-    /* Load decoder weights */
+    /* Load decoder weights (skips quantization for weights already in cache) */
     if (qwen_verbose >= 1) fprintf(stderr, "Loading decoder weights...\n");
     if (qwen_decoder_load(&ctx->decoder, ms, &ctx->config) != 0) {
         fprintf(stderr, "qwen_load: failed to load decoder\n");
         qwen_free(ctx);
         return NULL;
+    }
+
+    /* Save cache if it wasn't loaded (first-time quantization) */
+    if (cache_ok != 0) {
+        save_asr_qcache(ctx);
     }
 
     /* Default transcription mode: full-audio offline decode (no splitting). */
@@ -277,18 +585,18 @@ void qwen_free(qwen_ctx_t *ctx) {
     FREE0(ctx->encoder.proj1_weight_q8); FREE0(ctx->encoder.proj1_bias);
     FREE0(ctx->encoder.proj2_weight_q8); FREE0(ctx->encoder.proj2_bias);
 
-    /* Decoder layers (Q8_0 weights are all malloc'd, must be freed) */
+    /* Decoder layers (Q4_K weights are all malloc'd, must be freed) */
     for (int i = 0; i < ctx->config.dec_layers; i++) {
         qwen_dec_layer_t *l = &ctx->decoder.layers[i];
-        FREE0(l->wq_weight_q8); FREE0(l->wk_weight_q8);
-        FREE0(l->wv_weight_q8); FREE0(l->wo_weight_q8);
+        FREE0(l->wq_weight_q4k); FREE0(l->wk_weight_q4k);
+        FREE0(l->wv_weight_q4k); FREE0(l->wo_weight_q4k);
         FREE0(l->q_norm_weight); FREE0(l->k_norm_weight);
         FREE0(l->input_norm); FREE0(l->post_attn_norm);
-        FREE0(l->down_weight_q8);
-        FREE0(l->gate_up_fused_q8);
+        FREE0(l->down_weight_q4k);
+        FREE0(l->gate_up_fused_q4k);
     }
     FREE0(ctx->decoder.norm);
-    FREE0(ctx->decoder.tok_embeddings_q8);
+    FREE0(ctx->decoder.tok_embeddings_q4k);
 
     #undef FREE0
 

@@ -193,6 +193,28 @@ int qwen_argmax_matvec_q8(const float *x, const block_q8_0 *W_q8,
                             int in_dim, int out_dim);
 
 /* ========================================================================
+ * Q4_K Super-Block Weight Operations
+ * ======================================================================== */
+
+/* Q4_K linear: y = W_q4k @ x (no bias), seq_len=1 matvec or batched GEMM.
+ * W_q4k: [out_dim * (in_dim/QK_K)] block_q4_k blocks.
+ * Pre-quantizes x to int8, computes bsums, uses SDOT inner loop. */
+void qwen_linear_nobias_q4k(float *y, const float *x, const block_q4_k *W_q4k,
+                              int seq_len, int in_dim, int out_dim);
+
+/* Q4_K fused QKV matvec for single-token decoder.
+ * Quantizes x once, dispatches Q/K/V to thread pool. */
+void qwen_linear_nobias_q4k_qkv(float *q, float *k, float *v, const float *x,
+                                  const block_q4_k *Wq_q4k,
+                                  const block_q4_k *Wk_q4k,
+                                  const block_q4_k *Wv_q4k,
+                                  int in_dim, int q_dim, int kv_dim);
+
+/* Q4_K streaming argmax: finds argmax(W_q4k @ x) using Q4_K dot products. */
+int qwen_argmax_matvec_q4k(const float *x, const block_q4_k *W_q4k,
+                             int in_dim, int out_dim);
+
+/* ========================================================================
  * FP16 Conversion
  * ======================================================================== */
 

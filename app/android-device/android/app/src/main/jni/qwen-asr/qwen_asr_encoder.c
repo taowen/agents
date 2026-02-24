@@ -83,9 +83,11 @@ int qwen_encoder_load(qwen_encoder_t *enc, multi_safetensors_t *ms,
 
     if (!enc->conv1_weight || !enc->conv2_weight || !enc->conv3_weight) return -1;
 
-    /* Conv output projection (bf16 -> Q8_0, no bias) */
-    snprintf(name, sizeof(name), "%sconv_out.weight", ENC_PREFIX);
-    enc->conv_out_weight_q8 = load_bf16_as_q8(ms, name);
+    /* Conv output projection (bf16 -> Q8_0, no bias) - skip if qcache loaded */
+    if (!enc->conv_out_weight_q8) {
+        snprintf(name, sizeof(name), "%sconv_out.weight", ENC_PREFIX);
+        enc->conv_out_weight_q8 = load_bf16_as_q8(ms, name);
+    }
     if (!enc->conv_out_weight_q8) return -1;
 
     /* Transformer layers */
@@ -93,41 +95,53 @@ int qwen_encoder_load(qwen_encoder_t *enc, multi_safetensors_t *ms,
         qwen_enc_layer_t *l = &enc->layers[i];
         const char *lp = ENC_PREFIX "layers";
 
-        /* Attention weights (bf16 -> Q8_0) and biases (f32) */
-        snprintf(name, sizeof(name), "%s.%d.self_attn.q_proj.weight", lp, i);
-        l->wq_weight_q8 = load_bf16_as_q8(ms, name);
+        /* Attention weights (bf16 -> Q8_0) - skip if qcache loaded */
+        if (!l->wq_weight_q8) {
+            snprintf(name, sizeof(name), "%s.%d.self_attn.q_proj.weight", lp, i);
+            l->wq_weight_q8 = load_bf16_as_q8(ms, name);
+        }
         snprintf(name, sizeof(name), "%s.%d.self_attn.q_proj.bias", lp, i);
         l->wq_bias = load_f32(ms, name);
-        snprintf(name, sizeof(name), "%s.%d.self_attn.k_proj.weight", lp, i);
-        l->wk_weight_q8 = load_bf16_as_q8(ms, name);
+        if (!l->wk_weight_q8) {
+            snprintf(name, sizeof(name), "%s.%d.self_attn.k_proj.weight", lp, i);
+            l->wk_weight_q8 = load_bf16_as_q8(ms, name);
+        }
         snprintf(name, sizeof(name), "%s.%d.self_attn.k_proj.bias", lp, i);
         l->wk_bias = load_f32(ms, name);
-        snprintf(name, sizeof(name), "%s.%d.self_attn.v_proj.weight", lp, i);
-        l->wv_weight_q8 = load_bf16_as_q8(ms, name);
+        if (!l->wv_weight_q8) {
+            snprintf(name, sizeof(name), "%s.%d.self_attn.v_proj.weight", lp, i);
+            l->wv_weight_q8 = load_bf16_as_q8(ms, name);
+        }
         snprintf(name, sizeof(name), "%s.%d.self_attn.v_proj.bias", lp, i);
         l->wv_bias = load_f32(ms, name);
-        snprintf(name, sizeof(name), "%s.%d.self_attn.out_proj.weight", lp, i);
-        l->wo_weight_q8 = load_bf16_as_q8(ms, name);
+        if (!l->wo_weight_q8) {
+            snprintf(name, sizeof(name), "%s.%d.self_attn.out_proj.weight", lp, i);
+            l->wo_weight_q8 = load_bf16_as_q8(ms, name);
+        }
         snprintf(name, sizeof(name), "%s.%d.self_attn.out_proj.bias", lp, i);
         l->wo_bias = load_f32(ms, name);
 
-        /* Pre-attention LayerNorm */
+        /* Pre-attention LayerNorm (from safetensors, not cached) */
         snprintf(name, sizeof(name), "%s.%d.self_attn_layer_norm.weight", lp, i);
         l->attn_norm_weight = load_f32(ms, name);
         snprintf(name, sizeof(name), "%s.%d.self_attn_layer_norm.bias", lp, i);
         l->attn_norm_bias = load_f32(ms, name);
 
-        /* FFN weights (bf16 -> Q8_0) and biases (f32) */
-        snprintf(name, sizeof(name), "%s.%d.fc1.weight", lp, i);
-        l->fc1_weight_q8 = load_bf16_as_q8(ms, name);
+        /* FFN weights (bf16 -> Q8_0) - skip if qcache loaded */
+        if (!l->fc1_weight_q8) {
+            snprintf(name, sizeof(name), "%s.%d.fc1.weight", lp, i);
+            l->fc1_weight_q8 = load_bf16_as_q8(ms, name);
+        }
         snprintf(name, sizeof(name), "%s.%d.fc1.bias", lp, i);
         l->fc1_bias = load_f32(ms, name);
-        snprintf(name, sizeof(name), "%s.%d.fc2.weight", lp, i);
-        l->fc2_weight_q8 = load_bf16_as_q8(ms, name);
+        if (!l->fc2_weight_q8) {
+            snprintf(name, sizeof(name), "%s.%d.fc2.weight", lp, i);
+            l->fc2_weight_q8 = load_bf16_as_q8(ms, name);
+        }
         snprintf(name, sizeof(name), "%s.%d.fc2.bias", lp, i);
         l->fc2_bias = load_f32(ms, name);
 
-        /* Pre-FFN LayerNorm */
+        /* Pre-FFN LayerNorm (from safetensors, not cached) */
         snprintf(name, sizeof(name), "%s.%d.final_layer_norm.weight", lp, i);
         l->ffn_norm_weight = load_f32(ms, name);
         snprintf(name, sizeof(name), "%s.%d.final_layer_norm.bias", lp, i);
@@ -141,19 +155,23 @@ int qwen_encoder_load(qwen_encoder_t *enc, multi_safetensors_t *ms,
 
     }
 
-    /* Final LayerNorm */
+    /* Final LayerNorm (from safetensors, not cached) */
     snprintf(name, sizeof(name), "%sln_post.weight", ENC_PREFIX);
     enc->ln_post_weight = load_f32(ms, name);
     snprintf(name, sizeof(name), "%sln_post.bias", ENC_PREFIX);
     enc->ln_post_bias = load_f32(ms, name);
 
-    /* Projection layers */
-    snprintf(name, sizeof(name), "%sproj1.weight", ENC_PREFIX);
-    enc->proj1_weight_q8 = load_bf16_as_q8(ms, name);
+    /* Projection layers - skip if qcache loaded */
+    if (!enc->proj1_weight_q8) {
+        snprintf(name, sizeof(name), "%sproj1.weight", ENC_PREFIX);
+        enc->proj1_weight_q8 = load_bf16_as_q8(ms, name);
+    }
     snprintf(name, sizeof(name), "%sproj1.bias", ENC_PREFIX);
     enc->proj1_bias = load_f32(ms, name);
-    snprintf(name, sizeof(name), "%sproj2.weight", ENC_PREFIX);
-    enc->proj2_weight_q8 = load_bf16_as_q8(ms, name);
+    if (!enc->proj2_weight_q8) {
+        snprintf(name, sizeof(name), "%sproj2.weight", ENC_PREFIX);
+        enc->proj2_weight_q8 = load_bf16_as_q8(ms, name);
+    }
     snprintf(name, sizeof(name), "%sproj2.bias", ENC_PREFIX);
     enc->proj2_bias = load_f32(ms, name);
 
