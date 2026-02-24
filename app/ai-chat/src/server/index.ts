@@ -18,7 +18,7 @@ app.all("/auth/*", (c) => handleAuthRoutes(c.req.raw, c.env));
 // 1.5 Public download page & R2 public file serving — no auth required
 app.get("/download", (c) => {
   const apkUrl =
-    "https://ai.connect-screen.com/api/public/connect-screen-0aa8c27.apk";
+    "https://ai.connect-screen.com/api/public/connect-screen-28d7fda.apk";
   const winZipUrl =
     "https://ai.connect-screen.com/api/public/connect-screen-win-572d4ce.zip";
   const apkQrUrl = `https://api.qrserver.com/v1/create-qr-code/?data=${encodeURIComponent(apkUrl)}&size=200x200`;
@@ -43,6 +43,7 @@ a.btn.android:hover{background:#1d4ed8}
 a.btn.windows{background:#0078d4}
 a.btn.windows:hover{background:#006abc}
 p.hint{margin-top:20px;font-size:12px;color:#999}
+a.link{display:block;margin-top:12px;font-size:12px;color:#2563eb;word-break:break-all}
 .icon{font-size:36px;margin-bottom:12px}
 </style>
 </head>
@@ -55,6 +56,7 @@ p.hint{margin-top:20px;font-size:12px;color:#999}
 <img class="qr" src="${apkQrUrl}" width="200" height="200" alt="Android QR Code">
 <br>
 <a class="btn android" href="${apkUrl}">Download APK</a>
+<a class="link" href="${apkUrl}">${apkUrl}</a>
 <p class="hint">Requires Android 8.0+. Allow installs from unknown sources.</p>
 </div>
 <div class="card">
@@ -64,6 +66,7 @@ p.hint{margin-top:20px;font-size:12px;color:#999}
 <img class="qr" src="${winQrUrl}" width="200" height="200" alt="Windows QR Code">
 <br>
 <a class="btn windows" href="${winZipUrl}">Download ZIP</a>
+<a class="link" href="${winZipUrl}">${winZipUrl}</a>
 <p class="hint">Requires Windows 10/11 with PowerShell 5.1+. Extract and run connect.ps1.</p>
 </div>
 </div>

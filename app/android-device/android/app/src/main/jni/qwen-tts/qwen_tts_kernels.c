@@ -274,6 +274,67 @@ void kernel_bf16_to_f32(float *out, const uint16_t *in, int n) {
 }
 
 /* ======================================================================== */
+/* FP16 conversion and utility kernels                                       */
+/* ======================================================================== */
+
+#ifdef __ARM_FEATURE_FP16_VECTOR_ARITHMETIC
+
+void kernel_f32_to_f16(__fp16 *dst, const float *src, int n) {
+    int i = 0;
+    for (; i + 7 < n; i += 8) {
+        float32x4_t lo = vld1q_f32(src + i);
+        float32x4_t hi = vld1q_f32(src + i + 4);
+        float16x4_t hlo = vcvt_f16_f32(lo);
+        float16x4_t hhi = vcvt_f16_f32(hi);
+        vst1q_f16(dst + i, vcombine_f16(hlo, hhi));
+    }
+    for (; i + 3 < n; i += 4) {
+        float32x4_t v = vld1q_f32(src + i);
+        vst1_f16(dst + i, vcvt_f16_f32(v));
+    }
+    for (; i < n; i++) dst[i] = (__fp16)src[i];
+}
+
+void kernel_f16_to_f32(float *dst, const __fp16 *src, int n) {
+    int i = 0;
+    for (; i + 7 < n; i += 8) {
+        float16x8_t h = vld1q_f16(src + i);
+        vst1q_f32(dst + i,     vcvt_f32_f16(vget_low_f16(h)));
+        vst1q_f32(dst + i + 4, vcvt_f32_f16(vget_high_f16(h)));
+    }
+    for (; i + 3 < n; i += 4) {
+        float16x4_t h = vld1_f16(src + i);
+        vst1q_f32(dst + i, vcvt_f32_f16(h));
+    }
+    for (; i < n; i++) dst[i] = (float)src[i];
+}
+
+void kernel_add_inplace_f16(__fp16 *a, const __fp16 *b, int n) {
+    int i = 0;
+    for (; i + 7 < n; i += 8)
+        vst1q_f16(a + i, vaddq_f16(vld1q_f16(a + i), vld1q_f16(b + i)));
+    for (; i < n; i++) a[i] = (__fp16)((float)a[i] + (float)b[i]);
+}
+
+void kernel_clamp_f16(__fp16 *x, int n, __fp16 min_val, __fp16 max_val) {
+    float16x8_t vmin = vdupq_n_f16(min_val);
+    float16x8_t vmax = vdupq_n_f16(max_val);
+    int i = 0;
+    for (; i + 7 < n; i += 8) {
+        float16x8_t v = vld1q_f16(x + i);
+        v = vmaxq_f16(v, vmin);
+        v = vminq_f16(v, vmax);
+        vst1q_f16(x + i, v);
+    }
+    for (; i < n; i++) {
+        if (x[i] < min_val) x[i] = min_val;
+        if (x[i] > max_val) x[i] = max_val;
+    }
+}
+
+#endif /* __ARM_FEATURE_FP16_VECTOR_ARITHMETIC */
+
+/* ======================================================================== */
 /* Platform dispatch (no-op for now)                                         */
 /* ======================================================================== */
 

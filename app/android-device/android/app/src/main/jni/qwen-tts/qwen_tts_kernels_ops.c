@@ -924,3 +924,291 @@ void kernel_transposed_conv1d(float *out, const float *input, const float *weigh
 
     if (out_length) *out_length = final_len;
 }
+
+/* ======================================================================== */
+/* FP16 vocoder kernels                                                      */
+/* ======================================================================== */
+
+#ifdef __ARM_FEATURE_FP16_VECTOR_ARITHMETIC
+
+/* ---- saxpy_broadcast_f16: dst[i] += alpha * src[i] (FP16) ---- */
+
+static inline void saxpy_broadcast_f16(
+    __fp16 * __restrict__ dst, __fp16 alpha,
+    const __fp16 * __restrict__ src, int n) {
+    float16x8_t va = vdupq_n_f16(alpha);
+    int i = 0;
+    for (; i + 31 < n; i += 32) {
+        vst1q_f16(dst+i,    vfmaq_f16(vld1q_f16(dst+i),    va, vld1q_f16(src+i)));
+        vst1q_f16(dst+i+8,  vfmaq_f16(vld1q_f16(dst+i+8),  va, vld1q_f16(src+i+8)));
+        vst1q_f16(dst+i+16, vfmaq_f16(vld1q_f16(dst+i+16), va, vld1q_f16(src+i+16)));
+        vst1q_f16(dst+i+24, vfmaq_f16(vld1q_f16(dst+i+24), va, vld1q_f16(src+i+24)));
+    }
+    for (; i + 7 < n; i += 8)
+        vst1q_f16(dst+i, vfmaq_f16(vld1q_f16(dst+i), va, vld1q_f16(src+i)));
+    for (; i < n; i++) dst[i] = (__fp16)((float)dst[i] + (float)alpha * (float)src[i]);
+}
+
+/* ---- kernel_snake_beta_f16: FP16 data, F32 alpha/beta params ---- */
+
+void kernel_snake_beta_f16(__fp16 *out, const __fp16 *x, const float *alpha,
+                           const float *beta, int channels, int length) {
+    /*
+     * SnakeBeta: out = x + inv_beta * sin^2(alpha * x)
+     * FP16 polynomial sine: same 5th-order approximation as F32 path.
+     * Alpha/beta are F32 per-channel scalars, converted to FP16 per channel.
+     */
+    for (int c = 0; c < channels; c++) {
+        float16x8_t va = vdupq_n_f16((__fp16)alpha[c]);
+        float16x8_t vb = vdupq_n_f16((__fp16)beta[c]);
+        /* Constants for range reduction and polynomial */
+        float16x8_t v_inv_twopi = vdupq_n_f16((__fp16)0.15915494f);
+        float16x8_t v_twopi    = vdupq_n_f16((__fp16)6.2831853f);
+        float16x8_t v_pi       = vdupq_n_f16((__fp16)3.1415927f);
+        float16x8_t v_neg_pi   = vdupq_n_f16((__fp16)(-3.1415927f));
+        float16x8_t v_c3       = vdupq_n_f16((__fp16)(-1.0f / 6.0f));
+        float16x8_t v_c5       = vdupq_n_f16((__fp16)(1.0f / 120.0f));
+        float16x8_t v_half     = vdupq_n_f16((__fp16)0.5f);
+        float16x8_t v_one      = vdupq_n_f16((__fp16)1.0f);
+
+        const __fp16 *xc = x + (size_t)c * length;
+        __fp16 *oc = out + (size_t)c * length;
+        int t = 0;
+        for (; t + 7 < length; t += 8) {
+            float16x8_t vx = vld1q_f16(xc + t);
+            float16x8_t ax = vmulq_f16(vx, va);
+            /* Range reduce to [-pi, pi] */
+            float16x8_t n_val = vfmaq_f16(v_half, ax, v_inv_twopi);
+            /* Floor via round-toward-zero and correction */
+            int16x8_t ni = vcvtq_s16_f16(n_val);
+            float16x8_t nf = vcvtq_f16_s16(ni);
+            uint16x8_t mask = vcgtq_f16(nf, n_val);
+            nf = vsubq_f16(nf, vreinterpretq_f16_u16(vandq_u16(mask, vreinterpretq_u16_f16(v_one))));
+            ax = vsubq_f16(ax, vmulq_f16(nf, v_twopi));
+            ax = vmaxq_f16(ax, v_neg_pi);
+            ax = vminq_f16(ax, v_pi);
+            /* sin(ax) ~ ax * (1 + ax^2 * (-1/6 + ax^2 * 1/120)) */
+            float16x8_t ax2 = vmulq_f16(ax, ax);
+            float16x8_t poly = vfmaq_f16(v_c3, ax2, v_c5);
+            poly = vfmaq_f16(v_one, ax2, poly);
+            float16x8_t s = vmulq_f16(ax, poly);
+            /* out = x + inv_b * s^2 */
+            float16x8_t s2 = vmulq_f16(s, s);
+            float16x8_t result = vfmaq_f16(vx, vb, s2);
+            vst1q_f16(oc + t, result);
+        }
+        /* Scalar cleanup */
+        float a_val = alpha[c];
+        float inv_b_val = beta[c];
+        for (; t < length; t++) {
+            int idx = c * length + t;
+            float s = sinf((float)x[idx] * a_val);
+            out[idx] = (__fp16)((float)x[idx] + inv_b_val * s * s);
+        }
+    }
+}
+
+/* ---- kernel_causal_conv1d_f16 ---- */
+
+void kernel_causal_conv1d_f16(__fp16 *out, const __fp16 *input, const __fp16 *weight,
+                              const __fp16 *bias, int in_channels, int out_channels,
+                              int kernel_size, int length, int dilation, int groups) {
+    int eff_kernel = (kernel_size - 1) * dilation + 1;
+    int pad = eff_kernel - 1;
+    int ch_per_group = in_channels / groups;
+    int out_per_group = out_channels / groups;
+
+    /* Pointwise k=1, dilation=1 */
+    if (kernel_size == 1 && dilation == 1) {
+        if (groups == in_channels && in_channels == out_channels) {
+            /* Depthwise pointwise */
+            for (int c = 0; c < in_channels; c++) {
+                __fp16 w = weight[c];
+                __fp16 b = bias ? bias[c] : (__fp16)0.0f;
+                const __fp16 *in_ch = input + (size_t)c * length;
+                __fp16 *out_ch = out + (size_t)c * length;
+                float16x8_t vw = vdupq_n_f16(w);
+                float16x8_t vb = vdupq_n_f16(b);
+                int t = 0;
+                for (; t + 7 < length; t += 8)
+                    vst1q_f16(out_ch + t, vfmaq_f16(vb, vw, vld1q_f16(in_ch + t)));
+                for (; t < length; t++)
+                    out_ch[t] = (__fp16)((float)in_ch[t] * (float)w + (float)b);
+            }
+            return;
+        }
+
+        /* groups=1 pointwise: saxpy_broadcast_f16 */
+        for (int oc = 0; oc < out_channels; oc++) {
+            __fp16 *out_ch = out + (size_t)oc * length;
+            __fp16 b = bias ? bias[oc] : (__fp16)0.0f;
+            float16x8_t vb = vdupq_n_f16(b);
+            int t = 0;
+            for (; t + 7 < length; t += 8) vst1q_f16(out_ch + t, vb);
+            for (; t < length; t++) out_ch[t] = b;
+
+            int g = oc / out_per_group;
+            int ic_base = g * ch_per_group;
+            const __fp16 *w_row = weight + (size_t)oc * ch_per_group;
+            for (int ic = 0; ic < ch_per_group; ic++) {
+                const __fp16 *in_ch = input + (size_t)(ic_base + ic) * length;
+                saxpy_broadcast_f16(out_ch, w_row[ic], in_ch, length);
+            }
+        }
+        return;
+    }
+
+    /* dilation=1, kernel>1 */
+    if (dilation == 1) {
+        for (int oc = 0; oc < out_channels; oc++) {
+            int g = oc / out_per_group;
+            int ic_base = g * ch_per_group;
+            __fp16 *out_ch = out + (size_t)oc * length;
+            __fp16 b = bias ? bias[oc] : (__fp16)0.0f;
+            float16x8_t vb = vdupq_n_f16(b);
+            int t = 0;
+            for (; t + 7 < length; t += 8) vst1q_f16(out_ch + t, vb);
+            for (; t < length; t++) out_ch[t] = b;
+
+            for (int ic = 0; ic < ch_per_group; ic++) {
+                const __fp16 *w = weight + ((size_t)oc * ch_per_group + ic) * kernel_size;
+                const __fp16 *in_ch = input + (size_t)(ic_base + ic) * length;
+
+                for (int k = 0; k < kernel_size; k++) {
+                    __fp16 wk = w[k];
+                    int out_start = pad - k;
+                    if (out_start >= length) continue;
+                    saxpy_broadcast_f16(out_ch + out_start, wk, in_ch, length - out_start);
+                }
+            }
+        }
+        return;
+    }
+
+    /* General dilated convolution */
+    for (int oc = 0; oc < out_channels; oc++) {
+        int g = oc / out_per_group;
+        int ic_base = g * ch_per_group;
+        __fp16 *out_ch = out + (size_t)oc * length;
+        __fp16 b = bias ? bias[oc] : (__fp16)0.0f;
+        float16x8_t vb = vdupq_n_f16(b);
+        int t_init = 0;
+        for (; t_init + 7 < length; t_init += 8) vst1q_f16(out_ch + t_init, vb);
+        for (; t_init < length; t_init++) out_ch[t_init] = b;
+
+        for (int ic = 0; ic < ch_per_group; ic++) {
+            const __fp16 *w = weight + ((size_t)oc * ch_per_group + ic) * kernel_size;
+            const __fp16 *in_ch = input + (size_t)(ic_base + ic) * length;
+
+            for (int k = 0; k < kernel_size; k++) {
+                __fp16 wk = w[k];
+                int shift = pad - k * dilation;
+                int out_start = shift;
+                int in_start = 0;
+                if (out_start < 0) {
+                    in_start = -out_start;
+                    out_start = 0;
+                }
+                if (out_start >= length || in_start >= length) continue;
+                int n = length - out_start;
+                int n_in = length - in_start;
+                if (n > n_in) n = n_in;
+                if (n <= 0) continue;
+                saxpy_broadcast_f16(out_ch + out_start, wk, in_ch + in_start, n);
+            }
+        }
+    }
+}
+
+/* ---- kernel_transposed_conv1d_f16 ---- */
+
+void kernel_transposed_conv1d_f16(__fp16 *out, const __fp16 *input, const __fp16 *weight,
+                                  const __fp16 *bias, int in_channels, int out_channels,
+                                  int kernel_size, int stride, int length, int *out_length) {
+    int raw_out_len = (length - 1) * stride + kernel_size;
+    int right_pad = kernel_size - stride;
+    int final_len = raw_out_len - right_pad;
+    if (final_len < 0) final_len = 0;
+
+    /* GEMM-per-tap using saxpy_broadcast_f16 */
+    {
+        size_t wk_size = (size_t)out_channels * in_channels;
+        size_t temp_size = (size_t)out_channels * length;
+        __fp16 *wk_packed = (__fp16 *)malloc(wk_size * sizeof(__fp16));
+        __fp16 *temp = (__fp16 *)malloc(temp_size * sizeof(__fp16));
+        if (wk_packed && temp) {
+            for (int oc = 0; oc < out_channels; oc++) {
+                __fp16 *out_ch = out + (size_t)oc * final_len;
+                __fp16 b = bias ? bias[oc] : (__fp16)0.0f;
+                float16x8_t vb = vdupq_n_f16(b);
+                int t = 0;
+                for (; t + 7 < final_len; t += 8) vst1q_f16(out_ch + t, vb);
+                for (; t < final_len; t++) out_ch[t] = b;
+            }
+
+            for (int k = 0; k < kernel_size; k++) {
+                /* Pack weights for this tap */
+                for (int oc = 0; oc < out_channels; oc++) {
+                    for (int ic = 0; ic < in_channels; ic++) {
+                        wk_packed[(size_t)oc * in_channels + ic] =
+                            weight[(size_t)ic * out_channels * kernel_size + (size_t)oc * kernel_size + k];
+                    }
+                }
+
+                int n = (final_len - 1 - k) / stride + 1;
+                if (n <= 0) continue;
+                if (n > length) n = length;
+
+                /* Manual GEMM via saxpy */
+                for (int oc = 0; oc < out_channels; oc++) {
+                    __fp16 *tp = temp + (size_t)oc * length;
+                    memset(tp, 0, (size_t)n * sizeof(__fp16));
+                    const __fp16 *wk_row = wk_packed + (size_t)oc * in_channels;
+                    for (int ic = 0; ic < in_channels; ic++) {
+                        const __fp16 *in_ch = input + (size_t)ic * length;
+                        saxpy_broadcast_f16(tp, wk_row[ic], in_ch, n);
+                    }
+                }
+
+                /* Scatter to strided output */
+                for (int oc = 0; oc < out_channels; oc++) {
+                    const __fp16 *tp = temp + (size_t)oc * length;
+                    __fp16 *op = out + (size_t)oc * final_len + k;
+                    for (int t = 0; t < n; t++) {
+                        op[t * stride] = (__fp16)((float)op[t * stride] + (float)tp[t]);
+                    }
+                }
+            }
+            free(wk_packed);
+            free(temp);
+            if (out_length) *out_length = final_len;
+            return;
+        }
+        free(wk_packed);
+        free(temp);
+    }
+
+    /* Scalar fallback */
+    for (int oc = 0; oc < out_channels; oc++) {
+        __fp16 *out_ch = out + (size_t)oc * final_len;
+        __fp16 b = bias ? bias[oc] : (__fp16)0.0f;
+        for (int t = 0; t < final_len; t++) out_ch[t] = b;
+
+        for (int ic = 0; ic < in_channels; ic++) {
+            const __fp16 *in_ch = input + (size_t)ic * length;
+            const __fp16 *w = weight + (size_t)ic * out_channels * kernel_size + (size_t)oc * kernel_size;
+            for (int t = 0; t < length; t++) {
+                float val = (float)in_ch[t];
+                int base = t * stride;
+                for (int kk = 0; kk < kernel_size; kk++) {
+                    int ot = base + kk;
+                    if (ot < final_len) out_ch[ot] = (__fp16)((float)out_ch[ot] + val * (float)w[kk]);
+                }
+            }
+        }
+    }
+
+    if (out_length) *out_length = final_len;
+}
+
+#endif /* __ARM_FEATURE_FP16_VECTOR_ARITHMETIC */

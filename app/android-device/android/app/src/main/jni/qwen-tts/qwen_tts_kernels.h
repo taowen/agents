@@ -129,6 +129,44 @@ void kernel_bf16_to_f32(float *out, const uint16_t *in, int n);
 void kernel_zero(float *x, int n);
 
 /* ========================================================================
+ * FP16 kernels (codec transformer + vocoder)
+ * ======================================================================== */
+
+#ifdef __ARM_FEATURE_FP16_VECTOR_ARITHMETIC
+
+/* Convert F32 to FP16 */
+void kernel_f32_to_f16(__fp16 *dst, const float *src, int n);
+
+/* Convert FP16 to F32 */
+void kernel_f16_to_f32(float *dst, const __fp16 *src, int n);
+
+/* Element-wise add in-place: a[i] += b[i] (FP16) */
+void kernel_add_inplace_f16(__fp16 *a, const __fp16 *b, int n);
+
+/* Clamp FP16 values */
+void kernel_clamp_f16(__fp16 *x, int n, __fp16 min_val, __fp16 max_val);
+
+/* Matrix-vector multiply: FP16 weights, F32 input, F32 output
+ * out[r] = dot(W_f16[r,:], x_f32) for r in [0, rows) */
+void kernel_matvec_f16w(float *out, const __fp16 *W_f16, const float *x, int rows, int cols);
+
+/* SnakeBeta activation with FP16 data, F32 alpha/beta params */
+void kernel_snake_beta_f16(__fp16 *out, const __fp16 *x, const float *alpha,
+                           const float *beta, int channels, int length);
+
+/* Causal Conv1d with FP16 buffers */
+void kernel_causal_conv1d_f16(__fp16 *out, const __fp16 *input, const __fp16 *weight,
+                              const __fp16 *bias, int in_channels, int out_channels,
+                              int kernel_size, int length, int dilation, int groups);
+
+/* Transposed Conv1d with FP16 buffers */
+void kernel_transposed_conv1d_f16(__fp16 *out, const __fp16 *input, const __fp16 *weight,
+                                  const __fp16 *bias, int in_channels, int out_channels,
+                                  int kernel_size, int stride, int length, int *out_length);
+
+#endif /* __ARM_FEATURE_FP16_VECTOR_ARITHMETIC */
+
+/* ========================================================================
  * Platform-specific dispatch
  * ======================================================================== */
 

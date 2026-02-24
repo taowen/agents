@@ -17,7 +17,7 @@ add_library(qwen_tts_static STATIC ${QWEN_TTS_SOURCES})
 target_include_directories(qwen_tts_static PUBLIC ${CMAKE_CURRENT_SOURCE_DIR})
 target_compile_options(qwen_tts_static PRIVATE -O3 -ffast-math -flto)
 if(CMAKE_SYSTEM_PROCESSOR MATCHES "aarch64|arm64")
-    target_compile_options(qwen_tts_static PRIVATE -march=armv8.2-a+dotprod)
+    target_compile_options(qwen_tts_static PRIVATE -march=armv8.2-a+dotprod+fp16)
 endif()
 
 find_package(OpenMP)

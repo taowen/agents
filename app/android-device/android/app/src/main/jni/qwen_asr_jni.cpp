@@ -376,7 +376,16 @@ Java_ai_connct_1screen_rn_VoiceService_nativeTestWavStream(
     }
 
     qwen_verbose = 3;
-    setup_stderr_redirect();
+
+    // Redirect stderr to file for reliable profiling output
+    const char *bench_path = "/data/data/ai.connct_screen.rn/cache/asr_bench.txt";
+    int saved_stderr = dup(STDERR_FILENO);
+    FILE *bench_file = fopen(bench_path, "w");
+    if (bench_file) {
+        dup2(fileno(bench_file), STDERR_FILENO);
+    } else {
+        setup_stderr_redirect();
+    }
 
     LOGI("nativeTestWavStream: loading %s", path);
     int n_samples = 0;
@@ -385,6 +394,7 @@ Java_ai_connct_1screen_rn_VoiceService_nativeTestWavStream(
 
     if (!samples || n_samples <= 0) {
         LOGE("nativeTestWavStream: failed to load WAV");
+        if (bench_file) { fflush(stderr); dup2(saved_stderr, STDERR_FILENO); close(saved_stderr); fclose(bench_file); }
         return;
     }
     LOGI("nativeTestWavStream: loaded %d samples (%.2f sec)", n_samples, (float)n_samples / 16000.0f);
@@ -397,6 +407,7 @@ Java_ai_connct_1screen_rn_VoiceService_nativeTestWavStream(
     if (!live) {
         LOGE("nativeTestWavStream: failed to create live audio");
         free(samples);
+        if (bench_file) { fflush(stderr); dup2(saved_stderr, STDERR_FILENO); close(saved_stderr); fclose(bench_file); }
         return;
     }
 
@@ -405,6 +416,15 @@ Java_ai_connct_1screen_rn_VoiceService_nativeTestWavStream(
 
     LOGI("nativeTestWavStream: starting streaming transcription...");
     char *text = qwen_transcribe_stream_live(g_ctx, live);
+
+    // Restore stderr
+    if (bench_file) {
+        fflush(stderr);
+        dup2(saved_stderr, STDERR_FILENO);
+        close(saved_stderr);
+        fclose(bench_file);
+        LOGI("nativeTestWavStream: profiling written to %s", bench_path);
+    }
 
     if (text) {
         LOGI("nativeTestWavStream: result = %s", text);

@@ -373,6 +373,69 @@ float kernel_dot(const float *a, const float *b, int n) {
 #endif
 }
 
+/* ======================================================================== */
+/* FP16 weights × F32 input → F32 output (codec transformer)                */
+/* ======================================================================== */
+
+#ifdef __ARM_FEATURE_FP16_VECTOR_ARITHMETIC
+
+void kernel_matvec_f16w(float *out, const __fp16 *W_f16, const float *x, int rows, int cols) {
+    /* Each row: load 8 FP16 weights, convert to F32, FMA with F32 input, F32 accumulation.
+     * 2-wide row unroll for better ILP. */
+    int r = 0;
+    for (; r + 1 < rows; r += 2) {
+        const __fp16 *w0 = W_f16 + (size_t)r * cols;
+        const __fp16 *w1 = W_f16 + (size_t)(r + 1) * cols;
+        float32x4_t acc0a = vdupq_n_f32(0.0f);
+        float32x4_t acc0b = vdupq_n_f32(0.0f);
+        float32x4_t acc1a = vdupq_n_f32(0.0f);
+        float32x4_t acc1b = vdupq_n_f32(0.0f);
+        int c = 0;
+        for (; c + 7 < cols; c += 8) {
+            float32x4_t xlo = vld1q_f32(x + c);
+            float32x4_t xhi = vld1q_f32(x + c + 4);
+
+            float16x8_t hw0 = vld1q_f16(w0 + c);
+            float32x4_t w0lo = vcvt_f32_f16(vget_low_f16(hw0));
+            float32x4_t w0hi = vcvt_f32_f16(vget_high_f16(hw0));
+            acc0a = vfmaq_f32(acc0a, w0lo, xlo);
+            acc0b = vfmaq_f32(acc0b, w0hi, xhi);
+
+            float16x8_t hw1 = vld1q_f16(w1 + c);
+            float32x4_t w1lo = vcvt_f32_f16(vget_low_f16(hw1));
+            float32x4_t w1hi = vcvt_f32_f16(vget_high_f16(hw1));
+            acc1a = vfmaq_f32(acc1a, w1lo, xlo);
+            acc1b = vfmaq_f32(acc1b, w1hi, xhi);
+        }
+        float s0 = vaddvq_f32(vaddq_f32(acc0a, acc0b));
+        float s1 = vaddvq_f32(vaddq_f32(acc1a, acc1b));
+        for (; c < cols; c++) {
+            float xc = x[c];
+            s0 += (float)w0[c] * xc;
+            s1 += (float)w1[c] * xc;
+        }
+        out[r] = s0;
+        out[r + 1] = s1;
+    }
+    /* Handle remaining odd row */
+    for (; r < rows; r++) {
+        const __fp16 *w0 = W_f16 + (size_t)r * cols;
+        float32x4_t acc0 = vdupq_n_f32(0.0f);
+        float32x4_t acc1 = vdupq_n_f32(0.0f);
+        int c = 0;
+        for (; c + 7 < cols; c += 8) {
+            float16x8_t hw = vld1q_f16(w0 + c);
+            acc0 = vfmaq_f32(acc0, vcvt_f32_f16(vget_low_f16(hw)), vld1q_f32(x + c));
+            acc1 = vfmaq_f32(acc1, vcvt_f32_f16(vget_high_f16(hw)), vld1q_f32(x + c + 4));
+        }
+        float s = vaddvq_f32(vaddq_f32(acc0, acc1));
+        for (; c < cols; c++) s += (float)w0[c] * x[c];
+        out[r] = s;
+    }
+}
+
+#endif /* __ARM_FEATURE_FP16_VECTOR_ARITHMETIC */
+
 float kernel_sum_sq(const float *x, int n) {
 #if defined(__ARM_NEON) || defined(__aarch64__)
     float32x4_t acc = vdupq_n_f32(0.0f);

@@ -2,7 +2,7 @@
 
 ## Architecture
 
-**Dual-Track Chunked Streaming**: accumulate `chunk_size` codec frames during AR generation, decode each chunk with `left_context` overlap, trim context audio, deliver via callback. Codec decoder is stateless.
+**Dual-Track Chunked Streaming**: accumulate `chunk_size` codec frames during AR generation, decode each chunk with batch vocoder on background thread, deliver via callback. Codec decoder is stateless.
 
 Source: upstream `Qwen3-TTS-C/c/`, backed up to `jni/qwen-tts-old/`.
 
@@ -15,11 +15,12 @@ jni/
 └── qwen-tts/
     ├── CMakeLists.txt           # Own build: qwen_tts_static STATIC library
     ├── qwen_tts.h               # Public API + types (~480 lines, was 648)
-    ├── qwen_tts_quant.h         # Q4_K block_q4_k struct, QK_K/Q4K_NUM_SUBS defines
+    ├── qwen_tts_quant.h         # Q8_0 block struct (36 bytes: float scale + int8_t[32])
+    ├── qwen_tts_quant.c         # Q8_0 quantization (f32→q8, bf16→q8), NEON-accelerated
     ├── qwen_tts_internal.h      # Internal cross-module declarations (talker, codec, stream)
     ├── qwen_tts_kernels.h       # Kernel function declarations
     ├── qwen_tts_kernels.c       # Norms, activations, element-wise ops (~285 lines, was 1816)
-    ├── qwen_tts_kernels_neon.c  # NEON matvec/matmul: BF16, F32, INT8, Q4K, SwiGLU, dot
+    ├── qwen_tts_kernels_neon.c  # NEON Q8_0 matvec (SDOT), SwiGLU, F32 matvec/matmul
     ├── qwen_tts_kernels_ops.c   # Conv1d, TransConv1d, RoPE, M-RoPE, SnakeBeta, softmax, sampling
     ├── qwen_tts.c               # Main API: config, weight loading, generate()
     ├── qwen_tts_talker.c        # Talker transformer forward pass
@@ -51,110 +52,128 @@ Codec 8 layers, hidden=512, codebook_dim=512, decoder_dim=1536
 Speakers: 9, Languages: 12
 ```
 
-## Quantization: INT8 is the only viable option
+## Quantization: Q8_0 unified (2026-02-24)
 
-All talker + sub-talker weight matrices use INT8 (8-bit symmetric per-row quantization). Pre-quantized weights cached in `.qcache` file.
+Talker + sub-talker weight matrices use **Q8_0** (32-element blocks, `float scale` + `int8_t[32]` = 36 bytes). Same format as qwen-asr. Replaced the previous 3-format system (per-row INT8, Q4_K super-blocks, BF16 matvec).
 
-### Q4_K rejected — twice
+**Codec transformer uses F32** (not Q8_0). Q8_0 on the codec transformer (hidden=512, 8 layers) caused audible hoarseness/raspy artifacts. The small hidden dimension makes it more sensitive to quantization error. F32 codec decode is ~2x slower than Q8_0 but audio quality is correct. Codec transformer F32 adds ~16MB RAM (8 layers × 4 matrices × ~512KB each).
 
-**Round 1 (custom Q4_K)**: Token count 29→34, audible quality degradation.
+**What was unified:**
+- Layer structs: ~12 weight pointer fields → 4 (`wqkv_q8`, `wo_q8`, `gate_up_q8`, `down_q8`)
+- Kernels: 10 matvec/swiglu/matmul variants → 2 (`kernel_matvec_q8`, `kernel_swiglu_matvec_q8`)
+- Qcache: single Q8_0 format (version 3, magic "QQC3")
+- Forward pass: removed 3-way if/else dispatch
 
-**Round 2 (standard ggml Q4_K_M, 2026-02-24)**: Replaced custom Q4_K with standard ggml implementation (256-element super-blocks, 6-bit scales/mins). New files: `qwen_tts_ggml_quants.h/c`. Results:
+**Files changed:** `qwen_tts_quant.h` (block_q8_0 def), `qwen_tts_quant.c` (new, quantization functions from qwen-asr), `qwen_tts.h` (simplified structs), `qwen_tts.c` (weight loading, qcache), `qwen_tts_talker.c` (forward pass), `qwen_tts_codec.c` (codec transformer), `qwen_tts_kernels.h` + `qwen_tts_kernels_neon.c` (Q8_0 matvec with SDOT).
 
-| Metric | BF16 | Q4_K custom | Q4_K ggml | INT8 |
-|--------|------|-------------|-----------|------|
-| Tokens ("Hello world") | 29 | 34 | **18** | **26** |
-| Audio length | 2.32s | 2.72s | **1.44s** | 2.08s |
-| Tokens ("你好今天天气") | 24 | — | **38** | **25** |
-| Audio length | 1.92s | — | **3.04s** | 2.00s |
-| Talker ms/token | 281.5 | 46.9 | **74.2** | **36.2** |
-| Model load (first) | 467ms | 2,004ms | **50,362ms** | 1,052ms |
-| Model load (cached) | — | 758ms | **595ms** | — |
+**Bug fix:** qcache round-trip for optional `input_proj_q8` (NULL → zeros → non-NULL on load → wrong forward path). Fixed by writing 0 bytes for NULL pointers.
 
-**Q4_K ggml is worse than the custom Q4_K in every way:**
-1. **Token count distortion is severe and inconsistent**: EN gets too few tokens (18 vs 29), CN gets too many (38 vs 24). The sampling distribution is broken.
-2. **Talker is 2x slower than INT8** (74 vs 36 ms/token): Q4_K vec_dot has higher per-element overhead (6-bit scale unpacking, 256-element super-blocks) that dominates at hidden=1024. The bandwidth savings don't compensate.
-3. **First quantization takes 50s** (vs INT8's 1s): `quantize_row_q4_K_ref` is expensive — `make_qkx2_quants` does iterative grid search per sub-block.
-4. **Long Chinese also degraded**: 178 tokens / 75.7 ms/token / 46.8s total (vs INT8+NEON: 202 tokens / 42.9 ms/token / 40.5s).
+### Q4_K rejected (historical)
 
-**Conclusion: 4-bit quantization is fundamentally unsuitable for this 0.6B model.** The model has hidden=1024 with low weight redundancy. INT8 (8-bit symmetric per-row) is the right trade-off: near-BF16 quality, faster than Q4_K, negligible quantization cost.
+4-bit quantization fundamentally unsuitable for this 0.6B model (hidden=1024, low weight redundancy). Token count distortion, 2x slower than INT8. See git history for details.
 
-## Benchmark: "Hello world" batch (INT8, best result)
+## Benchmark: "Hello world" batch (Q8_0)
 
-| Metric | BF16 | INT8-only |
-|--------|------|-----------|
-| Codec tokens | 29 | **26** |
-| Talker ms/token | 281.5 | **36.2** |
-| Talker total | 8,163ms | **941ms** |
-| Codec decode | 5,009ms | 4,490ms |
-| **Total** | **13,695ms** | **5,667ms** |
+| Metric | Value |
+|--------|-------|
+| Codec tokens | 25 |
+| Talker | 433ms (64.8 ms/token) |
+| Sub-talker | 1,187ms |
+| Codec decode | 3,243ms |
+| **Total** | **4,992ms** |
+| Audio | 2.00s |
+| Realtime factor | 0.40x |
 
-INT8: 7.8x talker speedup vs BF16, token count close to BF16, near-baseline audio quality.
+## Benchmark: long CN batch (Q8_0)
 
-## NEON vocoder optimization (applied)
+Text: "今天的天气真不错，阳光明媚，微风轻拂，我们一起出去散步吧，外面的花都开了，空气中弥漫着花香"
 
-NEON k=7 output-centric fast path (8 outputs × 7 FMA), NEON k-loop scatter for transposed conv.
+| Metric | Value |
+|--------|-------|
+| Codec tokens | 157 |
+| Talker + Sub-talker | 7,856ms (50.0 ms/token) |
+| Talker | 2,289ms (29.1%) |
+| Sub-talker | 5,566ms (70.9%) |
+| Codec decode | 19,921ms |
+| **Total** | **27,859ms** |
+| Audio | 12.56s |
+| Realtime factor | 0.45x |
 
-| Metric | Before NEON | After NEON | Speedup |
-|--------|------------|-----------|---------|
-| Codec decode ("Hello world") | 4,490ms | 3,524ms | 1.27x |
-| Codec ms/token (long CN) | 244 | 156 | 1.56x |
-| Total ("Hello world") | 5,667ms | **4,826ms** | 1.17x |
+## Streaming: pipelined batch vocoder (2026-02-24)
 
-## Streaming benchmarks (INT8 + NEON vocoder, "Hello world")
+Replaced per-token incremental vocoder with **batch vocoder on background thread**. While vocoder decodes chunk N, talker generates chunk N+1 tokens concurrently.
 
-| Mode | TTFA | Total | Overhead |
-|------|------|-------|----------|
-| Batch | =total | **4,826ms** | 1.0x |
-| Stream chunk=5 | **1,524ms** | 14,643ms | 3.03x |
-| Stream chunk=10 | **3,302ms** | 14,030ms | 2.91x |
+**Architecture:**
+```
+Main thread:    [talker×5] → launch vocoder → [talker×5] → join+deliver → launch → ...
+Vocoder thread:              [batch decode 5]              [batch decode 5]
+```
 
-## Vocoder bottleneck breakdown (26 tokens, "Hello world")
+**Streaming results (chunk_size=5, USAGE_MEDIA AudioTrack, 4s buffer):**
 
-| Component | Time (ms) | % of vocoder |
-|-----------|-----------|-------------|
-| Conv1 (k=1) | ~1,080 | 35% |
-| TransConv | ~1,066 | 34% |
-| Conv7 (k=7) | ~900 | 29% |
-| SnakeBeta + add | ~50 | 2% |
+Same long CN text streamed: 153 tokens, 12.24s audio, TTFA=2,076ms.
 
-Vocoder is 71-81% of total time. Memory-bandwidth limited (activation buffers >> L2 512KB).
+**Known issue: vocoder too slow for smooth playback.** Each 5-token chunk produces 400ms of audio but takes ~1,200ms to decode. AudioTrack underruns between chunks, causing audible stuttering ("结结巴巴"). Batch mode plays smoothly because all audio is decoded before playback starts.
 
-**Cache tiling was tried and reverted** — 2.6x regression due to L1 output thrashing and redundant SnakeBeta recomputation.
+**AudioTrack config:** Changed `USAGE_ASSISTANT` → `USAGE_MEDIA` (assistant audio was inaudible on some devices, possibly routed to earpiece). Buffer size = 4s (192KB) to avoid `track.write()` blocking.
+
+## Vocoder bottleneck breakdown (25 tokens batch)
+
+| Component | Time (ms) | % of total |
+|-----------|-----------|-----------|
+| Vocoder (codec decode) | 3,243ms | 65.0% |
+| Sub-talker | 1,187ms | 23.8% |
+| Talker | 433ms | 8.7% |
+
+Vocoder is the dominant cost. Memory-bandwidth limited (FP32 activation buffers >> L2 512KB).
+
+**Vocoder internal pipeline (157 tokens batch):**
+- 4 decoder blocks: dim 1536→768→384→192→96
+- Upsampling rates: 8×5×4×3 = 480× (plus 2×2 pre-upsample = 1920× total)
+- Block 2 (384→192, len=16000): 192×16000 = 12.3MB activations (24× L2)
+- Block 3 (192→96, len=48000): 96×48000 = 18.4MB activations (36× L2)
 
 ## Test commands
 
 ```bash
-# Batch
+# Batch EN
 adb shell "am broadcast -a ai.connct_screen.rn.TTS_DEBUG -p ai.connct_screen.rn \
   --es cmd speak --es text 'Hello world' --es path /data/local/tmp/qwen-tts-model"
 
-# Stream
+# Batch long CN
+adb shell "am broadcast -a ai.connct_screen.rn.TTS_DEBUG -p ai.connct_screen.rn \
+  --es cmd speak --es text '今天的天气真不错，阳光明媚，微风轻拂，我们一起出去散步吧，外面的花都开了，空气中弥漫着花香' \
+  --es path /data/local/tmp/qwen-tts-model"
+
+# Stream (pipelined batch vocoder, chunk_size=5)
 adb shell "am broadcast -a ai.connct_screen.rn.TTS_DEBUG -p ai.connct_screen.rn \
   --es cmd speak_stream --es text 'Hello world' --es path /data/local/tmp/qwen-tts-model \
-  --ei chunk_size 10"
+  --ei chunk_size 5"
 
-# Delete qcache (force re-quantization)
+# Delete qcache (force re-quantization, needed after format change)
 adb shell "run-as ai.connct_screen.rn rm -f cache/model.qcache"
 ```
 
-## Refactor verification (2026-02-24)
+## Codec transformer: Q8_0 → F32 (2026-02-24)
 
-Post-refactor build + on-device test. No functional regressions, timings match pre-refactor baselines.
+Q8_0 quantization on the codec transformer caused audible hoarseness. Codec transformer has hidden=512 (vs talker hidden=1024), making it more sensitive to quantization noise. Switching to F32 matvec for all 4 weight matrices (wqkv, wo, gate_up, down) per layer restored clean audio.
 
-| Test | Tokens | ms/token | Codec | Total | Audio |
-|------|--------|----------|-------|-------|-------|
-| "Hello world" batch | 20 | 84.2 | 3,274ms | 5,366ms | 1.60s |
-| "你好今天天气怎么样" batch | 32 | 81.4 | 4,545ms | 7,517ms | 2.56s |
-| "Hello world" stream chunk=5 | 20 | ~440 | (incr) | 9,194ms | 1.60s |
+**Performance impact (batch, vivian, same text):**
 
-Model load: 2,588ms (with qcache). All three modes (batch EN, batch CN, streaming) pass.
+| Metric | Q8_0 codec | F32 codec |
+|--------|-----------|-----------|
+| Codec decode (157 tokens) | 19,921ms | ~39,200ms |
+| Total (157 tokens) | 27,859ms | ~50,200ms |
+| Realtime factor | 0.45x | ~0.25x |
+
+Codec transformer F32 is ~2x slower but vocoder (conv/transconv, already F32) dominates total codec time. The transformer is only ~30% of codec decode time.
 
 ## Next steps
 
-1. ~~**Validate Q4_K ggml re-implementation**~~ — FAILED: token count distortion (18 vs 29), 2x slower than INT8. **Revert to INT8.**
-2. **Optimize TransConv** (~1,066ms, 34%) — GEMM-per-tap approach instead of scatter
-3. **Optimize k=1 conv** (~1,080ms, 35%) — profile compute vs memory bound
-4. **INT8 vocoder conv weights** — halve weight memory bandwidth
-5. **Tune chunk_size** for streaming
-6. **Test speaker/language params**: `--es speaker serena --es language chinese`
+1. ~~**Q8_0 unification**~~ — DONE. Replaced INT8/Q4_K/BF16 with unified Q8_0 for talker/sub-talker.
+2. ~~**Pipelined streaming**~~ — DONE. Batch vocoder on background thread.
+3. ~~**Non-blocking audio callback**~~ — DONE. AudioTrack buffer 4s, USAGE_MEDIA.
+4. ~~**Codec transformer F32**~~ — DONE. Q8_0 caused hoarseness; F32 restores quality.
+5. **Vocoder FP16** — conv weights and activations in FP16 (NEON FMLA), halve bandwidth. Target: vocoder decode < 400ms per 5 tokens (real-time threshold).
+6. **Optimize TransConv** — GEMM-per-tap approach instead of scatter
+7. **Core pinning** — bind talker to big cores, vocoder to little cores for reduced contention

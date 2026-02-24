@@ -237,7 +237,7 @@ public class TtsDebugReceiver extends BroadcastReceiver {
 
                 AudioTrack track = new AudioTrack.Builder()
                         .setAudioAttributes(new AudioAttributes.Builder()
-                                .setUsage(AudioAttributes.USAGE_ASSISTANT)
+                                .setUsage(AudioAttributes.USAGE_MEDIA)
                                 .setContentType(AudioAttributes.CONTENT_TYPE_SPEECH)
                                 .build())
                         .setAudioFormat(new AudioFormat.Builder()
@@ -301,16 +301,16 @@ public class TtsDebugReceiver extends BroadcastReceiver {
                 Log.i(TAG, "speak_stream: tokenized " + tokenCount + " tokens in "
                         + (System.currentTimeMillis() - tokStart) + "ms");
 
-                // Create AudioTrack in MODE_STREAM
+                // Create AudioTrack in MODE_STREAM with large buffer so writes don't block inference
                 int sampleRate = 24000;
                 int bufSize = AudioTrack.getMinBufferSize(sampleRate,
                         AudioFormat.CHANNEL_OUT_MONO,
                         AudioFormat.ENCODING_PCM_16BIT);
-                bufSize = Math.max(bufSize, 8192);
+                bufSize = Math.max(bufSize, sampleRate * 2 * 4); /* 4 seconds */
 
                 AudioTrack track = new AudioTrack.Builder()
                         .setAudioAttributes(new AudioAttributes.Builder()
-                                .setUsage(AudioAttributes.USAGE_ASSISTANT)
+                                .setUsage(AudioAttributes.USAGE_MEDIA)
                                 .setContentType(AudioAttributes.CONTENT_TYPE_SPEECH)
                                 .build())
                         .setAudioFormat(new AudioFormat.Builder()

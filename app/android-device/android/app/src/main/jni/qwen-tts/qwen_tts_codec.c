@@ -359,19 +359,31 @@ static void codec_transformer_forward(qwen_tts_ctx_t *ctx, float *hidden,
             kernel_rms_norm(x_norm + t * codec_hidden, x + t * codec_hidden,
                            l->input_norm, codec_hidden, eps);
 
-        /* 2. Q, K, V projections (per-token Q8_0 matvec) */
+        /* 2. Q, K, V projections */
         {
             int q_dim = heads * head_dim;
             int total_rows = q_dim + kv_dim + kv_dim;
-            int n_blocks = codec_hidden / QK8_0;
             float *qkv_tmp = (float *)malloc(total_rows * sizeof(float));
-            for (int t = 0; t < seq_len; t++) {
-                block_q8_0 xn_q8[n_blocks];
-                kernel_quantize_x_q8(x_norm + t * codec_hidden, codec_hidden, xn_q8);
-                kernel_matvec_q8(qkv_tmp, l->wqkv_q8, xn_q8, total_rows, n_blocks);
-                memcpy(q_all + (size_t)t * q_dim, qkv_tmp, q_dim * sizeof(float));
-                memcpy(k_all + (size_t)t * kv_dim, qkv_tmp + q_dim, kv_dim * sizeof(float));
-                memcpy(v_all + (size_t)t * kv_dim, qkv_tmp + q_dim + kv_dim, kv_dim * sizeof(float));
+#ifdef __ARM_FEATURE_FP16_VECTOR_ARITHMETIC
+            if (l->wqkv_f16) {
+                for (int t = 0; t < seq_len; t++) {
+                    kernel_matvec_f16w(qkv_tmp, l->wqkv_f16, x_norm + t * codec_hidden, total_rows, codec_hidden);
+                    memcpy(q_all + (size_t)t * q_dim, qkv_tmp, q_dim * sizeof(float));
+                    memcpy(k_all + (size_t)t * kv_dim, qkv_tmp + q_dim, kv_dim * sizeof(float));
+                    memcpy(v_all + (size_t)t * kv_dim, qkv_tmp + q_dim + kv_dim, kv_dim * sizeof(float));
+                }
+            } else
+#endif
+            {
+                int n_blocks = codec_hidden / QK8_0;
+                for (int t = 0; t < seq_len; t++) {
+                    block_q8_0 xn_q8[n_blocks];
+                    kernel_quantize_x_q8(x_norm + t * codec_hidden, codec_hidden, xn_q8);
+                    kernel_matvec_q8(qkv_tmp, l->wqkv_q8, xn_q8, total_rows, n_blocks);
+                    memcpy(q_all + (size_t)t * q_dim, qkv_tmp, q_dim * sizeof(float));
+                    memcpy(k_all + (size_t)t * kv_dim, qkv_tmp + q_dim, kv_dim * sizeof(float));
+                    memcpy(v_all + (size_t)t * kv_dim, qkv_tmp + q_dim + kv_dim, kv_dim * sizeof(float));
+                }
             }
             free(qkv_tmp);
         }
@@ -416,14 +428,23 @@ static void codec_transformer_forward(qwen_tts_ctx_t *ctx, float *hidden,
             }
         }
 
-        /* 5. Output projection + LayerScale + residual (per-token Q8_0) */
+        /* 5. Output projection + LayerScale + residual */
         {
             int q_dim = heads * head_dim;
-            int n_blocks = q_dim / QK8_0;
-            for (int t = 0; t < seq_len; t++) {
-                block_q8_0 attn_q8[n_blocks];
-                kernel_quantize_x_q8(attn_out + (size_t)t * q_dim, q_dim, attn_q8);
-                kernel_matvec_q8(x_norm + t * codec_hidden, l->wo_q8, attn_q8, codec_hidden, n_blocks);
+#ifdef __ARM_FEATURE_FP16_VECTOR_ARITHMETIC
+            if (l->wo_f16) {
+                for (int t = 0; t < seq_len; t++)
+                    kernel_matvec_f16w(x_norm + t * codec_hidden, l->wo_f16,
+                                       attn_out + (size_t)t * q_dim, codec_hidden, q_dim);
+            } else
+#endif
+            {
+                int n_blocks = q_dim / QK8_0;
+                for (int t = 0; t < seq_len; t++) {
+                    block_q8_0 attn_q8[n_blocks];
+                    kernel_quantize_x_q8(attn_out + (size_t)t * q_dim, q_dim, attn_q8);
+                    kernel_matvec_q8(x_norm + t * codec_hidden, l->wo_q8, attn_q8, codec_hidden, n_blocks);
+                }
             }
         }
         for (int t = 0; t < seq_len; t++) {
@@ -437,8 +458,39 @@ static void codec_transformer_forward(qwen_tts_ctx_t *ctx, float *hidden,
             kernel_rms_norm(x_norm + t * codec_hidden, x + t * codec_hidden,
                            l->post_attn_norm, codec_hidden, eps);
 
-        /* SwiGLU MLP + down projection (per-token Q8_0) */
-        {
+        /* SwiGLU MLP + down projection */
+#ifdef __ARM_FEATURE_FP16_VECTOR_ARITHMETIC
+        if (l->gate_up_f16 && l->down_f16) {
+            float *gu_tmp = (float *)malloc(2 * intermediate * sizeof(float));
+            for (int t = 0; t < seq_len; t++) {
+                kernel_matvec_f16w(gu_tmp, l->gate_up_f16, x_norm + t * codec_hidden,
+                                   2 * intermediate, codec_hidden);
+                float *g_out = gate_all + (size_t)t * intermediate;
+                for (int i = 0; i < intermediate; i++) {
+                    float g = gu_tmp[i];
+                    g_out[i] = (g / (1.0f + expf(-g))) * gu_tmp[intermediate + i];
+                }
+                kernel_matvec_f16w(x_norm + t * codec_hidden, l->down_f16,
+                                   g_out, codec_hidden, intermediate);
+            }
+            free(gu_tmp);
+        } else
+#endif
+        if (l->gate_up_f32 && l->down_f32) {
+            float *gu_tmp = (float *)malloc(2 * intermediate * sizeof(float));
+            for (int t = 0; t < seq_len; t++) {
+                kernel_matvec_f32(gu_tmp, l->gate_up_f32, x_norm + t * codec_hidden,
+                                  2 * intermediate, codec_hidden);
+                float *g_out = gate_all + (size_t)t * intermediate;
+                for (int i = 0; i < intermediate; i++) {
+                    float g = gu_tmp[i];
+                    g_out[i] = (g / (1.0f + expf(-g))) * gu_tmp[intermediate + i];
+                }
+                kernel_matvec_f32(x_norm + t * codec_hidden, l->down_f32,
+                                  g_out, codec_hidden, intermediate);
+            }
+            free(gu_tmp);
+        } else {
             int n_blocks_h = codec_hidden / QK8_0;
             int n_blocks_i = intermediate / QK8_0;
             for (int t = 0; t < seq_len; t++) {
@@ -736,18 +788,6 @@ float *qwen_tts_codec_decode(qwen_tts_ctx_t *ctx, const int *codes,
         }
     }
 
-    /* Allocate ping-pong buffers */
-    hidden = (float *)realloc(hidden, voc_max_buf * sizeof(float));
-    float *voc_buf_b = (float *)malloc(voc_max_buf * sizeof(float));
-
-    /* Initial conv: hidden(input) → voc_buf_b(output) */
-    kernel_causal_conv1d(voc_buf_b, hidden, ctx->codec.vocoder_pre_conv_weight,
-                         ctx->codec.vocoder_pre_conv_bias,
-                         latent_dim, decoder_dim, 7, current_len, 1, 1);
-    float *voc = voc_buf_b;      /* active buffer */
-    float *voc_alt = hidden;     /* alternate buffer */
-
-    /* 7b. 4 decoder blocks: SnakeBeta → TransConv → 3 ResUnits */
     int upsample_rates[4] = {
         cfg->codec_upsample_rates[0],
         cfg->codec_upsample_rates[1],
@@ -755,80 +795,85 @@ float *qwen_tts_codec_decode(qwen_tts_ctx_t *ctx, const int *codes,
         cfg->codec_upsample_rates[3],
     };
     int current_dim = decoder_dim;
-    vocoder_resunit_scratch_t ru_scratch = {0};
 
     double voc_total_snake_ms = 0.0, voc_total_transconv_ms = 0.0;
     double voc_total_conv7_ms = 0.0, voc_total_conv1_ms = 0.0, voc_total_resadd_ms = 0.0;
 
-    for (int block = 0; block < 4; block++) {
-        int in_dim = current_dim;
-        int out_dim = in_dim / 2;
-        int rate = upsample_rates[block];
-        qwen_tts_vocoder_block_t *vb = &ctx->codec.vocoder_blocks[block];
+    float *wav;
 
-        double blk_snake_ms = 0.0, blk_transconv_ms = 0.0;
-        double blk_conv7_ms = 0.0, blk_conv1_ms = 0.0, blk_resadd_ms = 0.0;
-        double t0;
+    /* F32 vocoder pipeline */
+    {
+        hidden = (float *)realloc(hidden, voc_max_buf * sizeof(float));
+        float *voc_buf_b = (float *)malloc(voc_max_buf * sizeof(float));
 
-        /* SnakeBeta activation (in-place) */
-        t0 = now_ms();
-        kernel_snake_beta(voc, voc, vb->act_alpha, vb->act_beta, in_dim, current_len);
-        blk_snake_ms += now_ms() - t0;
+        kernel_causal_conv1d(voc_buf_b, hidden, ctx->codec.vocoder_pre_conv_weight,
+                             ctx->codec.vocoder_pre_conv_bias,
+                             latent_dim, decoder_dim, 7, current_len, 1, 1);
+        float *voc = voc_buf_b;
+        float *voc_alt = hidden;
 
-        /* TransposedConv1d: [in_dim, current_len] → [out_dim, new_len] */
-        int new_len;
-        int ks = 2 * rate;
-        t0 = now_ms();
-        kernel_transposed_conv1d(voc_alt, voc, vb->transconv_weight, vb->transconv_bias,
-                                  in_dim, out_dim, ks, rate, current_len, &new_len);
-        blk_transconv_ms += now_ms() - t0;
+        vocoder_resunit_scratch_t ru_scratch = {0};
 
-        /* Swap ping-pong: voc_alt becomes active */
-        { float *tmp = voc; voc = voc_alt; voc_alt = tmp; }
-        current_len = new_len;
-        current_dim = out_dim;
+        for (int block = 0; block < 4; block++) {
+            int in_dim = current_dim;
+            int out_dim = in_dim / 2;
+            int rate = upsample_rates[block];
+            qwen_tts_vocoder_block_t *vb = &ctx->codec.vocoder_blocks[block];
 
-        /* 3 Residual units with dilations 1, 3, 9 */
-        int dilations[3] = {1, 3, 9};
-        for (int ru = 0; ru < 3; ru++) {
-            if (vocoder_resunit_forward(&vb->resunits[ru], voc, current_dim, current_len,
-                                        dilations[ru], &ru_scratch,
-                                        &blk_snake_ms, &blk_conv7_ms,
-                                        &blk_conv1_ms, &blk_resadd_ms) != 0) {
-                free(voc);
-                free(voc_alt);
-                free(ru_scratch.residual);
-                free(ru_scratch.conv1_out);
-                *out_samples = 0;
-                return NULL;
+            double blk_snake_ms = 0.0, blk_transconv_ms = 0.0;
+            double blk_conv7_ms = 0.0, blk_conv1_ms = 0.0, blk_resadd_ms = 0.0;
+            double t0;
+
+            t0 = now_ms();
+            kernel_snake_beta(voc, voc, vb->act_alpha, vb->act_beta, in_dim, current_len);
+            blk_snake_ms += now_ms() - t0;
+
+            int new_len;
+            int ks = 2 * rate;
+            t0 = now_ms();
+            kernel_transposed_conv1d(voc_alt, voc, vb->transconv_weight, vb->transconv_bias,
+                                      in_dim, out_dim, ks, rate, current_len, &new_len);
+            blk_transconv_ms += now_ms() - t0;
+
+            { float *tmp = voc; voc = voc_alt; voc_alt = tmp; }
+            current_len = new_len;
+            current_dim = out_dim;
+
+            int dilations[3] = {1, 3, 9};
+            for (int ru = 0; ru < 3; ru++) {
+                if (vocoder_resunit_forward(&vb->resunits[ru], voc, current_dim, current_len,
+                                            dilations[ru], &ru_scratch,
+                                            &blk_snake_ms, &blk_conv7_ms,
+                                            &blk_conv1_ms, &blk_resadd_ms) != 0) {
+                    free(voc); free(voc_alt);
+                    free(ru_scratch.residual); free(ru_scratch.conv1_out);
+                    *out_samples = 0;
+                    return NULL;
+                }
             }
+
+            if (qwen_tts_verbose >= 1) {
+                fprintf(stderr, "  Vocoder block %d [%d->%d, len %d]: snake=%.1f transconv=%.1f conv7=%.1f conv1=%.1f resadd=%.1f ms\n",
+                        block, in_dim, out_dim, current_len,
+                        blk_snake_ms, blk_transconv_ms, blk_conv7_ms, blk_conv1_ms, blk_resadd_ms);
+            }
+            voc_total_snake_ms += blk_snake_ms;
+            voc_total_transconv_ms += blk_transconv_ms;
+            voc_total_conv7_ms += blk_conv7_ms;
+            voc_total_conv1_ms += blk_conv1_ms;
+            voc_total_resadd_ms += blk_resadd_ms;
         }
 
-        if (qwen_tts_verbose >= 2) {
-            fprintf(stderr, "  Vocoder block %d [%d->%d, len %d]: snake=%.1f transconv=%.1f conv7=%.1f conv1=%.1f resadd=%.1f ms\n",
-                    block, in_dim, out_dim, current_len,
-                    blk_snake_ms, blk_transconv_ms, blk_conv7_ms, blk_conv1_ms, blk_resadd_ms);
-        }
-        voc_total_snake_ms += blk_snake_ms;
-        voc_total_transconv_ms += blk_transconv_ms;
-        voc_total_conv7_ms += blk_conv7_ms;
-        voc_total_conv1_ms += blk_conv1_ms;
-        voc_total_resadd_ms += blk_resadd_ms;
+        kernel_snake_beta(voc, voc, ctx->codec.vocoder_final_act_alpha,
+                          ctx->codec.vocoder_final_act_beta, current_dim, current_len);
+
+        wav = (float *)malloc((size_t)current_len * sizeof(float));
+        kernel_causal_conv1d(wav, voc, ctx->codec.vocoder_final_conv_weight,
+                             ctx->codec.vocoder_final_conv_bias,
+                             current_dim, 1, 7, current_len, 1, 1);
+        free(voc); free(voc_alt);
+        free(ru_scratch.residual); free(ru_scratch.conv1_out);
     }
-
-    /* 7c. Final: SnakeBeta → CausalConv1d → output channel 1 */
-    kernel_snake_beta(voc, voc, ctx->codec.vocoder_final_act_alpha,
-                      ctx->codec.vocoder_final_act_beta, current_dim, current_len);
-
-    /* Final conv: [current_dim, current_len] → [1, current_len] */
-    float *wav = (float *)malloc((size_t)current_len * sizeof(float));
-    kernel_causal_conv1d(wav, voc, ctx->codec.vocoder_final_conv_weight,
-                         ctx->codec.vocoder_final_conv_bias,
-                         current_dim, 1, 7, current_len, 1, 1);
-    free(voc);
-    free(voc_alt);
-    free(ru_scratch.residual);
-    free(ru_scratch.conv1_out);
 
     /* 8. Clamp to [-1, 1] */
     kernel_clamp(wav, current_len, -1.0f, 1.0f);
@@ -839,7 +884,7 @@ float *qwen_tts_codec_decode(qwen_tts_ctx_t *ctx, const int *codes,
     if (qwen_tts_verbose >= 1)
         fprintf(stderr, "Codec decode complete: %d samples (%.2f seconds)\n",
                 current_len, (float)current_len / QWEN_TTS_SAMPLE_RATE);
-    if (qwen_tts_verbose >= 2) {
+    if (qwen_tts_verbose >= 1) {
         fprintf(stderr, "Codec stages (ms): rvq=%.1f preconv=%.1f transformer=%.1f upsample=%.1f vocoder=%.1f\n",
                 stage_rvq_ms, stage_preconv_ms, stage_transformer_ms, stage_upsample_ms, stage_vocoder_ms);
         fprintf(stderr, "Vocoder totals (ms): snake=%.1f transconv=%.1f conv7=%.1f conv1=%.1f resadd=%.1f\n",
@@ -1056,14 +1101,21 @@ static void codec_transformer_step(qwen_tts_ctx_t *ctx,
         /* 1. Input RMSNorm */
         kernel_rms_norm(x_norm, x, l->input_norm, codec_hidden, eps);
 
-        /* 2. QKV projections (Q8_0) */
+        /* 2. QKV projections */
         {
             int total_rows = q_dim + kv_dim + kv_dim;
-            int n_blocks = codec_hidden / QK8_0;
-            block_q8_0 xn_q8[n_blocks];
-            kernel_quantize_x_q8(x_norm, codec_hidden, xn_q8);
             float *qkv_tmp = (float *)malloc(total_rows * sizeof(float));
-            kernel_matvec_q8(qkv_tmp, l->wqkv_q8, xn_q8, total_rows, n_blocks);
+#ifdef __ARM_FEATURE_FP16_VECTOR_ARITHMETIC
+            if (l->wqkv_f16) {
+                kernel_matvec_f16w(qkv_tmp, l->wqkv_f16, x_norm, total_rows, codec_hidden);
+            } else
+#endif
+            {
+                int n_blocks = codec_hidden / QK8_0;
+                block_q8_0 xn_q8[n_blocks];
+                kernel_quantize_x_q8(x_norm, codec_hidden, xn_q8);
+                kernel_matvec_q8(qkv_tmp, l->wqkv_q8, xn_q8, total_rows, n_blocks);
+            }
             memcpy(q_buf, qkv_tmp, q_dim * sizeof(float));
             memcpy(k_buf, qkv_tmp + q_dim, kv_dim * sizeof(float));
             memcpy(v_buf, qkv_tmp + q_dim + kv_dim, kv_dim * sizeof(float));
@@ -1106,7 +1158,12 @@ static void codec_transformer_step(qwen_tts_ctx_t *ctx,
             }
         }
 
-        /* 6. Output projection + LayerScale + residual (Q8_0) */
+        /* 6. Output projection + LayerScale + residual */
+#ifdef __ARM_FEATURE_FP16_VECTOR_ARITHMETIC
+        if (l->wo_f16) {
+            kernel_matvec_f16w(x_norm, l->wo_f16, attn_out, codec_hidden, q_dim);
+        } else
+#endif
         {
             int n_blocks = q_dim / QK8_0;
             block_q8_0 attn_q8[n_blocks];
@@ -1120,19 +1177,41 @@ static void codec_transformer_step(qwen_tts_ctx_t *ctx,
         /* 7. Post-attention norm + SwiGLU MLP + LayerScale */
         kernel_rms_norm(x_norm, x, l->post_attn_norm, codec_hidden, eps);
 
-        /* SwiGLU MLP (Q8_0) */
-        {
-            int n_blocks = codec_hidden / QK8_0;
-            block_q8_0 xn_q8[n_blocks];
-            kernel_quantize_x_q8(x_norm, codec_hidden, xn_q8);
-            kernel_swiglu_matvec_q8(gate_buf, l->gate_up_q8, xn_q8, intermediate, n_blocks);
-        }
-        /* down projection (Q8_0) */
-        {
-            int n_blocks = intermediate / QK8_0;
-            block_q8_0 gate_q8[n_blocks];
-            kernel_quantize_x_q8(gate_buf, intermediate, gate_q8);
-            kernel_matvec_q8(x_norm, l->down_q8, gate_q8, codec_hidden, n_blocks);
+        /* SwiGLU MLP + down projection */
+#ifdef __ARM_FEATURE_FP16_VECTOR_ARITHMETIC
+        if (l->gate_up_f16 && l->down_f16) {
+            float *gu_tmp = (float *)malloc(2 * intermediate * sizeof(float));
+            kernel_matvec_f16w(gu_tmp, l->gate_up_f16, x_norm, 2 * intermediate, codec_hidden);
+            for (int i = 0; i < intermediate; i++) {
+                float g = gu_tmp[i];
+                gate_buf[i] = (g / (1.0f + expf(-g))) * gu_tmp[intermediate + i];
+            }
+            free(gu_tmp);
+            kernel_matvec_f16w(x_norm, l->down_f16, gate_buf, codec_hidden, intermediate);
+        } else
+#endif
+        if (l->gate_up_f32 && l->down_f32) {
+            float *gu_tmp = (float *)malloc(2 * intermediate * sizeof(float));
+            kernel_matvec_f32(gu_tmp, l->gate_up_f32, x_norm, 2 * intermediate, codec_hidden);
+            for (int i = 0; i < intermediate; i++) {
+                float g = gu_tmp[i];
+                gate_buf[i] = (g / (1.0f + expf(-g))) * gu_tmp[intermediate + i];
+            }
+            free(gu_tmp);
+            kernel_matvec_f32(x_norm, l->down_f32, gate_buf, codec_hidden, intermediate);
+        } else {
+            {
+                int n_blocks = codec_hidden / QK8_0;
+                block_q8_0 xn_q8[n_blocks];
+                kernel_quantize_x_q8(x_norm, codec_hidden, xn_q8);
+                kernel_swiglu_matvec_q8(gate_buf, l->gate_up_q8, xn_q8, intermediate, n_blocks);
+            }
+            {
+                int n_blocks = intermediate / QK8_0;
+                block_q8_0 gate_q8[n_blocks];
+                kernel_quantize_x_q8(gate_buf, intermediate, gate_q8);
+                kernel_matvec_q8(x_norm, l->down_q8, gate_q8, codec_hidden, n_blocks);
+            }
         }
         if (l->mlp_layer_scale)
             kernel_mul_inplace(x_norm, l->mlp_layer_scale, codec_hidden);
@@ -1353,23 +1432,21 @@ qwen_tts_codec_stream_state_t *qwen_tts_codec_stream_init(qwen_tts_ctx_t *ctx)
         s->upsample_cn_state[i] = (float *)calloc((size_t)latent * 6, sizeof(float));
 
     /* Vocoder pre-conv: CausalConv1d(1024→1536, k=7), state_len=6 */
+    int dim = decoder_dim;
     s->voc_preconv_state = (float *)calloc((size_t)latent * 6, sizeof(float));
 
-    /* Vocoder blocks */
-    int dim = decoder_dim;
     for (int b = 0; b < 4; b++) {
         int out_dim = dim / 2;
         int rate = cfg->codec_upsample_rates[b];
         int K = 2 * rate;
-        int overlap_len = K - rate;  /* = rate */
+        int overlap_len = K - rate;
 
         s->voc_blocks[b].transconv_overlap = (float *)calloc(
             (size_t)out_dim * overlap_len, sizeof(float));
 
-        /* 3 ResUnits with dilations 1, 3, 9 */
         int dilations[3] = {1, 3, 9};
         for (int r = 0; r < 3; r++) {
-            int state_len = (7 - 1) * dilations[r]; /* (K-1)*dilation */
+            int state_len = (7 - 1) * dilations[r];
             s->voc_blocks[b].ru_conv1_state[r] = (float *)calloc(
                 (size_t)out_dim * state_len, sizeof(float));
         }
@@ -1377,8 +1454,6 @@ qwen_tts_codec_stream_state_t *qwen_tts_codec_stream_init(qwen_tts_ctx_t *ctx)
         dim = out_dim;
     }
 
-    /* Final conv: CausalConv1d(96→1, k=7), state_len=6 */
-    /* dim is now 96 (decoder_dim/2/2/2/2 = 1536/16 = 96) */
     s->final_conv_state = (float *)calloc((size_t)dim * 6, sizeof(float));
 
     s->n_processed = 0;
@@ -1486,7 +1561,11 @@ float *qwen_tts_codec_decode_step(
     ms_upsample = now_ms() - t0;
     /* After 2 upsample stages: cur_len = 1*2*2 = 4, hidden = [1024, 4] */
 
-    /* 6. Vocoder pre-conv: CausalConv1d(1024→1536, k=7, N_new=cur_len) */
+    /* 6-8. Vocoder: pre-conv → 4 blocks → final conv */
+    int current_dim = decoder_dim;
+    float *wav;
+
+    /* 6. Vocoder pre-conv */
     t0 = now_ms();
     float *voc_pre = (float *)malloc((size_t)decoder_dim * cur_len * sizeof(float));
     codec_causal_conv_incremental(voc_pre, hidden, state->voc_preconv_state,
@@ -1496,23 +1575,19 @@ float *qwen_tts_codec_decode_step(
     free(hidden);
     ms_voc_preconv = now_ms() - t0;
 
-    /* 7. Vocoder blocks: 4× (SnakeBeta → TransConv → 3× ResUnit) */
     hidden = voc_pre;
-    int current_dim = decoder_dim;
 
+    /* 7. Vocoder blocks */
     for (int block = 0; block < 4; block++) {
         t0 = now_ms();
         int in_dim = current_dim;
         int out_dim = in_dim / 2;
         int rate = cfg->codec_upsample_rates[block];
         int K = 2 * rate;
-        int overlap_len = K - rate;
         qwen_tts_vocoder_block_t *vb = &ctx->codec.vocoder_blocks[block];
 
-        /* SnakeBeta (in-place) */
         kernel_snake_beta(hidden, hidden, vb->act_alpha, vb->act_beta, in_dim, cur_len);
 
-        /* TransposedConv1d with overlap management */
         int emit_len = cur_len * rate;
         float *tc_out = (float *)malloc((size_t)out_dim * emit_len * sizeof(float));
         codec_transconv_incremental(tc_out, hidden,
@@ -1524,7 +1599,6 @@ float *qwen_tts_codec_decode_step(
         cur_len = emit_len;
         current_dim = out_dim;
 
-        /* 3 ResUnits with dilations 1, 3, 9 */
         int dilations[3] = {1, 3, 9};
         for (int ru = 0; ru < 3; ru++) {
             vocoder_resunit_incremental(&vb->resunits[ru],
@@ -1534,16 +1608,15 @@ float *qwen_tts_codec_decode_step(
         }
         ms_voc_blocks[block] = now_ms() - t0;
     }
-    /* After 4 blocks: current_dim=96, cur_len=4*8*5*4*3=1920 */
 
-    /* 8. Final: SnakeBeta → CausalConv1d(96→1, k=7) */
+    /* 8. Final */
     t0 = now_ms();
     kernel_snake_beta(hidden, hidden,
                       ctx->codec.vocoder_final_act_alpha,
                       ctx->codec.vocoder_final_act_beta,
                       current_dim, cur_len);
 
-    float *wav = (float *)malloc(cur_len * sizeof(float));
+    wav = (float *)malloc(cur_len * sizeof(float));
     codec_causal_conv_incremental(wav, hidden, state->final_conv_state,
                                    ctx->codec.vocoder_final_conv_weight,
                                    ctx->codec.vocoder_final_conv_bias,

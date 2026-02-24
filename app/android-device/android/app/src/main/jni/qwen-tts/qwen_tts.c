@@ -677,6 +677,27 @@ static int load_quantized_cache(qwen_tts_ctx_t *ctx) { (void)ctx; return -1; }
     if (!dst && qwen_tts_verbose >= 2) fprintf(stderr, "  Warning: tensor not found: %s\n", name); \
 } while(0)
 
+/* Load F32 from safetensors, convert to FP16, free F32 original */
+#ifdef __ARM_FEATURE_FP16_VECTOR_ARITHMETIC
+static __fp16 *load_f16_from_safetensors(const multi_safetensors_t *ms, const char *name) {
+    int64_t shape[8];
+    int ndim = 0;
+    float *f32 = multi_safetensors_load_f32(ms, name, shape, &ndim);
+    if (!f32) return NULL;
+    size_t n_elems = 1;
+    for (int d = 0; d < ndim; d++) n_elems *= (size_t)shape[d];
+    __fp16 *f16 = (__fp16 *)malloc(n_elems * sizeof(__fp16));
+    if (f16) kernel_f32_to_f16(f16, f32, (int)n_elems);
+    free(f32);
+    return f16;
+}
+
+#define LOAD_F16_CHECK(dst, ms, name) do { \
+    dst = load_f16_from_safetensors(ms, name); \
+    if (!dst && qwen_tts_verbose >= 2) fprintf(stderr, "  Warning: tensor not found: %s\n", name); \
+} while(0)
+#endif
+
 static int expect_tensor_bf16_2d(const multi_safetensors_t *ms, const char *name,
                                  int64_t dim0, int64_t dim1) {
     void *data = NULL;
@@ -1050,7 +1071,7 @@ static void load_codec_weights(qwen_tts_ctx_t *ctx, const multi_safetensors_t *m
         snprintf(name, sizeof(name), "decoder.pre_transformer.layers.%d.mlp_layer_scale.scale", i);
         LOAD_F32_CHECK(l->mlp_layer_scale, ms, name);
 
-        /* Load F32 weights into locals, fuse, quantize to Q8_0, free originals */
+        /* Load F32 weights into locals, fuse, convert to FP16 (primary) + Q8_0 (fallback) */
         {
             float *wq = NULL, *wk = NULL, *wv = NULL, *wo = NULL;
             float *gate = NULL, *up = NULL, *down = NULL;
@@ -1076,38 +1097,62 @@ static void load_codec_weights(qwen_tts_ctx_t *ctx, const multi_safetensors_t *m
             int codec_hidden = cfg->codec_hidden;
             int intermediate = cfg->codec_intermediate;
 
-            /* Fused QKV -> Q8_0 */
+            /* Fused QKV -> FP16 (primary) + Q8_0 (fallback), free F32 */
             if (wq && wk && wv) {
                 int total_rows = q_dim + kv_dim + kv_dim;
-                float *fused = (float *)malloc((size_t)total_rows * codec_hidden * sizeof(float));
+                size_t n_elems = (size_t)total_rows * codec_hidden;
+                float *fused = (float *)malloc(n_elems * sizeof(float));
                 if (fused) {
                     memcpy(fused, wq, (size_t)q_dim * codec_hidden * sizeof(float));
                     memcpy(fused + (size_t)q_dim * codec_hidden, wk, (size_t)kv_dim * codec_hidden * sizeof(float));
                     memcpy(fused + (size_t)(q_dim + kv_dim) * codec_hidden, wv, (size_t)kv_dim * codec_hidden * sizeof(float));
                     l->wqkv_q8 = quantize_weight_f32(fused, total_rows, codec_hidden);
+#ifdef __ARM_FEATURE_FP16_VECTOR_ARITHMETIC
+                    l->wqkv_f16 = (__fp16 *)malloc(n_elems * sizeof(__fp16));
+                    if (l->wqkv_f16) kernel_f32_to_f16(l->wqkv_f16, fused, (int)n_elems);
+#endif
                     free(fused);
                 }
             }
 
-            /* wo -> Q8_0 */
-            if (wo)
+            /* wo -> FP16 + Q8_0, free F32 */
+            if (wo) {
+                size_t n_elems = (size_t)codec_hidden * q_dim;
                 l->wo_q8 = quantize_weight_f32(wo, codec_hidden, q_dim);
+#ifdef __ARM_FEATURE_FP16_VECTOR_ARITHMETIC
+                l->wo_f16 = (__fp16 *)malloc(n_elems * sizeof(__fp16));
+                if (l->wo_f16) kernel_f32_to_f16(l->wo_f16, wo, (int)n_elems);
+#endif
+                free(wo); wo = NULL;
+            }
 
-            /* Fused gate+up -> Q8_0 */
+            /* Fused gate+up -> FP16 + Q8_0, free F32 */
             if (gate && up) {
                 int gu_rows = 2 * intermediate;
-                float *fused = (float *)malloc((size_t)gu_rows * codec_hidden * sizeof(float));
+                size_t n_elems = (size_t)gu_rows * codec_hidden;
+                float *fused = (float *)malloc(n_elems * sizeof(float));
                 if (fused) {
                     memcpy(fused, gate, (size_t)intermediate * codec_hidden * sizeof(float));
                     memcpy(fused + (size_t)intermediate * codec_hidden, up, (size_t)intermediate * codec_hidden * sizeof(float));
                     l->gate_up_q8 = quantize_weight_f32(fused, gu_rows, codec_hidden);
+#ifdef __ARM_FEATURE_FP16_VECTOR_ARITHMETIC
+                    l->gate_up_f16 = (__fp16 *)malloc(n_elems * sizeof(__fp16));
+                    if (l->gate_up_f16) kernel_f32_to_f16(l->gate_up_f16, fused, (int)n_elems);
+#endif
                     free(fused);
                 }
             }
 
-            /* down -> Q8_0 */
-            if (down)
+            /* down -> FP16 + Q8_0, free F32 */
+            if (down) {
+                size_t n_elems = (size_t)codec_hidden * intermediate;
                 l->down_q8 = quantize_weight_f32(down, codec_hidden, intermediate);
+#ifdef __ARM_FEATURE_FP16_VECTOR_ARITHMETIC
+                l->down_f16 = (__fp16 *)malloc(n_elems * sizeof(__fp16));
+                if (l->down_f16) kernel_f32_to_f16(l->down_f16, down, (int)n_elems);
+#endif
+                free(down); down = NULL;
+            }
 
             /* Free original F32 weights */
             free(wq); free(wk); free(wv); free(wo);
@@ -1149,6 +1194,9 @@ static void load_codec_weights(qwen_tts_ctx_t *ctx, const multi_safetensors_t *m
      *   [1..4] = DecoderBlock (each has .block = [SnakeBeta, TransConv, ResUnit, ResUnit, ResUnit])
      *   [5] = final SnakeBeta
      *   [6] = final CausalConv (out_dim -> 1, k=7)
+     *
+     * Vocoder uses F32 weights and activations (FP16 vocoder was slower on
+     * test devices due to poor FP16 NEON throughput on some ARM cores).
      */
     LOAD_F32_CHECK(codec->vocoder_pre_conv_weight, ms, "decoder.decoder.0.conv.weight");
     LOAD_F32_CHECK(codec->vocoder_pre_conv_bias, ms, "decoder.decoder.0.conv.bias");
@@ -1157,7 +1205,7 @@ static void load_codec_weights(qwen_tts_ctx_t *ctx, const multi_safetensors_t *m
         qwen_tts_vocoder_block_t *vb = &codec->vocoder_blocks[b];
         int idx = b + 1;  /* Python module index: decoder.decoder.{b+1} */
 
-        /* SnakeBeta activation at block[0] */
+        /* SnakeBeta activation at block[0] — always F32 */
         snprintf(name, sizeof(name), "decoder.decoder.%d.block.0.alpha", idx);
         LOAD_F32_CHECK(vb->act_alpha, ms, name);
         snprintf(name, sizeof(name), "decoder.decoder.%d.block.0.beta", idx);
@@ -1175,20 +1223,24 @@ static void load_codec_weights(qwen_tts_ctx_t *ctx, const multi_safetensors_t *m
             qwen_tts_vocoder_resunit_t *ru = &vb->resunits[r];
             int ridx = r + 2;
 
+            /* SnakeBeta — always F32 */
             snprintf(name, sizeof(name), "decoder.decoder.%d.block.%d.act1.alpha", idx, ridx);
             LOAD_F32_CHECK(ru->act1_alpha, ms, name);
             snprintf(name, sizeof(name), "decoder.decoder.%d.block.%d.act1.beta", idx, ridx);
             LOAD_F32_CHECK(ru->act1_beta, ms, name);
             preprocess_snakebeta_params(ru->act1_alpha, ru->act1_beta, cfg->codec_decoder_dim >> (b + 1));
+
             snprintf(name, sizeof(name), "decoder.decoder.%d.block.%d.conv1.conv.weight", idx, ridx);
             LOAD_F32_CHECK(ru->conv1_weight, ms, name);
             snprintf(name, sizeof(name), "decoder.decoder.%d.block.%d.conv1.conv.bias", idx, ridx);
             LOAD_F32_CHECK(ru->conv1_bias, ms, name);
+
             snprintf(name, sizeof(name), "decoder.decoder.%d.block.%d.act2.alpha", idx, ridx);
             LOAD_F32_CHECK(ru->act2_alpha, ms, name);
             snprintf(name, sizeof(name), "decoder.decoder.%d.block.%d.act2.beta", idx, ridx);
             LOAD_F32_CHECK(ru->act2_beta, ms, name);
             preprocess_snakebeta_params(ru->act2_alpha, ru->act2_beta, cfg->codec_decoder_dim >> (b + 1));
+
             snprintf(name, sizeof(name), "decoder.decoder.%d.block.%d.conv2.conv.weight", idx, ridx);
             LOAD_F32_CHECK(ru->conv2_weight, ms, name);
             snprintf(name, sizeof(name), "decoder.decoder.%d.block.%d.conv2.conv.bias", idx, ridx);
@@ -1440,6 +1492,10 @@ void qwen_tts_free(qwen_tts_ctx_t *ctx) {
         free(l->attn_layer_scale); free(l->mlp_layer_scale);
         free(l->wqkv_q8); free(l->wo_q8);
         free(l->gate_up_q8); free(l->down_q8);
+        free(l->wqkv_f16); free(l->wo_f16);
+        free(l->gate_up_f16); free(l->down_f16);
+        free(l->wqkv_f32); free(l->wo_f32);
+        free(l->gate_up_f32); free(l->down_f32);
     }
 
     for (int s = 0; s < 2; s++) {

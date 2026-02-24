@@ -256,11 +256,27 @@ typedef struct {
     float *attn_layer_scale;       /* [hidden] LayerScale */
     float *mlp_layer_scale;        /* [hidden] LayerScale */
 
-    /* Q8_0 quantized weights */
+    /* Q8_0 quantized weights (qcache fallback) */
     block_q8_0 *wqkv_q8;          /* [q_dim+kv_dim+kv_dim, hidden] fused QKV */
     block_q8_0 *wo_q8;            /* [hidden, q_dim] */
     block_q8_0 *gate_up_q8;       /* [2*intermediate, hidden] fused gate+up */
     block_q8_0 *down_q8;          /* [hidden, intermediate] */
+
+#ifdef __ARM_FEATURE_FP16_VECTOR_ARITHMETIC
+    /* FP16 weights (primary path: zero precision loss vs F32, halved bandwidth) */
+    __fp16 *wqkv_f16;             /* [q_dim+kv_dim+kv_dim, hidden] fused QKV */
+    __fp16 *wo_f16;               /* [hidden, q_dim] */
+    __fp16 *gate_up_f16;          /* [2*intermediate, hidden] fused gate+up */
+    __fp16 *down_f16;             /* [hidden, intermediate] */
+#else
+    void *wqkv_f16, *wo_f16, *gate_up_f16, *down_f16;  /* unused placeholders */
+#endif
+
+    /* F32 weights (kept when loading from safetensors for quality comparison) */
+    float *wqkv_f32;              /* NULL when loaded from qcache */
+    float *wo_f32;
+    float *gate_up_f32;
+    float *down_f32;
 } qwen_tts_codec_transformer_layer_t;
 
 /* ConvNeXt block */

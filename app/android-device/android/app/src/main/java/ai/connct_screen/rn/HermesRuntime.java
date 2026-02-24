@@ -255,7 +255,10 @@ public class HermesRuntime {
             int bufSize = AudioTrack.getMinBufferSize(sampleRate,
                     AudioFormat.CHANNEL_OUT_MONO,
                     AudioFormat.ENCODING_PCM_16BIT);
-            bufSize = Math.max(bufSize, 8192);
+            /* Large buffer (4s) so track.write() doesn't block the inference thread.
+             * Each streaming chunk is ~9600 samples (19,200 bytes / 400ms).
+             * With 4s buffer, ~10 chunks can queue without blocking. */
+            bufSize = Math.max(bufSize, sampleRate * 2 * 4); /* 4 seconds */
 
             final AudioTrack track = new AudioTrack.Builder()
                     .setAudioAttributes(new AudioAttributes.Builder()
@@ -278,7 +281,7 @@ public class HermesRuntime {
             final CountDownLatch doneLatch = new CountDownLatch(1);
             final AtomicBoolean genSuccess = new AtomicBoolean(false);
 
-            nativeTtsGenerateStream(tokenIds, speaker, language, 10, new TtsStreamCallback() {
+            nativeTtsGenerateStream(tokenIds, speaker, language, 5, new TtsStreamCallback() {
                 @Override
                 public void onAudioChunk(short[] samples, int numSamples) {
                     track.write(samples, 0, numSamples);
@@ -301,10 +304,15 @@ public class HermesRuntime {
 
             doneLatch.await();
 
-            // Wait for AudioTrack to finish playing remaining buffer
+            // Wait for AudioTrack to finish playing all buffered audio.
+            // With the large buffer, generation may finish well before playback.
             if (totalSamples[0] > 0) {
-                long durationMs = (long)(totalSamples[0] * 1000.0 / sampleRate);
-                Thread.sleep(Math.min(durationMs, 500) + 200);
+                int played = track.getPlaybackHeadPosition();
+                int remaining = totalSamples[0] - played;
+                if (remaining > 0) {
+                    long waitMs = (long)(remaining * 1000.0 / sampleRate) + 200;
+                    Thread.sleep(waitMs);
+                }
             }
 
             track.stop();

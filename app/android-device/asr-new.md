@@ -187,24 +187,81 @@ Set `past_text_conditioning=1` (in `qwen_asr.c`). The decoder receives previousl
 
 Trade-off: prefill sequence is longer (encoder + prefix tokens), so prefill time per chunk increases. But total wall time decreases because decode time drops more than prefill grows.
 
+## Streaming Slowdown Analysis (A/B test, chunk=1s)
+
+### Problem
+
+Streaming mode gets progressively slower. Per-chunk latency increases with audio length.
+
+### Root cause
+
+Prefill cost grows because **every chunk invalidates KV cache from the encoder output position onward**. Two sources:
+
+1. **Encoder output changes every chunk** (main cause, ~66% of growth): the encoder uses bidirectional attention within each 8s window. As the partial window grows (1s→2s→...→8s), all positions' outputs change. The row-by-row KV comparison diverges at the first changed encoder token, forcing re-prefill of everything after it.
+2. **Prefix tokens grow** (secondary, ~34%): `past_text_conditioning` appends previously decoded text (0→55 tokens over 19.6s). These tokens sit after the encoder output, so they're always part of the invalidated region.
+
+Note: the encoder uses **local attention** (`cu_seqlens` windowed). Windows don't attend to each other, so completed windows' encoder outputs are deterministic and their KV cache entries are correctly reused. Only the partial tail window causes invalidation.
+
+### A/B test: prefix ON vs OFF (complex_chinese.wav, 19.6s)
+
+Profiling output written to file (`/data/data/ai.connct_screen.rn/cache/asr_bench.txt`) for reliability. Read with `adb shell "run-as ai.connct_screen.rn cat cache/asr_bench.txt"`.
+
+Comparable range: chunks 9-13 (window 1 cached, reused=113 tokens, no recovery reset in either run).
+
+| Chunk | Audio | Prefix ON ||| Prefix OFF |||
+|-------|-------|-----------|-----------|-----------|-----------|-----------|-----------|
+| | | delta | total | **prefill ms** | delta | total | **prefill ms** |
+| 9 | 0-9s | 44 (25 prefix) | 157 | **358** | 19 | 132 | **160** |
+| 10 | 0-10s | 59 (27 prefix) | 172 | **396** | 32 | 145 | **319** |
+| 11 | 0-11s | 78 (33 prefix) | 191 | **606** | 45 | 158 | **317** |
+| 12 | 0-12s | 95 (37 prefix) | 208 | **732** | 58 | 171 | **446** |
+| 13 | 0-13s | 108 (37 prefix) | 221 | **865** | 71 | 184 | **552** |
+
+Key observation: **prefix OFF still grows 160→552ms (3.5x)** because encoder output itself grows ~13 tokens/chunk.
+
+### But prefix is a net win on total wall time
+
+| Metric | Prefix ON | Prefix OFF |
+|--------|-----------|------------|
+| Total prefill | 12,376 ms | 8,313 ms |
+| Total decode | **2,543 ms** | **10,815 ms** |
+| Total compute | **~14.9 s** | **~19.1 s** |
+| Final tokens | 55 | 54 (with recovery reset + content loss) |
+
+Without prefix, each chunk decodes full text from scratch, hitting `max_new=32` cap. Prefix saves ~8.3s decode but costs ~4.1s extra prefill = **net 4.2s faster**.
+
+### Official implementation comparison
+
+The [official Qwen3-ASR streaming](https://github.com/QwenLM/Qwen3-ASR/blob/main/qwen_asr/inference/qwen3_asr.py) re-feeds ALL accumulated audio every chunk with no encoder caching and no cross-chunk KV reuse. On GPU this doesn't matter — sequence lengths of 100-300 tokens leave GPU massively underutilized, so the O(n²) attention growth is invisible. On CPU every FLOP maps to wall time.
+
 ## Next Optimization Opportunities
 
-### 1. Prefill at window boundary (chunk 2: 743ms)
+### 1. Freeze partial encoder output within a window
 
-The biggest single prefill. Root cause: at the 8s boundary, the complete window is re-encoded with bidirectional attention over 8s, producing completely new encoder output. All KV cache after the template head (~15 tokens) is invalidated.
+**The biggest win.** Currently the partial window encoder output changes every chunk (bidirectional attention recomputes all positions when new audio arrives). This invalidates decoder KV cache for the encoder region + suffix + prefix.
 
-**Option A — skip complete window re-encoding**: use the last partial window's encoder output as the cached window. The partial at 6s was encoded with bidirectional attention over 6s — slightly less context but saves ~500ms (encoder) + ~300ms (prefill KV reuse improves). Trade-off: cached window quality slightly lower for subsequent chunks.
+Approach: after encoding a partial window, cache the per-position encoder output. When the partial window grows by 1s, only encode the new positions and append to cached output. This requires switching the encoder transformer from bidirectional to **causal attention** for partial windows (or simply concatenating independently-encoded chunks).
 
-**Option B — fixed-length encoder output padding**: pad encoder output to constant length so positions of suffix/text-prefix tokens don't shift between chunks. Would improve KV reuse but requires model behavior testing.
+Impact estimate: eliminates ~66% of prefill growth. Within a window, KV cache would only need to re-prefill the new encoder tokens (~13/chunk) + new prefix tokens (~3-5/chunk), not the full encoder output + suffix + prefix.
 
-### 2. Encoder GELU (~200ms across streaming, 13% of encoder)
+Risk: encoder quality degrades without bidirectional context. Needs quality testing on CER benchmarks.
+
+### 2. Skip complete window re-encoding at boundary
+
+At 8s boundaries the partial window is replaced by a complete-window re-encoding (bidirectional over full 8s). This produces different encoder output, invalidating all KV cache.
+
+Instead: keep the last partial window's encoder output as the cached window. Saves encoder time (~400ms) and preserves KV cache (~800ms prefill savings at chunk 16).
+
+Risk: slightly lower encoder quality for that window. Low risk since partial-7s vs complete-8s is marginal.
+
+### 3. Encoder GELU (~200ms across streaming, 13% of encoder)
 
 `qwen_gelu` uses scalar `tanhf()`. NEON polynomial approximation (e.g. rational Padé) could cut this by 50-70%. Straightforward implementation, no quality impact.
 
-### 3. ~~Encoder Q4_K~~ (tested, rejected)
+### 4. ~~Encoder Q4_K~~ (tested, rejected)
 
 Tested: encoder Q4_K with padded d_model (896→1024). Batch encoder **+17% slower** (974→1139ms), streaming encoder flat (+30ms). Root cause: encoder uses batched GEMM (seq=100-143 tokens) where compute dominates over bandwidth. Q4_K's complex dequant (4-bit unpack + sub-group corrections) is slower than Q8_0's simple INT8×INT8 SDOT. Plus 14% padding overhead for 0.6B (896→1024). Q4_K only helps bandwidth-bound paths (decoder matvec).
 
-### 4. Chunk 1 encoder (613ms, no stem cache)
+### 5. Chunk 1 encoder (613ms, no stem cache)
 
 Cold-start skip means no stem cache is built for the first real chunk. Running encoder-only (no prefill/decode) during cold-start would cost ~600ms but only save ~200ms at chunk 1. Net loss with current audio length. Might help for longer audio where window reuse is more frequent.
