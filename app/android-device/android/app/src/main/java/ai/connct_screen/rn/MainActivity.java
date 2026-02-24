@@ -24,9 +24,15 @@ import android.widget.ScrollView;
 import android.widget.Spinner;
 import android.widget.TextView;
 import android.view.inputmethod.EditorInfo;
+import android.widget.ProgressBar;
 import android.widget.ViewFlipper;
 
+import android.Manifest;
+import android.content.pm.PackageManager;
+
 import androidx.appcompat.app.AppCompatActivity;
+import androidx.core.app.ActivityCompat;
+import androidx.core.content.ContextCompat;
 
 import com.google.android.accessibility.selecttospeak.SelectToSpeakService;
 
@@ -84,6 +90,24 @@ public class MainActivity extends AppCompatActivity implements DeviceConnection.
     private boolean isRunning;
     private boolean serviceRunning;
 
+    // Settings screen views
+    private TextView modelStatusText;
+    private Spinner sourceSpinner;
+    private ProgressBar downloadProgress;
+    private TextView downloadProgressText;
+    private Button downloadBtn;
+    private Button loadModelBtn;
+    private Button testStreamBtn;
+    private Button freeModelBtn;
+    private TextView asrResultText;
+
+    private ModelManager modelManager;
+    private volatile boolean isDownloading;
+    private volatile boolean modelLoaded;
+    private volatile boolean isAsrTesting;
+    private android.media.AudioRecord testRecorder;
+    private Thread testRecordThread;
+
     // Per-agent connection status
     private boolean appConnected;
     private boolean browserConnected;
@@ -127,6 +151,24 @@ public class MainActivity extends AppCompatActivity implements DeviceConnection.
         browserGoBtn = findViewById(R.id.browserGoBtn);
         logScroll = findViewById(R.id.logScroll);
         logText = findViewById(R.id.logText);
+
+        // Settings screen
+        modelStatusText = findViewById(R.id.modelStatusText);
+        sourceSpinner = findViewById(R.id.sourceSpinner);
+        downloadProgress = findViewById(R.id.downloadProgress);
+        downloadProgressText = findViewById(R.id.downloadProgressText);
+        downloadBtn = findViewById(R.id.downloadBtn);
+        loadModelBtn = findViewById(R.id.loadModelBtn);
+        testStreamBtn = findViewById(R.id.testStreamBtn);
+        freeModelBtn = findViewById(R.id.freeModelBtn);
+        asrResultText = findViewById(R.id.asrResultText);
+
+        modelManager = new ModelManager(this);
+        setupSettingsScreen();
+
+        // Settings button in header
+        findViewById(R.id.settingsBtn).setOnClickListener(v -> openSettings());
+        findViewById(R.id.settingsBackBtn).setOnClickListener(v -> viewFlipper.setDisplayedChild(1));
 
         // Login button handlers
         loginBtn.setOnClickListener(v -> startDeviceLogin());
@@ -488,6 +530,234 @@ public class MainActivity extends AppCompatActivity implements DeviceConnection.
             logText.append("\n" + line);
         }
         logScroll.post(() -> logScroll.fullScroll(View.FOCUS_DOWN));
+    }
+
+    // --- Settings screen ---
+
+    private void setupSettingsScreen() {
+        // Source spinner
+        String[] sources = {"ModelScope", "HF Mirror"};
+        ArrayAdapter<String> sourceAdapter = new ArrayAdapter<>(this,
+                android.R.layout.simple_spinner_item, sources);
+        sourceAdapter.setDropDownViewResource(android.R.layout.simple_spinner_dropdown_item);
+        sourceSpinner.setAdapter(sourceAdapter);
+        // Restore saved source
+        if (modelManager.getSource() == ModelManager.Source.HF_MIRROR) {
+            sourceSpinner.setSelection(1);
+        }
+        sourceSpinner.setOnItemSelectedListener(new AdapterView.OnItemSelectedListener() {
+            @Override
+            public void onItemSelected(AdapterView<?> parent, View view, int pos, long id) {
+                modelManager.setSource(pos == 0 ? ModelManager.Source.MODELSCOPE : ModelManager.Source.HF_MIRROR);
+            }
+            @Override
+            public void onNothingSelected(AdapterView<?> parent) {}
+        });
+
+        downloadBtn.setOnClickListener(v -> startDownload());
+        loadModelBtn.setOnClickListener(v -> doLoadModel());
+        testStreamBtn.setOnClickListener(v -> doTestStream());
+        freeModelBtn.setOnClickListener(v -> doFreeModel());
+    }
+
+    private void openSettings() {
+        refreshModelStatus();
+        viewFlipper.setDisplayedChild(2);
+    }
+
+    private void refreshModelStatus() {
+        if (modelManager.isModelReady()) {
+            modelStatusText.setText("Model: ready" + (modelLoaded ? " (loaded)" : ""));
+            downloadBtn.setText("Re-download");
+            downloadBtn.setEnabled(!isDownloading);
+            loadModelBtn.setEnabled(!modelLoaded);
+            testStreamBtn.setEnabled(modelLoaded);
+            freeModelBtn.setEnabled(modelLoaded);
+        } else {
+            modelStatusText.setText("Model: not downloaded");
+            downloadBtn.setText("Download Model (~1.8 GB)");
+            downloadBtn.setEnabled(!isDownloading);
+            loadModelBtn.setEnabled(false);
+            testStreamBtn.setEnabled(false);
+            freeModelBtn.setEnabled(false);
+        }
+    }
+
+    private void startDownload() {
+        if (isDownloading) return;
+        isDownloading = true;
+        downloadBtn.setEnabled(false);
+        downloadProgress.setVisibility(View.VISIBLE);
+        downloadProgress.setProgress(0);
+        downloadProgressText.setVisibility(View.VISIBLE);
+        downloadProgressText.setText("Starting...");
+        asrResultText.setText("");
+
+        new Thread(() -> modelManager.download(new ModelManager.DownloadListener() {
+            @Override
+            public void onProgress(long downloaded, long total, String currentFile) {
+                int pct = total > 0 ? (int) (downloaded * 1000 / total) : 0;
+                handler.post(() -> {
+                    downloadProgress.setProgress(pct);
+                    downloadProgressText.setText(String.format(Locale.US,
+                            "%d%% (%d/%d MB) %s",
+                            pct / 10, downloaded >> 20, total >> 20, currentFile));
+                });
+            }
+
+            @Override
+            public void onComplete(String modelDir) {
+                handler.post(() -> {
+                    isDownloading = false;
+                    downloadProgress.setVisibility(View.GONE);
+                    downloadProgressText.setVisibility(View.GONE);
+                    refreshModelStatus();
+                    asrResultText.setText("Download complete: " + modelDir);
+                });
+            }
+
+            @Override
+            public void onError(String message) {
+                handler.post(() -> {
+                    isDownloading = false;
+                    downloadBtn.setEnabled(true);
+                    downloadProgressText.setText("Error: " + message);
+                    asrResultText.setText("Download failed. Partial files kept for resume.");
+                });
+            }
+        })).start();
+    }
+
+    private void doLoadModel() {
+        if (!modelManager.isModelReady()) return;
+        loadModelBtn.setEnabled(false);
+        asrResultText.setText("Loading model (first time includes quantization)...");
+
+        String cacheDir = getCacheDir().getAbsolutePath();
+        new Thread(() -> {
+            VoiceService.nativeSetCacheDir(cacheDir);
+            boolean ok = VoiceService.nativeLoadModel(modelManager.getModelDir(), 4);
+            handler.post(() -> {
+                modelLoaded = ok;
+                refreshModelStatus();
+                asrResultText.setText(ok ? "Model loaded successfully" : "Model load failed");
+            });
+        }).start();
+    }
+
+    private static final int REQUEST_MIC = 1001;
+
+    private void doTestStream() {
+        if (!modelLoaded) return;
+
+        if (isAsrTesting) {
+            stopAsrTest();
+            return;
+        }
+
+        // Check mic permission
+        if (ContextCompat.checkSelfPermission(this, Manifest.permission.RECORD_AUDIO)
+                != PackageManager.PERMISSION_GRANTED) {
+            ActivityCompat.requestPermissions(this,
+                    new String[]{Manifest.permission.RECORD_AUDIO}, REQUEST_MIC);
+            return;
+        }
+
+        startAsrTest();
+    }
+
+    private void startAsrTest() {
+        int bufSize = android.media.AudioRecord.getMinBufferSize(
+                16000, android.media.AudioFormat.CHANNEL_IN_MONO,
+                android.media.AudioFormat.ENCODING_PCM_16BIT);
+        try {
+            testRecorder = new android.media.AudioRecord(
+                    android.media.MediaRecorder.AudioSource.MIC,
+                    16000, android.media.AudioFormat.CHANNEL_IN_MONO,
+                    android.media.AudioFormat.ENCODING_PCM_16BIT,
+                    Math.max(bufSize, 16000 * 2));
+        } catch (SecurityException e) {
+            asrResultText.setText("No mic permission");
+            return;
+        }
+
+        if (testRecorder.getState() != android.media.AudioRecord.STATE_INITIALIZED) {
+            asrResultText.setText("Failed to init AudioRecord");
+            testRecorder.release();
+            testRecorder = null;
+            return;
+        }
+
+        // Set up token listener
+        VoiceService.setTokenListener(piece -> handler.post(() -> asrResultText.append(piece)));
+
+        // Start native ASR
+        if (!VoiceService.nativeStartAsr()) {
+            asrResultText.setText("nativeStartAsr failed");
+            testRecorder.release();
+            testRecorder = null;
+            VoiceService.setTokenListener(null);
+            return;
+        }
+
+        isAsrTesting = true;
+        asrResultText.setText("");
+        testStreamBtn.setText("Stop ASR");
+        testStreamBtn.setBackgroundColor(0xFFF44336);
+        loadModelBtn.setEnabled(false);
+        freeModelBtn.setEnabled(false);
+
+        testRecorder.startRecording();
+        testRecordThread = new Thread(() -> {
+            short[] buf = new short[1600]; // 100ms chunks
+            while (isAsrTesting) {
+                int read = testRecorder.read(buf, 0, buf.length);
+                if (read > 0) {
+                    VoiceService.nativePushAudio(buf, read);
+                }
+            }
+        }, "AsrTestRecord");
+        testRecordThread.start();
+    }
+
+    private void stopAsrTest() {
+        isAsrTesting = false;
+
+        if (testRecordThread != null) {
+            try { testRecordThread.join(2000); } catch (InterruptedException ignored) {}
+            testRecordThread = null;
+        }
+
+        if (testRecorder != null) {
+            testRecorder.stop();
+            testRecorder.release();
+            testRecorder = null;
+        }
+
+        VoiceService.nativeStopAsr();
+        VoiceService.setTokenListener(null);
+
+        testStreamBtn.setText("Start ASR");
+        testStreamBtn.setBackgroundColor(0xFFFF9800);
+        refreshModelStatus();
+    }
+
+    @Override
+    public void onRequestPermissionsResult(int requestCode, String[] permissions, int[] grantResults) {
+        super.onRequestPermissionsResult(requestCode, permissions, grantResults);
+        if (requestCode == REQUEST_MIC && grantResults.length > 0
+                && grantResults[0] == PackageManager.PERMISSION_GRANTED) {
+            doTestStream();
+        } else if (requestCode == REQUEST_MIC) {
+            asrResultText.setText("Microphone permission denied");
+        }
+    }
+
+    private void doFreeModel() {
+        VoiceService.nativeFreeModel();
+        modelLoaded = false;
+        refreshModelStatus();
+        asrResultText.setText("Model freed");
     }
 
     private void onLoginComplete() {

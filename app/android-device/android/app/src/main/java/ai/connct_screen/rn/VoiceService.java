@@ -62,6 +62,17 @@ public class VoiceService extends Service {
         void onAsrToken(String token);
     }
 
+    /** Static token listener for use outside VoiceService (e.g. test UI). */
+    private static volatile TokenListener sTokenListener;
+
+    public interface TokenListener {
+        void onToken(String piece);
+    }
+
+    public static void setTokenListener(TokenListener l) {
+        sTokenListener = l;
+    }
+
     public static VoiceService getInstance() {
         return sInstance;
     }
@@ -99,9 +110,15 @@ public class VoiceService extends Service {
 
     // Called from JNI on the ASR inference thread
     public static void onNativeToken(String piece) {
+        if (piece == null) return;
+        // Notify static listener (test UI)
+        TokenListener tl = sTokenListener;
+        if (tl != null) tl.onToken(piece);
+        // Notify service instance
         VoiceService instance = sInstance;
-        if (instance == null || piece == null) return;
-        instance.mainHandler.post(() -> instance.handleToken(piece));
+        if (instance != null) {
+            instance.mainHandler.post(() -> instance.handleToken(piece));
+        }
     }
 
     private void handleToken(String piece) {

@@ -167,9 +167,9 @@ Java_ai_connct_1screen_rn_VoiceService_nativeLoadModel(
     LOGI("Set thread count to %d", threads);
 
     // Configure for live streaming
-    g_ctx->stream_chunk_sec = 2.0f;
-    g_ctx->stream_rollback = 5;
-    g_ctx->stream_unfixed_chunks = 2;
+    g_ctx->stream_chunk_sec = 1.0f;
+    g_ctx->stream_rollback = 3;
+    g_ctx->stream_unfixed_chunks = 1;
     g_ctx->stream_max_new_tokens = 32;
 
     // Set token callback

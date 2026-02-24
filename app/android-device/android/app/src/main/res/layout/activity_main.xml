@@ -153,6 +153,18 @@
                 android:popupBackground="#ffffff"
                 android:paddingHorizontal="10dp"
                 android:gravity="center_vertical" />
+
+            <!-- Settings button -->
+            <TextView
+                android:id="@+id/settingsBtn"
+                android:layout_width="36dp"
+                android:layout_height="36dp"
+                android:text="\u2699"
+                android:textSize="22sp"
+                android:textColor="#666666"
+                android:gravity="center"
+                android:layout_marginStart="8dp"
+                android:background="?android:attr/selectableItemBackgroundBorderless" />
         </LinearLayout>
 
         <!-- Task input row -->
@@ -330,72 +342,200 @@
                 android:text="Enter a task and tap Send" />
         </ScrollView>
     </LinearLayout>
-    <!-- Screen 2: Model Download -->
+    <!-- Screen 2: Settings -->
     <LinearLayout
         android:layout_width="match_parent"
         android:layout_height="match_parent"
         android:orientation="vertical"
-        android:gravity="center"
-        android:padding="24dp">
+        android:padding="12dp">
 
-        <TextView
-            android:layout_width="wrap_content"
-            android:layout_height="wrap_content"
-            android:text="Voice Model Setup"
-            android:textColor="#212121"
-            android:textSize="24sp"
-            android:textStyle="bold"
-            android:layout_marginBottom="16dp" />
-
-        <TextView
-            android:id="@+id/downloadStatusText"
-            android:layout_width="wrap_content"
-            android:layout_height="wrap_content"
-            android:text="Download ASR model (~1.8 GB) for voice recognition?"
-            android:textColor="#666666"
-            android:textSize="14sp"
-            android:gravity="center"
-            android:layout_marginBottom="16dp" />
-
-        <ProgressBar
-            android:id="@+id/downloadProgress"
-            style="?android:attr/progressBarStyleHorizontal"
+        <!-- Settings header -->
+        <LinearLayout
             android:layout_width="match_parent"
             android:layout_height="wrap_content"
-            android:max="1000"
-            android:progress="0"
-            android:layout_marginBottom="16dp"
-            android:visibility="gone" />
+            android:orientation="horizontal"
+            android:gravity="center_vertical"
+            android:layout_marginBottom="16dp">
 
-        <LinearLayout
-            android:layout_width="wrap_content"
-            android:layout_height="wrap_content"
-            android:orientation="horizontal">
-
-            <Button
-                android:id="@+id/downloadBtn"
-                android:layout_width="wrap_content"
-                android:layout_height="wrap_content"
-                android:text="Download"
-                android:textColor="#ffffff"
-                android:textSize="16sp"
-                android:background="#1976D2"
-                android:paddingHorizontal="24dp"
-                android:paddingVertical="10dp"
-                android:layout_marginEnd="12dp"
-                android:textAllCaps="false" />
-
-            <Button
-                android:id="@+id/skipDownloadBtn"
-                android:layout_width="wrap_content"
-                android:layout_height="wrap_content"
-                android:text="Skip"
+            <TextView
+                android:id="@+id/settingsBackBtn"
+                android:layout_width="36dp"
+                android:layout_height="36dp"
+                android:text="\u2190"
+                android:textSize="22sp"
                 android:textColor="#666666"
-                android:textSize="16sp"
-                android:background="#e0e0e0"
-                android:paddingHorizontal="24dp"
-                android:paddingVertical="10dp"
-                android:textAllCaps="false" />
+                android:gravity="center"
+                android:background="?android:attr/selectableItemBackgroundBorderless" />
+
+            <TextView
+                android:layout_width="wrap_content"
+                android:layout_height="wrap_content"
+                android:text="Settings"
+                android:textColor="#212121"
+                android:textSize="20sp"
+                android:textStyle="bold"
+                android:layout_marginStart="8dp" />
         </LinearLayout>
+
+        <ScrollView
+            android:layout_width="match_parent"
+            android:layout_height="match_parent">
+
+            <LinearLayout
+                android:layout_width="match_parent"
+                android:layout_height="wrap_content"
+                android:orientation="vertical">
+
+                <!-- === ASR Model Section === -->
+                <TextView
+                    android:layout_width="wrap_content"
+                    android:layout_height="wrap_content"
+                    android:text="ASR Model"
+                    android:textColor="#1976D2"
+                    android:textSize="14sp"
+                    android:textStyle="bold"
+                    android:layout_marginBottom="8dp" />
+
+                <LinearLayout
+                    android:layout_width="match_parent"
+                    android:layout_height="wrap_content"
+                    android:orientation="vertical"
+                    android:background="#ffffff"
+                    android:padding="12dp"
+                    android:layout_marginBottom="16dp">
+
+                    <TextView
+                        android:id="@+id/modelStatusText"
+                        android:layout_width="match_parent"
+                        android:layout_height="wrap_content"
+                        android:text="Model: not downloaded"
+                        android:textColor="#424242"
+                        android:textSize="14sp"
+                        android:layout_marginBottom="8dp" />
+
+                    <!-- Download source selector -->
+                    <LinearLayout
+                        android:layout_width="match_parent"
+                        android:layout_height="wrap_content"
+                        android:orientation="horizontal"
+                        android:gravity="center_vertical"
+                        android:layout_marginBottom="8dp">
+
+                        <TextView
+                            android:layout_width="wrap_content"
+                            android:layout_height="wrap_content"
+                            android:text="Source:"
+                            android:textColor="#666666"
+                            android:textSize="13sp"
+                            android:layout_marginEnd="8dp" />
+
+                        <Spinner
+                            android:id="@+id/sourceSpinner"
+                            android:layout_width="wrap_content"
+                            android:layout_height="32dp"
+                            android:background="#e0e0e0"
+                            android:popupBackground="#ffffff"
+                            android:paddingHorizontal="8dp" />
+                    </LinearLayout>
+
+                    <ProgressBar
+                        android:id="@+id/downloadProgress"
+                        style="?android:attr/progressBarStyleHorizontal"
+                        android:layout_width="match_parent"
+                        android:layout_height="wrap_content"
+                        android:max="1000"
+                        android:progress="0"
+                        android:layout_marginBottom="8dp"
+                        android:visibility="gone" />
+
+                    <TextView
+                        android:id="@+id/downloadProgressText"
+                        android:layout_width="match_parent"
+                        android:layout_height="wrap_content"
+                        android:textColor="#999999"
+                        android:textSize="12sp"
+                        android:layout_marginBottom="8dp"
+                        android:visibility="gone" />
+
+                    <Button
+                        android:id="@+id/downloadBtn"
+                        android:layout_width="match_parent"
+                        android:layout_height="wrap_content"
+                        android:text="Download Model (~1.8 GB)"
+                        android:textColor="#ffffff"
+                        android:textSize="14sp"
+                        android:background="#1976D2"
+                        android:paddingVertical="10dp"
+                        android:textAllCaps="false" />
+                </LinearLayout>
+
+                <!-- === ASR Test Section === -->
+                <TextView
+                    android:layout_width="wrap_content"
+                    android:layout_height="wrap_content"
+                    android:text="ASR Test"
+                    android:textColor="#1976D2"
+                    android:textSize="14sp"
+                    android:textStyle="bold"
+                    android:layout_marginBottom="8dp" />
+
+                <LinearLayout
+                    android:layout_width="match_parent"
+                    android:layout_height="wrap_content"
+                    android:orientation="vertical"
+                    android:background="#ffffff"
+                    android:padding="12dp"
+                    android:layout_marginBottom="16dp">
+
+                    <Button
+                        android:id="@+id/loadModelBtn"
+                        android:layout_width="match_parent"
+                        android:layout_height="wrap_content"
+                        android:text="Load Model"
+                        android:textColor="#ffffff"
+                        android:textSize="14sp"
+                        android:background="#4CAF50"
+                        android:paddingVertical="10dp"
+                        android:layout_marginBottom="8dp"
+                        android:textAllCaps="false" />
+
+                    <Button
+                        android:id="@+id/testStreamBtn"
+                        android:layout_width="match_parent"
+                        android:layout_height="wrap_content"
+                        android:text="Start ASR"
+                        android:textColor="#ffffff"
+                        android:textSize="14sp"
+                        android:background="#FF9800"
+                        android:paddingVertical="10dp"
+                        android:layout_marginBottom="8dp"
+                        android:textAllCaps="false"
+                        android:enabled="false" />
+
+                    <Button
+                        android:id="@+id/freeModelBtn"
+                        android:layout_width="match_parent"
+                        android:layout_height="wrap_content"
+                        android:text="Free Model"
+                        android:textColor="#ffffff"
+                        android:textSize="14sp"
+                        android:background="#F44336"
+                        android:paddingVertical="10dp"
+                        android:layout_marginBottom="8dp"
+                        android:textAllCaps="false"
+                        android:enabled="false" />
+
+                    <TextView
+                        android:id="@+id/asrResultText"
+                        android:layout_width="match_parent"
+                        android:layout_height="wrap_content"
+                        android:textColor="#424242"
+                        android:textSize="13sp"
+                        android:fontFamily="monospace"
+                        android:lineSpacingExtra="2dp"
+                        android:text="" />
+                </LinearLayout>
+            </LinearLayout>
+        </ScrollView>
     </LinearLayout>
 </ViewFlipper>

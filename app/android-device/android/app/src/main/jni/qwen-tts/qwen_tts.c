@@ -15,6 +15,7 @@
 #include "qwen_tts_safetensors.h"
 
 #include <math.h>
+#include <pthread.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -1966,9 +1967,30 @@ float *qwen_tts_generate(
  *
  * Same logic as qwen_tts_generate() but periodically decodes accumulated
  * codec tokens and delivers new PCM samples via callback.
- * Uses re-decode + diff strategy: codec decode is causal, so
- * decode(N tokens)[0:N] == decode(N+M tokens)[0:N].
+ * Pipelined: vocoder runs on a background thread while talker generates
+ * the next chunk of tokens, overlapping compute.
  * ======================================================================== */
+
+/* Vocoder pipeline: background thread job for batch codec decode */
+typedef struct {
+    qwen_tts_ctx_t *ctx;
+    const int *codes;      /* pointer into all_codes (stable, no realloc) */
+    int num_groups;        /* quantizers per frame */
+    int decode_len;        /* total tokens to decode (new + context) */
+    int n_ctx;             /* context frames to trim from output */
+    float *audio;          /* output: malloc'd audio buffer */
+    int n_audio;           /* output: number of audio samples */
+    double decode_ms;      /* output: decode time */
+} vocoder_job_t;
+
+static void *vocoder_thread_fn(void *arg) {
+    vocoder_job_t *job = (vocoder_job_t *)arg;
+    double t0 = qwen_tts_time_ms();
+    job->audio = qwen_tts_codec_decode(job->ctx, job->codes,
+                                        job->decode_len, &job->n_audio);
+    job->decode_ms = qwen_tts_time_ms() - t0;
+    return NULL;
+}
 
 int qwen_tts_generate_stream(
     qwen_tts_ctx_t *ctx,
@@ -2139,26 +2161,23 @@ int qwen_tts_generate_stream(
     }
 
     int prev_audio_len = 0;    /* samples already sent via callback */
-    int prev_decoded_tokens = 0;  /* tokens already decoded */
     double t_gen = qwen_tts_time_ms();
     ctx->perf_subtalker_ms = 0.0;
 
-    /* chunk_size > 0: incremental mode (per-token decode + callback)
+    /* chunk_size > 0: batch-decode every chunk_size tokens with pipelined vocoder
      * chunk_size == 0: batch mode (decode all at EOS) */
     int effective_chunk = (chunk_size > 0) ? chunk_size : 0;
 
-    /* Initialize incremental codec decode state for streaming mode */
-    qwen_tts_codec_stream_state_t *codec_state = NULL;
-    if (effective_chunk > 0) {
-        codec_state = qwen_tts_codec_stream_init(ctx);
-        if (!codec_state) {
-            fprintf(stderr, "Error: failed to init incremental codec state\n");
-            free(all_codes); free(generated_tokens); free(logits); free(next_embed);
-            free(emb_tmp); free(suppress_tokens); free(trailing_text);
-            free(tts_pad_proj); free(tts_bos_proj); free(tts_eos_proj); free(text_tokens);
-            return -1;
-        }
-    }
+    /* Sliding window context: re-decode this many previous frames for boundary quality.
+     * 0 = no context (fastest), 2-4 = smoother boundaries (costs ~170ms per context frame). */
+    int context_frames = 0;
+    int accumulated_new = 0;    /* tokens accumulated since last batch decode */
+    int prev_decoded_end = 0;   /* how many tokens have been decoded so far */
+
+    /* Pipeline: vocoder runs on background thread */
+    vocoder_job_t voc_job = {0};
+    pthread_t voc_thread;
+    int voc_thread_active = 0;
 
     for (int step = 0; step < max_tokens; step++) {
         if (step == 0) {
@@ -2205,32 +2224,114 @@ int qwen_tts_generate_stream(
 
             memcpy(all_codes + n_generated * num_groups, codes, num_groups * sizeof(int));
             n_generated++;
+            accumulated_new++;
 
-            /* Incremental decode: process this token immediately */
-            if (codec_state) {
-                int n_audio = 0;
-                float *audio = qwen_tts_codec_decode_step(ctx, codec_state,
-                    all_codes + (n_generated - 1) * num_groups, &n_audio);
-                if (audio && n_audio > 0) {
-                    prev_audio_len += n_audio;
-                    if (qwen_tts_verbose >= 1)
-                        fprintf(stderr, "Stream incr: %d samples (%d total, %.2fs) at step %d\n",
-                                n_audio, prev_audio_len,
-                                (float)prev_audio_len / QWEN_TTS_SAMPLE_RATE, step);
-                    int ret = audio_cb(audio, n_audio, userdata);
-                    free(audio);
-                    if (ret != 0) {
-                        aborted = 1;
-                        break;
+            /* Launch pipelined batch decode when we've accumulated enough tokens.
+             * Vocoder runs on background thread while talker continues generating. */
+            if (effective_chunk > 0 && accumulated_new >= effective_chunk) {
+                /* Join previous vocoder thread and deliver its audio */
+                if (voc_thread_active) {
+                    pthread_join(voc_thread, NULL);
+                    voc_thread_active = 0;
+                    if (voc_job.audio && voc_job.n_audio > 0) {
+                        int ctx_samples = voc_job.n_ctx * QWEN_TTS_DECODE_UPSAMPLE;
+                        int emit_len = voc_job.n_audio - ctx_samples;
+                        if (emit_len > 0) {
+                            prev_audio_len += emit_len;
+                            if (qwen_tts_verbose >= 1)
+                                fprintf(stderr, "Stream chunk: %d samples (%d total, %.2fs), decode %.0fms\n",
+                                        emit_len, prev_audio_len,
+                                        (float)prev_audio_len / QWEN_TTS_SAMPLE_RATE, voc_job.decode_ms);
+                            int ret = audio_cb(voc_job.audio + ctx_samples, emit_len, userdata);
+                            if (ret != 0) {
+                                aborted = 1;
+                                free(voc_job.audio);
+                                break;
+                            }
+                        }
                     }
-                } else {
-                    free(audio);
+                    free(voc_job.audio);
+                    voc_job.audio = NULL;
                 }
+
+                /* Launch new vocoder decode on background thread */
+                int n_ctx = (prev_decoded_end > 0) ? context_frames : 0;
+                if (n_ctx > prev_decoded_end) n_ctx = prev_decoded_end;
+                int decode_start = n_generated - accumulated_new - n_ctx;
+
+                voc_job.ctx = ctx;
+                voc_job.codes = all_codes + decode_start * num_groups;
+                voc_job.num_groups = num_groups;
+                voc_job.decode_len = accumulated_new + n_ctx;
+                voc_job.n_ctx = n_ctx;
+                voc_job.audio = NULL;
+                voc_job.n_audio = 0;
+                voc_job.decode_ms = 0;
+
+                if (qwen_tts_verbose >= 1)
+                    fprintf(stderr, "Pipeline: launch vocoder (%d new +%d ctx), talker continues...\n",
+                            accumulated_new, n_ctx);
+
+                pthread_create(&voc_thread, NULL, vocoder_thread_fn, &voc_job);
+                voc_thread_active = 1;
+
+                prev_decoded_end = n_generated;
+                accumulated_new = 0;
             }
         }
 
-        /* Batch mode: decode all at EOS */
-        if (!codec_state && effective_chunk == 0 && is_eos && n_generated > 0) {
+        /* At EOS or loop end: join vocoder, flush remaining tokens */
+        if (is_eos) {
+            /* Join any running vocoder thread and deliver its audio */
+            if (voc_thread_active) {
+                pthread_join(voc_thread, NULL);
+                voc_thread_active = 0;
+                if (voc_job.audio && voc_job.n_audio > 0) {
+                    int ctx_samples = voc_job.n_ctx * QWEN_TTS_DECODE_UPSAMPLE;
+                    int emit_len = voc_job.n_audio - ctx_samples;
+                    if (emit_len > 0) {
+                        prev_audio_len += emit_len;
+                        if (qwen_tts_verbose >= 1)
+                            fprintf(stderr, "Stream chunk: %d samples (%d total, %.2fs), decode %.0fms\n",
+                                    emit_len, prev_audio_len,
+                                    (float)prev_audio_len / QWEN_TTS_SAMPLE_RATE, voc_job.decode_ms);
+                        int ret = audio_cb(voc_job.audio + ctx_samples, emit_len, userdata);
+                        if (ret != 0) aborted = 1;
+                    }
+                }
+                free(voc_job.audio);
+                voc_job.audio = NULL;
+            }
+
+            /* Decode remaining accumulated tokens (synchronous) */
+            if (effective_chunk > 0 && accumulated_new > 0) {
+                int n_ctx = (prev_decoded_end > 0) ? context_frames : 0;
+                if (n_ctx > prev_decoded_end) n_ctx = prev_decoded_end;
+                int decode_start = n_generated - accumulated_new - n_ctx;
+                int decode_len = accumulated_new + n_ctx;
+
+                int n_audio = 0;
+                float *audio = qwen_tts_codec_decode(ctx, all_codes + decode_start * num_groups,
+                                                      decode_len, &n_audio);
+                if (audio && n_audio > 0) {
+                    int ctx_samples = n_ctx * QWEN_TTS_DECODE_UPSAMPLE;
+                    int emit_len = n_audio - ctx_samples;
+                    if (emit_len > 0) {
+                        prev_audio_len += emit_len;
+                        if (qwen_tts_verbose >= 1)
+                            fprintf(stderr, "Stream final: %d new (+%d ctx), %d samples (%d total, %.2fs)\n",
+                                    accumulated_new, n_ctx, emit_len, prev_audio_len,
+                                    (float)prev_audio_len / QWEN_TTS_SAMPLE_RATE);
+                        int ret = audio_cb(audio + ctx_samples, emit_len, userdata);
+                        if (ret != 0) aborted = 1;
+                    }
+                }
+                free(audio);
+            }
+        }
+
+        /* Batch mode (chunk_size==0): decode all at EOS */
+        if (effective_chunk == 0 && is_eos && n_generated > 0) {
             int n_audio = 0;
             float *audio = qwen_tts_codec_decode(ctx, all_codes, n_generated, &n_audio);
             if (audio && n_audio > 0) {
@@ -2272,10 +2373,21 @@ int qwen_tts_generate_stream(
         }
     }
 
-    /* Clean up incremental state */
-    if (codec_state) {
-        qwen_tts_codec_stream_free(codec_state);
-        codec_state = NULL;
+    /* Safety: join vocoder thread if still active (e.g., loop aborted or max_tokens hit) */
+    if (voc_thread_active) {
+        pthread_join(voc_thread, NULL);
+        voc_thread_active = 0;
+        /* Deliver remaining audio if not aborted */
+        if (!aborted && voc_job.audio && voc_job.n_audio > 0) {
+            int ctx_samples = voc_job.n_ctx * QWEN_TTS_DECODE_UPSAMPLE;
+            int emit_len = voc_job.n_audio - ctx_samples;
+            if (emit_len > 0) {
+                prev_audio_len += emit_len;
+                audio_cb(voc_job.audio + ctx_samples, emit_len, userdata);
+            }
+        }
+        free(voc_job.audio);
+        voc_job.audio = NULL;
     }
 
     double t_gen_done = qwen_tts_time_ms();
