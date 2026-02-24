@@ -1081,6 +1081,256 @@ int qwen_argmax_matvec_q8(const float *x, const block_q8_0 *W_q8,
 }
 
 /* ========================================================================
+ * Q4_K Quantized Weight Operations (decoder, QK_K=256)
+ * ======================================================================== */
+
+/* Q4_K matvec dispatch wrappers */
+static void q4k_matvec_fused(float *y, const block_q8_K *x_q8k, const block_q4_K *W_q4k,
+                               const float *bias, int n_blocks_k, int out_dim) {
+    qwen_q4k_q8k_matvec_impl(y, x_q8k, W_q4k, bias, n_blocks_k, out_dim);
+}
+
+typedef struct {
+    float *y;
+    const block_q8_K *x_q8k;
+    const block_q4_K *W_q4k;
+    const float *bias;
+    int n_blocks_k;
+    int out_dim;
+} q4k_matvec_task_t;
+
+static void q4k_matvec_worker(int tid, int n_threads, void *arg) {
+    q4k_matvec_task_t *t = (q4k_matvec_task_t *)arg;
+    int chunk = (t->out_dim + n_threads - 1) / n_threads;
+    int start = tid * chunk;
+    int end = start + chunk;
+    if (end > t->out_dim) end = t->out_dim;
+    if (start >= end) return;
+
+    q4k_matvec_fused(t->y + start, t->x_q8k,
+                      t->W_q4k + (size_t)start * t->n_blocks_k,
+                      t->bias ? t->bias + start : NULL,
+                      t->n_blocks_k, end - start);
+}
+
+static void q4k_matvec_threaded(float *y, const float *x, const block_q4_K *W_q4k,
+                                  const float *bias, int in_dim, int out_dim) {
+    int n_blocks_k = in_dim / QK_K;
+
+    /* Quantize input x to Q8_K once */
+    block_q8_K *x_q8k = (block_q8_K *)malloc((size_t)n_blocks_k * sizeof(block_q8_K));
+    quantize_f32_to_q8_K(x, x_q8k, in_dim);
+
+    if (tp.n_threads <= 1) {
+        q4k_matvec_fused(y, x_q8k, W_q4k, bias, n_blocks_k, out_dim);
+    } else {
+        q4k_matvec_task_t task = { y, x_q8k, W_q4k, bias, n_blocks_k, out_dim };
+        parallel_for(q4k_matvec_worker, &task);
+    }
+
+    free(x_q8k);
+}
+
+void qwen_linear_nobias_q4k(float *y, const float *x, const block_q4_K *W_q4k,
+                              int seq_len, int in_dim, int out_dim) {
+    /* For seq_len > 1, fall back to row-by-row matvec (no batched Q4K GEMM) */
+    if (seq_len > 1) {
+        int n_blocks_k = in_dim / QK_K;
+        block_q8_K *x_q8k = (block_q8_K *)malloc((size_t)n_blocks_k * sizeof(block_q8_K));
+
+        for (int s = 0; s < seq_len; s++) {
+            const float *xs = x + (size_t)s * in_dim;
+            float *ys = y + (size_t)s * out_dim;
+            quantize_f32_to_q8_K(xs, x_q8k, in_dim);
+            q4k_matvec_fused(ys, x_q8k, W_q4k, NULL, n_blocks_k, out_dim);
+        }
+        free(x_q8k);
+    } else {
+        q4k_matvec_threaded(y, x, W_q4k, NULL, in_dim, out_dim);
+    }
+}
+
+void qwen_linear_q4k(float *y, const float *x, const block_q4_K *W_q4k,
+                     const float *b, int seq_len, int in_dim, int out_dim) {
+    if (seq_len > 1) {
+        int n_blocks_k = in_dim / QK_K;
+        block_q8_K *x_q8k = (block_q8_K *)malloc((size_t)n_blocks_k * sizeof(block_q8_K));
+
+        for (int s = 0; s < seq_len; s++) {
+            const float *xs = x + (size_t)s * in_dim;
+            float *ys = y + (size_t)s * out_dim;
+            quantize_f32_to_q8_K(xs, x_q8k, in_dim);
+            q4k_matvec_fused(ys, x_q8k, W_q4k, b, n_blocks_k, out_dim);
+        }
+        free(x_q8k);
+    } else {
+        q4k_matvec_threaded(y, x, W_q4k, b, in_dim, out_dim);
+    }
+}
+
+/* Q4_K QKV fused matvec for single-token decoder */
+typedef struct {
+    float *q;
+    float *k;
+    float *v;
+    const block_q8_K *x_q8k;
+    const block_q4_K *Wq_q4k;
+    const block_q4_K *Wk_q4k;
+    const block_q4_K *Wv_q4k;
+    int n_blocks_k;
+    int q_dim;
+    int kv_dim;
+    int total_dim;
+} q4k_qkv_matvec_task_t;
+
+static void q4k_qkv_matvec_worker(int tid, int n_threads, void *arg) {
+    q4k_qkv_matvec_task_t *t = (q4k_qkv_matvec_task_t *)arg;
+    int chunk = (t->total_dim + n_threads - 1) / n_threads;
+    int start = tid * chunk;
+    int end = start + chunk;
+    if (end > t->total_dim) end = t->total_dim;
+    if (start >= end) return;
+
+    int q_end = t->q_dim;
+    int k_end = q_end + t->kv_dim;
+    int v_end = k_end + t->kv_dim;
+
+    if (start < q_end) {
+        int s = start;
+        int e = end < q_end ? end : q_end;
+        if (s < e) {
+            q4k_matvec_fused(t->q + s, t->x_q8k,
+                              t->Wq_q4k + (size_t)s * t->n_blocks_k,
+                              NULL, t->n_blocks_k, e - s);
+        }
+    }
+
+    if (end > q_end && start < k_end) {
+        int s = start > q_end ? start - q_end : 0;
+        int e_abs = end < k_end ? end : k_end;
+        int e = e_abs - q_end;
+        if (s < e) {
+            q4k_matvec_fused(t->k + s, t->x_q8k,
+                              t->Wk_q4k + (size_t)s * t->n_blocks_k,
+                              NULL, t->n_blocks_k, e - s);
+        }
+    }
+
+    if (end > k_end && start < v_end) {
+        int s = start > k_end ? start - k_end : 0;
+        int e_abs = end < v_end ? end : v_end;
+        int e = e_abs - k_end;
+        if (s < e) {
+            q4k_matvec_fused(t->v + s, t->x_q8k,
+                              t->Wv_q4k + (size_t)s * t->n_blocks_k,
+                              NULL, t->n_blocks_k, e - s);
+        }
+    }
+}
+
+void qwen_linear_nobias_q4k_qkv(float *q, float *k, float *v, const float *x,
+                                  const block_q4_K *Wq_q4k,
+                                  const block_q4_K *Wk_q4k,
+                                  const block_q4_K *Wv_q4k,
+                                  int in_dim, int q_dim, int kv_dim) {
+    int n_blocks_k = in_dim / QK_K;
+
+    /* Quantize x once, shared across Q/K/V */
+    block_q8_K *x_q8k = (block_q8_K *)malloc((size_t)n_blocks_k * sizeof(block_q8_K));
+    quantize_f32_to_q8_K(x, x_q8k, in_dim);
+
+    if (tp.n_threads <= 1) {
+        q4k_matvec_fused(q, x_q8k, Wq_q4k, NULL, n_blocks_k, q_dim);
+        q4k_matvec_fused(k, x_q8k, Wk_q4k, NULL, n_blocks_k, kv_dim);
+        q4k_matvec_fused(v, x_q8k, Wv_q4k, NULL, n_blocks_k, kv_dim);
+        free(x_q8k);
+        return;
+    }
+
+    q4k_qkv_matvec_task_t task = {
+        .q = q,
+        .k = k,
+        .v = v,
+        .x_q8k = x_q8k,
+        .Wq_q4k = Wq_q4k,
+        .Wk_q4k = Wk_q4k,
+        .Wv_q4k = Wv_q4k,
+        .n_blocks_k = n_blocks_k,
+        .q_dim = q_dim,
+        .kv_dim = kv_dim,
+        .total_dim = q_dim + 2 * kv_dim,
+    };
+    parallel_for(q4k_qkv_matvec_worker, &task);
+    free(x_q8k);
+}
+
+/* Q4_K argmax */
+static void argmax_q4k_range(const block_q8_K *x_q8k, const block_q4_K *W_q4k,
+                               int n_blocks_k, int start, int end,
+                               int *best_out, float *best_val_out) {
+    qwen_argmax_q4k_range_impl(x_q8k, W_q4k, n_blocks_k, start, end, best_out, best_val_out);
+}
+
+typedef struct {
+    const block_q8_K *x_q8k;
+    const block_q4_K *W_q4k;
+    int n_blocks_k;
+    int out_dim;
+    int best_idx[QWEN_MAX_THREADS];
+    float best_val[QWEN_MAX_THREADS];
+} argmax_q4k_task_t;
+
+static void argmax_q4k_worker(int tid, int n_threads, void *arg) {
+    argmax_q4k_task_t *t = (argmax_q4k_task_t *)arg;
+    int chunk = (t->out_dim + n_threads - 1) / n_threads;
+    int start = tid * chunk;
+    int end = start + chunk;
+    if (end > t->out_dim) end = t->out_dim;
+    if (start >= end) {
+        t->best_val[tid] = -1e30f;
+        t->best_idx[tid] = 0;
+        return;
+    }
+    argmax_q4k_range(t->x_q8k, t->W_q4k, t->n_blocks_k, start, end,
+                      &t->best_idx[tid], &t->best_val[tid]);
+}
+
+int qwen_argmax_matvec_q4k(const float *x, const block_q4_K *W_q4k,
+                             int in_dim, int out_dim) {
+    int n_blocks_k = in_dim / QK_K;
+
+    /* Allocate x_q8k: for dec_hidden=1024, n_blocks_k=4, 4*292=1168 bytes */
+    block_q8_K *x_q8k = (block_q8_K *)malloc((size_t)n_blocks_k * sizeof(block_q8_K));
+    quantize_f32_to_q8_K(x, x_q8k, in_dim);
+
+    int best;
+    float best_val;
+
+    if (tp.n_threads <= 1) {
+        argmax_q4k_range(x_q8k, W_q4k, n_blocks_k, 0, out_dim, &best, &best_val);
+    } else {
+        argmax_q4k_task_t task;
+        task.x_q8k = x_q8k;
+        task.W_q4k = W_q4k;
+        task.n_blocks_k = n_blocks_k;
+        task.out_dim = out_dim;
+        parallel_for(argmax_q4k_worker, &task);
+
+        best = task.best_idx[0];
+        best_val = task.best_val[0];
+        for (int i = 1; i < tp.n_threads; i++) {
+            if (task.best_val[i] > best_val) {
+                best_val = task.best_val[i];
+                best = task.best_idx[i];
+            }
+        }
+    }
+
+    free(x_q8k);
+    return best;
+}
+
+/* ========================================================================
  * 2D Convolution (im2col + BLAS sgemm)
  * ======================================================================== */
 

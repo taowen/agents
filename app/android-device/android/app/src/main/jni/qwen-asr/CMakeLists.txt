@@ -12,7 +12,7 @@ set(QWEN_ASR_SOURCES
     qwen_asr_encoder.c
     qwen_asr_decoder.c
     qwen_asr_tokenizer.c
-    qwen_asr_safetensors.c
+    qwen_asr_gguf.c
 )
 
 add_library(qwen_asr_static STATIC ${QWEN_ASR_SOURCES})

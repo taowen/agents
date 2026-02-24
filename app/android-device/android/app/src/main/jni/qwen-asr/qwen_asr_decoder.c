@@ -12,8 +12,6 @@
 
 #include "qwen_asr.h"
 #include "qwen_asr_kernels.h"
-#include "qwen_asr_safetensors.h"
-#include "qwen_asr_quant.h"
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -26,142 +24,7 @@ static double dec_get_time_ms(void) {
     return tv.tv_sec * 1000.0 + tv.tv_usec / 1000.0;
 }
 
-/* ========================================================================
- * Weight Loading
- * ======================================================================== */
-
-static float *load_f32(multi_safetensors_t *ms, const char *name) {
-    safetensors_file_t *sf = NULL;
-    const safetensor_t *t = multi_safetensors_find(ms, name, &sf);
-    if (!t) {
-        fprintf(stderr, "decoder: weight not found: %s\n", name);
-        return NULL;
-    }
-    return safetensors_get_f32(sf, t);
-}
-
-static uint16_t *load_bf16_direct(multi_safetensors_t *ms, const char *name) {
-    safetensors_file_t *sf = NULL;
-    const safetensor_t *t = multi_safetensors_find(ms, name, &sf);
-    if (!t) {
-        fprintf(stderr, "decoder: weight not found: %s\n", name);
-        return NULL;
-    }
-    return safetensors_get_bf16_direct(sf, t);
-}
-
-static block_q8_0 *load_bf16_as_q8(multi_safetensors_t *ms, const char *name) {
-    safetensors_file_t *sf = NULL;
-    const safetensor_t *t = multi_safetensors_find(ms, name, &sf);
-    if (!t) {
-        fprintf(stderr, "decoder: weight not found: %s\n", name);
-        return NULL;
-    }
-    uint16_t *bf16 = safetensors_get_bf16_direct(sf, t);
-    if (!bf16) return NULL;
-
-    size_t n = 1;
-    for (int i = 0; i < t->ndim; i++) n *= t->shape[i];
-
-    size_t n_blocks = n / QK8_0;
-    block_q8_0 *q8 = (block_q8_0 *)malloc(n_blocks * sizeof(block_q8_0));
-    if (!q8) return NULL;
-
-    quantize_bf16_to_q8_0(bf16, q8, (int)n);
-    return q8;
-}
-
-int qwen_decoder_load(qwen_decoder_t *dec, multi_safetensors_t *ms,
-                       const qwen_config_t *cfg) {
-    char name[512];
-
-    /* Token embeddings (large, bf16 mmap direct) */
-    dec->tok_embeddings_bf16 = load_bf16_direct(ms,
-        "thinker.model.embed_tokens.weight");
-    if (!dec->tok_embeddings_bf16) return -1;
-
-    /* Transformer layers */
-    for (int i = 0; i < cfg->dec_layers; i++) {
-        qwen_dec_layer_t *l = &dec->layers[i];
-
-        /* Attention weights (bf16 -> Q8_0, no bias) */
-        snprintf(name, sizeof(name), "thinker.model.layers.%d.self_attn.q_proj.weight", i);
-        l->wq_weight_q8 = load_bf16_as_q8(ms, name);
-        snprintf(name, sizeof(name), "thinker.model.layers.%d.self_attn.k_proj.weight", i);
-        l->wk_weight_q8 = load_bf16_as_q8(ms, name);
-        snprintf(name, sizeof(name), "thinker.model.layers.%d.self_attn.v_proj.weight", i);
-        l->wv_weight_q8 = load_bf16_as_q8(ms, name);
-        snprintf(name, sizeof(name), "thinker.model.layers.%d.self_attn.o_proj.weight", i);
-        l->wo_weight_q8 = load_bf16_as_q8(ms, name);
-
-        /* Per-head Q/K RMSNorm weights */
-        snprintf(name, sizeof(name), "thinker.model.layers.%d.self_attn.q_norm.weight", i);
-        l->q_norm_weight = load_f32(ms, name);
-        snprintf(name, sizeof(name), "thinker.model.layers.%d.self_attn.k_norm.weight", i);
-        l->k_norm_weight = load_f32(ms, name);
-
-        /* RMSNorm weights */
-        snprintf(name, sizeof(name), "thinker.model.layers.%d.input_layernorm.weight", i);
-        l->input_norm = load_f32(ms, name);
-        snprintf(name, sizeof(name), "thinker.model.layers.%d.post_attention_layernorm.weight", i);
-        l->post_attn_norm = load_f32(ms, name);
-
-        /* SwiGLU MLP weights: gate/up kept as bf16 mmap for Q8 fusion, down quantized */
-        snprintf(name, sizeof(name), "thinker.model.layers.%d.mlp.gate_proj.weight", i);
-        l->gate_weight_bf16 = load_bf16_direct(ms, name);
-        snprintf(name, sizeof(name), "thinker.model.layers.%d.mlp.up_proj.weight", i);
-        l->up_weight_bf16 = load_bf16_direct(ms, name);
-        snprintf(name, sizeof(name), "thinker.model.layers.%d.mlp.down_proj.weight", i);
-        l->down_weight_q8 = load_bf16_as_q8(ms, name);
-
-        if (!l->wq_weight_q8 || !l->wk_weight_q8 ||
-            !l->wv_weight_q8 || !l->wo_weight_q8 ||
-            !l->gate_weight_bf16 || !l->up_weight_bf16 || !l->down_weight_q8) {
-            fprintf(stderr, "decoder: failed to load layer %d\n", i);
-            return -1;
-        }
-
-        /* Fuse gate+up weights: interleave BF16 rows, then quantize to Q8_0 */
-        {
-            int inter = cfg->dec_intermediate;
-            int hidden = cfg->dec_hidden;
-            int fused_rows = 2 * inter;
-            size_t row_elems = (size_t)hidden;
-            size_t n_blocks_per_row = row_elems / QK8_0;
-            size_t total_blocks = (size_t)fused_rows * n_blocks_per_row;
-
-            l->gate_up_fused_q8 = (block_q8_0 *)malloc(total_blocks * sizeof(block_q8_0));
-            for (int r = 0; r < inter; r++) {
-                /* gate row r -> fused row 2*r */
-                quantize_bf16_to_q8_0(
-                    l->gate_weight_bf16 + (size_t)r * hidden,
-                    l->gate_up_fused_q8 + (size_t)(2 * r) * n_blocks_per_row,
-                    hidden);
-                /* up row r -> fused row 2*r+1 */
-                quantize_bf16_to_q8_0(
-                    l->up_weight_bf16 + (size_t)r * hidden,
-                    l->gate_up_fused_q8 + (size_t)(2 * r + 1) * n_blocks_per_row,
-                    hidden);
-            }
-        }
-
-    }
-
-    /* Final RMSNorm */
-    dec->norm = load_f32(ms, "thinker.model.norm.weight");
-    if (!dec->norm) return -1;
-
-    /* Quantize tok_embeddings to Q8_0 for argmax (separate from BF16 mmap used for embedding lookup) */
-    {
-        size_t n = (size_t)cfg->vocab_size * cfg->dec_hidden;
-        size_t n_blocks = n / QK8_0;
-        dec->tok_embeddings_q8 = (block_q8_0 *)malloc(n_blocks * sizeof(block_q8_0));
-        if (!dec->tok_embeddings_q8) return -1;
-        quantize_bf16_to_q8_0(dec->tok_embeddings_bf16, dec->tok_embeddings_q8, (int)n);
-    }
-
-    return 0;
-}
+/* Weight loading is now handled centrally in qwen_asr.c via GGUF. */
 
 /* ========================================================================
  * KV Cache Management
@@ -362,11 +225,11 @@ void qwen_decoder_prefill(qwen_ctx_t *ctx, const float *input_embeds, int seq_le
         qwen_rms_norm(x_norm, x, l->input_norm, seq_len, dim, eps);
         prof_norm_rope += dec_get_time_ms() - prof_t;
 
-        /* QKV projections (no bias, Q8_0) */
+        /* QKV projections (no bias, Q4_K) */
         prof_t = dec_get_time_ms();
-        qwen_linear_nobias_q8(q, x_norm, l->wq_weight_q8, seq_len, dim, q_dim);
-        qwen_linear_nobias_q8(k, x_norm, l->wk_weight_q8, seq_len, dim, kv_dim);
-        qwen_linear_nobias_q8(v, x_norm, l->wv_weight_q8, seq_len, dim, kv_dim);
+        qwen_linear_nobias_q4k(q, x_norm, l->wq_weight_q4k, seq_len, dim, q_dim);
+        qwen_linear_nobias_q4k(k, x_norm, l->wk_weight_q4k, seq_len, dim, kv_dim);
+        qwen_linear_nobias_q4k(v, x_norm, l->wv_weight_q4k, seq_len, dim, kv_dim);
         prof_qkv += dec_get_time_ms() - prof_t;
 
         /* Per-head Q/K RMSNorm + RoPE */
@@ -397,7 +260,7 @@ void qwen_decoder_prefill(qwen_ctx_t *ctx, const float *input_embeds, int seq_le
 
         /* Output projection + residual */
         prof_t = dec_get_time_ms();
-        qwen_linear_nobias_q8(proj_out, attn_out, l->wo_weight_q8,
+        qwen_linear_nobias_q4k(proj_out, attn_out, l->wo_weight_q4k,
                                seq_len, q_dim, dim);
         prof_out_proj += dec_get_time_ms() - prof_t;
         qwen_add_inplace(x, proj_out, seq_len * dim);
@@ -409,10 +272,10 @@ void qwen_decoder_prefill(qwen_ctx_t *ctx, const float *input_embeds, int seq_le
 
         /* SwiGLU MLP */
         prof_t = dec_get_time_ms();
-        qwen_linear_nobias_q8(gate_up, x_norm, l->gate_up_fused_q8,
+        qwen_linear_nobias_q4k(gate_up, x_norm, l->gate_up_fused_q4k,
                                seq_len, dim, 2 * intermediate);
         qwen_swiglu_multiply(gate, gate_up, seq_len, intermediate);
-        qwen_linear_nobias_q8(ffn_out, gate, l->down_weight_q8,
+        qwen_linear_nobias_q4k(ffn_out, gate, l->down_weight_q4k,
                                seq_len, intermediate, dim);
         prof_mlp += dec_get_time_ms() - prof_t;
 
@@ -503,10 +366,10 @@ int qwen_decoder_forward(qwen_ctx_t *ctx, const float *input_embed) {
 
         prof_t = dec_get_time_ms();
         qwen_rms_norm(x_norm, x, l->input_norm, 1, dim, eps);
-        qwen_linear_nobias_q8_qkv(q, k, v, x_norm,
-                                   l->wq_weight_q8,
-                                   l->wk_weight_q8,
-                                   l->wv_weight_q8,
+        qwen_linear_nobias_q4k_qkv(q, k, v, x_norm,
+                                   l->wq_weight_q4k,
+                                   l->wk_weight_q4k,
+                                   l->wv_weight_q4k,
                                    dim, q_dim, kv_dim);
         qwen_rms_norm_per_head(q, l->q_norm_weight, 1, n_heads, head_dim, eps);
         qwen_rms_norm_per_head(k, l->k_norm_weight, 1, n_kv_heads, head_dim, eps);
@@ -527,23 +390,23 @@ int qwen_decoder_forward(qwen_ctx_t *ctx, const float *input_embed) {
         ctx->prof_dec_attn_ms += dec_get_time_ms() - prof_t;
 
         prof_t = dec_get_time_ms();
-        qwen_linear_nobias_q8(proj_out, attn_out, l->wo_weight_q8, 1, q_dim, dim);
+        qwen_linear_nobias_q4k(proj_out, attn_out, l->wo_weight_q4k, 1, q_dim, dim);
         qwen_add_inplace(x, proj_out, dim);
         qwen_rms_norm(x_norm, x, l->post_attn_norm, 1, dim, eps);
-        qwen_linear_nobias_q8(gate_buf, x_norm, l->gate_up_fused_q8,
+        qwen_linear_nobias_q4k(gate_buf, x_norm, l->gate_up_fused_q4k,
                                1, dim, 2 * intermediate);
         qwen_swiglu_multiply(gate_buf, gate_buf, 1, intermediate);
-        qwen_linear_nobias_q8(ffn_out, gate_buf, l->down_weight_q8, 1, intermediate, dim);
+        qwen_linear_nobias_q4k(ffn_out, gate_buf, l->down_weight_q4k, 1, intermediate, dim);
         qwen_add_inplace(x, ffn_out, dim);
         ctx->prof_dec_mlp_ms += dec_get_time_ms() - prof_t;
     }
 
     ctx->kv_cache_len = pos + 1;
 
-    /* Final norm + streaming argmax (Q8_0, no logits buffer needed) */
+    /* Final norm + streaming argmax (Q4_K, no logits buffer needed) */
     prof_t = dec_get_time_ms();
     qwen_rms_norm(x, x, dec->norm, 1, dim, eps);
-    int token = qwen_argmax_matvec_q8(x, dec->tok_embeddings_q8, dim, cfg->vocab_size);
+    int token = qwen_argmax_matvec_q4k(x, dec->tok_embeddings_q4k, dim, cfg->vocab_size);
     ctx->prof_dec_argmax_ms += dec_get_time_ms() - prof_t;
     return token;
 }

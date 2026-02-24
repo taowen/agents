@@ -211,6 +211,59 @@ void quantize_f32_rows_transpose_q8(
     }
 }
 
+/* ========================================================================
+ * Q8_K Quantization (256-element super-blocks for runtime activation quant)
+ * Reference: llama.cpp quantize_row_q8_K_ref
+ * ======================================================================== */
+
+void quantize_f32_to_q8_K(const float *src, block_q8_K *dst, int n) {
+    int nb = n / QK_K;
+
+    for (int i = 0; i < nb; i++) {
+        const float *sp = src + (size_t)i * QK_K;
+        block_q8_K *dp = &dst[i];
+
+        /* Find absolute maximum */
+        float max = 0.0f;
+#ifdef __ARM_NEON
+        float32x4_t vmax = vdupq_n_f32(0.0f);
+        for (int j = 0; j < QK_K; j += 4) {
+            float32x4_t v = vld1q_f32(sp + j);
+            vmax = vmaxq_f32(vmax, vabsq_f32(v));
+        }
+        max = vmaxvq_f32(vmax);
+#else
+        for (int j = 0; j < QK_K; j++) {
+            float amax = fabsf(sp[j]);
+            if (amax > max) max = amax;
+        }
+#endif
+
+        if (max == 0.0f) {
+            dp->d = 0.0f;
+            memset(dp->qs, 0, QK_K);
+            memset(dp->bsums, 0, sizeof(dp->bsums));
+            continue;
+        }
+
+        dp->d = max / 127.0f;
+        float id = 1.0f / dp->d;
+
+        for (int j = 0; j < QK_K / 16; j++) {
+            int sum = 0;
+            for (int l = 0; l < 16; l++) {
+                float v = sp[16 * j + l] * id;
+                int iv = (int)roundf(v);
+                if (iv < -128) iv = -128;
+                if (iv > 127) iv = 127;
+                dp->qs[16 * j + l] = (int8_t)iv;
+                sum += dp->qs[16 * j + l];
+            }
+            dp->bsums[j] = (int16_t)sum;
+        }
+    }
+}
+
 void dequantize_q8_0_to_f32(const block_q8_0 *src, float *dst, int n) {
     int n_blocks = n / QK8_0;
 

@@ -50,6 +50,7 @@ add_library(qwentts SHARED
     ${QWEN_TTS_DIR}/qwen_tts_safetensors.c
     ${QWEN_TTS_DIR}/qwen_tts_audio.c
     ${QWEN_TTS_DIR}/qwen_tts_quant.c
+    ${QWEN_TTS_DIR}/qwen_tts_ggml_quants.c
     ${QWEN_TTS_DIR}/qwen_tts_jni.c
 )
 

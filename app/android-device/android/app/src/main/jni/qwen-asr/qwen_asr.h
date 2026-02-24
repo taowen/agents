@@ -134,11 +134,11 @@ typedef struct {
  * ======================================================================== */
 
 typedef struct {
-    /* Self-attention (NO biases in decoder) - Q8_0 quantized */
-    block_q8_0 *wq_weight_q8;  /* [n_heads*head_dim, hidden/QK8_0 blocks] */
-    block_q8_0 *wk_weight_q8;  /* [n_kv_heads*head_dim, hidden/QK8_0 blocks] */
-    block_q8_0 *wv_weight_q8;  /* [n_kv_heads*head_dim, hidden/QK8_0 blocks] */
-    block_q8_0 *wo_weight_q8;  /* [hidden, n_heads*head_dim/QK8_0 blocks] */
+    /* Self-attention (NO biases in decoder) - Q4_K quantized */
+    block_q4_K *wq_weight_q4k;  /* [n_heads*head_dim, hidden/QK_K blocks] */
+    block_q4_K *wk_weight_q4k;  /* [n_kv_heads*head_dim, hidden/QK_K blocks] */
+    block_q4_K *wv_weight_q4k;  /* [n_kv_heads*head_dim, hidden/QK_K blocks] */
+    block_q4_K *wo_weight_q4k;  /* [hidden, n_heads*head_dim/QK_K blocks] */
 
     /* Per-head Q/K RMSNorm */
     float *q_norm_weight;      /* [head_dim] = [128] */
@@ -148,19 +148,15 @@ typedef struct {
     float *input_norm;         /* [hidden] */
     float *post_attn_norm;     /* [hidden] */
 
-    /* SwiGLU MLP (NO biases) - Q8_0 quantized */
-    uint16_t *gate_weight_bf16; /* [intermediate, hidden] — BF16 mmap, kept for Q8 fusion */
-    uint16_t *up_weight_bf16;   /* [intermediate, hidden] — BF16 mmap, kept for Q8 fusion */
-    block_q8_0 *down_weight_q8; /* [hidden, intermediate/QK8_0 blocks] */
-
-    /* Fused gate+up weight Q8_0 [2*intermediate, hidden/QK8_0 blocks] */
-    block_q8_0 *gate_up_fused_q8;
+    /* SwiGLU MLP (NO biases) - Q4_K quantized */
+    block_q4_K *gate_up_fused_q4k; /* [2*intermediate, hidden/QK_K blocks] */
+    block_q4_K *down_weight_q4k;   /* [hidden, intermediate/QK_K blocks] */
 } qwen_dec_layer_t;
 
 typedef struct {
     /* Token embeddings (tied with lm_head) */
-    uint16_t *tok_embeddings_bf16; /* [vocab_size, hidden] — BF16 mmap for embedding lookup */
-    block_q8_0 *tok_embeddings_q8; /* [vocab_size, hidden/QK8_0 blocks] — Q8 for argmax */
+    uint16_t *tok_embeddings_f16; /* [vocab_size, hidden] — F16 mmap for embedding lookup */
+    block_q4_K *tok_embeddings_q4k; /* [vocab_size, hidden/QK_K blocks] — Q4_K for argmax */
 
     /* Transformer layers */
     qwen_dec_layer_t layers[QWEN_MAX_DEC_LAYERS];
@@ -186,13 +182,9 @@ typedef struct {
     qwen_encoder_t encoder;
     qwen_decoder_t decoder;
 
-    /* Model files (kept open for mmap) */
-    void *safetensors;         /* multi_safetensors_t* */
+    /* GGUF model file (kept open for mmap — all weight pointers point into this) */
+    void *gguf;                /* gguf_ctx_t* */
     char model_dir[512];
-
-    /* Pre-quantized model mmap (NULL if using safetensors path) */
-    void *qmodel_mmap;
-    size_t qmodel_mmap_size;
 
     /* KV cache for decoder */
     float *kv_cache_k;         /* [layers, max_seq, kv_heads * head_dim] */

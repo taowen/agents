@@ -1,10 +1,8 @@
 package ai.connct_screen.rn;
 
-import android.Manifest;
 import android.content.Context;
 import android.content.Intent;
 import android.content.SharedPreferences;
-import android.content.pm.PackageManager;
 import android.content.res.Configuration;
 import android.graphics.Bitmap;
 import android.os.Build;
@@ -14,7 +12,6 @@ import android.os.Looper;
 import android.provider.Settings;
 import android.util.Log;
 import android.view.View;
-import android.view.ViewGroup;
 import android.webkit.WebResourceRequest;
 import android.webkit.WebSettings;
 import android.webkit.WebView;
@@ -23,7 +20,6 @@ import android.widget.AdapterView;
 import android.widget.ArrayAdapter;
 import android.widget.Button;
 import android.widget.EditText;
-import android.widget.ProgressBar;
 import android.widget.ScrollView;
 import android.widget.Spinner;
 import android.widget.TextView;
@@ -31,8 +27,6 @@ import android.view.inputmethod.EditorInfo;
 import android.widget.ViewFlipper;
 
 import androidx.appcompat.app.AppCompatActivity;
-import androidx.core.app.ActivityCompat;
-import androidx.core.content.ContextCompat;
 
 import com.google.android.accessibility.selecttospeak.SelectToSpeakService;
 
@@ -50,15 +44,12 @@ import okhttp3.OkHttpClient;
 import okhttp3.Request;
 import okhttp3.Response;
 
-public class MainActivity extends AppCompatActivity implements DeviceConnection.Listener,
-        VoiceService.AsrListener {
+public class MainActivity extends AppCompatActivity implements DeviceConnection.Listener {
 
     private static final String TAG = "MainActivity";
     private static final String SERVER_URL = "https://ai.connect-screen.com";
     private static final String PREFS_NAME = "llm_config";
     private static final long DEVICE_POLL_INTERVAL = 2000;
-    private static final int REQUEST_RECORD_AUDIO = 100;
-    private static final int REQUEST_POST_NOTIFICATIONS = 101;
 
     private ViewFlipper viewFlipper;
 
@@ -82,23 +73,6 @@ public class MainActivity extends AppCompatActivity implements DeviceConnection.
     private Button browserBackBtn, browserFwdBtn, browserGoBtn;
     private ScrollView logScroll;
     private TextView logText;
-
-    // Voice views
-    private View voiceStatusBar;
-    private View voiceStatusDot;
-    private TextView voiceStatusText;
-    private Button micToggleBtn;
-    private TextView transcriptionText;
-
-    // Model download views
-    private TextView downloadStatusText;
-    private ProgressBar downloadProgress;
-    private Button downloadBtn;
-    private Button skipDownloadBtn;
-
-    // Voice / model state
-    private ModelManager modelManager;
-    private boolean voiceEnabled;
 
     private final OkHttpClient httpClient = new OkHttpClient();
     private final Handler handler = new Handler(Looper.getMainLooper());
@@ -154,21 +128,6 @@ public class MainActivity extends AppCompatActivity implements DeviceConnection.
         logScroll = findViewById(R.id.logScroll);
         logText = findViewById(R.id.logText);
 
-        // Voice views
-        voiceStatusBar = findViewById(R.id.voiceStatusBar);
-        voiceStatusDot = findViewById(R.id.voiceStatusDot);
-        voiceStatusText = findViewById(R.id.voiceStatusText);
-        micToggleBtn = findViewById(R.id.micToggleBtn);
-        transcriptionText = findViewById(R.id.transcriptionText);
-
-        // Model download views
-        downloadStatusText = findViewById(R.id.downloadStatusText);
-        downloadProgress = findViewById(R.id.downloadProgress);
-        downloadBtn = findViewById(R.id.downloadBtn);
-        skipDownloadBtn = findViewById(R.id.skipDownloadBtn);
-
-        modelManager = new ModelManager(this);
-
         // Login button handlers
         loginBtn.setOnClickListener(v -> startDeviceLogin());
         cancelLoginBtn.setOnClickListener(v -> cancelDeviceLogin());
@@ -197,23 +156,6 @@ public class MainActivity extends AppCompatActivity implements DeviceConnection.
                 return true;
             }
             return false;
-        });
-
-        // Mic toggle
-        micToggleBtn.setOnClickListener(v -> {
-            if (voiceEnabled) {
-                stopVoiceService();
-            } else {
-                startVoiceService();
-            }
-        });
-
-        // Model download handlers
-        downloadBtn.setOnClickListener(v -> startModelDownload());
-        skipDownloadBtn.setOnClickListener(v -> {
-            // Skip model download, go to task screen without voice
-            showTaskScreen();
-            connectCloud();
         });
 
         // Set up agent spinner
@@ -318,9 +260,6 @@ public class MainActivity extends AppCompatActivity implements DeviceConnection.
         stopDevicePoll();
         DeviceConnection.getInstance("app").setListener(null);
         DeviceConnection.getInstance("browser").setListener(null);
-        if (voiceEnabled) {
-            stopVoiceService();
-        }
     }
 
     // --- Login flow ---
@@ -551,168 +490,9 @@ public class MainActivity extends AppCompatActivity implements DeviceConnection.
         logScroll.post(() -> logScroll.fullScroll(View.FOCUS_DOWN));
     }
 
-    // --- Voice / Model ---
-
     private void onLoginComplete() {
-        if (modelManager.isModelReady()) {
-            showTaskScreen();
-            connectCloud();
-            requestAudioPermissionAndStart();
-        } else {
-            // Show model download screen
-            viewFlipper.setDisplayedChild(2);
-        }
-    }
-
-    private void startModelDownload() {
-        downloadBtn.setEnabled(false);
-        skipDownloadBtn.setEnabled(false);
-        downloadProgress.setVisibility(View.VISIBLE);
-        downloadStatusText.setText("Downloading...");
-
-        new Thread(() -> modelManager.download(new ModelManager.DownloadListener() {
-            @Override
-            public void onProgress(long downloaded, long total, String currentFile) {
-                int pct = total > 0 ? (int)(downloaded * 1000 / total) : 0;
-                handler.post(() -> {
-                    downloadProgress.setProgress(pct);
-                    long mb = downloaded / (1024 * 1024);
-                    long totalMb = total / (1024 * 1024);
-                    downloadStatusText.setText("Downloading " + currentFile
-                            + " (" + mb + "/" + totalMb + " MB)");
-                });
-            }
-
-            @Override
-            public void onComplete(String modelDir) {
-                handler.post(() -> {
-                    showTaskScreen();
-                    connectCloud();
-                    requestAudioPermissionAndStart();
-                });
-            }
-
-            @Override
-            public void onError(String message) {
-                handler.post(() -> {
-                    downloadStatusText.setText("Error: " + message);
-                    downloadBtn.setEnabled(true);
-                    skipDownloadBtn.setEnabled(true);
-                });
-            }
-        })).start();
-    }
-
-    private void requestAudioPermissionAndStart() {
-        // Request POST_NOTIFICATIONS first (Android 13+)
-        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) {
-            if (ContextCompat.checkSelfPermission(this,
-                    Manifest.permission.POST_NOTIFICATIONS) != PackageManager.PERMISSION_GRANTED) {
-                ActivityCompat.requestPermissions(this,
-                        new String[]{Manifest.permission.POST_NOTIFICATIONS},
-                        REQUEST_POST_NOTIFICATIONS);
-                return;
-            }
-        }
-        requestAudioPermission();
-    }
-
-    private void requestAudioPermission() {
-        if (ContextCompat.checkSelfPermission(this,
-                Manifest.permission.RECORD_AUDIO) != PackageManager.PERMISSION_GRANTED) {
-            ActivityCompat.requestPermissions(this,
-                    new String[]{Manifest.permission.RECORD_AUDIO},
-                    REQUEST_RECORD_AUDIO);
-        } else {
-            loadModelAndStartVoice();
-        }
-    }
-
-    @Override
-    public void onRequestPermissionsResult(int requestCode, String[] permissions, int[] grantResults) {
-        super.onRequestPermissionsResult(requestCode, permissions, grantResults);
-        if (requestCode == REQUEST_POST_NOTIFICATIONS) {
-            // Continue to audio permission regardless
-            requestAudioPermission();
-        } else if (requestCode == REQUEST_RECORD_AUDIO) {
-            if (grantResults.length > 0 && grantResults[0] == PackageManager.PERMISSION_GRANTED) {
-                loadModelAndStartVoice();
-            } else {
-                appendLog("[VOICE] Microphone permission denied");
-            }
-        }
-    }
-
-    private void loadModelAndStartVoice() {
-        if (!modelManager.isModelReady()) {
-            appendLog("[VOICE] Model not downloaded, voice disabled");
-            return;
-        }
-
-        appendLog("[VOICE] Loading ASR model...");
-        new Thread(() -> {
-            boolean ok = VoiceService.nativeLoadModel(modelManager.getModelDir(), 4);
-            handler.post(() -> {
-                if (ok) {
-                    appendLog("[VOICE] Model loaded successfully");
-                    startVoiceService();
-                } else {
-                    appendLog("[VOICE] Failed to load model");
-                }
-            });
-        }).start();
-    }
-
-    private void startVoiceService() {
-        voiceEnabled = true;
-        voiceStatusBar.setVisibility(View.VISIBLE);
-        voiceStatusText.setText("Listening...");
-        voiceStatusDot.setBackgroundColor(0xFF4CAF50);
-        micToggleBtn.setText("Mic OFF");
-        micToggleBtn.setBackgroundColor(0xFFF44336);
-
-        Intent intent = new Intent(this, VoiceService.class);
-        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
-            startForegroundService(intent);
-        } else {
-            startService(intent);
-        }
-
-        // Wait for service to start, then set listener
-        handler.postDelayed(() -> {
-            VoiceService svc = VoiceService.getInstance();
-            if (svc != null) {
-                svc.setAsrListener(this);
-            }
-        }, 500);
-    }
-
-    private void stopVoiceService() {
-        voiceEnabled = false;
-        voiceStatusBar.setVisibility(View.GONE);
-        transcriptionText.setVisibility(View.GONE);
-        stopService(new Intent(this, VoiceService.class));
-    }
-
-    // --- VoiceService.AsrListener ---
-
-    @Override
-    public void onTextSegment(String text) {
-        appendLog("[VOICE] " + text);
-        transcriptionText.setVisibility(View.GONE);
-        // Send to the currently selected agent
-        DeviceConnection.getInstance(currentAgentType).sendUserTask(text);
-    }
-
-    @Override
-    public void onAsrToken(String token) {
-        transcriptionText.setVisibility(View.VISIBLE);
-        transcriptionText.append(token);
-        // Keep only last portion visible
-        String full = transcriptionText.getText().toString();
-        if (full.length() > 200) {
-            transcriptionText.setText(full.substring(full.length() - 200));
-        }
+        showTaskScreen();
+        connectCloud();
     }
 
     // --- DeviceConnection.Listener ---

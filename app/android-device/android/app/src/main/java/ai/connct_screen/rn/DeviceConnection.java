@@ -268,6 +268,18 @@ public class DeviceConnection {
                         "JSON.stringify(executeCodeForServer(" + escapeJsString(code) + "))",
                         "exec_js"
                 );
+                // If executeCodeForServer is gone (runtime state lost), reinit and retry once
+                if (rawResult != null && rawResult.contains("executeCodeForServer")
+                        && rawResult.contains("doesn't exist")) {
+                    Log.w(TAG, "[" + agentType + "] executeCodeForServer missing, reinitializing runtime");
+                    hermesInitialized = false;
+                    initHermesRuntime();
+                    rawResult = HermesRuntime.nativeEvaluateJS(
+                            agentType,
+                            "JSON.stringify(executeCodeForServer(" + escapeJsString(code) + "))",
+                            "exec_js"
+                    );
+                }
                 try {
                     JSONObject parsed = new JSONObject(rawResult);
                     result = parsed.optString("result", rawResult);
@@ -313,14 +325,18 @@ public class DeviceConnection {
 
         com.google.android.accessibility.selecttospeak.SelectToSpeakService service =
                 com.google.android.accessibility.selecttospeak.SelectToSpeakService.getInstance();
-        if (service != null) {
-            String bundleJs = HermesRuntime.loadAsset(service, assetName);
-            if (bundleJs != null) {
-                HermesRuntime.nativeEvaluateJS(agentType, bundleJs, assetName);
-            } else {
-                Log.e(TAG, "[" + agentType + "] Failed to load " + assetName);
-            }
+        if (service == null) {
+            Log.e(TAG, "[" + agentType + "] A11y service not available, destroying bare runtime");
+            HermesRuntime.nativeDestroyRuntime(agentType);
+            return;
         }
+        String bundleJs = HermesRuntime.loadAsset(service, assetName);
+        if (bundleJs == null) {
+            Log.e(TAG, "[" + agentType + "] Failed to load " + assetName + ", destroying bare runtime");
+            HermesRuntime.nativeDestroyRuntime(agentType);
+            return;
+        }
+        HermesRuntime.nativeEvaluateJS(agentType, bundleJs, assetName);
 
         // Read __DEVICE_PROMPT__ (set by prompt.ts / browser-prompt.ts)
         try {

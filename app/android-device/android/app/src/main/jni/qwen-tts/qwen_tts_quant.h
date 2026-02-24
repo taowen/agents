@@ -1,9 +1,9 @@
 /*
- * qwen_tts_quant.h - INT8 Weight Quantization for Qwen3-TTS
+ * qwen_tts_quant.h - Q4_K Weight Quantization for Qwen3-TTS
  *
- * INT8-only strategy:
- *   Talker:     all weights -> INT8 (8-bit symmetric per-row)
- *   Sub-talker: all weights -> INT8
+ * Q4_K_M strategy (ggml standard):
+ *   Talker:     all weights -> Q4_K (4.5 bpw, 256-element super-blocks)
+ *   Sub-talker: all weights -> Q4_K
  */
 
 #ifndef QWEN_TTS_QUANT_H
@@ -11,39 +11,37 @@
 
 #include <stdint.h>
 #include <stddef.h>
+#include "qwen_tts_ggml_quants.h"
 
 /* ========================================================================
- * INT8 kernels
+ * Q4_K matvec kernels
  * ======================================================================== */
 
-/* INT8 matvec: out[rows] = A_int8[rows,cols] @ x[cols], with per-row scales */
-void kernel_matvec_int8(float *out, const int8_t *A_int8, const float *scales,
-                         const float *x, int rows, int cols);
-
-/* Quantize float vector x to int8 (symmetric, single global scale) */
-void kernel_quantize_x_int8(const float *x, int cols,
-                              int8_t *x_int8_out, float *x_scale_out);
-
-/* INT8 matvec with pre-quantized x vector */
-void kernel_matvec_int8_pq(float *out, const int8_t *A_int8, const float *scales,
-                             const int8_t *x_int8, float x_scale, int rows, int cols);
+/* Q4_K matvec: out[rows] = A_q4k[rows * cols/QK_K blocks] @ x[cols]
+ * x is quantized on-the-fly to Q8_K, then vec_dot is called per row. */
+void kernel_matvec_q4k(float *out, const block_q4_K *A_q4k,
+                       const float *x, int rows, int cols);
 
 /* ========================================================================
- * Fused SwiGLU kernels (quantized)
+ * Fused SwiGLU kernel (Q4_K)
  * ======================================================================== */
 
-/* Fused SwiGLU with INT8 gate+up weights */
-void kernel_swiglu_matvec_int8(float *out, const int8_t *gate_up_int8,
-                                const float *scales, const float *x,
-                                int intermediate, int hidden);
+/* Fused SwiGLU with Q4_K gate+up weights:
+ * gate_up_q4k has [2*intermediate] rows of [hidden] cols.
+ * First half = gate, second half = up.
+ * out[intermediate] = SiLU(gate @ x) * (up @ x) */
+void kernel_swiglu_matvec_q4k(float *out, const block_q4_K *gate_up_q4k,
+                               const float *x, int intermediate, int hidden);
 
 /* ========================================================================
- * BF16 -> quantized format conversion
+ * BF16 -> Q4_K conversion
  * ======================================================================== */
 
-/* BF16 -> INT8 per-row symmetric quantization */
-void quantize_bf16_to_int8(const uint16_t *bf16, int rows, int cols,
-                             int8_t **out_int8, float **out_scales);
+/* BF16 -> Q4_K quantization.
+ * bf16[rows * cols] -> out_q4k[rows * (cols/QK_K) blocks]
+ * cols must be divisible by QK_K (256). */
+void quantize_bf16_to_q4k(const uint16_t *bf16, int rows, int cols,
+                           block_q4_K **out_q4k);
 
 /* ========================================================================
  * Weight cache API

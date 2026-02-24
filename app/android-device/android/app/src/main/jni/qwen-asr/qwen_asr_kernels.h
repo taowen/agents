@@ -195,6 +195,29 @@ void qwen_linear_q8_qkv_batched(
 int qwen_argmax_matvec_q8(const float *x, const block_q8_0 *W_q8,
                             int in_dim, int out_dim);
 
+/* ========================================================================
+ * Q4_K Quantized Weight Operations (decoder)
+ * ======================================================================== */
+
+/* y = x @ W_q4k^T + b: x[seq,in], W_q4k[out, in/QK_K blocks], b[out], y[seq,out]
+ * Input is quantized to Q8_K at runtime, then Q4_K×Q8_K dot products. */
+void qwen_linear_q4k(float *y, const float *x, const block_q4_K *W_q4k,
+                     const float *b, int seq_len, int in_dim, int out_dim);
+
+void qwen_linear_nobias_q4k(float *y, const float *x, const block_q4_K *W_q4k,
+                              int seq_len, int in_dim, int out_dim);
+
+/* seq=1 decoder fast path: compute Q/K/V matvecs with one threaded dispatch (Q4_K weights) */
+void qwen_linear_nobias_q4k_qkv(float *q, float *k, float *v, const float *x,
+                                  const block_q4_K *Wq_q4k,
+                                  const block_q4_K *Wk_q4k,
+                                  const block_q4_K *Wv_q4k,
+                                  int in_dim, int q_dim, int kv_dim);
+
+/* Streaming Q4_K argmax: finds argmax(W_q4k @ x) without materializing full logits */
+int qwen_argmax_matvec_q4k(const float *x, const block_q4_K *W_q4k,
+                             int in_dim, int out_dim);
+
 /* Free GEMM workspace buffers */
 void qwen_gemm_workspace_free(void);
 

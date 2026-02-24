@@ -585,6 +585,151 @@ void qwen_argmax_q8_range_neon(const block_q8_0 *x_q8,
     *best_val_out = best_val;
 }
 
+/* ========================================================================
+ * Q4_K × Q8_K dot product (NEON)
+ * Ported from llama.cpp ggml_vec_dot_q4_K_q8_K (__ARM_NEON block)
+ * ======================================================================== */
+
+/* Helper: load 2×16 uint8 values */
+#ifndef ggml_vld1q_u8_x2
+static inline uint8x16x2_t ggml_vld1q_u8_x2(const uint8_t *p) {
+    uint8x16x2_t r;
+    r.val[0] = vld1q_u8(p);
+    r.val[1] = vld1q_u8(p + 16);
+    return r;
+}
+#endif
+
+#ifndef ggml_vld1q_s8_x2
+static inline int8x16x2_t ggml_vld1q_s8_x2(const int8_t *p) {
+    int8x16x2_t r;
+    r.val[0] = vld1q_s8(p);
+    r.val[1] = vld1q_s8(p + 16);
+    return r;
+}
+#endif
+
+static float q4k_q8k_dot_neon(const block_q4_K *x, const block_q8_K *y, int n_blocks) {
+    const uint8x16_t m4b = vdupq_n_u8(0xf);
+    float sumf = 0.0f;
+
+    for (int i = 0; i < n_blocks; i++) {
+        const uint8_t *q4 = x[i].qs;
+        const int8_t  *q8 = y[i].qs;
+        const uint8_t *scales = x[i].scales;
+
+        const float d = fp16_to_fp32(x[i].d);
+        const float m = fp16_to_fp32(x[i].dmin);
+        const float d8 = y[i].d;
+
+        int32x4_t sumv0 = vdupq_n_s32(0);
+        int32x4_t sumv1 = vdupq_n_s32(0);
+        float sum_ms = 0.0f;
+
+        for (int j = 0; j < QK_K / 64; j++) {
+            const uint8x16x2_t q4bits = ggml_vld1q_u8_x2(q4); q4 += 32;
+            const int8x16x2_t q8bytes = ggml_vld1q_s8_x2(q8); q8 += 32;
+
+            const uint8x16_t q4_0 = vandq_u8(q4bits.val[0], m4b);
+            const uint8x16_t q4_1 = vandq_u8(q4bits.val[1], m4b);
+            const uint8x16_t q4_2 = vshrq_n_u8(q4bits.val[0], 4);
+            const uint8x16_t q4_3 = vshrq_n_u8(q4bits.val[1], 4);
+
+            const int8x16_t q4s0 = vreinterpretq_s8_u8(q4_0);
+            const int8x16_t q4s1 = vreinterpretq_s8_u8(q4_1);
+            const int8x16_t q4s2 = vreinterpretq_s8_u8(q4_2);
+            const int8x16_t q4s3 = vreinterpretq_s8_u8(q4_3);
+
+#if defined(__ARM_FEATURE_DOTPROD)
+            sumv0 = vdotq_s32(sumv0, q4s0, q8bytes.val[0]);
+            sumv1 = vdotq_s32(sumv1, q4s1, q8bytes.val[1]);
+            /* Second half of 64 elements (high nibbles) */
+            {
+                const int8x16x2_t q8b2 = ggml_vld1q_s8_x2(q8); q8 += 32;
+                sumv0 = vdotq_s32(sumv0, q4s2, q8b2.val[0]);
+                sumv1 = vdotq_s32(sumv1, q4s3, q8b2.val[1]);
+            }
+#else
+            {
+                const int16x8_t p0 = vmull_s8(vget_low_s8(q4s0), vget_low_s8(q8bytes.val[0]));
+                const int16x8_t p1 = vmull_high_s8(q4s0, q8bytes.val[0]);
+                sumv0 = vpadalq_s16(sumv0, p0);
+                sumv0 = vpadalq_s16(sumv0, p1);
+                const int16x8_t p2 = vmull_s8(vget_low_s8(q4s1), vget_low_s8(q8bytes.val[1]));
+                const int16x8_t p3 = vmull_high_s8(q4s1, q8bytes.val[1]);
+                sumv1 = vpadalq_s16(sumv1, p2);
+                sumv1 = vpadalq_s16(sumv1, p3);
+            }
+            {
+                const int8x16x2_t q8b2 = ggml_vld1q_s8_x2(q8); q8 += 32;
+                const int16x8_t p0 = vmull_s8(vget_low_s8(q4s2), vget_low_s8(q8b2.val[0]));
+                const int16x8_t p1 = vmull_high_s8(q4s2, q8b2.val[0]);
+                sumv0 = vpadalq_s16(sumv0, p0);
+                sumv0 = vpadalq_s16(sumv0, p1);
+                const int16x8_t p2 = vmull_s8(vget_low_s8(q4s3), vget_low_s8(q8b2.val[1]));
+                const int16x8_t p3 = vmull_high_s8(q4s3, q8b2.val[1]);
+                sumv1 = vpadalq_s16(sumv1, p2);
+                sumv1 = vpadalq_s16(sumv1, p3);
+            }
+#endif
+
+            sum_ms += (float)(scales[2 * j + 0] & 0x3f) * (float)y[i].bsums[2 * j + 0]
+                    + (float)(scales[2 * j + 1] & 0x3f) * (float)y[i].bsums[2 * j + 1]
+                    + (float)(scales[2 * j + 2] & 0x3f) * (float)y[i].bsums[2 * j + 2]
+                    + (float)(scales[2 * j + 3] & 0x3f) * (float)y[i].bsums[2 * j + 3];
+        }
+
+        sumf += d * d8 * (float)(vaddvq_s32(sumv0) + vaddvq_s32(sumv1)) - m * d8 * sum_ms;
+    }
+    return sumf;
+}
+
+void qwen_q4k_q8k_matvec_neon(float *y, const block_q8_K *x_q8k,
+                                const block_q4_K *W_q4k, const float *bias,
+                                int n_blocks_k, int out_dim) {
+    int o = 0;
+
+    /* Process 2 output rows at a time */
+    for (; o + 1 < out_dim; o += 2) {
+        const block_q4_K *w0 = W_q4k + (size_t)o * n_blocks_k;
+        const block_q4_K *w1 = W_q4k + (size_t)(o + 1) * n_blocks_k;
+        float s0 = bias ? bias[o] : 0.0f;
+        float s1 = bias ? bias[o + 1] : 0.0f;
+        s0 += q4k_q8k_dot_neon(w0, x_q8k, n_blocks_k);
+        s1 += q4k_q8k_dot_neon(w1, x_q8k, n_blocks_k);
+        y[o] = s0;
+        y[o + 1] = s1;
+    }
+
+    /* Handle remaining odd row */
+    for (; o < out_dim; o++) {
+        const block_q4_K *w0 = W_q4k + (size_t)o * n_blocks_k;
+        float sum = bias ? bias[o] : 0.0f;
+        sum += q4k_q8k_dot_neon(w0, x_q8k, n_blocks_k);
+        y[o] = sum;
+    }
+}
+
+void qwen_argmax_q4k_range_neon(const block_q8_K *x_q8k,
+                                 const block_q4_K *W_q4k,
+                                 int n_blocks_k, int start, int end,
+                                 int *best_out, float *best_val_out) {
+    int best = start;
+    float best_val = -1e30f;
+
+    for (int o = start; o < end; o++) {
+        const block_q4_K *w0 = W_q4k + (size_t)o * n_blocks_k;
+        float sum = q4k_q8k_dot_neon(w0, x_q8k, n_blocks_k);
+        if (sum > best_val) {
+            best_val = sum;
+            best = o;
+        }
+    }
+
+    *best_out = best;
+    *best_val_out = best_val;
+}
+
 void qwen_vec_scale_add_neon(float *dst, const float *src, float correction, int n) {
     int i = 0;
     float32x4_t c = vdupq_n_f32(correction);
