@@ -207,6 +207,25 @@ Debug entry types:
 | `durationMs` | Round-trip duration |
 | `error` | Error string if the call failed |
 
+**`type: "schedule"`** — scheduled task lifecycle events:
+
+| Field | Content |
+|-------|---------|
+| `action` | `"create"`, `"cancel"`, `"execute"`, or `"session_deleted"` |
+| `taskId` | Schedule ID |
+| `description` | Task description |
+| `cron` | Cron expression (for recurring tasks) |
+| `scheduledAt` | ISO timestamp of scheduled execution time |
+| `error` | Error string if the action failed |
+
+**`type: "device_connection"`** — device WebSocket connection events:
+
+| Field | Content |
+|-------|---------|
+| `event` | `"connect"`, `"ready"`, `"disconnect"`, or `"error"` |
+| `deviceName` | Device name (available on `ready`) |
+| `deviceId` | Device identifier (available on `ready`) |
+
 ### End-to-end diagnostics flow
 
 1. **Find the bug report in Sentry** — search by `report_id:BUG-XXXXXXXX-XXXX` to get the Sentry issue with user description and session metadata.

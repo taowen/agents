@@ -59,7 +59,7 @@ class ChatAgentBase extends AIChatAgent {
   constructor(ctx: DurableObjectState, env: Env) {
     super(ctx, env);
     this.session = new SessionContext(ctx, env);
-    this.deviceHub = new DeviceHub(ctx);
+    this.deviceHub = new DeviceHub(ctx, this.debugBuffer);
     const parentAlarm = this.alarm.bind(this);
     // eslint-disable-next-line @typescript-eslint/no-explicit-any -- framework workaround: alarm() not exposed on AIChatAgent type
     (this as any).alarm = async () => {
@@ -220,7 +220,7 @@ class ChatAgentBase extends AIChatAgent {
    */
   async executeScheduledTask(
     payload: { description: string; prompt: string; timezone?: string },
-    _schedule: Schedule<{
+    schedule: Schedule<{
       description: string;
       prompt: string;
       timezone?: string;
@@ -231,6 +231,14 @@ class ChatAgentBase extends AIChatAgent {
       async () => {
         await this.session.ensureReady();
         this.applySentryTags();
+
+        this.debugBuffer.push({
+          type: "schedule",
+          timestamp: new Date().toISOString(),
+          action: "execute",
+          taskId: schedule.id ?? "",
+          description: payload.description
+        });
 
         // Check if session still exists in D1 — it may have been deleted by the user
         if (this.session.userId && this.session.sessionUuid) {
@@ -244,6 +252,13 @@ class ChatAgentBase extends AIChatAgent {
             console.log(
               `Session ${this.session.sessionUuid} deleted, cleaning up DO`
             );
+            this.debugBuffer.push({
+              type: "schedule",
+              timestamp: new Date().toISOString(),
+              action: "session_deleted",
+              taskId: schedule.id ?? "",
+              description: payload.description
+            });
             const schedules = this.getSchedules();
             for (const s of schedules) {
               await this.cancelSchedule(s.id);
@@ -476,7 +491,8 @@ class ChatAgentBase extends AIChatAgent {
               this.schedule(when, method as keyof typeof this, payload),
             getSchedules: () => this.getSchedules(),
             cancelSchedule: (id) => this.cancelSchedule(id),
-            getTimezone: () => this.session.getTimezone()
+            getTimezone: () => this.session.getTimezone(),
+            debugBuffer: this.debugBuffer
           }),
           ...createDeviceTools(
             this.env,

@@ -275,6 +275,7 @@ export interface CreateToolsDeps {
   }>;
   cancelSchedule: (id: string) => Promise<boolean>;
   getTimezone: () => Promise<string>;
+  debugBuffer?: DebugRingBuffer;
 }
 
 export function createSearchTool(env: Env) {
@@ -374,6 +375,14 @@ export function createTools(deps: CreateToolsDeps): ToolSet {
           prompt,
           timezone: tz
         });
+        deps.debugBuffer?.push({
+          type: "schedule",
+          timestamp: new Date().toISOString(),
+          action: "create",
+          taskId: s.id,
+          description,
+          scheduledAt: new Date(s.time * 1000).toISOString()
+        });
         return {
           success: true,
           id: s.id,
@@ -407,6 +416,15 @@ export function createTools(deps: CreateToolsDeps): ToolSet {
           description,
           prompt,
           timezone: tz
+        });
+        deps.debugBuffer?.push({
+          type: "schedule",
+          timestamp: new Date().toISOString(),
+          action: "create",
+          taskId: s.id,
+          description,
+          cron,
+          scheduledAt: new Date(s.time * 1000).toISOString()
         });
         return {
           success: true,
@@ -449,9 +467,17 @@ export function createTools(deps: CreateToolsDeps): ToolSet {
         }
         if (action === "cancel" && taskId) {
           const ok = await deps.cancelSchedule(taskId);
-          return ok
-            ? { success: true, cancelled: taskId }
-            : { error: "Task not found" };
+          if (ok) {
+            deps.debugBuffer?.push({
+              type: "schedule",
+              timestamp: new Date().toISOString(),
+              action: "cancel",
+              taskId,
+              description: ""
+            });
+            return { success: true, cancelled: taskId };
+          }
+          return { error: "Task not found" };
         }
         return { error: "Invalid action or missing taskId" };
       }

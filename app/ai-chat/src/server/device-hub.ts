@@ -1,3 +1,5 @@
+import type { DebugRingBuffer } from "./llm-debug-buffer";
+
 interface DeviceInfo {
   type: "device";
   deviceName: string;
@@ -34,7 +36,10 @@ export function getDeviceName(sessionUuid: string): string {
 export class DeviceHub {
   private pendingExecs = new Map<string, PendingExec>();
 
-  constructor(private ctx: DurableObjectState) {}
+  constructor(
+    private ctx: DurableObjectState,
+    private debugBuffer?: DebugRingBuffer
+  ) {}
 
   // --- WebSocket management ---
 
@@ -92,6 +97,12 @@ export class DeviceHub {
     if (!alarm) {
       await this.ctx.storage.setAlarm(Date.now() + 30_000);
     }
+
+    this.debugBuffer?.push({
+      type: "device_connection",
+      timestamp: new Date().toISOString(),
+      event: "connect"
+    });
 
     return new Response(null, { status: 101, webSocket: pair[0] });
   }
@@ -166,6 +177,14 @@ export class DeviceHub {
         };
         ws.serializeAttachment(info);
 
+        this.debugBuffer?.push({
+          type: "device_connection",
+          timestamp: new Date().toISOString(),
+          event: "ready",
+          deviceName: info.deviceName,
+          deviceId: info.deviceId
+        });
+
         // Store device system prompt, tools, and exec type if provided
         if (data.systemPrompt) {
           await this.ctx.storage.put("deviceSystemPrompt", data.systemPrompt);
@@ -225,6 +244,11 @@ export class DeviceHub {
   // --- Device WebSocket close/error ---
 
   handleClose(): void {
+    this.debugBuffer?.push({
+      type: "device_connection",
+      timestamp: new Date().toISOString(),
+      event: "disconnect"
+    });
     // Reject all pending execs
     for (const [execId, pending] of this.pendingExecs) {
       clearTimeout(pending.timer);
@@ -234,6 +258,11 @@ export class DeviceHub {
   }
 
   handleError(): void {
+    this.debugBuffer?.push({
+      type: "device_connection",
+      timestamp: new Date().toISOString(),
+      event: "error"
+    });
     // webSocketClose will fire after this — cleanup happens there
   }
 }

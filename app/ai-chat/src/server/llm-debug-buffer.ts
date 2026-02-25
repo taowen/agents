@@ -44,7 +44,30 @@ export interface DoCallEntry {
   error?: string;
 }
 
-export type DebugEntry = LlmInteractionEntry | DoCallEntry;
+export interface ScheduleEntry {
+  type: "schedule";
+  timestamp: string;
+  action: "create" | "cancel" | "execute" | "session_deleted";
+  taskId: string;
+  description: string;
+  cron?: string;
+  scheduledAt?: string;
+  error?: string;
+}
+
+export interface DeviceConnectionEntry {
+  type: "device_connection";
+  timestamp: string;
+  event: "connect" | "ready" | "disconnect" | "error";
+  deviceName?: string;
+  deviceId?: string;
+}
+
+export type DebugEntry =
+  | LlmInteractionEntry
+  | DoCallEntry
+  | ScheduleEntry
+  | DeviceConnectionEntry;
 
 /**
  * SQLite-backed ring buffer that stores the last N debug entries.
