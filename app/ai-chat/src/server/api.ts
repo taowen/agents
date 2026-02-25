@@ -104,6 +104,17 @@ api.delete("/sessions/:id", async (c) => {
     // Don't block deletion if archiving fails
   }
 
+  // Cancel all scheduled tasks and destroy the DO
+  try {
+    const isolatedName = encodeURIComponent(`${userId}:${sessionId}`);
+    const doId = c.env.ChatAgent.idFromName(isolatedName);
+    const stub = c.env.ChatAgent.get(doId);
+    await stub.fetch(new Request("http://agent/destroy", { method: "POST" }));
+  } catch (e) {
+    console.error("destroy DO failed:", e);
+    // Don't block deletion if destruction fails
+  }
+
   const deleted = await deleteSession(c.env.DB, sessionId, userId);
   if (!deleted) {
     return c.json({ error: "Session not found" }, 404);

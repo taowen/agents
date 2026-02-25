@@ -277,6 +277,57 @@ export interface CreateToolsDeps {
   getTimezone: () => Promise<string>;
 }
 
+export function createSearchTool(env: Env) {
+  return tool({
+    description:
+      "Search the web for real-time information. Use this when you need current facts, documentation, API references, error messages, or anything not in your training data. " +
+      "IMPORTANT: If the user refers to relative dates like 'today', 'yesterday', or 'this week', use the bash tool first (e.g. `date`) to get the current date, then include the actual date in the search query.",
+    inputSchema: z.object({
+      query: z
+        .string()
+        .describe(
+          "The search query. MUST be in English. Translate non-English queries to English before searching."
+        )
+    }),
+    execute: async ({ query }) => {
+      if (!env.SEARCH_API_KEY) {
+        return "SEARCH_API_KEY is not set";
+      }
+      try {
+        const baseUrl = env.SEARCH_API_BASE_URL;
+        const resp = await fetch(baseUrl + "/v1/responses", {
+          method: "POST",
+          headers: {
+            "Content-Type": "application/json",
+            Authorization: "Bearer " + env.SEARCH_API_KEY
+          },
+          body: JSON.stringify({
+            model: env.SEARCH_API_MODEL,
+            input: [{ role: "user", content: "Use web_search tool: " + query }],
+            tools: [{ type: "web_search" }]
+          })
+        });
+        // eslint-disable-next-line @typescript-eslint/no-explicit-any
+        const data = (await resp.json()) as any;
+        if (data.error) {
+          return "Search API error: " + data.error.message;
+        }
+        // eslint-disable-next-line @typescript-eslint/no-explicit-any
+        const outputMsg = data.output?.find((o: any) => o.type === "message");
+        // eslint-disable-next-line @typescript-eslint/no-explicit-any
+        const textContent = outputMsg?.content?.find(
+          (c: any) => c.type === "output_text"
+        );
+        return textContent?.text || JSON.stringify(data.output);
+      } catch (err) {
+        return (
+          "Search failed: " + (err instanceof Error ? err.message : String(err))
+        );
+      }
+    }
+  });
+}
+
 export function createTools(deps: CreateToolsDeps): ToolSet {
   const tools: ToolSet = {
     bash: deps.bashTool,

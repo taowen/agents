@@ -28,12 +28,12 @@ import {
   createBashTool,
   createTools,
   createDeviceExecTool,
-  createDeviceTools
+  createDeviceTools,
+  createSearchTool
 } from "./tools";
 import { DeviceHub, isDeviceSession } from "./device-hub";
 import { ensureMcpServers } from "./mcp-config";
 import { queryUsageData, logUsageDiagnostics } from "./usage-tracker";
-import { runScheduledTask } from "./scheduled-tasks";
 import { SessionContext } from "./session-context";
 
 interface DeviceTool {
@@ -51,8 +51,8 @@ class ChatAgentBase extends AIChatAgent {
   private deviceHub: DeviceHub;
   private debugBuffer = new DebugRingBuffer(20, this.ctx.storage.sql);
 
-  // Deferred promise for dispatch-task: resolved by handleDeviceChatMessage's onFinish
-  private deviceTaskDeferred: {
+  // Deferred promise for internal tasks (device-initiated and scheduled): resolved by onFinish
+  private internalTaskDeferred: {
     resolve: (text: string) => void;
   } | null = null;
 
@@ -173,6 +173,24 @@ class ChatAgentBase extends AIChatAgent {
       const since = url.searchParams.get("since");
       return Response.json(queryUsageData(this.ctx.storage.sql, since));
     }
+    if (
+      url.pathname.endsWith("/cancel-all-schedules") &&
+      request.method === "POST"
+    ) {
+      const schedules = this.getSchedules();
+      for (const s of schedules) {
+        await this.cancelSchedule(s.id);
+      }
+      return Response.json({ cancelled: schedules.length });
+    }
+    if (url.pathname.endsWith("/destroy") && request.method === "POST") {
+      const schedules = this.getSchedules();
+      for (const s of schedules) {
+        await this.cancelSchedule(s.id);
+      }
+      await this.ctx.storage.deleteAll();
+      return Response.json({ ok: true });
+    }
     if (url.pathname.startsWith("/api/files")) {
       const uid = await this.session.getUserId(request);
       this.session.doInitBash(uid);
@@ -214,24 +232,69 @@ class ChatAgentBase extends AIChatAgent {
         await this.session.ensureReady();
         this.applySentryTags();
 
-        const { data: llmConfig, cache } = await getCachedLlmConfig(
-          this.session.mountableFs,
-          this.session.cachedLlmConfig
-        );
-        this.session.cachedLlmConfig = cache;
-        const model = getLlmModel(this.env, llmConfig);
-        const timezone = await this.session.getTimezone();
+        // Check if session still exists in D1 — it may have been deleted by the user
+        if (this.session.userId && this.session.sessionUuid) {
+          const row = await this.env.DB.prepare(
+            "SELECT 1 FROM sessions WHERE id = ? AND user_id = ?"
+          )
+            .bind(this.session.sessionUuid, this.session.userId)
+            .first();
+          if (!row) {
+            // Session was deleted — cancel all schedules and destroy this DO
+            console.log(
+              `Session ${this.session.sessionUuid} deleted, cleaning up DO`
+            );
+            const schedules = this.getSchedules();
+            for (const s of schedules) {
+              await this.cancelSchedule(s.id);
+            }
+            this.ctx.storage.deleteAll();
+            return;
+          }
+        }
 
-        await runScheduledTask({
-          messages: this.messages,
-          persistMessages: (msgs) => this.persistMessages(msgs),
-          bash: this.session.bash,
-          ensureMounted: () => this.session.ensureMounted(),
-          model,
-          timezone,
-          payload,
-          debugBuffer: this.debugBuffer
+        const now = new Date();
+        const tz = payload.timezone || (await this.session.getTimezone());
+        const userMsg: UIMessage = {
+          id: crypto.randomUUID(),
+          role: "user",
+          parts: [
+            {
+              type: "text",
+              text: `[Scheduled Task] ${now.toISOString()} (${tz}) - ${payload.description}\n\n${payload.prompt}`
+            }
+          ]
+        };
+
+        const resultPromise = new Promise<string>((resolve) => {
+          this.internalTaskDeferred = { resolve };
         });
+
+        try {
+          await this.saveMessages([...this.messages, userMsg]);
+          await resultPromise;
+        } catch (e) {
+          // Clean up deferred on error
+          this.internalTaskDeferred = null;
+          console.error("executeScheduledTask failed:", e);
+          Sentry.captureException(e);
+
+          const errorMsg: UIMessage = {
+            id: crypto.randomUUID(),
+            role: "assistant",
+            parts: [
+              {
+                type: "text",
+                text: `[Scheduled Task Failed] ${new Date().toISOString()} - ${payload.description}\nError: ${e instanceof Error ? e.message : String(e)}`
+              }
+            ]
+          };
+          try {
+            await this.persistMessages([...this.messages, errorMsg]);
+          } catch (persistErr) {
+            console.error("Failed to persist error message:", persistErr);
+          }
+        }
       }
     );
   }
@@ -420,6 +483,7 @@ class ChatAgentBase extends AIChatAgent {
             this.session.userId!,
             this.debugBuffer
           ),
+          search: createSearchTool(this.env),
           ...mcpTools
         } as ToolSet;
       }
@@ -460,6 +524,10 @@ class ChatAgentBase extends AIChatAgent {
         onFinish: async (event) => {
           onResponse(event);
           await archiveUsage();
+          if (this.internalTaskDeferred) {
+            this.internalTaskDeferred.resolve(event.text || "done");
+            this.internalTaskDeferred = null;
+          }
         },
         abortSignal: options?.abortSignal
       });
@@ -519,16 +587,9 @@ class ChatAgentBase extends AIChatAgent {
         onResponse(event);
         await archiveUsage();
         // Resolve the deferred so handleDeviceInitiatedTask can return the result
-        if (this.deviceTaskDeferred) {
-          const lastMsg = this.messages[this.messages.length - 1];
-          let resultText = "";
-          if (lastMsg?.role === "assistant") {
-            for (const part of lastMsg.parts) {
-              if (part.type === "text") resultText += part.text;
-            }
-          }
-          this.deviceTaskDeferred.resolve(resultText);
-          this.deviceTaskDeferred = null;
+        if (this.internalTaskDeferred) {
+          this.internalTaskDeferred.resolve(event.text || "done");
+          this.internalTaskDeferred = null;
         }
         this.deviceHub.sendTaskDone("done");
       },
@@ -557,7 +618,7 @@ class ChatAgentBase extends AIChatAgent {
 
           // Set up a deferred promise that onFinish in handleDeviceChatMessage will resolve
           const resultPromise = new Promise<string>((resolve) => {
-            this.deviceTaskDeferred = { resolve };
+            this.internalTaskDeferred = { resolve };
           });
 
           // Reuse the same path as web-initiated messages:

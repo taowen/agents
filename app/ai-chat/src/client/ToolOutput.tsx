@@ -88,20 +88,39 @@ function GenericToolOutput({ part }: { part: ToolUIPart }) {
 
   return (
     <div className="flex justify-start">
-      <details className="max-w-[85%]">
-        <summary className="cursor-pointer list-none flex items-center gap-2 px-3 py-1.5 rounded-lg bg-kumo-base ring ring-kumo-line hover:bg-kumo-elevated transition-colors">
-          <GearIcon size={12} className="text-kumo-inactive shrink-0" />
-          <Text size="xs" variant="secondary" bold>
-            {toolName}
-          </Text>
-          <Badge variant="secondary">Done</Badge>
-        </summary>
-        <div className="mt-1 px-3 py-2 rounded-lg bg-kumo-base ring ring-kumo-line font-mono text-xs whitespace-pre-wrap">
-          <Text size="xs" variant="secondary">
-            {JSON.stringify(part.output, null, 2)}
-          </Text>
-        </div>
-      </details>
+      <div className="max-w-[85%] space-y-1">
+        {/* Request (input) — collapsed by default */}
+        <details className="group">
+          <summary className="cursor-pointer list-none flex items-center gap-2 px-3 py-1.5 rounded-lg bg-kumo-base ring ring-kumo-line hover:bg-kumo-elevated transition-colors">
+            <GearIcon size={12} className="text-kumo-inactive shrink-0" />
+            <Text size="xs" variant="secondary" bold>
+              {toolName}
+            </Text>
+          </summary>
+          {part.input && (
+            <div className="mt-1 px-3 py-2 rounded-lg bg-kumo-base ring ring-kumo-line font-mono text-xs whitespace-pre-wrap overflow-x-auto max-h-[300px] overflow-y-auto">
+              <Text size="xs" variant="secondary">
+                {JSON.stringify(part.input, null, 2)}
+              </Text>
+            </div>
+          )}
+        </details>
+        {/* Response (output) — collapsed by default */}
+        <details className="group">
+          <summary className="cursor-pointer list-none flex items-center gap-2 px-3 py-1.5 rounded-lg bg-kumo-base ring ring-kumo-line hover:bg-kumo-elevated transition-colors">
+            <CheckCircleIcon
+              size={12}
+              className="text-kumo-inactive shrink-0"
+            />
+            <Badge variant="secondary">Done</Badge>
+          </summary>
+          <div className="mt-1 px-3 py-2 rounded-lg bg-kumo-base ring ring-kumo-line font-mono text-xs whitespace-pre-wrap overflow-x-auto max-h-[400px] overflow-y-auto">
+            <Text size="xs" variant="secondary">
+              {JSON.stringify(part.output, null, 2)}
+            </Text>
+          </div>
+        </details>
+      </div>
     </div>
   );
 }
@@ -176,14 +195,24 @@ function ToolRunning({ part }: { part: ToolUIPart }) {
 
   return (
     <div className="flex justify-start">
-      <Surface className="max-w-[85%] px-4 py-2.5 rounded-xl ring ring-kumo-line">
-        <div className="flex items-center gap-2">
-          <GearIcon size={14} className="text-kumo-inactive animate-spin" />
+      <details className="max-w-[85%]">
+        <summary className="cursor-pointer list-none flex items-center gap-2 px-3 py-1.5 rounded-lg bg-kumo-base ring ring-kumo-line hover:bg-kumo-elevated transition-colors">
+          <GearIcon
+            size={12}
+            className="text-kumo-inactive animate-spin shrink-0"
+          />
           <Text size="xs" variant="secondary">
             Running {toolName}...
           </Text>
-        </div>
-      </Surface>
+        </summary>
+        {part.input && (
+          <div className="mt-1 px-3 py-2 rounded-lg bg-kumo-base ring ring-kumo-line font-mono text-xs whitespace-pre-wrap overflow-x-auto max-h-[300px] overflow-y-auto">
+            <Text size="xs" variant="secondary">
+              {JSON.stringify(part.input, null, 2)}
+            </Text>
+          </div>
+        )}
+      </details>
     </div>
   );
 }

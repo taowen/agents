@@ -1,190 +1,201 @@
 /**
- * Scheduled tasks tests.
+ * Scheduled tasks — DO-level business flow tests.
  *
- * Tests the scheduling tool execute functions from tools.ts.
- * Uses dependency injection (CreateToolsDeps) — no LLM needed.
+ * Tests the executeScheduledTask deferred pattern:
+ *   saveMessages → onChatMessage → deferred.resolve → caller unblocks
+ *
+ * Also covers D1 session guard and error handling.
  */
-import { describe, it, expect } from "vitest";
-import { createTools, type CreateToolsDeps } from "../ai-chat/src/server/tools";
+import { env } from "cloudflare:test";
+import { describe, it, expect, beforeAll } from "vitest";
+import { getAgentByName } from "agents";
+import type { UIMessage as ChatMessage } from "ai";
+import { applyD1Schema, createTestUser } from "./test-utils";
 
-function createMockDeps(overrides?: Partial<CreateToolsDeps>): CreateToolsDeps {
-  return {
-    bashTool: {} as ReturnType<
-      typeof import("../ai-chat/src/server/tools").createBashTool
-    >,
-    schedule:
-      overrides?.schedule ??
-      (async (when, _method, _payload) => {
-        const time =
-          typeof when === "number"
-            ? Math.floor(Date.now() / 1000) + when
-            : typeof when === "string"
-              ? Math.floor(Date.now() / 1000) + 60
-              : Math.floor(when.getTime() / 1000);
-        return {
-          id: `sched-${crypto.randomUUID().slice(0, 8)}`,
-          time
-        };
-      }),
-    getSchedules: overrides?.getSchedules ?? (() => []),
-    cancelSchedule: overrides?.cancelSchedule ?? (async () => false),
-    getTimezone: overrides?.getTimezone ?? (async () => "UTC")
-  };
-}
+describe("Scheduled tasks — DO business flow", () => {
+  let db: D1Database;
 
-// eslint-disable-next-line @typescript-eslint/no-explicit-any
-async function executeTool(
-  tools: Record<string, any>,
-  name: string,
-  input: Record<string, unknown>
-): Promise<unknown> {
-  const tool = tools[name];
-  if (!tool?.execute)
-    throw new Error(`Tool ${name} not found or has no execute`);
-  return tool.execute(input);
-}
+  beforeAll(async () => {
+    db = (env as unknown as { DB: D1Database }).DB;
+    await applyD1Schema(db);
+  });
 
-describe("Scheduled tasks", () => {
-  it("schedule one-time task with delaySeconds", async () => {
-    const tools = createTools(createMockDeps());
-    const result = (await executeTool(tools, "schedule_task", {
-      description: "Remind me",
-      prompt: "Send a reminder",
-      delaySeconds: 60
-    })) as {
-      success: boolean;
-      id: string;
-      scheduledAt: string;
-      description: string;
+  it("executeScheduledTask persists [Scheduled Task] user message + assistant response", async () => {
+    const room = crypto.randomUUID();
+    const agentStub = await getAgentByName(env.TestChatAgent, room);
+
+    const result = await agentStub.executeScheduledTask({
+      description: "daily-report",
+      prompt: "Generate the daily report",
+      timezone: "Asia/Shanghai"
+    });
+
+    expect(result.success).toBe(true);
+
+    const messages = (await agentStub.getPersistedMessages()) as ChatMessage[];
+    expect(messages.length).toBe(2);
+
+    // User message has the correct format
+    const userMsg = messages[0];
+    expect(userMsg.role).toBe("user");
+    const userText = (userMsg.parts[0] as { type: string; text: string }).text;
+    expect(userText).toContain("[Scheduled Task]");
+    expect(userText).toContain("(Asia/Shanghai)");
+    expect(userText).toContain("daily-report");
+    expect(userText).toContain("Generate the daily report");
+
+    // Assistant message is present (from onChatMessage)
+    const assistantMsg = messages[1];
+    expect(assistantMsg.role).toBe("assistant");
+  });
+
+  it("user message format: [Scheduled Task] ISO (TZ) - description\\n\\nprompt", async () => {
+    const room = crypto.randomUUID();
+    const agentStub = await getAgentByName(env.TestChatAgent, room);
+
+    await agentStub.executeScheduledTask({
+      description: "test-format",
+      prompt: "do the thing",
+      timezone: "US/Eastern"
+    });
+
+    const messages = (await agentStub.getPersistedMessages()) as ChatMessage[];
+    const userText = (messages[0].parts[0] as { type: string; text: string })
+      .text;
+
+    // Verify the exact format: [Scheduled Task] ISO (TZ) - desc\n\nprompt
+    const match = userText.match(
+      /^\[Scheduled Task\] (\d{4}-\d{2}-\d{2}T[\d:.]+Z) \((.+?)\) - (.+?)\n\n(.+)$/s
+    );
+    expect(match).not.toBeNull();
+    expect(match![2]).toBe("US/Eastern");
+    expect(match![3]).toBe("test-format");
+    expect(match![4]).toBe("do the thing");
+    // Verify ISO timestamp is valid
+    expect(new Date(match![1]).getTime()).toBeGreaterThan(0);
+  });
+
+  it("defaults timezone to UTC when payload.timezone is absent", async () => {
+    const room = crypto.randomUUID();
+    const agentStub = await getAgentByName(env.TestChatAgent, room);
+
+    await agentStub.executeScheduledTask({
+      description: "no-tz",
+      prompt: "test"
+    });
+
+    const messages = (await agentStub.getPersistedMessages()) as ChatMessage[];
+    const userText = (messages[0].parts[0] as { type: string; text: string })
+      .text;
+    expect(userText).toContain("(UTC)");
+  });
+
+  it("deferred resolves: executeScheduledTask returns after onChatMessage completes", async () => {
+    const room = crypto.randomUUID();
+    const agentStub = await getAgentByName(env.TestChatAgent, room);
+
+    // The deferred should resolve without hanging — this test verifies
+    // that the saveMessages → onChatMessage → deferred.resolve pipeline works.
+    const result = await agentStub.executeScheduledTask({
+      description: "deferred-test",
+      prompt: "verify deferred resolution"
+    });
+
+    expect(result.success).toBe(true);
+    // After resolution, messages should be persisted
+    const count = await agentStub.getMessageCount();
+    expect(count).toBe(2); // 1 user + 1 assistant
+  });
+
+  it("normal chat unaffected: no deferred means onChatMessage is a no-op for deferred", async () => {
+    const room = crypto.randomUUID();
+    const agentStub = await getAgentByName(env.TestChatAgent, room);
+
+    // First: normal chat (no deferred set)
+    const userMsg: ChatMessage = {
+      id: "user-normal",
+      role: "user",
+      parts: [{ type: "text", text: "Hello, normal chat" }]
     };
+    await agentStub.saveMessages([userMsg]);
+
+    const messages = (await agentStub.getPersistedMessages()) as ChatMessage[];
+    expect(messages.length).toBe(2); // 1 user + 1 assistant from onChatMessage
+
+    // Then: scheduled task still works after normal chat
+    const result = await agentStub.executeScheduledTask({
+      description: "after-chat",
+      prompt: "test"
+    });
+    expect(result.success).toBe(true);
+
+    const allMessages =
+      (await agentStub.getPersistedMessages()) as ChatMessage[];
+    expect(allMessages.length).toBe(4); // 2 from chat + 2 from scheduled task
+  });
+
+  it("D1 session guard: missing session triggers cleanup and returns early", async () => {
+    const room = crypto.randomUUID();
+    const agentStub = await getAgentByName(env.TestChatAgent, room);
+
+    // Set userId and sessionUuid in DO storage (simulates production state)
+    const userId = await createTestUser(db);
+    await agentStub.setStorageValue("userId", userId);
+    await agentStub.setStorageValue("sessionUuid", "nonexistent-session-id");
+
+    const result = await agentStub.executeScheduledTask({
+      description: "orphaned-task",
+      prompt: "should not run"
+    });
+
+    expect(result.success).toBe(false);
+    expect(result.error).toBe("session_deleted");
+  });
+
+  it("D1 session guard: existing session allows task to proceed", async () => {
+    const room = crypto.randomUUID();
+    const agentStub = await getAgentByName(env.TestChatAgent, room);
+
+    // Create a real user + session in D1
+    const userId = await createTestUser(db);
+    const sessionId = crypto.randomUUID();
+    await db
+      .prepare("INSERT INTO sessions (id, user_id, title) VALUES (?, ?, ?)")
+      .bind(sessionId, userId, "Test Session")
+      .run();
+
+    // Set the same userId/sessionUuid in DO storage
+    await agentStub.setStorageValue("userId", userId);
+    await agentStub.setStorageValue("sessionUuid", sessionId);
+
+    const result = await agentStub.executeScheduledTask({
+      description: "valid-session-task",
+      prompt: "this should run"
+    });
 
     expect(result.success).toBe(true);
-    expect(result.id).toBeDefined();
-    expect(result.scheduledAt).toBeDefined();
-    expect(result.description).toBe("Remind me");
+
+    const messages = (await agentStub.getPersistedMessages()) as ChatMessage[];
+    expect(messages.length).toBe(2);
+
+    const userText = (messages[0].parts[0] as { type: string; text: string })
+      .text;
+    expect(userText).toContain("valid-session-task");
   });
 
-  it("schedule one-time task with absolute scheduledAt", async () => {
-    const futureDate = new Date(Date.now() + 3600_000).toISOString();
-    const tools = createTools(
-      createMockDeps({
-        schedule: async (when, _method, _payload) => {
-          const time =
-            when instanceof Date ? Math.floor(when.getTime() / 1000) : 0;
-          return { id: "sched-abs", time };
-        }
-      })
-    );
+  it("D1 session guard: skipped when userId/sessionUuid not set", async () => {
+    const room = crypto.randomUUID();
+    const agentStub = await getAgentByName(env.TestChatAgent, room);
 
-    const result = (await executeTool(tools, "schedule_task", {
-      description: "Future task",
-      prompt: "Do something later",
-      scheduledAt: futureDate
-    })) as { success: boolean; id: string; scheduledAt: string };
+    // Don't set userId/sessionUuid — guard should be skipped
+    const result = await agentStub.executeScheduledTask({
+      description: "no-session-info",
+      prompt: "test"
+    });
 
     expect(result.success).toBe(true);
-    expect(result.id).toBe("sched-abs");
-    expect(result.scheduledAt).toBeDefined();
-  });
 
-  it("schedule recurring task with cron", async () => {
-    const tools = createTools(createMockDeps());
-    const result = (await executeTool(tools, "schedule_recurring", {
-      description: "Daily standup",
-      prompt: "Send standup reminder",
-      cron: "0 9 * * *"
-    })) as { success: boolean; id: string; cron: string; nextRun: string };
-
-    expect(result.success).toBe(true);
-    expect(result.id).toBeDefined();
-    expect(result.cron).toBe("0 9 * * *");
-    expect(result.nextRun).toBeDefined();
-  });
-
-  it("list tasks via manage_tasks", async () => {
-    const tools = createTools(
-      createMockDeps({
-        getSchedules: () => [
-          {
-            id: "task-1",
-            type: "scheduled",
-            payload: JSON.stringify({
-              description: "Reminder",
-              prompt: "remind"
-            }),
-            time: Math.floor(Date.now() / 1000) + 60
-          },
-          {
-            id: "task-2",
-            type: "cron",
-            payload: { description: "Daily check", prompt: "check" },
-            time: Math.floor(Date.now() / 1000) + 120,
-            cron: "0 9 * * *"
-          }
-        ]
-      })
-    );
-
-    const result = (await executeTool(tools, "manage_tasks", {
-      action: "list"
-    })) as Array<{ id: string; description: string; cron?: string }>;
-
-    expect(result).toHaveLength(2);
-    expect(result[0].id).toBe("task-1");
-    expect(result[0].description).toBe("Reminder");
-    expect(result[1].cron).toBe("0 9 * * *");
-  });
-
-  it("cancel existing task", async () => {
-    const tools = createTools(
-      createMockDeps({
-        cancelSchedule: async (id) => id === "task-1"
-      })
-    );
-
-    const result = (await executeTool(tools, "manage_tasks", {
-      action: "cancel",
-      taskId: "task-1"
-    })) as { success: boolean; cancelled: string };
-
-    expect(result.success).toBe(true);
-    expect(result.cancelled).toBe("task-1");
-  });
-
-  it("cancel non-existent task returns error", async () => {
-    const tools = createTools(
-      createMockDeps({
-        cancelSchedule: async () => false
-      })
-    );
-
-    const result = (await executeTool(tools, "manage_tasks", {
-      action: "cancel",
-      taskId: "nonexistent"
-    })) as { error: string };
-
-    expect(result.error).toBe("Task not found");
-  });
-
-  it("validation: negative delaySeconds returns error", async () => {
-    const tools = createTools(createMockDeps());
-    const result = (await executeTool(tools, "schedule_task", {
-      description: "Bad task",
-      prompt: "fail",
-      delaySeconds: -10
-    })) as { error: string };
-
-    expect(result.error).toBe("delaySeconds must be positive");
-  });
-
-  it("validation: past scheduledAt returns error", async () => {
-    const tools = createTools(createMockDeps());
-    const result = (await executeTool(tools, "schedule_task", {
-      description: "Past task",
-      prompt: "fail",
-      scheduledAt: "2020-01-01T00:00:00Z"
-    })) as { error: string };
-
-    expect(result.error).toBe("Scheduled time must be in the future");
+    const messages = (await agentStub.getPersistedMessages()) as ChatMessage[];
+    expect(messages.length).toBe(2);
   });
 });

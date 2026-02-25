@@ -35,13 +35,122 @@ export class TestChatAgent extends AIChatAgent<Env> {
   observability = undefined;
   private debugBuffer = new DebugRingBuffer(20, this.ctx.storage.sql);
 
+  // Deferred promise for internal tasks (scheduled / device-initiated):
+  // resolved by onChatMessage, mirrors production internalTaskDeferred.
+  private internalTaskDeferred: { resolve: (text: string) => void } | null =
+    null;
+
   async onChatMessage(
     _onFinish: StreamTextOnFinishCallback<ToolSet>,
     _options?: OnChatMessageOptions
   ) {
+    // Resolve deferred if set — mirrors production streamText.onFinish callback
+    if (this.internalTaskDeferred) {
+      this.internalTaskDeferred.resolve("Hello from chat agent!");
+      this.internalTaskDeferred = null;
+    }
     return new Response("Hello from chat agent!", {
       headers: { "Content-Type": "text/plain" }
     });
+  }
+
+  /**
+   * Mirrors production handleDeviceInitiatedTask: creates a user message from
+   * device text, sets up deferred, calls saveMessages → onChatMessage pipeline,
+   * returns the assistant's response text.
+   */
+  async handleDeviceInitiatedTask(text: string): Promise<string> {
+    try {
+      const userMsg: ChatMessage = {
+        id: crypto.randomUUID(),
+        role: "user",
+        parts: [{ type: "text", text }]
+      };
+
+      const resultPromise = new Promise<string>((resolve) => {
+        this.internalTaskDeferred = { resolve };
+      });
+
+      await this.saveMessages([...this.messages, userMsg]);
+      const resultText = await resultPromise;
+      return resultText || "done";
+    } catch (e) {
+      this.internalTaskDeferred = null;
+      return "Error: " + (e instanceof Error ? e.message : String(e));
+    }
+  }
+
+  /**
+   * Mirrors production executeScheduledTask: D1 session guard, message
+   * construction, saveMessages → onChatMessage → deferred pattern, error
+   * handling.  Returns a result object so tests can assert outcomes.
+   */
+  async executeScheduledTask(payload: {
+    description: string;
+    prompt: string;
+    timezone?: string;
+  }): Promise<{ success: boolean; error?: string }> {
+    // ---- D1 session guard (same logic as production) ----
+    const userId = await this.ctx.storage.get<string>("userId");
+    const sessionUuid = await this.ctx.storage.get<string>("sessionUuid");
+
+    if (userId && sessionUuid) {
+      const row = await this.env.DB.prepare(
+        "SELECT 1 FROM sessions WHERE id = ? AND user_id = ?"
+      )
+        .bind(sessionUuid, userId)
+        .first();
+      if (!row) {
+        const schedules = this.getSchedules();
+        for (const s of schedules) {
+          await this.cancelSchedule(s.id);
+        }
+        await this.ctx.storage.deleteAll();
+        return { success: false, error: "session_deleted" };
+      }
+    }
+
+    // ---- Build user message ----
+    const tz = payload.timezone || "UTC";
+    const now = new Date();
+    const userMsg: ChatMessage = {
+      id: crypto.randomUUID(),
+      role: "user",
+      parts: [
+        {
+          type: "text",
+          text: `[Scheduled Task] ${now.toISOString()} (${tz}) - ${payload.description}\n\n${payload.prompt}`
+        }
+      ]
+    };
+
+    // ---- Deferred + saveMessages ----
+    const resultPromise = new Promise<string>((resolve) => {
+      this.internalTaskDeferred = { resolve };
+    });
+
+    try {
+      await this.saveMessages([...this.messages, userMsg]);
+      await resultPromise;
+      return { success: true };
+    } catch (e) {
+      this.internalTaskDeferred = null;
+
+      const errorMsg: ChatMessage = {
+        id: crypto.randomUUID(),
+        role: "assistant",
+        parts: [
+          {
+            type: "text",
+            text: `[Scheduled Task Failed] ${new Date().toISOString()} - ${payload.description}\nError: ${e instanceof Error ? e.message : String(e)}`
+          }
+        ]
+      };
+      try {
+        await this.persistMessages([...this.messages, errorMsg]);
+      } catch {}
+      return { success: false, error: String(e) };
+    }
   }
 
   getPersistedMessages(): ChatMessage[] {

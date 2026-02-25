@@ -299,6 +299,53 @@ The 8 Elite has ~22% memory bandwidth utilization during decode — enough headr
 
 Transcription quality: identical output on both English (jfk.wav) and Chinese (complex_chinese.wav).
 
-### 6. Chunk 1 encoder (613ms, no stem cache)
+### 6. NPU offload for decoder Linear ops
+
+**Potentially the largest decode speedup.** Don't put the whole model on NPU — split the graph: static-shape ops (Linear layers) go to NPU, dynamic-shape ops (attention with KV cache) stay on CPU.
+
+```
+Decoder Layer (single-token decode):
+┌─────────────────────────────────────────────┐
+│  RMSNorm → Q/K/V Proj (Linear)             │ ← static [1, 1024] → NPU ✓  (16% = 3.3ms)
+├─────────────────────────────────────────────┤
+│  RoPE + Attention (KV cache)                │ ← dynamic shape → CPU       (15% = 3.1ms)
+├─────────────────────────────────────────────┤
+│  RMSNorm → FFN Gate/Up/Down (Linear)        │ ← static [1, 1024] → NPU ✓  (52% = 10.7ms)
+├─────────────────────────────────────────────┤
+│  Argmax (LM head, tied embeddings)          │ ← static [1, 1024] → NPU ✓  (16% = 3.3ms)
+└─────────────────────────────────────────────┘
+```
+
+**84% of decode time (17.3ms of 20.6ms) is in static-shape Linears.** If NPU achieves 3-5x over CPU NEON Q4_K matvec:
+
+| Component | CPU (current) | NPU (est. 3-5x) | Notes |
+|-----------|---------------|------------------|-------|
+| MLP | 10.7ms | 2-3.5ms | gate_up_fused [1,1024]→[1,6144] + down [1,3072]→[1,1024] |
+| QKV | 3.3ms | 0.7-1.1ms | Q [1,1024]→[1,2048] + KV [1,1024]→[1,1024] |
+| Attention | 3.1ms | 3.1ms | stays on CPU, dynamic KV cache |
+| Argmax | 3.3ms | 0.7-1.1ms | [1,1024]→[1,151936] |
+| **Total** | **20.6ms** | **~6.5-8.8ms** | **2.3-3.2x speedup** |
+
+Approach (from MNN's QNN backend pattern):
+- Offline (or first-load) compilation: walk the op graph, break at KV-cache Attention ops (`isBreakOp`)
+- Model becomes alternating subgraphs: `[NPU subgraph₀] [CPU attention] [NPU subgraph₁] [CPU attention] ...`
+- Each NPU subgraph compiled at two shapes: `chunk_size` (e.g., 128) for prefill, `1` for decode
+- Prefill chunks long sequences: 500 tokens → 128+128+128+116, each block uses chunk_size NPU graph
+- **Zero-copy**: Snapdragon is unified memory — CPU and NPU share the same physical address space, no data transfer needed at subgraph boundaries
+
+Implementation options:
+1. **QNN SDK direct**: Qualcomm AI Engine Direct. Build QNN graphs for each Linear subgraph, compile to `.so` at first-load. Most control, most work. Snapdragon 8 Elite has Hexagon NPU with INT4/INT8 support.
+2. **MNN framework**: Already has QNN backend with subgraph splitting (`compilefornpu.cpp`). Could port model to MNN format. Replaces our hand-written engine for decoder path.
+3. **NNAPI**: Android abstraction. Simpler but less efficient than direct QNN.
+
+Considerations:
+- Weights must be in NPU-compatible quantization (QNN supports INT4/INT8 natively)
+- First-load compilation overhead (QNN graph compilation can take seconds)
+- Keep CPU engine for encoder (Q8_0 GEMM is compute-bound, NPU less helpful for batched GEMM)
+- NPU is most beneficial for the bandwidth-bound decoder matvec path — exactly where CPU Q4_K is bottlenecked
+
+Risk: integration complexity is high. QNN SDK has device-specific quirks. But the potential 2-3x decode speedup (20ms → 7-9ms/tok) would be the single largest improvement possible.
+
+### 7. Chunk 1 encoder (613ms, no stem cache)
 
 Cold-start skip means no stem cache is built for the first real chunk. Running encoder-only (no prefill/decode) during cold-start would cost ~600ms but only save ~200ms at chunk 1. Net loss with current audio length. Might help for longer audio where window reuse is more frequent.
