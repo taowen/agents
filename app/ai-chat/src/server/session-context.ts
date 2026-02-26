@@ -13,7 +13,11 @@ import type { Bash, MountableFs } from "just-bash";
 import type { ToolSet } from "ai";
 import { initBash, doFstabMount } from "vfs";
 import type { FsBindings } from "vfs";
-import { createSessionsCommand } from "./session-commands";
+import {
+  createSessionsCommand,
+  createSearchCommand,
+  createWebFetchCommand
+} from "./session-commands";
 import {
   getCachedLlmConfig,
   getLlmModel,
@@ -139,7 +143,9 @@ export class SessionContext {
       bindings: this.fsBindings,
       userId,
       customCommands: [
-        createSessionsCommand(this.env.DB, userId, this.env.ChatAgent)
+        createSessionsCommand(this.env.DB, userId, this.env.ChatAgent),
+        createSearchCommand(this.env),
+        createWebFetchCommand(this.env)
       ]
     });
     this.bash = bash;
@@ -171,6 +177,11 @@ export class SessionContext {
     await this.mountPromise;
   }
 
+  /** Invalidate cached LLM config so the next request re-reads /etc/llm.json. */
+  invalidateLlmConfigCache(): void {
+    this.cachedLlmConfig = null;
+  }
+
   // ---- Quota + LLM model resolution ----
 
   async resolveQuotaAndModel(): Promise<{
@@ -180,7 +191,8 @@ export class SessionContext {
     modelId: string;
   }> {
     const { data: llmConfig, cache } = await getCachedLlmConfig(
-      this.mountableFs,
+      this.env.DB,
+      this.userId!,
       this.cachedLlmConfig
     );
     this.cachedLlmConfig = cache;

@@ -10,19 +10,27 @@ type ToolUIPart = Extract<
 
 function BashToolOutput({ part }: { part: ToolUIPart }) {
   const bashInput = part.input as { command?: string } | undefined;
-  const bashOutput = part.output as
-    | {
-        stdout?: string;
-        stderr?: string;
-        exitCode?: number;
-      }
-    | undefined;
+  const raw = part.output;
+
+  // Tool now returns a formatted string; support legacy object format as fallback
+  let output: string;
+  let hasError: boolean;
+  if (typeof raw === "string") {
+    output = raw;
+    hasError = output.includes("[exit code:") || output.includes("[stderr]");
+  } else if (raw && typeof raw === "object") {
+    const obj = raw as { stdout?: string; stderr?: string; exitCode?: number };
+    output = obj.stdout || "";
+    if (obj.stderr) output += (output ? "\n" : "") + obj.stderr;
+    hasError = obj.exitCode !== 0;
+  } else {
+    output = "";
+    hasError = false;
+  }
 
   const cmd = bashInput?.command || "";
   const cmdShort = cmd.length > 80 ? cmd.slice(0, 80) + "\u2026" : cmd;
-  const output = bashOutput?.stdout || "";
   const outputShort = output.split("\n")[0]?.slice(0, 80) || "";
-  const exitOk = bashOutput?.exitCode === 0;
 
   return (
     <div className="flex justify-start">
@@ -44,38 +52,24 @@ function BashToolOutput({ part }: { part: ToolUIPart }) {
         {/* Response (output) — collapsed by default */}
         <details className="group">
           <summary className="cursor-pointer list-none flex items-center gap-2 px-3 py-1.5 rounded-lg bg-kumo-base ring ring-kumo-line hover:bg-kumo-elevated transition-colors">
-            {exitOk ? (
+            {hasError ? (
+              <XCircleIcon size={12} className="text-kumo-inactive shrink-0" />
+            ) : (
               <CheckCircleIcon
                 size={12}
                 className="text-kumo-inactive shrink-0"
               />
-            ) : (
-              <XCircleIcon size={12} className="text-kumo-inactive shrink-0" />
             )}
-            {exitOk ? (
-              <span className="text-xs text-kumo-secondary truncate">
-                {outputShort || "OK"}
-              </span>
-            ) : (
-              <span className="text-xs text-kumo-secondary truncate">
-                Exit {bashOutput?.exitCode}
-                {bashOutput?.stderr
-                  ? `: ${bashOutput.stderr.split("\n")[0]?.slice(0, 60)}`
-                  : ""}
-              </span>
-            )}
+            <span className="text-xs text-kumo-secondary truncate">
+              {outputShort || "OK"}
+            </span>
           </summary>
           <div className="mt-1 px-3 py-2 rounded-lg bg-kumo-base ring ring-kumo-line font-mono text-xs whitespace-pre-wrap overflow-x-auto max-h-[400px] overflow-y-auto">
-            {bashOutput?.stdout && (
-              <Text size="xs" variant="secondary">
-                {bashOutput.stdout}
+            {output ? (
+              <Text size="xs" variant={hasError ? "error" : "secondary"}>
+                {output}
               </Text>
-            )}
-            {bashOutput?.stderr && (
-              <Text size="xs" variant="error">
-                {bashOutput.stderr}
-              </Text>
-            )}
+            ) : null}
           </div>
         </details>
       </div>
@@ -97,13 +91,13 @@ function GenericToolOutput({ part }: { part: ToolUIPart }) {
               {toolName}
             </Text>
           </summary>
-          {part.input && (
+          {part.input ? (
             <div className="mt-1 px-3 py-2 rounded-lg bg-kumo-base ring ring-kumo-line font-mono text-xs whitespace-pre-wrap overflow-x-auto max-h-[300px] overflow-y-auto">
               <Text size="xs" variant="secondary">
                 {JSON.stringify(part.input, null, 2)}
               </Text>
             </div>
-          )}
+          ) : null}
         </details>
         {/* Response (output) — collapsed by default */}
         <details className="group">
@@ -205,13 +199,13 @@ function ToolRunning({ part }: { part: ToolUIPart }) {
             Running {toolName}...
           </Text>
         </summary>
-        {part.input && (
+        {part.input ? (
           <div className="mt-1 px-3 py-2 rounded-lg bg-kumo-base ring ring-kumo-line font-mono text-xs whitespace-pre-wrap overflow-x-auto max-h-[300px] overflow-y-auto">
             <Text size="xs" variant="secondary">
               {JSON.stringify(part.input, null, 2)}
             </Text>
           </div>
-        )}
+        ) : null}
       </details>
     </div>
   );

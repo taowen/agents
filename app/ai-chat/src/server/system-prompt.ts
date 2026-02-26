@@ -19,7 +19,7 @@ export function buildSystemPrompt(): string {
       "Data: jq, base64, expr, seq, md5sum, sha1sum, sha256sum.\n" +
       "Utils: date, sleep, timeout, time, basename, dirname, env, printenv, alias, unalias, history, " +
       "uname, id, uptime, hostname, whoami, clear, pwd, bash, sh.\n" +
-      "Network: curl (use this to fetch URLs).\n" +
+      "Network: curl, web-search, web-fetch.\n" +
       "Custom: mount, umount, git, sessions, help.\n" +
       "NOT available: apt, npm, pip, python, node, tar, gzip, ssh, wget, docker, sudo, rclone, " +
       "and any package managers, compilers, or tools not listed above.",
@@ -57,6 +57,15 @@ export function buildSystemPrompt(): string {
       "Example: mount -t gdrive -o root_folder_id=1ABCxyz none /mnt/project. " +
       "Google Drive mounts are read-write. chmod, symlink, link, and readlink are not supported. " +
       "Google Docs/Sheets are exported as plain text/CSV when read.",
+
+    // Web search & fetch
+    "web-search and web-fetch are BASH COMMANDS, not tools. You must call them through the bash tool, " +
+      "for example: bash({command: 'web-search what is cloudflare workers'}) or bash({command: 'web-fetch https://example.com'}). " +
+      "NEVER call web-search or web-fetch as a standalone tool — they do NOT exist as tools. " +
+      "Use `web-search <query>` to search the web for real-time information (documentation, current events, error messages, etc.). " +
+      "The query MUST be in English — translate non-English queries before searching. " +
+      "Use `web-fetch <url>` to fetch a webpage and get its content as markdown (renders JavaScript). " +
+      "curl is for fetching raw HTTP responses; web-search is for getting search results; web-fetch is for reading webpage content as markdown.",
 
     // Scheduling
     "You can schedule tasks for yourself using the schedule_task (one-time) and schedule_recurring (cron) tools. " +

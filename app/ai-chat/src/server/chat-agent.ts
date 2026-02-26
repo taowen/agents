@@ -28,8 +28,7 @@ import {
   createBashTool,
   createTools,
   createDeviceExecTool,
-  createDeviceTools,
-  createSearchTool
+  createDeviceTools
 } from "./tools";
 import { DeviceHub, isDeviceSession } from "./device-hub";
 import { ensureMcpServers } from "./mcp-config";
@@ -196,7 +195,18 @@ class ChatAgentBase extends AIChatAgent {
       this.session.doInitBash(uid);
       await this.session.ensureMounted();
       this.applySentryTags();
-      return handleFileRequest(request, this.session.mountableFs);
+      const response = await handleFileRequest(
+        request,
+        this.session.mountableFs
+      );
+      // Invalidate LLM config cache when /etc/llm.json is written or deleted
+      if (request.method === "PUT" || request.method === "DELETE") {
+        const filePath = url.searchParams.get("path") || "";
+        if (filePath === "/etc/llm.json") {
+          this.session.invalidateLlmConfigCache();
+        }
+      }
+      return response;
     }
     return super.onRequest(request);
   }
@@ -433,7 +443,8 @@ class ChatAgentBase extends AIChatAgent {
 
         const { data: llmConfig, cache: newLlmCache } =
           await getCachedLlmConfig(
-            this.session.mountableFs,
+            this.env.DB,
+            this.session.userId!,
             this.session.cachedLlmConfig
           );
         this.session.cachedLlmConfig = newLlmCache;
@@ -499,7 +510,6 @@ class ChatAgentBase extends AIChatAgent {
             this.session.userId!,
             this.debugBuffer
           ),
-          search: createSearchTool(this.env),
           ...mcpTools
         } as ToolSet;
       }
@@ -519,7 +529,7 @@ class ChatAgentBase extends AIChatAgent {
         content: this.session.cachedDynamicContext!
       });
 
-      const { onResponse, hookAbort } = instrumentLlmCall(
+      const { onResponse, onError, hookAbort } = instrumentLlmCall(
         this.debugBuffer,
         buildRequestSnapshot(
           this.session.cachedSystemPrompt!,
@@ -537,6 +547,11 @@ class ChatAgentBase extends AIChatAgent {
         messages,
         tools: this.session.cachedTools!,
         stopWhen: stepCountIs(10),
+        onError: ({ error }) => {
+          const msg = error instanceof Error ? error.message : String(error);
+          onError(msg);
+          Sentry.captureException(error);
+        },
         onFinish: async (event) => {
           onResponse(event);
           await archiveUsage();
@@ -587,7 +602,7 @@ class ChatAgentBase extends AIChatAgent {
       reasoning: "before-last-message"
     });
 
-    const { onResponse, hookAbort } = instrumentLlmCall(
+    const { onResponse, onError, hookAbort } = instrumentLlmCall(
       this.debugBuffer,
       buildRequestSnapshot(deviceSystemPrompt, "", messages, tools, modelId)
     );
@@ -599,6 +614,11 @@ class ChatAgentBase extends AIChatAgent {
       messages,
       tools,
       stopWhen: stepCountIs(30),
+      onError: ({ error }) => {
+        const msg = error instanceof Error ? error.message : String(error);
+        onError(msg);
+        Sentry.captureException(error);
+      },
       onFinish: async (event) => {
         onResponse(event);
         await archiveUsage();

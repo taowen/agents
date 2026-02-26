@@ -1,6 +1,5 @@
 import { createGoogleGenerativeAI } from "@ai-sdk/google";
 import { createOpenAICompatible } from "@ai-sdk/openai-compatible";
-import type { MountableFs } from "just-bash";
 import type { LlmFileConfig } from "../client/api";
 
 export type LlmConfigCache = {
@@ -53,22 +52,33 @@ export function resolveFromRaw(
   };
 }
 
-const SETTINGS_TTL = 60_000; // 60 seconds
-
+/**
+ * Read /etc/llm.json directly from D1 (bypasses MountableFs).
+ * Settings are saved via the Worker-level API which writes to D1 directly,
+ * so reading from D1 is the most reliable path — no dependency on mount state.
+ */
 export async function getCachedLlmConfig(
-  mountableFs: MountableFs,
+  db: D1Database,
+  userId: string,
   cache: LlmConfigCache
 ): Promise<{ data: LlmFileConfig | null; cache: LlmConfigCache }> {
   const now = Date.now();
-  if (cache && now - cache.fetchedAt < SETTINGS_TTL) {
-    return { data: cache.data, cache };
-  }
   try {
-    const buf = await mountableFs.readFileBuffer("/etc/llm.json");
-    const data = JSON.parse(new TextDecoder().decode(buf)) as LlmFileConfig;
-    const newCache = { data, fetchedAt: now };
-    return { data, cache: newCache };
-  } catch {
+    const row = await db
+      .prepare(
+        "SELECT CAST(content AS TEXT) as content FROM files WHERE user_id = ? AND path = '/etc/llm.json' AND is_directory = 0"
+      )
+      .bind(userId)
+      .first<{ content: string | null }>();
+    if (row?.content) {
+      const data = JSON.parse(row.content) as LlmFileConfig;
+      const newCache = { data, fetchedAt: now };
+      return { data, cache: newCache };
+    }
+    const newCache = { data: null, fetchedAt: now };
+    return { data: null, cache: newCache };
+  } catch (e) {
+    console.error("getCachedLlmConfig: D1 read failed:", e);
     const newCache = { data: null, fetchedAt: now };
     return { data: null, cache: newCache };
   }

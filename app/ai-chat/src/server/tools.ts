@@ -8,12 +8,16 @@ import {
   getSentryTraceContext
 } from "./llm-debug-buffer";
 
+const BASH_OUTPUT_LIMIT = 32_000;
+
 export function createBashTool(bash: Bash, ensureMounted: () => Promise<void>) {
   return tool({
     description:
       "Execute a bash command in a sandboxed virtual filesystem. " +
-      "Supports ls, grep, awk, sed, find, cat, echo, mkdir, cp, mv, sort, uniq, wc, head, tail, curl, and more. " +
-      "Use curl to fetch content from URLs. Files persist across commands within the session.",
+      "Supports ls, grep, awk, sed, find, cat, echo, mkdir, cp, mv, sort, uniq, wc, head, tail, curl, web-search, web-fetch, and more. " +
+      "Use curl to fetch raw content from URLs. Use `web-search <query>` to search the web (query must be in English). " +
+      "Use `web-fetch <url>` to fetch a webpage and return its content as markdown (renders JavaScript). " +
+      "Files persist across commands within the session.",
     inputSchema: z.object({
       command: z.string().describe("The bash command to execute")
     }),
@@ -24,9 +28,25 @@ export function createBashTool(bash: Bash, ensureMounted: () => Promise<void>) {
           await Sentry.startSpan({ name: "ensureMounted", op: "mount" }, () =>
             ensureMounted()
           );
-          return await Sentry.startSpan({ name: "bash.exec", op: "exec" }, () =>
-            bash.exec(command)
+          const result = await Sentry.startSpan(
+            { name: "bash.exec", op: "exec" },
+            () => bash.exec(command)
           );
+
+          // Format as a clean string and truncate to avoid overflowing LLM context
+          let output = result.stdout || "";
+          if (result.stderr) {
+            output += (output ? "\n" : "") + "[stderr] " + result.stderr;
+          }
+          if (result.exitCode !== 0) {
+            output += (output ? "\n" : "") + `[exit code: ${result.exitCode}]`;
+          }
+          if (output.length > BASH_OUTPUT_LIMIT) {
+            output =
+              output.slice(0, BASH_OUTPUT_LIMIT) +
+              `\n... [output truncated: ${output.length} chars, showing first ${BASH_OUTPUT_LIMIT} chars]`;
+          }
+          return output || "(no output)";
         }
       );
     }
@@ -276,57 +296,6 @@ export interface CreateToolsDeps {
   cancelSchedule: (id: string) => Promise<boolean>;
   getTimezone: () => Promise<string>;
   debugBuffer?: DebugRingBuffer;
-}
-
-export function createSearchTool(env: Env) {
-  return tool({
-    description:
-      "Search the web for real-time information. Use this when you need current facts, documentation, API references, error messages, or anything not in your training data. " +
-      "IMPORTANT: If the user refers to relative dates like 'today', 'yesterday', or 'this week', use the bash tool first (e.g. `date`) to get the current date, then include the actual date in the search query.",
-    inputSchema: z.object({
-      query: z
-        .string()
-        .describe(
-          "The search query. MUST be in English. Translate non-English queries to English before searching."
-        )
-    }),
-    execute: async ({ query }) => {
-      if (!env.SEARCH_API_KEY) {
-        return "SEARCH_API_KEY is not set";
-      }
-      try {
-        const baseUrl = env.SEARCH_API_BASE_URL;
-        const resp = await fetch(baseUrl + "/v1/responses", {
-          method: "POST",
-          headers: {
-            "Content-Type": "application/json",
-            Authorization: "Bearer " + env.SEARCH_API_KEY
-          },
-          body: JSON.stringify({
-            model: env.SEARCH_API_MODEL,
-            input: [{ role: "user", content: "Use web_search tool: " + query }],
-            tools: [{ type: "web_search" }]
-          })
-        });
-        // eslint-disable-next-line @typescript-eslint/no-explicit-any
-        const data = (await resp.json()) as any;
-        if (data.error) {
-          return "Search API error: " + data.error.message;
-        }
-        // eslint-disable-next-line @typescript-eslint/no-explicit-any
-        const outputMsg = data.output?.find((o: any) => o.type === "message");
-        // eslint-disable-next-line @typescript-eslint/no-explicit-any
-        const textContent = outputMsg?.content?.find(
-          (c: any) => c.type === "output_text"
-        );
-        return textContent?.text || JSON.stringify(data.output);
-      } catch (err) {
-        return (
-          "Search failed: " + (err instanceof Error ? err.message : String(err))
-        );
-      }
-    }
-  });
 }
 
 export function createTools(deps: CreateToolsDeps): ToolSet {

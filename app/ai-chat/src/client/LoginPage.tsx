@@ -240,6 +240,21 @@ export function LoginPage() {
         )}
 
         {error && <p className="mt-3 text-sm text-red-500">{error}</p>}
+
+        <div className="mt-6 pt-4 border-t border-kumo-line flex justify-center gap-4 text-xs text-kumo-secondary">
+          <a
+            href="/privacy.html"
+            className="hover:text-kumo-default transition-colors"
+          >
+            Privacy Policy
+          </a>
+          <a
+            href="/terms.html"
+            className="hover:text-kumo-default transition-colors"
+          >
+            Terms of Service
+          </a>
+        </div>
       </div>
     </div>
   );
