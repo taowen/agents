@@ -7,10 +7,35 @@ import { handleGitHubOAuth } from "./github-oauth";
 import { QUOTA_LIMITS } from "./quota-config";
 
 export { ChatAgent } from "./chat-agent";
+export { TunnelRelay } from "./tunnel-relay";
 
 type AppEnv = { Bindings: Env; Variables: { userId: string } };
 
 const app = new Hono<AppEnv>();
+
+// 0. Tunnel host detection — *.cscreen.cc
+app.all("*", async (c, next) => {
+  const host = c.req.header("host") || "";
+  const tunnelMatch = host.match(
+    /^([a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?)\.cscreen\.cc$/
+  );
+  if (!tunnelMatch) return next();
+
+  const tunnelName = tunnelMatch[1];
+
+  const url = new URL(c.req.url);
+
+  // /tunnel/connect requires auth (tunneld CLI must authenticate)
+  if (url.pathname === "/tunnel/connect") {
+    const result = await requireAuth(c.req.raw, c.env);
+    if (result instanceof Response) return result;
+  }
+
+  // Route to TunnelRelay DO by tunnel name
+  const id = c.env.TunnelRelay.idFromName(tunnelName);
+  const stub = c.env.TunnelRelay.get(id);
+  return stub.fetch(c.req.raw);
+});
 
 // 1. Public auth routes (Google OAuth + Email login) — no auth required
 app.all("/auth/*", (c) => handleAuthRoutes(c.req.raw, c.env));
@@ -90,6 +115,26 @@ app.get("/api/public/:key", async (c) => {
     headers.set("content-disposition", `attachment; filename="${key}"`);
   }
   return new Response(object.body, { headers });
+});
+
+// Serve static assets for non-tunnel, non-API paths (before auth — allows unauthenticated SPA access)
+app.use("*", async (c, next) => {
+  const host = c.req.header("host") || "";
+  // Tunnel domain — always continue to worker handlers
+  if (host.endsWith(".cscreen.cc")) return next();
+
+  const path = new URL(c.req.url).pathname;
+  // Known worker paths — continue to auth + handlers
+  if (
+    path.startsWith("/agents/") ||
+    path.startsWith("/api/") ||
+    path.startsWith("/oauth/") ||
+    path.startsWith("/mcp-callback/")
+  ) {
+    return next();
+  }
+  // Everything else on main domain — serve from static assets
+  return c.env.ASSETS.fetch(c.req.raw);
 });
 
 // 2. Auth middleware — gates everything below

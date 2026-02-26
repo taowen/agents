@@ -3,11 +3,14 @@
 declare namespace Cloudflare {
   interface GlobalProps {
     mainModule: typeof import("./src/server/index");
-    durableNamespaces: "ChatAgent";
+    durableNamespaces: "ChatAgent" | "TunnelRelay";
   }
   interface Env {
     AI: Ai;
     ChatAgent: DurableObjectNamespace<import("./src/server/index").ChatAgent>;
+    TunnelRelay: DurableObjectNamespace<
+      import("./src/server/index").TunnelRelay
+    >;
     DB: D1Database;
     BUILTIN_LLM_PROVIDER: string;
     BUILTIN_LLM_BASE_URL: string;
@@ -28,6 +31,7 @@ declare namespace Cloudflare {
     R2?: R2Bucket;
     R2_PUBLIC: R2Bucket;
     OTP_KV: KVNamespace;
+    ASSETS: Fetcher;
   }
 }
 interface Env extends Cloudflare.Env {}

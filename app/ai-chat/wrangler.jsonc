@@ -3,14 +3,19 @@
   "compatibility_date": "2026-01-28",
   "compatibility_flags": ["nodejs_compat"],
   "assets": {
+    "binding": "ASSETS",
     "not_found_handling": "single-page-application",
-    "run_worker_first": ["/agents/*", "/oauth/*", "/auth/*", "/api/*", "/mcp-callback/*", "/download"]
+    "run_worker_first": true
   },
   "durable_objects": {
     "bindings": [
       {
         "class_name": "ChatAgent",
         "name": "ChatAgent"
+      },
+      {
+        "class_name": "TunnelRelay",
+        "name": "TunnelRelay"
       }
     ]
   },
@@ -56,6 +61,10 @@
     {
       "deleted_classes": ["DeviceHub"],
       "tag": "v5"
+    },
+    {
+      "new_sqlite_classes": ["TunnelRelay"],
+      "tag": "v6"
     }
   ],
   "name": "ai-chat-example",
@@ -63,6 +72,10 @@
     {
       "pattern": "ai.connect-screen.com",
       "custom_domain": true
+    },
+    {
+      "pattern": "*.cscreen.cc/*",
+      "zone_name": "cscreen.cc"
     }
   ],
   "observability": {

@@ -33,7 +33,7 @@ import {
 import { DeviceHub, isDeviceSession } from "./device-hub";
 import { ensureMcpServers } from "./mcp-config";
 import { queryUsageData, logUsageDiagnostics } from "./usage-tracker";
-import { SessionContext } from "./session-context";
+import { SessionContext, UserFacingError } from "./session-context";
 
 interface DeviceTool {
   function?: { name?: string; description?: string };
@@ -155,7 +155,9 @@ class ChatAgentBase extends AIChatAgent {
     this.applySentryTags();
     const err = error !== undefined ? error : connectionOrError;
     console.error("ChatAgent error:", err);
-    Sentry.captureException(err);
+    if (!(err instanceof UserFacingError)) {
+      Sentry.captureException(err);
+    }
     if (error !== undefined) {
       super.onError(connectionOrError as Connection, error);
     }

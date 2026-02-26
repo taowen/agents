@@ -29,6 +29,13 @@ import {
   type QuotaCache
 } from "./usage-tracker";
 
+export class UserFacingError extends Error {
+  constructor(message: string) {
+    super(message);
+    this.name = "UserFacingError";
+  }
+}
+
 export class SessionContext {
   // ---- Identity ----
   userId: string | null = null;
@@ -205,7 +212,7 @@ export class SessionContext {
         this.quotaCheckCache
       );
       if (this.quotaCheckCache.exceeded) {
-        throw new Error(
+        throw new UserFacingError(
           "You have exceeded the builtin API key usage quota. " +
             "Please configure your own API key in Settings to continue using the service."
         );
