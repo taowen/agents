@@ -7,6 +7,7 @@ export {
   TestMcpAgent,
   TestMcpJurisdiction,
   TestAddMcpServerAgent,
+  TestRpcMcpClientAgent,
   TestEmailAgent,
   TestCaseSensitiveAgent,
   TestUserNotificationAgent,
@@ -30,13 +31,23 @@ export {
   TestRaceAgent,
   TestRetryAgent,
   TestRetryDefaultsAgent,
-  TestFiberAgent
+  TestFiberAgent,
+  TestSessionAgent,
+  TestSessionAgentNoMicroCompaction,
+  TestSessionAgentCustomRules
 } from "./agents";
 
 export type { TestState } from "./agents";
 
 // Re-export test workflows for wrangler
-export { TestProcessingWorkflow, SimpleTestWorkflow } from "./test-workflow";
+export {
+  TestProcessingWorkflow,
+  SimpleTestWorkflow,
+  ThrowInRunWorkflow,
+  ReportErrorThenThrowWorkflow,
+  ReportErrorOnlyWorkflow,
+  ThrowNonErrorWorkflow
+} from "./test-workflow";
 
 // ── Env type ─────────────────────────────────────────────────────────
 // Uses import-type to reference agent classes without creating runtime
@@ -44,6 +55,7 @@ export { TestProcessingWorkflow, SimpleTestWorkflow } from "./test-workflow";
 
 import type {
   TestMcpAgent,
+  TestRpcMcpClientAgent,
   TestEmailAgent,
   TestCaseSensitiveAgent,
   TestUserNotificationAgent,
@@ -67,7 +79,10 @@ import type {
   TestQueueAgent,
   TestRetryAgent,
   TestRetryDefaultsAgent,
-  TestFiberAgent
+  TestFiberAgent,
+  TestSessionAgent,
+  TestSessionAgentNoMicroCompaction,
+  TestSessionAgentCustomRules
 } from "./agents";
 
 export type Env = {
@@ -84,6 +99,7 @@ export type Env = {
   TestScheduleAgent: DurableObjectNamespace<TestScheduleAgent>;
   TestWorkflowAgent: DurableObjectNamespace<TestWorkflowAgent>;
   TestAddMcpServerAgent: DurableObjectNamespace<TestAddMcpServerAgent>;
+  TestRpcMcpClientAgent: DurableObjectNamespace<TestRpcMcpClientAgent>;
   TestStateAgent: DurableObjectNamespace<TestStateAgent>;
   TestStateAgentNoInitial: DurableObjectNamespace<TestStateAgentNoInitial>;
   TestThrowingStateAgent: DurableObjectNamespace<TestThrowingStateAgent>;
@@ -96,9 +112,16 @@ export type Env = {
   TestRetryAgent: DurableObjectNamespace<TestRetryAgent>;
   TestRetryDefaultsAgent: DurableObjectNamespace<TestRetryDefaultsAgent>;
   TestFiberAgent: DurableObjectNamespace<TestFiberAgent>;
+  TestSessionAgent: DurableObjectNamespace<TestSessionAgent>;
+  TestSessionAgentNoMicroCompaction: DurableObjectNamespace<TestSessionAgentNoMicroCompaction>;
+  TestSessionAgentCustomRules: DurableObjectNamespace<TestSessionAgentCustomRules>;
   // Workflow bindings for integration testing
   TEST_WORKFLOW: Workflow;
   SIMPLE_WORKFLOW: Workflow;
+  THROW_IN_RUN_WORKFLOW: Workflow;
+  REPORT_ERROR_THEN_THROW_WORKFLOW: Workflow;
+  REPORT_ERROR_ONLY_WORKFLOW: Workflow;
+  THROW_NON_ERROR_WORKFLOW: Workflow;
 };
 
 // ── Fetch handler ────────────────────────────────────────────────────

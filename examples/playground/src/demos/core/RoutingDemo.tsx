@@ -3,20 +3,63 @@ import { nanoid } from "nanoid";
 import { useState, useEffect } from "react";
 import { Button, Input, Surface, Text, Radio } from "@cloudflare/kumo";
 import { DemoWrapper } from "../../layout";
-import { LogPanel, ConnectionStatus } from "../../components";
-import { useLogs } from "../../hooks";
+import {
+  LogPanel,
+  ConnectionStatus,
+  CodeExplanation,
+  type CodeSection
+} from "../../components";
+import { useLogs, useUserId } from "../../hooks";
 import type { RoutingAgent, RoutingAgentState } from "./routing-agent";
 
-type RoutingStrategy = "per-user" | "shared" | "per-session" | "custom-path";
+const codeSections: CodeSection[] = [
+  {
+    title: "Route by agent name",
+    description:
+      "The name prop on useAgent determines which Durable Object instance you connect to. Same name = same agent. Use user IDs, session IDs, or fixed strings to control isolation.",
+    code: `// Per-user: each user gets their own agent
+const agent = useAgent({
+  agent: "routing-agent",
+  name: \`user-\${userId}\`,
+});
 
-function getStoredUserId(): string {
-  if (typeof window === "undefined") return "user-1";
-  const stored = localStorage.getItem("playground-user-id");
-  if (stored) return stored;
-  const newId = `user-${nanoid(6)}`;
-  localStorage.setItem("playground-user-id", newId);
-  return newId;
-}
+// Shared: everyone on the same instance
+const agent = useAgent({
+  agent: "routing-agent",
+  name: "shared",
+});
+
+// Per-session: each browser tab is isolated
+const agent = useAgent({
+  agent: "routing-agent",
+  name: \`session-\${sessionId}\`,
+});`
+  },
+  {
+    title: "Custom routing with basePath",
+    description:
+      "For server-controlled routing, use basePath instead of name. Your Worker's fetch handler resolves the URL to the right Durable Object using getAgentByName().",
+    code: `// Client: connect via a custom URL path
+const agent = useAgent({
+  agent: "routing-agent",
+  basePath: \`custom-routing/\${userId}\`,
+});
+
+// Server: resolve the path in your Worker
+export default {
+  async fetch(request, env) {
+    const url = new URL(request.url);
+    if (url.pathname.startsWith("/custom-routing/")) {
+      const name = url.pathname.split("/")[2];
+      const agent = getAgentByName(env.RoutingAgent, name);
+      return agent.fetch(request);
+    }
+  }
+}`
+  }
+];
+
+type RoutingStrategy = "per-user" | "shared" | "per-session" | "custom-path";
 
 function getSessionId(): string {
   if (typeof window === "undefined") return "session-1";
@@ -29,8 +72,9 @@ function getSessionId(): string {
 }
 
 export function RoutingDemo() {
+  const initialUserId = useUserId();
   const { logs, addLog, clearLogs } = useLogs();
-  const [userId, setUserId] = useState(getStoredUserId);
+  const [userId, setUserId] = useState(initialUserId);
   const [strategy, setStrategy] = useState<RoutingStrategy>("per-user");
   const [connectionCount, setConnectionCount] = useState(0);
   const [agentInstanceName, setAgentInstanceName] = useState<string>("");
@@ -120,7 +164,25 @@ export function RoutingDemo() {
   return (
     <DemoWrapper
       title="Routing Strategies"
-      description="Different agent routing patterns for different use cases. Use 'name' to select an agent instance, or 'basePath' to route via a custom server-side path."
+      description={
+        <>
+          The{" "}
+          <code className="text-xs bg-kumo-fill px-1 py-0.5 rounded">name</code>{" "}
+          prop on{" "}
+          <code className="text-xs bg-kumo-fill px-1 py-0.5 rounded">
+            useAgent
+          </code>{" "}
+          determines which Durable Object instance you connect to — same name
+          means same agent. Use user IDs for per-user isolation, a fixed string
+          for a shared singleton, or session IDs for per-tab agents. For
+          server-controlled routing, use{" "}
+          <code className="text-xs bg-kumo-fill px-1 py-0.5 rounded">
+            basePath
+          </code>{" "}
+          instead. Switch strategies below and open multiple tabs to see the
+          difference.
+        </>
+      }
       statusIndicator={
         <ConnectionStatus
           status={
@@ -280,6 +342,8 @@ export function RoutingDemo() {
           <LogPanel logs={logs} onClear={clearLogs} maxHeight="600px" />
         </div>
       </div>
+
+      <CodeExplanation sections={codeSections} />
     </DemoWrapper>
   );
 }

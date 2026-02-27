@@ -212,6 +212,8 @@ class MyAgent extends Agent<Env, { count: number }> {
 
 State is stored in the `cf_agents_state` SQL table. State messages are sent with `type: "cf_agent_state"` (both from the client and the server). Since the `agents` provides [JS and React clients](https://developers.cloudflare.com/agents/api-reference/store-and-sync-state/#synchronizing-state), real-time state updates are available out of the box.
 
+Protocol messages (`CF_AGENT_IDENTITY`, `CF_AGENT_STATE`, `CF_AGENT_MCP_SERVERS`) are sent automatically on connect and broadcast on changes. You can suppress these per connection by overriding `shouldSendProtocolMessages(connection, ctx)` — see [Protocol Message Control](./http-websockets.md#protocol-message-control) for details.
+
 ### `this.sql`
 
 The Agent provides a convenient `sql` template tag for executing queries against the Durable Object's SQL storage. It constructs parameterized queries and executes them. This uses the **synchronous** SQL API from `this.ctx.storage.sql`.

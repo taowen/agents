@@ -7,6 +7,7 @@ import type {
 import { getCurrentAgent, routeAgentRequest } from "agents";
 import { MessageType, type OutgoingMessage } from "../types";
 import type { ClientToolSchema } from "../";
+import { ResumableStream } from "../resumable-stream";
 
 // Type helper for tool call parts - extracts from ChatMessage parts
 type TestToolCallPart = Extract<
@@ -16,6 +17,9 @@ type TestToolCallPart = Extract<
 
 export type Env = {
   TestChatAgent: DurableObjectNamespace<TestChatAgent>;
+  AgentWithSuperCall: DurableObjectNamespace<AgentWithSuperCall>;
+  AgentWithoutSuperCall: DurableObjectNamespace<AgentWithoutSuperCall>;
+  SlowStreamAgent: DurableObjectNamespace<SlowStreamAgent>;
 };
 
 export class TestChatAgent extends AIChatAgent<Env> {
@@ -36,14 +40,17 @@ export class TestChatAgent extends AIChatAgent<Env> {
   private _capturedBody: Record<string, unknown> | undefined = undefined;
   // Store captured clientTools from onChatMessage options for testing
   private _capturedClientTools: ClientToolSchema[] | undefined = undefined;
+  // Store captured requestId from onChatMessage options for testing
+  private _capturedRequestId: string | undefined = undefined;
 
   async onChatMessage(
     _onFinish: StreamTextOnFinishCallback<ToolSet>,
     options?: OnChatMessageOptions
   ) {
-    // Capture the body and clientTools from options for testing
+    // Capture the body, clientTools, and requestId from options for testing
     this._capturedBody = options?.body;
     this._capturedClientTools = options?.clientTools;
+    this._capturedRequestId = options?.requestId;
 
     // Capture getCurrentAgent() context for testing
     const { agent, connection } = getCurrentAgent();
@@ -98,6 +105,7 @@ export class TestChatAgent extends AIChatAgent<Env> {
     this._nestedContext = null;
     this._capturedBody = undefined;
     this._capturedClientTools = undefined;
+    this._capturedRequestId = undefined;
   }
 
   getCapturedBody(): Record<string, unknown> | undefined {
@@ -106,6 +114,10 @@ export class TestChatAgent extends AIChatAgent<Env> {
 
   getCapturedClientTools(): ClientToolSchema[] | undefined {
     return this._capturedClientTools;
+  }
+
+  getCapturedRequestId(): string | undefined {
+    return this._capturedRequestId;
   }
 
   getPersistedMessages(): ChatMessage[] {
@@ -285,6 +297,16 @@ export class TestChatAgent extends AIChatAgent<Env> {
   }
 
   /**
+   * Simulate DO hibernation wake by reinitializing the ResumableStream.
+   * The new instance calls restore() which reads from SQLite and sets
+   * _activeStreamId, but _isLive remains false (no live LLM reader).
+   * This mimics the DO constructor running after eviction.
+   */
+  testSimulateHibernationWake(): void {
+    this._resumableStream = new ResumableStream(this.sql.bind(this));
+  }
+
+  /**
    * Insert a raw JSON string as a message directly into SQLite.
    * Used to test validation of malformed/corrupt messages.
    */
@@ -317,6 +339,107 @@ export class TestChatAgent extends AIChatAgent<Env> {
         _chatMessageAbortControllers: Map<string, unknown>;
       }
     )._chatMessageAbortControllers.size;
+  }
+}
+
+/**
+ * Test agent that streams chunks slowly, useful for testing cancel/abort.
+ *
+ * Control via request body fields:
+ * - `format`: "sse" | "plaintext" (default: "plaintext")
+ * - `useAbortSignal`: boolean — whether to connect abortSignal to the stream
+ * - `chunkCount`: number of chunks to emit (default: 20)
+ * - `chunkDelayMs`: delay between chunks in ms (default: 50)
+ */
+export class SlowStreamAgent extends AIChatAgent<Env> {
+  observability = undefined;
+
+  async onChatMessage(
+    _onFinish: StreamTextOnFinishCallback<ToolSet>,
+    options?: OnChatMessageOptions
+  ) {
+    const body = options?.body as
+      | {
+          format?: string;
+          useAbortSignal?: boolean;
+          chunkCount?: number;
+          chunkDelayMs?: number;
+        }
+      | undefined;
+    const format = body?.format ?? "plaintext";
+    const useAbortSignal = body?.useAbortSignal ?? false;
+    const chunkCount = body?.chunkCount ?? 20;
+    const chunkDelayMs = body?.chunkDelayMs ?? 50;
+    const abortSignal = useAbortSignal ? options?.abortSignal : undefined;
+
+    const encoder = new TextEncoder();
+    const stream = new ReadableStream({
+      async pull(controller) {
+        for (let i = 0; i < chunkCount; i++) {
+          if (abortSignal?.aborted) {
+            controller.close();
+            return;
+          }
+          await new Promise((r) => setTimeout(r, chunkDelayMs));
+          if (abortSignal?.aborted) {
+            controller.close();
+            return;
+          }
+          if (format === "sse") {
+            const chunk = JSON.stringify({
+              type: "text-delta",
+              textDelta: `chunk-${i} `
+            });
+            controller.enqueue(encoder.encode(`data: ${chunk}\n\n`));
+          } else {
+            controller.enqueue(encoder.encode(`chunk-${i} `));
+          }
+        }
+        if (format === "sse") {
+          controller.enqueue(encoder.encode("data: [DONE]\n\n"));
+        }
+        controller.close();
+      }
+    });
+
+    const contentType = format === "sse" ? "text/event-stream" : "text/plain";
+    return new Response(stream, {
+      headers: { "Content-Type": contentType }
+    });
+  }
+
+  getAbortControllerCount(): number {
+    return (
+      this as unknown as {
+        _chatMessageAbortControllers: Map<string, unknown>;
+      }
+    )._chatMessageAbortControllers.size;
+  }
+}
+
+// Test agent that overrides onRequest and calls super.onRequest()
+export class AgentWithSuperCall extends AIChatAgent<Env> {
+  async onRequest(request: Request): Promise<Response> {
+    const url = new URL(request.url);
+    if (url.pathname.endsWith("/custom-route")) {
+      return new Response("custom route");
+    }
+    return super.onRequest(request);
+  }
+
+  async onChatMessage() {
+    return new Response("chat response");
+  }
+}
+
+// Test agent that overrides onRequest WITHOUT calling super.onRequest()
+export class AgentWithoutSuperCall extends AIChatAgent<Env> {
+  async onRequest(_request: Request): Promise<Response> {
+    return new Response("custom only");
+  }
+
+  async onChatMessage() {
+    return new Response("chat response");
   }
 }
 

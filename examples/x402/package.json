@@ -1,20 +1,28 @@
 {
-  "author": "",
-  "dependencies": {
-    "@x402/core": "^2.3.1",
-    "@x402/evm": "^2.3.1",
-    "@x402/fetch": "^2.3.0",
-    "@x402/hono": "^2.3.0",
-    "agents": "*",
-    "hono": "^4.11.9",
-    "viem": "^2.45.3"
-  },
-  "keywords": [],
   "name": "@cloudflare/agents-x402-example",
+  "description": "HTTP payment gating using the x402 protocol with Hono middleware",
   "private": true,
+  "type": "module",
   "scripts": {
-    "dev": "wrangler dev",
-    "types": "wrangler types --include-runtime false"
+    "start": "vite dev",
+    "deploy": "vite build && wrangler deploy",
+    "types": "wrangler types env.d.ts --include-runtime false"
   },
-  "type": "module"
+  "dependencies": {
+    "@cloudflare/agents-ui": "*",
+    "@cloudflare/kumo": "^1.7.0",
+    "@phosphor-icons/react": "^2.1.10",
+    "@x402/core": "^2.4.0",
+    "@x402/evm": "^2.4.0",
+    "@x402/fetch": "^2.4.0",
+    "@x402/hono": "^2.4.0",
+    "agents": "*",
+    "hono": "^4.12.1",
+    "nanoid": "^5.1.6",
+    "viem": "^2.46.2"
+  },
+  "devDependencies": {
+    "@tailwindcss/vite": "^4",
+    "tailwindcss": "^4.2.0"
+  }
 }

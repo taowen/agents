@@ -349,6 +349,41 @@ export class MyAgent extends Agent {
 }
 ```
 
+## Protocol Message Control
+
+By default, when a WebSocket client connects, the agent sends protocol text frames (`CF_AGENT_IDENTITY`, `CF_AGENT_STATE`, `CF_AGENT_MCP_SERVERS`) to keep the client in sync. You can suppress these on a per-connection basis by overriding `shouldSendProtocolMessages`:
+
+```typescript
+export class MyAgent extends Agent {
+  shouldSendProtocolMessages(
+    connection: Connection,
+    ctx: ConnectionContext
+  ): boolean {
+    // Suppress protocol frames for binary-only clients
+    const url = new URL(ctx.request.url);
+    return url.searchParams.get("protocol") !== "false";
+  }
+}
+```
+
+When `shouldSendProtocolMessages` returns `false` for a connection:
+
+- No `CF_AGENT_IDENTITY`, `CF_AGENT_STATE`, or `CF_AGENT_MCP_SERVERS` frames are sent on connect
+- The connection is excluded from protocol broadcasts (state updates, MCP server changes)
+- Regular messages via `connection.send()` and `this.broadcast()` still work normally
+
+This is useful for IoT devices, binary-only clients, or lightweight consumers that only need raw messages.
+
+### Checking Protocol Status
+
+Use `isConnectionProtocolEnabled` to check whether a connection receives protocol messages:
+
+```typescript
+const enabled = this.isConnectionProtocolEnabled(connection);
+```
+
+This status persists across hibernation — a connection that was marked as no-protocol before hibernation remains no-protocol after waking up.
+
 ## Error Handling
 
 Handle errors gracefully with `onError`:
@@ -591,24 +626,26 @@ export class PresenceAgent extends Agent {
 
 ### Agent Lifecycle Methods
 
-| Method      | Signature                                                       | Description                   |
-| ----------- | --------------------------------------------------------------- | ----------------------------- |
-| `onStart`   | `(props?) => void \| Promise<void>`                             | Called once when agent starts |
-| `onRequest` | `(request: Request) => Response \| Promise<Response>`           | Handle HTTP requests          |
-| `onConnect` | `(connection, ctx) => void \| Promise<void>`                    | WebSocket connected           |
-| `onMessage` | `(connection, message) => void \| Promise<void>`                | Message received              |
-| `onClose`   | `(connection, code, reason, wasClean) => void \| Promise<void>` | Connection closed             |
-| `onError`   | `(connection, error) => void \| Promise<void>`                  | WebSocket error               |
-| `onError`   | `(error) => void \| Promise<void>`                              | Server error (overload)       |
+| Method                       | Signature                                                       | Description                                            |
+| ---------------------------- | --------------------------------------------------------------- | ------------------------------------------------------ |
+| `onStart`                    | `(props?) => void \| Promise<void>`                             | Called once when agent starts                          |
+| `onRequest`                  | `(request: Request) => Response \| Promise<Response>`           | Handle HTTP requests                                   |
+| `onConnect`                  | `(connection, ctx) => void \| Promise<void>`                    | WebSocket connected                                    |
+| `onMessage`                  | `(connection, message) => void \| Promise<void>`                | Message received                                       |
+| `onClose`                    | `(connection, code, reason, wasClean) => void \| Promise<void>` | Connection closed                                      |
+| `onError`                    | `(connection, error) => void \| Promise<void>`                  | WebSocket error                                        |
+| `onError`                    | `(error) => void \| Promise<void>`                              | Server error (overload)                                |
+| `shouldSendProtocolMessages` | `(connection, ctx) => boolean`                                  | Control per-connection protocol frames (default: true) |
 
 ### Connection Management Methods
 
-| Method              | Signature                                 | Description                            |
-| ------------------- | ----------------------------------------- | -------------------------------------- |
-| `getConnections`    | `(tag?: string) => Iterable<Connection>`  | Get all connections, optionally by tag |
-| `getConnection`     | `(id: string) => Connection \| undefined` | Get connection by ID                   |
-| `getConnectionTags` | `(connection, ctx) => string[]`           | Override to tag connections            |
-| `broadcast`         | `(message, without?: string[]) => void`   | Send to all connections                |
+| Method                        | Signature                                 | Description                                    |
+| ----------------------------- | ----------------------------------------- | ---------------------------------------------- |
+| `getConnections`              | `(tag?: string) => Iterable<Connection>`  | Get all connections, optionally by tag         |
+| `getConnection`               | `(id: string) => Connection \| undefined` | Get connection by ID                           |
+| `getConnectionTags`           | `(connection, ctx) => string[]`           | Override to tag connections                    |
+| `broadcast`                   | `(message, without?: string[]) => void`   | Send to all connections                        |
+| `isConnectionProtocolEnabled` | `(connection) => boolean`                 | Check if connection receives protocol messages |
 
 ### Connection Object
 

@@ -225,6 +225,27 @@ class MyAgent extends Agent {
 
 Your custom class must implement the `AgentMcpOAuthProvider` interface, which extends the MCP SDK's `OAuthClientProvider` with additional properties (`authUrl`, `clientId`, `serverId`) and methods (`checkState`, `consumeState`, `deleteCodeVerifier`) used by the agent's MCP connection lifecycle.
 
+The override is used for both new connections (`addMcpServer`) and restored connections after a Durable Object restart, so your custom provider is always used consistently.
+
+#### Custom storage backend
+
+The most common customization is using a different storage backend while keeping the built-in OAuth logic (CSRF state, PKCE, nonce generation, token management). Import `DurableObjectOAuthClientProvider` and pass your own storage adapter:
+
+```typescript
+import { Agent, DurableObjectOAuthClientProvider } from "agents";
+import type { AgentMcpOAuthProvider } from "agents";
+
+class MyAgent extends Agent {
+  createMcpOAuthProvider(callbackUrl: string): AgentMcpOAuthProvider {
+    return new DurableObjectOAuthClientProvider(
+      myCustomStorage, // any DurableObjectStorage-compatible adapter
+      this.name,
+      callbackUrl
+    );
+  }
+}
+```
+
 ## Using MCP Capabilities
 
 Once connected, access the server's capabilities:
@@ -264,8 +285,8 @@ for (const prompt of state.prompts) {
 const state = this.getMcpServers();
 
 for (const [id, server] of Object.entries(state.servers)) {
-  console.log(`${server.name}: ${server.connectionState}`);
-  // connectionState: "ready" | "authenticating" | "connecting" | "not-connected"
+  console.log(`${server.name}: ${server.state}`);
+  // state: "ready" | "authenticating" | "connecting" | "connected" | "discovering" | "failed"
 }
 ```
 
@@ -363,7 +384,8 @@ For fine-grained control, use `this.mcp` directly:
 ### Step-by-Step Connection
 
 ```typescript
-// 1. Register the server
+// 1. Register the server (saves to storage and creates in-memory connection)
+const id = "my-server";
 await this.mcp.registerServer(id, {
   url: "https://mcp.example.com/mcp",
   name: "My Server",
@@ -371,7 +393,7 @@ await this.mcp.registerServer(id, {
   transport: { type: "auto" }
 });
 
-// 2. Connect
+// 2. Connect (initializes transport, handles OAuth if needed)
 const connectResult = await this.mcp.connectToServer(id);
 
 if (connectResult.state === "failed") {
@@ -380,37 +402,43 @@ if (connectResult.state === "failed") {
 }
 
 if (connectResult.state === "authenticating") {
-  // Handle OAuth...
+  console.log("OAuth required:", connectResult.authUrl);
   return;
 }
 
-// 3. Discover capabilities
-const discoverResult = await this.mcp.discoverIfConnected(id);
+// 3. Discover capabilities (transitions from "connected" to "ready")
+if (connectResult.state === "connected") {
+  const discoverResult = await this.mcp.discoverIfConnected(id);
 
-if (!discoverResult?.success) {
-  console.error("Discovery failed:", discoverResult?.error);
+  if (!discoverResult?.success) {
+    console.error("Discovery failed:", discoverResult?.error);
+  }
 }
 ```
 
 ### Event Subscription
 
 ```typescript
-// Listen for state changes
-this.mcp.onServerStateChanged(() => {
+// Listen for state changes (onServerStateChanged is an Event<void>)
+const disposable = this.mcp.onServerStateChanged(() => {
   console.log("MCP server state changed");
   this.broadcastMcpServers(); // Notify connected clients
 });
+
+// Clean up the subscription when no longer needed
+// disposable.dispose();
 ```
 
 ### Error Recovery
 
 ```typescript
 async retryConnection(serverId: string) {
-  // Retry connection for a registered server
   const result = await this.mcp.connectToServer(serverId);
 
   if (result.state === "connected") {
     await this.mcp.discoverIfConnected(serverId);
+  } else if (result.state === "failed") {
+    console.error("Reconnection failed:", result.error);
   }
 }
 ```
@@ -461,17 +489,18 @@ export class MyAgent extends Agent {
 ### addMcpServer()
 
 ```typescript
-// Preferred signature
+// HTTP transport (Streamable HTTP, SSE)
 async addMcpServer(
   name: string,
   url: string,
   options?: {
-    callbackHost?: string;
+    callbackHost?: string;  // only needed for OAuth-authenticated servers
+    callbackPath?: string;  // custom callback URL path (bypasses default /agents/{class}/{name}/callback)
     agentsPrefix?: string;
     client?: ClientOptions;
     transport?: {
       headers?: HeadersInit;
-      type?: "sse" | "streamable-http" | "auto"; // default: "streamable-http"
+      type?: "sse" | "streamable-http" | "auto"; // default: "auto"
     };
     retry?: RetryOptions; // retry options for connection/reconnection
   }
@@ -479,6 +508,17 @@ async addMcpServer(
   | { id: string; state: "ready" }
   | { id: string; state: "authenticating"; authUrl: string }
 >
+
+// RPC transport (Durable Object binding — no HTTP overhead)
+async addMcpServer(
+  name: string,
+  binding: DurableObjectNamespace,
+  options?: {
+    props?: Record<string, unknown>; // passed to the McpAgent's onStart(props)
+    client?: ClientOptions;
+    retry?: RetryOptions;
+  }
+): Promise<{ id: string; state: "ready" }>
 
 // Legacy signature (still supported)
 async addMcpServer(
@@ -491,6 +531,10 @@ async addMcpServer(
 ```
 
 Add and connect to an MCP server. Throws if connection or discovery fails.
+
+For non-OAuth servers, `callbackHost` is not required — you can call `addMcpServer("name", url)` with no options. For RPC transport, pass a `DurableObjectNamespace` binding instead of a URL. See [MCP Transports](./mcp-transports.md) for details.
+
+If `addMcpServer` is called with a `name` that already has an active connection, the existing connection is returned instead of creating a duplicate.
 
 ### removeMcpServer()
 
@@ -528,9 +572,15 @@ type MCPServer = {
   name: string;
   server_url: string;
   auth_url: string | null;
-  connectionState: "ready" | "authenticating" | "connecting" | "not-connected";
-  tools?: Tool[];
-  resources?: Resource[];
-  prompts?: Prompt[];
+  state:
+    | "ready"
+    | "authenticating"
+    | "connecting"
+    | "connected"
+    | "discovering"
+    | "failed";
+  error: string | null;
+  instructions: string | null;
+  capabilities: ServerCapabilities | null;
 };
 ```

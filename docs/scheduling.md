@@ -593,17 +593,18 @@ A Zod schema for validating parsed scheduling data:
 ```typescript
 import { scheduleSchema } from "agents";
 
-// The schema shape:
+// The schema uses a discriminated union on `when.type`:
 // {
 //   description: string,
-//   when: {
-//     type: "scheduled" | "delayed" | "cron" | "no-schedule",
-//     date?: Date,           // for "scheduled"
-//     delayInSeconds?: number, // for "delayed"
-//     cron?: string          // for "cron"
-//   }
+//   when:
+//     | { type: "scheduled", date: string }        // ISO 8601 date string
+//     | { type: "delayed", delayInSeconds: number }
+//     | { type: "cron", cron: string }
+//     | { type: "no-schedule" }
 // }
 ```
+
+When using this schema with OpenAI models via the AI SDK, you must pass `providerOptions: { openai: { strictJsonSchema: false } }` to `generateObject`. This is because the schema uses a discriminated union which is not compatible with OpenAI's strict structured outputs mode.
 
 ## Scheduling vs Queue vs Workflows
 
@@ -692,10 +693,10 @@ Schedule a task to run repeatedly at a fixed interval.
 ### getSchedule()
 
 ```typescript
-async getSchedule<T = string>(id: string): Promise<Schedule<T> | undefined>
+getSchedule<T = string>(id: string): Schedule<T> | undefined
 ```
 
-Get a scheduled task by ID.
+Get a scheduled task by ID. This method is synchronous.
 
 ### getSchedules()
 
@@ -707,7 +708,7 @@ getSchedules<T = string>(criteria?: {
 }): Schedule<T>[]
 ```
 
-Get scheduled tasks matching the criteria.
+Get scheduled tasks matching the criteria. This method is synchronous.
 
 ### cancelSchedule()
 

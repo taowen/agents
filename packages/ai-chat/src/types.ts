@@ -54,6 +54,8 @@ export type OutgoingMessage<ChatMessage extends UIMessage = UIMessage> =
       continuation?: boolean;
       /** Whether this chunk is being replayed from storage (stream resumption) */
       replay?: boolean;
+      /** Signals that replay of stored chunks is complete (stream is still active) */
+      replayComplete?: boolean;
     }
   | {
       /** Indicates the server is resuming an active stream */
@@ -127,6 +129,10 @@ export type IncomingMessage<ChatMessage extends UIMessage = UIMessage> =
       toolName: string;
       /** The output from the tool execution */
       output: unknown;
+      /** Override the tool part state (e.g. "output-error" for custom denial) */
+      state?: "output-available" | "output-error";
+      /** Error message when state is "output-error" */
+      errorText?: string;
       /** Whether server should auto-continue the conversation after applying result */
       autoContinue?: boolean;
       /** Client tool schemas for continuation (client is source of truth) */

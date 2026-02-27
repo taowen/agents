@@ -349,14 +349,14 @@ describe("MCPClientManager OAuth Integration", () => {
       );
     });
 
-    it("should throw error for callback without matching URL", async () => {
+    it("should return auth error for callback without matching URL", async () => {
       const callbackRequest = new Request(
         "http://localhost:3000/unknown?code=test&state=invalid.format"
       );
 
-      await expect(
-        manager.handleCallbackRequest(callbackRequest)
-      ).rejects.toThrow("No server found with id");
+      const result = await manager.handleCallbackRequest(callbackRequest);
+      expect(result.authSuccess).toBe(false);
+      expect(result.authError).toContain("No server found with id");
     });
 
     it("should handle OAuth error response from provider", async () => {
@@ -434,25 +434,25 @@ describe("MCPClientManager OAuth Integration", () => {
       expect(result.authError).toBe("Unauthorized: no code provided");
     });
 
-    it("should throw error for callback without state", async () => {
+    it("should return auth error for callback without state", async () => {
       const callbackUrl = "http://localhost:3000/callback";
       const callbackRequest = new Request(`${callbackUrl}?code=test`);
 
-      await expect(
-        manager.handleCallbackRequest(callbackRequest)
-      ).rejects.toThrow("Unauthorized: no state provided");
+      const result = await manager.handleCallbackRequest(callbackRequest);
+      expect(result.authSuccess).toBe(false);
+      expect(result.authError).toBe("Unauthorized: no state provided");
     });
 
-    it("should throw error for callback with non-existent server", async () => {
+    it("should return auth error for callback with non-existent server", async () => {
       const stateStorage = createMockStateStorage();
       const state = stateStorage.createState("non-existent");
       const callbackRequest = new Request(
         `http://localhost:3000/callback?code=test&state=${state}`
       );
 
-      await expect(
-        manager.handleCallbackRequest(callbackRequest)
-      ).rejects.toThrow("No server found with id");
+      const result = await manager.handleCallbackRequest(callbackRequest);
+      expect(result.authSuccess).toBe(false);
+      expect(result.authError).toContain("No server found with id");
     });
 
     it("should handle duplicate callback when already in ready state", async () => {
@@ -935,7 +935,7 @@ describe("MCPClientManager OAuth Integration", () => {
       expect(result.authError).toBe("server_error");
     });
 
-    it("should escape XSS payloads in error_description", async () => {
+    it("should pass through raw error_description without escaping", async () => {
       const serverId = "test-server";
       const callbackUrl = "http://localhost:3000/callback";
       const stateStorage = createMockStateStorage();
@@ -970,19 +970,11 @@ describe("MCPClientManager OAuth Integration", () => {
       const result = await manager.handleCallbackRequest(callbackRequest);
 
       expect(result.authSuccess).toBe(false);
-      // Verify XSS payload is escaped
-      expect(result.authError).toBe(
-        "&lt;/script&gt;&lt;img src=x onerror=alert(1)&gt;"
-      );
-      expect(connection.connectionError).toBe(
-        "&lt;/script&gt;&lt;img src=x onerror=alert(1)&gt;"
-      );
-      // Should not contain raw script tag
-      expect(result.authError).not.toContain("<script>");
-      expect(result.authError).not.toContain("</script>");
+      expect(result.authError).toBe(xssPayload);
+      expect(connection.connectionError).toBe(xssPayload);
     });
 
-    it("should escape XSS payloads in error parameter when description is absent", async () => {
+    it("should pass through raw error parameter without escaping when description is absent", async () => {
       const serverId = "test-server";
       const callbackUrl = "http://localhost:3000/callback";
       const stateStorage = createMockStateStorage();
@@ -1017,12 +1009,8 @@ describe("MCPClientManager OAuth Integration", () => {
       const result = await manager.handleCallbackRequest(callbackRequest);
 
       expect(result.authSuccess).toBe(false);
-      expect(result.authError).toBe(
-        "&lt;script&gt;alert(&#39;xss&#39;)&lt;/script&gt;"
-      );
-      expect(connection.connectionError).toBe(
-        "&lt;script&gt;alert(&#39;xss&#39;)&lt;/script&gt;"
-      );
+      expect(result.authError).toBe(xssPayload);
+      expect(connection.connectionError).toBe(xssPayload);
     });
 
     it("should handle token exchange failure", async () => {
@@ -1834,8 +1822,7 @@ describe("MCPClientManager OAuth Integration", () => {
       expect(conn.client.callTool).toHaveBeenCalledWith(
         {
           name: "test_tool",
-          arguments: { message: "test" },
-          serverId: id
+          arguments: { message: "test" }
         },
         undefined,
         undefined
@@ -1918,8 +1905,7 @@ describe("MCPClientManager OAuth Integration", () => {
       expect(conn1.client.callTool).toHaveBeenCalledWith(
         {
           name: "tool_one",
-          arguments: {},
-          serverId: server1Id
+          arguments: {}
         },
         undefined,
         undefined
@@ -1929,8 +1915,7 @@ describe("MCPClientManager OAuth Integration", () => {
       expect(conn2.client.callTool).toHaveBeenCalledWith(
         {
           name: "tool_two",
-          arguments: {},
-          serverId: server2Id
+          arguments: {}
         },
         undefined,
         undefined
@@ -2292,6 +2277,225 @@ describe("MCPClientManager OAuth Integration", () => {
     });
   });
 
+  describe("restoreConnectionsFromStorage() - createAuthProvider factory", () => {
+    it("should use the injected factory when restoring connections", async () => {
+      const serverId = "factory-test";
+      const callbackUrl = "http://localhost:3000/callback";
+
+      saveServerToMock({
+        id: serverId,
+        name: "Factory Test Server",
+        server_url: "http://factory.com",
+        callback_url: callbackUrl,
+        client_id: null,
+        auth_url: null,
+        server_options: null
+      });
+
+      const mockProvider = createMockAuthProvider(createMockStateStorage());
+      const factory = vi.fn().mockReturnValue(mockProvider);
+
+      const factoryManager = new TestMCPClientManager("test-client", "1.0.0", {
+        storage: manager["_storage"],
+        createAuthProvider: factory
+      });
+
+      vi.spyOn(factoryManager, "connectToServer").mockResolvedValue({
+        state: "connected"
+      });
+
+      await factoryManager.restoreConnectionsFromStorage("test-agent");
+
+      expect(factory).toHaveBeenCalledWith(callbackUrl);
+      const conn = factoryManager.mcpConnections[serverId];
+      expect(conn).toBeDefined();
+      expect(conn.options.transport.authProvider).toBe(mockProvider);
+    });
+
+    it("should set serverId and clientId on the provider returned by the factory", async () => {
+      const serverId = "factory-ids-test";
+      const clientId = "custom-client-123";
+      const callbackUrl = "http://localhost:3000/callback";
+
+      saveServerToMock({
+        id: serverId,
+        name: "IDs Test Server",
+        server_url: "http://ids-test.com",
+        callback_url: callbackUrl,
+        client_id: clientId,
+        auth_url: null,
+        server_options: null
+      });
+
+      const mockProvider = createMockAuthProvider(createMockStateStorage());
+      const factory = vi.fn().mockReturnValue(mockProvider);
+
+      const factoryManager = new TestMCPClientManager("test-client", "1.0.0", {
+        storage: manager["_storage"],
+        createAuthProvider: factory
+      });
+
+      vi.spyOn(factoryManager, "connectToServer").mockResolvedValue({
+        state: "connected"
+      });
+
+      await factoryManager.restoreConnectionsFromStorage("test-agent");
+
+      expect(mockProvider.serverId).toBe(serverId);
+      expect(mockProvider.clientId).toBe(clientId);
+    });
+
+    it("should fall back to default createAuthProvider when no factory is provided", async () => {
+      const serverId = "no-factory-test";
+      const callbackUrl = "http://localhost:3000/callback";
+
+      saveServerToMock({
+        id: serverId,
+        name: "No Factory Server",
+        server_url: "http://no-factory.com",
+        callback_url: callbackUrl,
+        client_id: null,
+        auth_url: null,
+        server_options: null
+      });
+
+      vi.spyOn(manager, "connectToServer").mockResolvedValue({
+        state: "connected"
+      });
+
+      await manager.restoreConnectionsFromStorage("test-agent");
+
+      const conn = manager.mcpConnections[serverId];
+      expect(conn).toBeDefined();
+      expect(conn.options.transport.authProvider).toBeDefined();
+      expect(conn.options.transport.authProvider?.serverId).toBe(serverId);
+    });
+
+    it("should use the factory for OAuth servers with auth_url set", async () => {
+      const serverId = "factory-oauth-test";
+      const callbackUrl = "http://localhost:3000/callback";
+      const clientId = "oauth-client-id";
+
+      saveServerToMock({
+        id: serverId,
+        name: "OAuth Factory Server",
+        server_url: "http://oauth-factory.com",
+        callback_url: callbackUrl,
+        client_id: clientId,
+        auth_url: "https://auth.example.com/authorize",
+        server_options: null
+      });
+
+      const mockProvider = createMockAuthProvider(createMockStateStorage());
+      const factory = vi.fn().mockReturnValue(mockProvider);
+
+      const factoryManager = new TestMCPClientManager("test-client", "1.0.0", {
+        storage: manager["_storage"],
+        createAuthProvider: factory
+      });
+
+      await factoryManager.restoreConnectionsFromStorage("test-agent");
+
+      expect(factory).toHaveBeenCalledWith(callbackUrl);
+      const conn = factoryManager.mcpConnections[serverId];
+      expect(conn).toBeDefined();
+      expect(conn.connectionState).toBe("authenticating");
+      expect(mockProvider.serverId).toBe(serverId);
+      expect(mockProvider.clientId).toBe(clientId);
+    });
+
+    it("should use the factory when recreating failed connections", async () => {
+      const serverId = "factory-failed-test";
+      const callbackUrl = "http://localhost:3000/callback";
+
+      saveServerToMock({
+        id: serverId,
+        name: "Failed Server",
+        server_url: "http://failed-factory.com",
+        callback_url: callbackUrl,
+        client_id: null,
+        auth_url: null,
+        server_options: null
+      });
+
+      const mockProvider = createMockAuthProvider(createMockStateStorage());
+      const factory = vi.fn().mockReturnValue(mockProvider);
+
+      const factoryManager = new TestMCPClientManager("test-client", "1.0.0", {
+        storage: manager["_storage"],
+        createAuthProvider: factory
+      });
+
+      // Pre-populate with a failed connection
+      const failedConnection = new MCPClientConnection(
+        new URL("http://failed-factory.com"),
+        { name: "test-client", version: "1.0.0" },
+        { transport: { type: "auto" }, client: {} }
+      );
+      failedConnection.connectionState = "failed";
+      failedConnection.client.close = vi.fn().mockResolvedValue(undefined);
+      factoryManager.mcpConnections[serverId] = failedConnection;
+
+      vi.spyOn(factoryManager, "connectToServer").mockResolvedValue({
+        state: "connected"
+      });
+
+      await factoryManager.restoreConnectionsFromStorage("test-agent");
+
+      expect(factory).toHaveBeenCalledWith(callbackUrl);
+      expect(factoryManager.mcpConnections[serverId]).not.toBe(
+        failedConnection
+      );
+    });
+
+    it("should call the factory once per server in mixed restore", async () => {
+      const callbackUrl1 = "http://localhost:3000/callback/s1";
+      const callbackUrl2 = "http://localhost:3000/callback/s2";
+
+      saveServerToMock({
+        id: "server-1",
+        name: "Server 1",
+        server_url: "http://s1.com",
+        callback_url: callbackUrl1,
+        client_id: null,
+        auth_url: null,
+        server_options: null
+      });
+
+      saveServerToMock({
+        id: "server-2",
+        name: "Server 2",
+        server_url: "http://s2.com",
+        callback_url: callbackUrl2,
+        client_id: "client-2",
+        auth_url: "https://auth.example.com/authorize",
+        server_options: null
+      });
+
+      const mockProvider1 = createMockAuthProvider(createMockStateStorage());
+      const mockProvider2 = createMockAuthProvider(createMockStateStorage());
+      const factory = vi
+        .fn()
+        .mockReturnValueOnce(mockProvider1)
+        .mockReturnValueOnce(mockProvider2);
+
+      const factoryManager = new TestMCPClientManager("test-client", "1.0.0", {
+        storage: manager["_storage"],
+        createAuthProvider: factory
+      });
+
+      vi.spyOn(factoryManager, "connectToServer").mockResolvedValue({
+        state: "connected"
+      });
+
+      await factoryManager.restoreConnectionsFromStorage("test-agent");
+
+      expect(factory).toHaveBeenCalledTimes(2);
+      expect(factory).toHaveBeenCalledWith(callbackUrl1);
+      expect(factory).toHaveBeenCalledWith(callbackUrl2);
+    });
+  });
+
   describe("connectToServer() - Connection States", () => {
     it("should return connected state for successful non-OAuth connection", async () => {
       const serverId = "non-oauth-connect-test";
@@ -2649,7 +2853,7 @@ describe("MCPClientManager OAuth Integration", () => {
       );
     });
 
-    it("should work as a manual refresh for tools", async () => {
+    it("should work as a manual refresh for tools (discover)", async () => {
       const serverId = "test-server";
       const connection = new MCPClientConnection(
         new URL("http://test.com"),
@@ -2676,6 +2880,136 @@ describe("MCPClientManager OAuth Integration", () => {
       // Tools should be refreshed
       expect(connection.tools).toHaveLength(1);
       expect(connection.tools[0].name).toBe("new-tool");
+    });
+  });
+
+  describe("SSRF URL validation", () => {
+    it("should reject localhost URLs", async () => {
+      await expect(
+        manager.registerServer("s1", {
+          url: "http://localhost:8080/mcp",
+          name: "bad"
+        })
+      ).rejects.toThrow("Blocked URL");
+    });
+
+    it("should reject 127.x.x.x loopback URLs", async () => {
+      await expect(
+        manager.registerServer("s2", {
+          url: "http://127.0.0.1/mcp",
+          name: "bad"
+        })
+      ).rejects.toThrow("Blocked URL");
+    });
+
+    it("should reject RFC 1918 10.x.x.x URLs", async () => {
+      await expect(
+        manager.registerServer("s3", {
+          url: "http://10.0.0.1/mcp",
+          name: "bad"
+        })
+      ).rejects.toThrow("Blocked URL");
+    });
+
+    it("should reject RFC 1918 172.16-31.x.x URLs", async () => {
+      await expect(
+        manager.registerServer("s4", {
+          url: "http://172.16.0.1/mcp",
+          name: "bad"
+        })
+      ).rejects.toThrow("Blocked URL");
+    });
+
+    it("should reject RFC 1918 192.168.x.x URLs", async () => {
+      await expect(
+        manager.registerServer("s5", {
+          url: "http://192.168.1.1/mcp",
+          name: "bad"
+        })
+      ).rejects.toThrow("Blocked URL");
+    });
+
+    it("should reject link-local / metadata 169.254.x.x URLs", async () => {
+      await expect(
+        manager.registerServer("s6", {
+          url: "http://169.254.169.254/latest/meta-data",
+          name: "bad"
+        })
+      ).rejects.toThrow("Blocked URL");
+    });
+
+    it("should reject metadata.google.internal", async () => {
+      await expect(
+        manager.registerServer("s7", {
+          url: "http://metadata.google.internal/computeMetadata/v1/",
+          name: "bad"
+        })
+      ).rejects.toThrow("Blocked URL");
+    });
+
+    it("should reject 0.0.0.0", async () => {
+      await expect(
+        manager.registerServer("s8", {
+          url: "http://0.0.0.0/mcp",
+          name: "bad"
+        })
+      ).rejects.toThrow("Blocked URL");
+    });
+
+    it("should reject IPv6 loopback", async () => {
+      await expect(
+        manager.registerServer("s9", {
+          url: "http://[::1]:8080/mcp",
+          name: "bad"
+        })
+      ).rejects.toThrow("Blocked URL");
+    });
+
+    it("should reject IPv6 unique local (fc00::/7) URLs", async () => {
+      await expect(
+        manager.registerServer("s-fc", {
+          url: "http://[fc00::1]/mcp",
+          name: "bad"
+        })
+      ).rejects.toThrow("Blocked URL");
+    });
+
+    it("should reject IPv6 unique local (fd00::) URLs", async () => {
+      await expect(
+        manager.registerServer("s-fd", {
+          url: "http://[fd12:3456::1]/mcp",
+          name: "bad"
+        })
+      ).rejects.toThrow("Blocked URL");
+    });
+
+    it("should reject IPv6 link-local (fe80::/10) URLs", async () => {
+      await expect(
+        manager.registerServer("s-fe80", {
+          url: "http://[fe80::1%25eth0]:8080/mcp",
+          name: "bad"
+        })
+      ).rejects.toThrow("Blocked URL");
+    });
+
+    it("should allow valid public URLs", async () => {
+      // This will fail at the connection level (no real server),
+      // but should NOT throw a "Blocked URL" error
+      await expect(
+        manager.registerServer("s10", {
+          url: "https://mcp.example.com/v1",
+          name: "public"
+        })
+      ).resolves.toBe("s10");
+    });
+
+    it("should allow non-private IP addresses", async () => {
+      await expect(
+        manager.registerServer("s11", {
+          url: "http://8.8.8.8/mcp",
+          name: "public-ip"
+        })
+      ).resolves.toBe("s11");
     });
   });
 });

@@ -10,17 +10,14 @@
     "types": "wrangler types env.d.ts --include-runtime false"
   },
   "dependencies": {
-    "@ai-sdk/openai-compatible": "^1.0.14",
     "@cloudflare/agents-ui": "*",
-    "@cloudflare/kumo": "^1.5.0",
-    "@cloudflare/puppeteer": "^0.0.15",
+    "@cloudflare/ai-chat": "*",
+    "@cloudflare/kumo": "^1.7.0",
     "@phosphor-icons/react": "^2.1.10",
-    "@sentry/cloudflare": "^10.39.0",
-    "pi": "file:../../packages/pi"
+    "agents": "*"
   },
   "devDependencies": {
-    "@sentry/vite-plugin": "^3.3.1",
     "@tailwindcss/vite": "^4",
-    "tailwindcss": "^4.1.18"
+    "tailwindcss": "^4.2.0"
   }
 }

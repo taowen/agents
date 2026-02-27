@@ -1358,3 +1358,369 @@ describe("useAgentChat body option", () => {
     expect(sentMessages).toBeDefined();
   });
 });
+
+describe("useAgentChat stale agent ref (issue #929)", () => {
+  it("should use the new agent's send method after agent switch, not the old one", async () => {
+    const oldSend = vi.fn();
+    const newSend = vi.fn();
+
+    const agentOld = createAgent({
+      name: "thread-old",
+      url: "ws://localhost:3000/agents/chat/thread-old?_pk=old",
+      send: oldSend
+    });
+
+    const agentNew = createAgent({
+      name: "thread-new",
+      url: "ws://localhost:3000/agents/chat/thread-new?_pk=new",
+      send: newSend
+    });
+
+    let chatInstance: ReturnType<typeof useAgentChat> | null = null;
+
+    const TestComponent = ({
+      agent
+    }: {
+      agent: ReturnType<typeof useAgent>;
+    }) => {
+      const chat = useAgentChat({
+        agent,
+        getInitialMessages: null,
+        messages: [] as UIMessage[]
+      });
+      chatInstance = chat;
+      return <div data-testid="status">{chat.status}</div>;
+    };
+
+    const screen = await act(async () => {
+      const screen = render(<TestComponent agent={agentOld} />, {
+        wrapper: ({ children }) => (
+          <StrictMode>
+            <Suspense fallback="Loading...">{children}</Suspense>
+          </StrictMode>
+        )
+      });
+      await sleep(10);
+      return screen;
+    });
+
+    // Switch to the new agent
+    await act(async () => {
+      screen.rerender(<TestComponent agent={agentNew} />);
+      await sleep(10);
+    });
+
+    // Clear any sends that happened during setup (e.g., stream resume requests)
+    oldSend.mockClear();
+    newSend.mockClear();
+
+    // Clear history triggers agent.send() — this should go to the NEW agent
+    await act(async () => {
+      chatInstance!.clearHistory();
+      await sleep(10);
+    });
+
+    // The clear message should have been sent to the NEW agent, not the old one
+    const newSendCalls = newSend.mock.calls
+      .map((args) => JSON.parse(args[0] as string))
+      .filter((m: Record<string, unknown>) => m.type === "cf_agent_chat_clear");
+    expect(newSendCalls.length).toBe(1);
+
+    // The old agent should NOT have received the clear message
+    const oldSendCalls = oldSend.mock.calls
+      .map((args) => JSON.parse(args[0] as string))
+      .filter((m: Record<string, unknown>) => m.type === "cf_agent_chat_clear");
+    expect(oldSendCalls.length).toBe(0);
+  });
+});
+
+describe("useAgentChat stream resumption (issue #896)", () => {
+  function createAgentWithTarget({ name, url }: { name: string; url: string }) {
+    const target = new EventTarget();
+    const sentMessages: string[] = [];
+    const agent = createAgent({
+      name,
+      url,
+      send: (data: string) => sentMessages.push(data)
+    });
+    // Wire up the target so we can dispatch messages to the hook
+    (agent as unknown as Record<string, unknown>).addEventListener =
+      target.addEventListener.bind(target);
+    (agent as unknown as Record<string, unknown>).removeEventListener =
+      target.removeEventListener.bind(target);
+    return { agent, target, sentMessages };
+  }
+
+  function dispatch(target: EventTarget, data: Record<string, unknown>) {
+    target.dispatchEvent(
+      new MessageEvent("message", { data: JSON.stringify(data) })
+    );
+  }
+
+  it("should flush messages to state after replayComplete for live streams", async () => {
+    const { agent, target } = createAgentWithTarget({
+      name: "replay-complete-test",
+      url: "ws://localhost:3000/agents/chat/replay-complete-test?_pk=abc"
+    });
+
+    const TestComponent = () => {
+      const chat = useAgentChat({
+        agent,
+        getInitialMessages: null,
+        messages: [] as UIMessage[]
+      });
+      const assistantMsg = chat.messages.find(
+        (m: UIMessage) => m.role === "assistant"
+      );
+      const textPart = assistantMsg?.parts.find(
+        (p: UIMessage["parts"][number]) => p.type === "text"
+      ) as { text?: string } | undefined;
+      return (
+        <div>
+          <div data-testid="count">{chat.messages.length}</div>
+          <div data-testid="text">{textPart?.text ?? ""}</div>
+        </div>
+      );
+    };
+
+    const screen = await act(async () => {
+      const screen = render(<TestComponent />, {
+        wrapper: ({ children }) => (
+          <StrictMode>
+            <Suspense fallback="Loading...">{children}</Suspense>
+          </StrictMode>
+        )
+      });
+      await sleep(10);
+      return screen;
+    });
+
+    // Initially no messages
+    await expect.element(screen.getByTestId("count")).toHaveTextContent("0");
+
+    // Simulate server sending CF_AGENT_STREAM_RESUMING
+    await act(async () => {
+      dispatch(target, {
+        type: "cf_agent_stream_resuming",
+        id: "req-1"
+      });
+      await sleep(10);
+    });
+
+    // Simulate replay chunks (these are batched, no per-chunk flush)
+    await act(async () => {
+      dispatch(target, {
+        type: "cf_agent_use_chat_response",
+        id: "req-1",
+        body: '{"type":"text-start","id":"t1"}',
+        done: false,
+        replay: true
+      });
+      dispatch(target, {
+        type: "cf_agent_use_chat_response",
+        id: "req-1",
+        body: '{"type":"text-delta","id":"t1","delta":"Hello world"}',
+        done: false,
+        replay: true
+      });
+      await sleep(10);
+    });
+
+    // Should still be 0 messages — replay chunks are not flushed yet
+    await expect.element(screen.getByTestId("count")).toHaveTextContent("0");
+
+    // Now send replayComplete — this should trigger a flush
+    await act(async () => {
+      dispatch(target, {
+        type: "cf_agent_use_chat_response",
+        id: "req-1",
+        body: "",
+        done: false,
+        replay: true,
+        replayComplete: true
+      });
+      await sleep(10);
+    });
+
+    // Now the assistant message should appear
+    await expect.element(screen.getByTestId("count")).toHaveTextContent("1");
+    await expect
+      .element(screen.getByTestId("text"))
+      .toHaveTextContent("Hello world");
+  });
+
+  it("should flush and finalize after done:true for orphaned streams", async () => {
+    const { agent, target } = createAgentWithTarget({
+      name: "orphaned-done-test",
+      url: "ws://localhost:3000/agents/chat/orphaned-done-test?_pk=abc"
+    });
+
+    const TestComponent = () => {
+      const chat = useAgentChat({
+        agent,
+        getInitialMessages: null,
+        messages: [] as UIMessage[]
+      });
+      const assistantMsg = chat.messages.find(
+        (m: UIMessage) => m.role === "assistant"
+      );
+      const textPart = assistantMsg?.parts.find(
+        (p: UIMessage["parts"][number]) => p.type === "text"
+      ) as { text?: string } | undefined;
+      return (
+        <div>
+          <div data-testid="count">{chat.messages.length}</div>
+          <div data-testid="text">{textPart?.text ?? ""}</div>
+          <div data-testid="status">{chat.status}</div>
+        </div>
+      );
+    };
+
+    const screen = await act(async () => {
+      const screen = render(<TestComponent />, {
+        wrapper: ({ children }) => (
+          <StrictMode>
+            <Suspense fallback="Loading...">{children}</Suspense>
+          </StrictMode>
+        )
+      });
+      await sleep(10);
+      return screen;
+    });
+
+    // Simulate resume + replay + done (orphaned stream path)
+    await act(async () => {
+      dispatch(target, {
+        type: "cf_agent_stream_resuming",
+        id: "req-orphaned"
+      });
+      await sleep(5);
+
+      dispatch(target, {
+        type: "cf_agent_use_chat_response",
+        id: "req-orphaned",
+        body: '{"type":"text-start","id":"t1"}',
+        done: false,
+        replay: true
+      });
+      dispatch(target, {
+        type: "cf_agent_use_chat_response",
+        id: "req-orphaned",
+        body: '{"type":"text-delta","id":"t1","delta":"partial from hibernation"}',
+        done: false,
+        replay: true
+      });
+
+      // done:true signals orphaned stream is finalized
+      dispatch(target, {
+        type: "cf_agent_use_chat_response",
+        id: "req-orphaned",
+        body: "",
+        done: true,
+        replay: true
+      });
+      await sleep(10);
+    });
+
+    // Message should be flushed with the accumulated text
+    await expect.element(screen.getByTestId("count")).toHaveTextContent("1");
+    await expect
+      .element(screen.getByTestId("text"))
+      .toHaveTextContent("partial from hibernation");
+  });
+
+  it("should continue receiving live chunks after replayComplete", async () => {
+    const { agent, target } = createAgentWithTarget({
+      name: "replay-then-live-test",
+      url: "ws://localhost:3000/agents/chat/replay-then-live-test?_pk=abc"
+    });
+
+    const TestComponent = () => {
+      const chat = useAgentChat({
+        agent,
+        getInitialMessages: null,
+        messages: [] as UIMessage[]
+      });
+      const assistantMsg = chat.messages.find(
+        (m: UIMessage) => m.role === "assistant"
+      );
+      const textPart = assistantMsg?.parts.find(
+        (p: UIMessage["parts"][number]) => p.type === "text"
+      ) as { text?: string } | undefined;
+      return (
+        <div>
+          <div data-testid="count">{chat.messages.length}</div>
+          <div data-testid="text">{textPart?.text ?? ""}</div>
+        </div>
+      );
+    };
+
+    const screen = await act(async () => {
+      const screen = render(<TestComponent />, {
+        wrapper: ({ children }) => (
+          <StrictMode>
+            <Suspense fallback="Loading...">{children}</Suspense>
+          </StrictMode>
+        )
+      });
+      await sleep(10);
+      return screen;
+    });
+
+    // Replay phase
+    await act(async () => {
+      dispatch(target, {
+        type: "cf_agent_stream_resuming",
+        id: "req-live"
+      });
+      await sleep(5);
+
+      dispatch(target, {
+        type: "cf_agent_use_chat_response",
+        id: "req-live",
+        body: '{"type":"text-start","id":"t1"}',
+        done: false,
+        replay: true
+      });
+      dispatch(target, {
+        type: "cf_agent_use_chat_response",
+        id: "req-live",
+        body: '{"type":"text-delta","id":"t1","delta":"replayed-"}',
+        done: false,
+        replay: true
+      });
+      dispatch(target, {
+        type: "cf_agent_use_chat_response",
+        id: "req-live",
+        body: "",
+        done: false,
+        replay: true,
+        replayComplete: true
+      });
+      await sleep(10);
+    });
+
+    // After replay, message should show replayed text
+    await expect.element(screen.getByTestId("count")).toHaveTextContent("1");
+    await expect
+      .element(screen.getByTestId("text"))
+      .toHaveTextContent("replayed-");
+
+    // Now simulate a live chunk arriving (no replay flag)
+    await act(async () => {
+      dispatch(target, {
+        type: "cf_agent_use_chat_response",
+        id: "req-live",
+        body: '{"type":"text-delta","id":"t1","delta":"and live!"}',
+        done: false
+      });
+      await sleep(10);
+    });
+
+    // The live chunk should append to the same message
+    await expect.element(screen.getByTestId("count")).toHaveTextContent("1");
+    await expect
+      .element(screen.getByTestId("text"))
+      .toHaveTextContent("replayed-and live!");
+  });
+});

@@ -64,6 +64,10 @@
         "name": "TestAddMcpServerAgent"
       },
       {
+        "class_name": "TestRpcMcpClientAgent",
+        "name": "TestRpcMcpClientAgent"
+      },
+      {
         "class_name": "TestStateAgent",
         "name": "TestStateAgent"
       },
@@ -110,6 +114,18 @@
       {
         "class_name": "TestFiberAgent",
         "name": "TestFiberAgent"
+      },
+      {
+        "class_name": "TestSessionAgent",
+        "name": "TestSessionAgent"
+      },
+      {
+        "class_name": "TestSessionAgentNoMicroCompaction",
+        "name": "TestSessionAgentNoMicroCompaction"
+      },
+      {
+        "class_name": "TestSessionAgentCustomRules",
+        "name": "TestSessionAgentCustomRules"
       }
     ]
   },
@@ -123,6 +139,26 @@
       "name": "simple-test-workflow",
       "binding": "SIMPLE_WORKFLOW",
       "class_name": "SimpleTestWorkflow"
+    },
+    {
+      "name": "throw-in-run-workflow",
+      "binding": "THROW_IN_RUN_WORKFLOW",
+      "class_name": "ThrowInRunWorkflow"
+    },
+    {
+      "name": "report-error-then-throw-workflow",
+      "binding": "REPORT_ERROR_THEN_THROW_WORKFLOW",
+      "class_name": "ReportErrorThenThrowWorkflow"
+    },
+    {
+      "name": "report-error-only-workflow",
+      "binding": "REPORT_ERROR_ONLY_WORKFLOW",
+      "class_name": "ReportErrorOnlyWorkflow"
+    },
+    {
+      "name": "throw-non-error-workflow",
+      "binding": "THROW_NON_ERROR_WORKFLOW",
+      "class_name": "ThrowNonErrorWorkflow"
     }
   ],
   "main": "worker.ts",
@@ -143,6 +179,7 @@
         "TestScheduleAgent",
         "TestWorkflowAgent",
         "TestAddMcpServerAgent",
+        "TestRpcMcpClientAgent",
         "TestStateAgent",
         "TestStateAgentNoInitial",
         "TestThrowingStateAgent",
@@ -154,7 +191,10 @@
         "TestQueueAgent",
         "TestRetryAgent",
         "TestRetryDefaultsAgent",
-        "TestFiberAgent"
+        "TestFiberAgent",
+        "TestSessionAgent",
+        "TestSessionAgentNoMicroCompaction",
+        "TestSessionAgentCustomRules"
       ],
       "tag": "v1"
     }

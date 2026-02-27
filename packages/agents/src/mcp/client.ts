@@ -1,5 +1,4 @@
 import type { Client } from "@modelcontextprotocol/sdk/client/index.js";
-import escapeHtml from "escape-html";
 import type { RequestOptions } from "@modelcontextprotocol/sdk/shared/protocol.js";
 import type {
   CallToolRequest,
@@ -25,6 +24,7 @@ import {
   type MCPTransportOptions
 } from "./client-connection";
 import { toErrorMessage } from "./errors";
+import { RPC_DO_PREFIX } from "./rpc";
 import type { TransportType } from "./types";
 import type { MCPServerRow } from "./client-storage";
 import type { AgentMcpOAuthProvider } from "./do-oauth-client-provider";
@@ -33,6 +33,65 @@ import { DurableObjectOAuthClientProvider } from "./do-oauth-client-provider";
 const defaultClientOptions: ConstructorParameters<typeof Client>[1] = {
   jsonSchemaValidator: new CfWorkerJsonSchemaValidator()
 };
+
+/**
+ * Blocked hostname patterns for SSRF protection.
+ * Prevents MCP client from connecting to internal/private network addresses.
+ */
+const BLOCKED_HOSTNAMES = new Set([
+  "localhost",
+  "0.0.0.0",
+  "[::1]",
+  "[::]",
+  "metadata.google.internal"
+]);
+
+/**
+ * Check whether a hostname looks like a private/internal IP address.
+ * Blocks RFC 1918, link-local, loopback, and cloud metadata endpoints.
+ */
+function isBlockedUrl(url: string): boolean {
+  let parsed: URL;
+  try {
+    parsed = new URL(url);
+  } catch {
+    return true; // Malformed URLs are blocked
+  }
+
+  const hostname = parsed.hostname;
+
+  if (BLOCKED_HOSTNAMES.has(hostname)) return true;
+
+  // IPv4 checks
+  const ipv4Parts = hostname.split(".");
+  if (ipv4Parts.length === 4 && ipv4Parts.every((p) => /^\d{1,3}$/.test(p))) {
+    const [a, b] = ipv4Parts.map(Number);
+    // 10.0.0.0/8
+    if (a === 10) return true;
+    // 172.16.0.0/12
+    if (a === 172 && b >= 16 && b <= 31) return true;
+    // 192.168.0.0/16
+    if (a === 192 && b === 168) return true;
+    // 127.0.0.0/8 (loopback)
+    if (a === 127) return true;
+    // 169.254.0.0/16 (link-local / cloud metadata)
+    if (a === 169 && b === 254) return true;
+    // 0.0.0.0/8
+    if (a === 0) return true;
+  }
+
+  // IPv6 private range checks
+  // URL parser keeps brackets: hostname for [fc00::1] is "[fc00::1]"
+  if (hostname.startsWith("[") && hostname.endsWith("]")) {
+    const addr = hostname.slice(1, -1).toLowerCase();
+    // fc00::/7 — unique local addresses (fc00:: through fdff::)
+    if (addr.startsWith("fc") || addr.startsWith("fd")) return true;
+    // fe80::/10 — link-local addresses
+    if (addr.startsWith("fe80")) return true;
+  }
+
+  return false;
+}
 
 /**
  * Options that can be stored in the server_options column
@@ -53,7 +112,7 @@ export type MCPServerOptions = {
  */
 export type MCPOAuthCallbackResult =
   | { serverId: string; authSuccess: true; authError?: undefined }
-  | { serverId: string; authSuccess: false; authError: string };
+  | { serverId?: string; authSuccess: false; authError: string };
 
 /**
  * Options for registering an MCP server
@@ -61,7 +120,7 @@ export type MCPOAuthCallbackResult =
 export type RegisterServerOptions = {
   url: string;
   name: string;
-  callbackUrl: string;
+  callbackUrl?: string;
   client?: ConstructorParameters<typeof Client>[1];
   transport?: MCPTransportOptions;
   authUrl?: string;
@@ -106,14 +165,18 @@ export type MCPClientOAuthCallbackConfig = {
   customHandler?: (result: MCPClientOAuthResult) => Response;
 };
 
-export type MCPClientOAuthResult = {
-  serverId: string;
-  authSuccess: boolean;
-  authError?: string;
-};
+export type MCPClientOAuthResult =
+  | { serverId: string; authSuccess: true; authError?: undefined }
+  | {
+      serverId?: string;
+      authSuccess: false;
+      /** May contain untrusted content from external OAuth providers. Escape appropriately for your output context. */
+      authError: string;
+    };
 
 export type MCPClientManagerOptions = {
   storage: DurableObjectStorage;
+  createAuthProvider?: (callbackUrl: string) => AgentMcpOAuthProvider;
 };
 
 /**
@@ -125,6 +188,9 @@ export class MCPClientManager {
   private _oauthCallbackConfig?: MCPClientOAuthCallbackConfig;
   private _connectionDisposables = new Map<string, DisposableStore>();
   private _storage: DurableObjectStorage;
+  private _createAuthProviderFn?: (
+    callbackUrl: string
+  ) => AgentMcpOAuthProvider;
   private _isRestored = false;
 
   /** @internal Protected for testing purposes. */
@@ -157,6 +223,7 @@ export class MCPClientManager {
       );
     }
     this._storage = options.storage;
+    this._createAuthProviderFn = options.createAuthProvider;
   }
 
   // SQL helper - runs a query and returns results as array
@@ -256,8 +323,43 @@ export class MCPClientManager {
   }
 
   /**
+   * Get saved RPC servers from storage (servers with rpc:// URLs).
+   * These are restored separately by the Agent class since they need env bindings.
+   */
+  getRpcServersFromStorage(): MCPServerRow[] {
+    return this.getServersFromStorage().filter((s) =>
+      s.server_url.startsWith(RPC_DO_PREFIX)
+    );
+  }
+
+  /**
+   * Save an RPC server to storage for hibernation recovery.
+   * The bindingName is stored in server_options so the Agent can look up
+   * the namespace from env during restore.
+   */
+  saveRpcServerToStorage(
+    id: string,
+    name: string,
+    normalizedName: string,
+    bindingName: string,
+    props?: Record<string, unknown>
+  ): void {
+    this.saveServerToStorage({
+      id,
+      name,
+      server_url: `${RPC_DO_PREFIX}${normalizedName}`,
+      client_id: null,
+      auth_url: null,
+      callback_url: "",
+      server_options: JSON.stringify({ bindingName, props })
+    });
+  }
+
+  /**
    * Restore MCP server connections from storage
-   * This method is called on Agent initialization to restore previously connected servers
+   * This method is called on Agent initialization to restore previously connected servers.
+   * RPC servers (rpc:// URLs) are skipped here -- they are restored by the Agent class
+   * which has access to env bindings.
    *
    * @param clientName Name to use for OAuth client (typically the agent instance name)
    */
@@ -274,6 +376,10 @@ export class MCPClientManager {
     }
 
     for (const server of servers) {
+      if (server.server_url.startsWith(RPC_DO_PREFIX)) {
+        continue;
+      }
+
       const existingConn = this.mcpConnections[server.id];
 
       // Skip if connection already exists and is in a good state
@@ -311,25 +417,25 @@ export class MCPClientManager {
         }
       }
 
-      let parsedOptions: MCPServerOptions | null = null;
-      if (server.server_options) {
-        try {
-          parsedOptions = JSON.parse(server.server_options);
-        } catch (e) {
-          console.error(
-            `[MCPClientManager] Failed to parse server_options for ${server.id}:`,
-            e
-          );
-          continue;
+      const parsedOptions: MCPServerOptions | null = server.server_options
+        ? JSON.parse(server.server_options)
+        : null;
+
+      let authProvider: AgentMcpOAuthProvider | undefined;
+      if (server.callback_url) {
+        authProvider = this._createAuthProviderFn
+          ? this._createAuthProviderFn(server.callback_url)
+          : this.createAuthProvider(
+              server.id,
+              server.callback_url,
+              clientName,
+              server.client_id ?? undefined
+            );
+        authProvider.serverId = server.id;
+        if (server.client_id) {
+          authProvider.clientId = server.client_id;
         }
       }
-
-      const authProvider = this.createAuthProvider(
-        server.id,
-        server.callback_url,
-        clientName,
-        server.client_id ?? undefined
-      );
 
       // Create the in-memory connection object (no need to save to storage - we just read from it!)
       const conn = this.createConnection(server.id, server.server_url, {
@@ -437,6 +543,12 @@ export class MCPClientManager {
         options.transport.authProvider.clientId =
           options.reconnect?.oauthClientId;
       }
+    }
+
+    if (isBlockedUrl(url)) {
+      throw new Error(
+        `Blocked URL: ${url} — MCP client connections to private/internal addresses are not allowed`
+      );
     }
 
     // During OAuth reconnect, reuse existing connection to preserve state
@@ -591,6 +703,12 @@ export class MCPClientManager {
     id: string,
     options: RegisterServerOptions
   ): Promise<string> {
+    if (isBlockedUrl(options.url)) {
+      throw new Error(
+        `Blocked URL: ${options.url} — MCP client connections to private/internal addresses are not allowed`
+      );
+    }
+
     // Create the in-memory connection
     this.createConnection(id, options.url, {
       client: options.client,
@@ -607,7 +725,7 @@ export class MCPClientManager {
       id,
       name: options.name,
       server_url: options.url,
-      callback_url: options.callbackUrl,
+      callback_url: options.callbackUrl ?? "",
       client_id: options.clientId ?? null,
       auth_url: options.authUrl ?? null,
       server_options: JSON.stringify({
@@ -732,39 +850,93 @@ export class MCPClientManager {
     });
   }
 
-  async handleCallbackRequest(req: Request): Promise<MCPOAuthCallbackResult> {
+  private validateCallbackRequest(
+    req: Request
+  ):
+    | { valid: true; serverId: string; code: string; state: string }
+    | { valid: false; serverId?: string; error: string } {
     const url = new URL(req.url);
     const code = url.searchParams.get("code");
     const state = url.searchParams.get("state");
     const error = url.searchParams.get("error");
     const errorDescription = url.searchParams.get("error_description");
 
-    // Early validation - these throw because we can't identify the connection
+    // Early validation - return errors because we can't identify the connection
     if (!state) {
-      throw new Error("Unauthorized: no state provided");
+      return {
+        valid: false,
+        error: "Unauthorized: no state provided"
+      };
     }
 
     const serverId = this.extractServerIdFromState(state);
     if (!serverId) {
-      throw new Error(
-        "No serverId found in state parameter. Expected format: {nonce}.{serverId}"
-      );
+      return {
+        valid: false,
+        error:
+          "No serverId found in state parameter. Expected format: {nonce}.{serverId}"
+      };
+    }
+
+    if (error) {
+      return {
+        serverId: serverId,
+        valid: false,
+        error: errorDescription || error
+      };
+    }
+
+    if (!code) {
+      return {
+        serverId: serverId,
+        valid: false,
+        error: "Unauthorized: no code provided"
+      };
     }
 
     const servers = this.getServersFromStorage();
     const serverExists = servers.some((server) => server.id === serverId);
     if (!serverExists) {
-      throw new Error(
-        `No server found with id "${serverId}". Was the request matched with \`isCallbackRequest()\`?`
-      );
+      return {
+        serverId: serverId,
+        valid: false,
+        error: `No server found with id "${serverId}". Was the request matched with \`isCallbackRequest()\`?`
+      };
     }
 
     if (this.mcpConnections[serverId] === undefined) {
-      throw new Error(`Could not find serverId: ${serverId}`);
+      return {
+        serverId: serverId,
+        valid: false,
+        error: `No connection found for serverId "${serverId}".`
+      };
     }
 
-    // We have a valid connection - all errors from here should fail the connection
-    const conn = this.mcpConnections[serverId];
+    return {
+      valid: true,
+      serverId,
+      code: code,
+      state: state
+    };
+  }
+
+  async handleCallbackRequest(req: Request): Promise<MCPOAuthCallbackResult> {
+    const validation = this.validateCallbackRequest(req);
+
+    if (!validation.valid) {
+      if (validation.serverId && this.mcpConnections[validation.serverId]) {
+        return this.failConnection(validation.serverId, validation.error);
+      }
+
+      return {
+        serverId: validation.serverId,
+        authSuccess: false,
+        authError: validation.error
+      };
+    }
+
+    const { serverId, code, state } = validation;
+    const conn = this.mcpConnections[serverId]; // We have a valid connection - all errors from here should fail the connection
 
     try {
       if (!conn.options.transport.authProvider) {
@@ -781,15 +953,6 @@ export class MCPClientManager {
       const stateValidation = await authProvider.checkState(state);
       if (!stateValidation.valid) {
         throw new Error(stateValidation.error || "Invalid state");
-      }
-
-      if (error) {
-        // Escape external OAuth error params to prevent XSS
-        throw new Error(escapeHtml(errorDescription || error));
-      }
-
-      if (!code) {
-        throw new Error("Unauthorized: no code provided");
       }
 
       // Already authenticated - just return success
@@ -987,11 +1150,12 @@ export class MCPClientManager {
       }
     }
 
-    const entries: [string, unknown][] = [];
+    const entries: [string, ToolSet[string]][] = [];
     for (const tool of getNamespacedData(this.mcpConnections, "tools")) {
       try {
+        const toolKey = `tool_${tool.serverId.replace(/-/g, "")}_${tool.name}`;
         entries.push([
-          `tool_${tool.serverId.replace(/-/g, "")}_${tool.name}`,
+          toolKey,
           {
             description: tool.description,
             execute: async (args) => {
@@ -1015,16 +1179,15 @@ export class MCPClientManager {
             },
             inputSchema: tool.inputSchema
               ? this.jsonSchema!(tool.inputSchema as JSONSchema7)
-              : undefined,
+              : this.jsonSchema!({ type: "object" } as JSONSchema7),
             outputSchema: tool.outputSchema
               ? this.jsonSchema!(tool.outputSchema as JSONSchema7)
               : undefined
           }
         ]);
       } catch (e) {
-        console.error(
-          `[getAITools] Failed to map tool "${tool.name}" from server "${tool.serverId}":`,
-          e
+        console.warn(
+          `[getAITools] Skipping tool "${tool.name}" from "${tool.serverId}": ${e}`
         );
       }
     }
@@ -1163,10 +1326,11 @@ export class MCPClientManager {
       | typeof CompatibilityCallToolResultSchema,
     options?: RequestOptions
   ) {
-    const unqualifiedName = params.name.replace(`${params.serverId}.`, "");
-    return this.mcpConnections[params.serverId].client.callTool(
+    const { serverId, ...mcpParams } = params;
+    const unqualifiedName = mcpParams.name.replace(`${serverId}.`, "");
+    return this.mcpConnections[serverId].client.callTool(
       {
-        ...params,
+        ...mcpParams,
         name: unqualifiedName
       },
       resultSchema,

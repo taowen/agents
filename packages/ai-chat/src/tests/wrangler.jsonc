@@ -13,6 +13,18 @@
       {
         "class_name": "TestChatAgent",
         "name": "TestChatAgent"
+      },
+      {
+        "class_name": "AgentWithSuperCall",
+        "name": "AgentWithSuperCall"
+      },
+      {
+        "class_name": "AgentWithoutSuperCall",
+        "name": "AgentWithoutSuperCall"
+      },
+      {
+        "class_name": "SlowStreamAgent",
+        "name": "SlowStreamAgent"
       }
     ]
   },
@@ -21,6 +33,18 @@
     {
       "new_sqlite_classes": ["TestChatAgent"],
       "tag": "v1"
+    },
+    {
+      "new_sqlite_classes": ["AgentWithSuperCall"],
+      "tag": "v2"
+    },
+    {
+      "new_sqlite_classes": ["AgentWithoutSuperCall"],
+      "tag": "v3"
+    },
+    {
+      "new_sqlite_classes": ["SlowStreamAgent"],
+      "tag": "v4"
     }
   ]
 }

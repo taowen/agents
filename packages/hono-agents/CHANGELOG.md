@@ -1,5 +1,17 @@
 # hono-agents
 
+## 3.0.6
+
+### Patch Changes
+
+- [#973](https://github.com/cloudflare/agents/pull/973) [`969fbff`](https://github.com/cloudflare/agents/commit/969fbff702d5702c1f0ea6faaecb3dfd0431a01b) Thanks [@threepointone](https://github.com/threepointone)! - Update dependencies
+
+## 3.0.5
+
+### Patch Changes
+
+- [#937](https://github.com/cloudflare/agents/pull/937) [`8b472a2`](https://github.com/cloudflare/agents/commit/8b472a2c8758c07430501dbc37c5817162df3954) Thanks [@deathbyknowledge](https://github.com/deathbyknowledge)! - Fix env type in `hono-agents` middleware
+
 ## 3.0.4
 
 ### Patch Changes

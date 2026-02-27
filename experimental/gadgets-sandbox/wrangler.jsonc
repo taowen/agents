@@ -1,6 +1,6 @@
 {
   "$schema": "../../node_modules/wrangler/config-schema.json",
-  "ai": { "binding": "AI" },
+  "ai": { "binding": "AI", "remote": true },
   "compatibility_date": "2026-01-28",
   // "experimental" enables ctx.facets, ctx.exports, and worker_loaders.
   "compatibility_flags": ["nodejs_compat", "experimental"],

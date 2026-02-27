@@ -1,5 +1,41 @@
 # @cloudflare/codemode
 
+## 0.1.1
+
+### Patch Changes
+
+- [#962](https://github.com/cloudflare/agents/pull/962) [`ef46d68`](https://github.com/cloudflare/agents/commit/ef46d68e9c381b7541c4aa803014144abce4fb72) Thanks [@tumberger](https://github.com/tumberger)! - Validate tool arguments against Zod schema before execution in codemode sandbox
+
+- [#973](https://github.com/cloudflare/agents/pull/973) [`969fbff`](https://github.com/cloudflare/agents/commit/969fbff702d5702c1f0ea6faaecb3dfd0431a01b) Thanks [@threepointone](https://github.com/threepointone)! - Update dependencies
+
+- [#960](https://github.com/cloudflare/agents/pull/960) [`179b8cb`](https://github.com/cloudflare/agents/commit/179b8cbc60bc9e6ac0d2ee26c430d842950f5f08) Thanks [@mattzcarey](https://github.com/mattzcarey)! - Harden JSON Schema to TypeScript converter for production use
+  - Add depth and circular reference guards to prevent stack overflows on recursive or deeply nested schemas
+  - Add `$ref` resolution for internal JSON Pointers (`#/definitions/...`, `#/$defs/...`, `#`)
+  - Add tuple support (`prefixItems` for JSON Schema 2020-12, array `items` for draft-07)
+  - Add OpenAPI 3.0 `nullable: true` support across all schema branches
+  - Fix string escaping in enum/const values, property names (control chars, U+2028/U+2029), and JSDoc comments (`*/`)
+  - Add per-tool error isolation in `generateTypes()` so one malformed schema cannot crash the pipeline
+  - Guard missing `inputSchema` in `getAITools()` with a fallback to `{ type: "object" }`
+  - Add per-tool error isolation in `getAITools()` so one bad MCP tool does not break the entire tool set
+
+- [#961](https://github.com/cloudflare/agents/pull/961) [`f6aa79f`](https://github.com/cloudflare/agents/commit/f6aa79f3bf86922db73b4d33439262aefcbcf817) Thanks [@mattzcarey](https://github.com/mattzcarey)! - Updated default tool prompt to explicitly request JavaScript code from LLMs, preventing TypeScript syntax errors in the Dynamic Worker executor.
+
+## 0.1.0
+
+### Minor Changes
+
+- [#879](https://github.com/cloudflare/agents/pull/879) [`90e54da`](https://github.com/cloudflare/agents/commit/90e54dab21f7c2c783aac117693918765e8b254b) Thanks [@mattzcarey](https://github.com/mattzcarey)! - Remove experimental_codemode() and CodeModeProxy. Replace with createCodeTool() from @cloudflare/codemode/ai which returns a standard AI SDK Tool. The package no longer owns an LLM call or model choice. Users call streamText/generateText with their own model and pass the codemode tool.
+
+  The AI-dependent export (createCodeTool) is now at @cloudflare/codemode/ai. The root export (@cloudflare/codemode) contains the executor, type generation, and utilities which do not require the ai peer dependency.
+
+  ToolDispatcher (extends RpcTarget) replaces CodeModeProxy (extends WorkerEntrypoint) for dispatching tool calls from the sandbox back to the host. It is passed as a parameter to the dynamic worker's evaluate() method instead of being injected as an env binding, removing the need for CodeModeProxy and globalOutbound service bindings. Only a WorkerLoader binding is required now. globalOutbound on DynamicWorkerExecutor defaults to null which blocks fetch/connect at the runtime level. New Executor interface (execute(code, fns) => ExecuteResult) allows custom sandbox implementations. DynamicWorkerExecutor is the Cloudflare Workers implementation. Console output captured in ExecuteResult.logs. Configurable execution timeout.
+
+  AST-based code normalization via acorn replaces regex. sanitizeToolName() exported for converting MCP-style tool names to valid JS identifiers.
+
+### Patch Changes
+
+- [#954](https://github.com/cloudflare/agents/pull/954) [`943c407`](https://github.com/cloudflare/agents/commit/943c4070992bb836625abb5bf4e3271a6f52f7a2) Thanks [@threepointone](https://github.com/threepointone)! - update dependencies
+
 ## 0.0.8
 
 ### Patch Changes

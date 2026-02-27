@@ -66,7 +66,7 @@ class MyAgent extends Agent {
 Removes a specific task from the queue by ID.
 
 ```typescript
-async dequeue(id: string): Promise<void>
+dequeue(id: string): void
 ```
 
 **Parameters:**
@@ -77,7 +77,7 @@ async dequeue(id: string): Promise<void>
 
 ```typescript
 // Remove a specific task
-await agent.dequeue("abc123def");
+agent.dequeue("abc123def");
 ```
 
 ### dequeueAll()
@@ -85,14 +85,14 @@ await agent.dequeue("abc123def");
 Removes all tasks from the queue.
 
 ```typescript
-async dequeueAll(): Promise<void>
+dequeueAll(): void
 ```
 
 **Example:**
 
 ```typescript
 // Clear the entire queue
-await agent.dequeueAll();
+agent.dequeueAll();
 ```
 
 ### dequeueAllByCallback()
@@ -100,7 +100,7 @@ await agent.dequeueAll();
 Removes all tasks that match a specific callback method.
 
 ```typescript
-async dequeueAllByCallback(callback: string): Promise<void>
+dequeueAllByCallback(callback: string): void
 ```
 
 **Parameters:**
@@ -111,7 +111,7 @@ async dequeueAllByCallback(callback: string): Promise<void>
 
 ```typescript
 // Remove all email processing tasks
-await agent.dequeueAllByCallback("processEmail");
+agent.dequeueAllByCallback("processEmail");
 ```
 
 ### getQueue()
@@ -119,7 +119,7 @@ await agent.dequeueAllByCallback("processEmail");
 Retrieves a specific queued task by ID.
 
 ```typescript
-async getQueue(id: string): Promise<QueueItem<string> | undefined>
+getQueue(id: string): QueueItem<string> | undefined
 ```
 
 **Parameters:**
@@ -133,7 +133,7 @@ async getQueue(id: string): Promise<QueueItem<string> | undefined>
 **Example:**
 
 ```typescript
-const task = await agent.getQueue("abc123def");
+const task = agent.getQueue("abc123def");
 if (task) {
   console.log(`Task callback: ${task.callback}`);
   console.log(`Task payload:`, task.payload);
@@ -145,7 +145,7 @@ if (task) {
 Retrieves all queued tasks that match a specific key-value pair in their payload.
 
 ```typescript
-async getQueues(key: string, value: string): Promise<QueueItem<string>[]>
+getQueues(key: string, value: string): QueueItem<string>[]
 ```
 
 **Parameters:**
