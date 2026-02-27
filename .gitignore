@@ -141,6 +141,8 @@ dist
 # cloudflare/wrangler
 .wrangler
 .dev.vars
+worker-configuration.d.ts
+bug-reports/
 
 # macOS
 .DS_Store

@@ -152,7 +152,7 @@ export class SessionContext {
       customCommands: [
         createSessionsCommand(this.env.DB, userId, this.env.ChatAgent),
         createSearchCommand(this.env),
-        createWebFetchCommand(this.env)
+        createWebFetchCommand(this.env, this.env.DB, userId)
       ]
     });
     this.bash = bash;

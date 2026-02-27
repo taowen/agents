@@ -1,5 +1,7 @@
 import { defineCommand } from "just-bash";
 import type { CustomCommand } from "just-bash";
+import { generateText } from "ai";
+import { getCachedLlmConfig, getLlmModel } from "./llm-config";
 
 /**
  * Create a `web-search` custom command that searches the web via the configured search API.
@@ -68,70 +70,100 @@ export function createSearchCommand(env: Env): CustomCommand {
 
 /**
  * Create a `web-fetch` custom command that fetches a URL and returns its content as markdown
- * using the same search API as web-search.
+ * via Cloudflare Browser Rendering API. An optional prompt triggers LLM extraction.
  *
  * Usage:
- *   web-fetch <url>   # fetch a webpage and return markdown
+ *   web-fetch <url>          # fetch a webpage and return markdown
+ *   web-fetch <url> "<prompt>" # fetch then extract via LLM
  */
-export function createWebFetchCommand(env: Env): CustomCommand {
+export function createWebFetchCommand(
+  env: Env,
+  db: D1Database,
+  userId: string
+): CustomCommand {
   return defineCommand("web-fetch", async (args: string[]) => {
     if (args.length === 0 || args[0] === "--help" || args[0] === "-h") {
       return {
         stdout:
-          "Usage: web-fetch <url>\n" +
-          "  Fetch a webpage and return its content as markdown.\n",
+          'Usage: web-fetch <url> ["prompt"]\n' +
+          "  Fetch a webpage and return its content as markdown.\n" +
+          "  If a prompt is given (in double quotes), use LLM to extract relevant content.\n",
         stderr: "",
         exitCode: 0
       };
     }
 
-    if (!env.SEARCH_API_KEY) {
+    if (!env.CF_ACCOUNT_ID || !env.CF_BROWSER_TOKEN) {
       return {
         stdout: "",
-        stderr: "web-fetch: SEARCH_API_KEY is not set\n",
+        stderr: "web-fetch: CF_ACCOUNT_ID and CF_BROWSER_TOKEN must be set\n",
         exitCode: 1
       };
     }
 
     const url = args[0];
+    const prompt = args.length > 1 ? args.slice(1).join(" ") : null;
     try {
-      const resp = await fetch(env.SEARCH_API_BASE_URL + "/v1/responses", {
-        method: "POST",
-        headers: {
-          "Content-Type": "application/json",
-          Authorization: "Bearer " + env.SEARCH_API_KEY
-        },
-        body: JSON.stringify({
-          model: env.SEARCH_API_MODEL,
-          input: [
-            {
-              role: "user",
-              content:
-                "Use web_search tool to fetch and read the content of this URL: " +
-                url +
-                "\nReturn the full page content as markdown."
-            }
-          ],
-          tools: [{ type: "web_search" }]
-        })
-      });
+      const resp = await fetch(
+        `https://api.cloudflare.com/client/v4/accounts/${env.CF_ACCOUNT_ID}/browser-rendering/markdown`,
+        {
+          method: "POST",
+          headers: {
+            "Content-Type": "application/json",
+            Authorization: `Bearer ${env.CF_BROWSER_TOKEN}`
+          },
+          body: JSON.stringify({ url, gotoOptions: { timeout: 60000 } })
+        }
+      );
       // eslint-disable-next-line @typescript-eslint/no-explicit-any
       const data = (await resp.json()) as any;
-      if (data.error) {
+      if (!data.success) {
         return {
           stdout: "",
-          stderr: "web-fetch: " + data.error.message + "\n",
+          stderr: "web-fetch: " + JSON.stringify(data.errors || data) + "\n",
           exitCode: 1
         };
       }
-      // eslint-disable-next-line @typescript-eslint/no-explicit-any
-      const outputMsg = data.output?.find((o: any) => o.type === "message");
-      // eslint-disable-next-line @typescript-eslint/no-explicit-any
-      const textContent = outputMsg?.content?.find(
-        (c: any) => c.type === "output_text"
-      );
-      const text = textContent?.text || JSON.stringify(data.output);
-      return { stdout: text + "\n", stderr: "", exitCode: 0 };
+      const markdown = data.result || "(empty page)";
+
+      if (!prompt) {
+        return { stdout: markdown + "\n", stderr: "", exitCode: 0 };
+      }
+
+      // LLM extraction
+      try {
+        const { data: llmConfig } = await getCachedLlmConfig(db, userId, null);
+        const model = getLlmModel(env, llmConfig);
+        const { text: extracted } = await generateText({
+          model,
+          system:
+            "You are a content extractor. Output ONLY the extracted content, no explanations.",
+          messages: [
+            { role: "user", content: `${prompt}\n\n---\n\n${markdown}` }
+          ],
+          maxOutputTokens: 4096
+        });
+        if (extracted) {
+          return { stdout: extracted + "\n", stderr: "", exitCode: 0 };
+        }
+        return {
+          stdout: markdown + "\n",
+          stderr:
+            "web-fetch: LLM returned no content, falling back to raw markdown\n",
+          exitCode: 0
+        };
+      } catch (llmErr) {
+        const llmMsg =
+          llmErr instanceof Error ? llmErr.message : String(llmErr);
+        return {
+          stdout: markdown + "\n",
+          stderr:
+            "web-fetch: LLM extraction failed (" +
+            llmMsg +
+            "), falling back to raw markdown\n",
+          exitCode: 0
+        };
+      }
     } catch (err) {
       const msg = err instanceof Error ? err.message : String(err);
       return { stdout: "", stderr: "web-fetch: " + msg + "\n", exitCode: 1 };

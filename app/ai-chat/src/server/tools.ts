@@ -17,6 +17,7 @@ export function createBashTool(bash: Bash, ensureMounted: () => Promise<void>) {
       "Supports ls, grep, awk, sed, find, cat, echo, mkdir, cp, mv, sort, uniq, wc, head, tail, curl, web-search, web-fetch, and more. " +
       "Use curl to fetch raw content from URLs. Use `web-search <query>` to search the web (query must be in English). " +
       "Use `web-fetch <url>` to fetch a webpage and return its content as markdown (renders JavaScript). " +
+      'Use `web-fetch <url> "<prompt>"` to fetch and extract specific content via LLM (prompt must be in double quotes). ' +
       "Files persist across commands within the session.",
     inputSchema: z.object({
       command: z.string().describe("The bash command to execute")

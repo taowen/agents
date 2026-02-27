@@ -65,6 +65,8 @@ export function buildSystemPrompt(): string {
       "Use `web-search <query>` to search the web for real-time information (documentation, current events, error messages, etc.). " +
       "The query MUST be in English — translate non-English queries before searching. " +
       "Use `web-fetch <url>` to fetch a webpage and get its content as markdown (renders JavaScript). " +
+      'Use `web-fetch <url> "<prompt>"` to fetch a webpage and then use LLM to extract specific content based on the prompt, ' +
+      "for example: bash({command: 'web-fetch https://example.com \"extract the page title and main heading\"'}). " +
       "curl is for fetching raw HTTP responses; web-search is for getting search results; web-fetch is for reading webpage content as markdown.",
 
     // Scheduling

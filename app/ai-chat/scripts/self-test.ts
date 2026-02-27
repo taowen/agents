@@ -73,25 +73,7 @@ async function getToken(): Promise<string> {
 
 const token = await getToken();
 
-// Create a proper D1 session so the scheduled task's D1 existence check passes
-const createRes = await fetch(`${BASE}/api/sessions`, {
-  method: "POST",
-  headers: {
-    Authorization: `Bearer ${token}`,
-    "Content-Type": "application/json"
-  },
-  body: JSON.stringify({ title: "self-test-schedule" })
-});
-if (!createRes.ok) {
-  console.error(
-    "Failed to create session:",
-    createRes.status,
-    await createRes.text()
-  );
-  process.exit(1);
-}
-const { id: SESSION } = (await createRes.json()) as { id: string };
-console.log("Created D1 session:", SESSION);
+console.log("Token ready, starting tests...");
 
 // Helper: send a chat message via WebSocket and collect the full streamed response
 async function sendChat(session: string, userContent: string): Promise<string> {
@@ -104,8 +86,8 @@ async function sendChat(session: string, userContent: string): Promise<string> {
   return new Promise<string>((resolve, reject) => {
     const timeout = setTimeout(() => {
       ws.close();
-      reject(new Error("WebSocket timeout after 90s"));
-    }, 90_000);
+      reject(new Error("WebSocket timeout after 180s"));
+    }, 180_000);
 
     let collected = "";
 
@@ -182,108 +164,134 @@ async function getMessages(session: string): Promise<any[]> {
   });
 }
 
-console.log(`\nUsing session: ${SESSION}`);
+// Helper: create a session, send one message, dump messages, cleanup
+async function testStep(
+  label: string,
+  userMsg: string,
+  checkFn: (parts: any[]) => boolean
+) {
+  console.log(`\n--- ${label} ---`);
+  const res = await fetch(`${BASE}/api/sessions`, {
+    method: "POST",
+    headers: {
+      Authorization: `Bearer ${token}`,
+      "Content-Type": "application/json"
+    },
+    body: JSON.stringify({ title: `self-test-${label}` })
+  });
+  const { id: sid } = (await res.json()) as { id: string };
+  console.log(`Session: ${sid}`);
 
-// ---- Step 1: Ask the agent to schedule a task 10s from now ----
-console.log("\n--- Step 1: Ask agent to schedule a delayed task ---");
-const chatResult = await sendChat(
-  SESSION,
-  'Schedule a one-time task to run in 10 seconds from now. The task description should be "self-test-delayed" and the prompt should be "reply with exactly: SCHEDULED_TASK_OK". Use the schedule_task tool with a delay. Do NOT use bash.'
-);
-console.log("Agent response stream length:", chatResult.length);
+  await sendChat(sid, userMsg);
+  console.log("Chat stream done.");
 
-// Verify the schedule_task tool was called
-if (chatResult.includes("schedule_task") || chatResult.includes("schedule")) {
-  console.log("✅ schedule_task tool was invoked in the response.");
-} else {
-  console.log(
-    "⚠️ schedule_task tool may not have been invoked. Checking anyway..."
-  );
-}
+  const msgs = await getMessages(sid);
+  const allParts: any[] = [];
+  for (const m of msgs) {
+    console.log(`[${m.role}]`);
+    for (const p of m.parts || []) {
+      allParts.push(p);
+      if (p.type === "text") {
+        console.log(`  text: ${p.text.slice(0, 300)}`);
+      } else if (p.type?.startsWith("tool-")) {
+        const inputStr =
+          typeof p.input === "string" ? p.input : JSON.stringify(p.input);
+        console.log(`  ${p.type} (${p.state}) input=${inputStr.slice(0, 200)}`);
+        if (p.output) {
+          const outStr =
+            typeof p.output === "string" ? p.output : JSON.stringify(p.output);
+          console.log(`  output: ${outStr.slice(0, 300)}`);
+        }
+      } else if (p.type === "reasoning") {
+        console.log("  (reasoning)");
+      } else {
+        console.log(`  ${p.type}`);
+      }
+    }
+  }
 
-// ---- Step 2: Verify schedule was created ----
-console.log("\n--- Step 2: Check schedules ---");
-const schedRes = await fetch(
-  `${BASE}/agents/chat-agent/${SESSION}/get-schedules`,
-  {
+  const pass = checkFn(allParts);
+  console.log(pass ? `✅ PASS: ${label}` : `❌ FAIL: ${label}`);
+
+  // cleanup
+  await fetch(`${BASE}/agents/chat-agent/${sid}/cancel-all-schedules`, {
+    method: "POST",
     headers: { Authorization: `Bearer ${token}` }
+  }).catch(() => {});
+  await fetch(`${BASE}/api/sessions/${sid}`, {
+    method: "DELETE",
+    headers: { Authorization: `Bearer ${token}` }
+  }).catch(() => {});
+  await fetch(`${BASE}/agents/chat-agent/${sid}/destroy`, {
+    method: "POST",
+    headers: { Authorization: `Bearer ${token}` }
+  }).catch(() => {});
+  return pass;
+}
+
+function hasBashWebFetch(parts: any[], withPrompt: boolean) {
+  for (const p of parts) {
+    if (p.type?.startsWith("tool-") && p.toolName === "bash") {
+      const inputStr =
+        typeof p.input === "string" ? p.input : JSON.stringify(p.input);
+      if (inputStr.includes("web-fetch")) {
+        if (!withPrompt) return true;
+        if (inputStr.includes("extract")) return true;
+      }
+    }
+  }
+  return false;
+}
+
+const r1 = await testStep(
+  "web-fetch (raw)",
+  'Run: bash({command: "web-fetch https://example.com"})',
+  (parts) => hasBashWebFetch(parts, false)
+);
+
+const r2 = await testStep(
+  "web-fetch (with prompt)",
+  "Run this exact command: bash({command: 'web-fetch https://example.com \"extract the page title and main heading\"'}). " +
+    "The prompt must be in double quotes. Do NOT split into separate commands.",
+  (parts) => hasBashWebFetch(parts, true)
+);
+
+const r3 = await testStep(
+  "web-fetch (pipe+redirect)",
+  "Run this exact bash command: web-fetch https://example.com > /home/user/test-fetch.txt && cat /home/user/test-fetch.txt | head -5",
+  (parts) => {
+    let hasRedirect = false;
+    let hasExampleDomain = false;
+    for (const p of parts) {
+      if (p.type?.startsWith("tool-") && p.toolName === "bash") {
+        const inputStr =
+          typeof p.input === "string" ? p.input : JSON.stringify(p.input);
+        if (
+          inputStr.includes("web-fetch") &&
+          (inputStr.includes("> /home/user/") ||
+            inputStr.includes(">/home/user/"))
+        ) {
+          hasRedirect = true;
+        }
+        const outStr = p.output
+          ? typeof p.output === "string"
+            ? p.output
+            : JSON.stringify(p.output)
+          : "";
+        if (outStr.includes("Example Domain")) {
+          hasExampleDomain = true;
+        }
+      }
+    }
+    if (!hasRedirect) console.log("  (missing: redirect to file)");
+    if (!hasExampleDomain)
+      console.log("  (missing: 'Example Domain' in output)");
+    return hasRedirect && hasExampleDomain;
   }
 );
-const schedules = await schedRes.json();
-console.log("Schedules:", JSON.stringify(schedules, null, 2));
 
-// ---- Step 3: Wait for the scheduled task to fire ----
-console.log("\n--- Step 3: Waiting 20s for scheduled task to execute ---");
-await new Promise((r) => setTimeout(r, 20_000));
+console.log(
+  `\n=== Summary: ${r1 && r2 && r3 ? "ALL PASS" : "SOME FAILED"} ===`
+);
 
-// ---- Step 4: Read messages and verify ----
-console.log("\n--- Step 4: Check messages for [Scheduled Task] ---");
-const messages = await getMessages(SESSION);
-console.log(`Total messages: ${messages.length}`);
-
-let foundScheduledUser = false;
-let foundScheduledAssistant = false;
-for (const m of messages) {
-  for (const p of m.parts || []) {
-    if (p.type === "text" && typeof p.text === "string") {
-      if (p.text.includes("[Scheduled Task]") && m.role === "user") {
-        foundScheduledUser = true;
-        console.log(
-          "Found [Scheduled Task] user message:",
-          p.text.slice(0, 120)
-        );
-      }
-      if (
-        m.role === "assistant" &&
-        foundScheduledUser &&
-        !foundScheduledAssistant
-      ) {
-        foundScheduledAssistant = true;
-        console.log("Found assistant response:", p.text.slice(0, 200));
-      }
-    }
-    // Also check for tool invocations in the scheduled task response
-    if (p.type === "tool-invocation") {
-      console.log(`  Tool call: ${p.toolName} (state: ${p.state})`);
-    }
-  }
-}
-
-if (foundScheduledUser && foundScheduledAssistant) {
-  console.log("\n✅ Scheduled task executed via unified chat path!");
-  console.log("   - [Scheduled Task] user message present");
-  console.log(
-    "   - Assistant response present (went through streamText + onChatMessage)"
-  );
-} else if (foundScheduledUser) {
-  console.log(
-    "\n⚠️ Scheduled task user message found but no assistant response yet."
-  );
-  console.log("   The task may still be processing or failed.");
-} else {
-  console.log(
-    "\n❌ No [Scheduled Task] message found. The task may not have fired yet."
-  );
-  console.log(
-    "   Messages found:",
-    messages.map(
-      (m: any) => `${m.role}: ${(m.parts?.[0]?.text || "").slice(0, 60)}`
-    )
-  );
-}
-
-// ---- Cleanup ----
-console.log("\n--- Cleanup ---");
-await fetch(`${BASE}/agents/chat-agent/${SESSION}/cancel-all-schedules`, {
-  method: "POST",
-  headers: { Authorization: `Bearer ${token}` }
-});
-await fetch(`${BASE}/api/sessions/${SESSION}`, {
-  method: "DELETE",
-  headers: { Authorization: `Bearer ${token}` }
-});
-await fetch(`${BASE}/agents/chat-agent/${SESSION}/destroy`, {
-  method: "POST",
-  headers: { Authorization: `Bearer ${token}` }
-});
-console.log("Session and schedules cleaned up.");
+// (cleanup is done per-step inside testStep)
