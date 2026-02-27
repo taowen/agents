@@ -74,6 +74,14 @@
       "custom_domain": true
     },
     {
+      "pattern": "cscreen.cc/*",
+      "zone_name": "cscreen.cc"
+    },
+    {
+      "pattern": "www.cscreen.cc/*",
+      "zone_name": "cscreen.cc"
+    },
+    {
       "pattern": "*.cscreen.cc/*",
       "zone_name": "cscreen.cc"
     }

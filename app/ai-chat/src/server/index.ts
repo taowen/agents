@@ -19,7 +19,7 @@ app.all("*", async (c, next) => {
   const tunnelMatch = host.match(
     /^([a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?)\.cscreen\.cc$/
   );
-  if (!tunnelMatch) return next();
+  if (!tunnelMatch || tunnelMatch[1] === "www") return next();
 
   const tunnelName = tunnelMatch[1];
 
