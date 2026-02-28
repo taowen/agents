@@ -1,6 +1,5 @@
-import { AIChatAgent } from "@cloudflare/ai-chat";
-import type { Connection } from "agents";
-import type { Schedule } from "agents";
+import { AIChatAgent } from "../lib/ai-chat";
+import type { Connection, Schedule } from "../lib/agents";
 import * as Sentry from "@sentry/cloudflare";
 import { instrumentDurableObjectWithSentry } from "@sentry/cloudflare";
 import {
@@ -34,6 +33,7 @@ import { DeviceHub, isDeviceSession } from "./device-hub";
 import { ensureMcpServers } from "./mcp-config";
 import { queryUsageData, logUsageDiagnostics } from "./usage-tracker";
 import { SessionContext, UserFacingError } from "./session-context";
+import { detectTopicChange } from "./compact-topic";
 
 interface DeviceTool {
   function?: { name?: string; description?: string };
@@ -44,7 +44,7 @@ interface DeviceTool {
  * Filesystem is backed by D1, scoped to the authenticated user.
  */
 class ChatAgentBase extends AIChatAgent {
-  maxPersistedMessages = 200;
+  initialMessageCount = 50;
 
   private session: SessionContext;
   private deviceHub: DeviceHub;
@@ -53,6 +53,12 @@ class ChatAgentBase extends AIChatAgent {
   // Deferred promise for internal tasks (device-initiated and scheduled): resolved by onFinish
   private internalTaskDeferred: {
     resolve: (text: string) => void;
+  } | null = null;
+
+  // Accumulated overhead usage (e.g. topic detection) to merge into next assistant message
+  private _pendingOverheadUsage: {
+    inputTokens: number;
+    outputTokens: number;
   } | null = null;
 
   constructor(ctx: DurableObjectState, env: Env) {
@@ -214,8 +220,8 @@ class ChatAgentBase extends AIChatAgent {
   }
 
   async onConnect(
-    connection: import("agents").Connection,
-    ctx: import("agents").ConnectionContext
+    connection: import("../lib/agents").Connection,
+    ctx: import("../lib/agents").ConnectionContext
   ) {
     const uid = await this.session.getUserId(ctx.request);
     await this.session.getSessionUuid(ctx.request);
@@ -336,10 +342,16 @@ class ChatAgentBase extends AIChatAgent {
     return result.toUIMessageStreamResponse({
       messageMetadata: ({ part }) => {
         if (part.type === "finish") {
+          const overhead = this._pendingOverheadUsage;
+          this._pendingOverheadUsage = null;
           return {
             usage: {
-              inputTokens: part.totalUsage.inputTokens,
-              outputTokens: part.totalUsage.outputTokens,
+              inputTokens:
+                (part.totalUsage.inputTokens || 0) +
+                (overhead?.inputTokens || 0),
+              outputTokens:
+                (part.totalUsage.outputTokens || 0) +
+                (overhead?.outputTokens || 0),
               cacheReadTokens:
                 part.totalUsage.inputTokenDetails?.cacheReadTokens
             },
@@ -516,11 +528,38 @@ class ChatAgentBase extends AIChatAgent {
         } as ToolSet;
       }
 
+      // Topic change detection — if new topic, update compact boundary
+      const compactBoundaryId = await this.session.getCompactBoundaryId();
+      if (this.messages.length > 2) {
+        const topicResult = await detectTopicChange(
+          this.session.cachedLlmModel!,
+          this.messages,
+          compactBoundaryId
+        );
+        this._pendingOverheadUsage = topicResult.usage;
+        if (topicResult.isNewTopic) {
+          const newBoundaryMsg = this.messages[this.messages.length - 1];
+          await this.session.setCompactBoundaryId(newBoundaryMsg.id);
+        }
+      }
+
+      // Filter messages from compact boundary for LLM context
+      const currentBoundaryId = await this.session.getCompactBoundaryId();
+      let llmMessages = this.messages;
+      if (currentBoundaryId) {
+        const boundaryIdx = this.messages.findIndex(
+          (m) => m.id === currentBoundaryId
+        );
+        if (boundaryIdx > 0) {
+          llmMessages = this.messages.slice(boundaryIdx);
+        }
+      }
+
       const messages = await Sentry.startSpan(
         { name: "convertMessages", op: "serialize" },
         async () =>
           pruneMessages({
-            messages: await convertToModelMessages(this.messages),
+            messages: await convertToModelMessages(llmMessages),
             toolCalls: "before-last-2-messages",
             reasoning: "before-last-message"
           })

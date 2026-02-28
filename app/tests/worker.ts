@@ -1,11 +1,14 @@
-import { AIChatAgent, type OnChatMessageOptions } from "@cloudflare/ai-chat";
+import {
+  AIChatAgent,
+  type OnChatMessageOptions
+} from "../ai-chat/src/lib/ai-chat";
 import type {
   UIMessage as ChatMessage,
   StreamTextOnFinishCallback,
   ToolSet
 } from "ai";
 import { Hono } from "hono";
-import { routeAgentRequest } from "agents";
+import { routeAgentRequest } from "../ai-chat/src/lib/agents";
 import {
   DebugRingBuffer,
   type DebugEntry,

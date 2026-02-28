@@ -8,7 +8,7 @@
  */
 import { env } from "cloudflare:test";
 import { describe, it, expect, beforeAll } from "vitest";
-import { getAgentByName } from "agents";
+import { getServerByName } from "partyserver";
 import type { UIMessage as ChatMessage } from "ai";
 import { applyD1Schema, createTestUser } from "./test-utils";
 
@@ -22,7 +22,7 @@ describe("Scheduled tasks — DO business flow", () => {
 
   it("executeScheduledTask persists [Scheduled Task] user message + assistant response", async () => {
     const room = crypto.randomUUID();
-    const agentStub = await getAgentByName(env.TestChatAgent, room);
+    const agentStub = await getServerByName(env.TestChatAgent, room);
 
     const result = await agentStub.executeScheduledTask({
       description: "daily-report",
@@ -51,7 +51,7 @@ describe("Scheduled tasks — DO business flow", () => {
 
   it("user message format: [Scheduled Task] ISO (TZ) - description\\n\\nprompt", async () => {
     const room = crypto.randomUUID();
-    const agentStub = await getAgentByName(env.TestChatAgent, room);
+    const agentStub = await getServerByName(env.TestChatAgent, room);
 
     await agentStub.executeScheduledTask({
       description: "test-format",
@@ -77,7 +77,7 @@ describe("Scheduled tasks — DO business flow", () => {
 
   it("defaults timezone to UTC when payload.timezone is absent", async () => {
     const room = crypto.randomUUID();
-    const agentStub = await getAgentByName(env.TestChatAgent, room);
+    const agentStub = await getServerByName(env.TestChatAgent, room);
 
     await agentStub.executeScheduledTask({
       description: "no-tz",
@@ -92,7 +92,7 @@ describe("Scheduled tasks — DO business flow", () => {
 
   it("deferred resolves: executeScheduledTask returns after onChatMessage completes", async () => {
     const room = crypto.randomUUID();
-    const agentStub = await getAgentByName(env.TestChatAgent, room);
+    const agentStub = await getServerByName(env.TestChatAgent, room);
 
     // The deferred should resolve without hanging — this test verifies
     // that the saveMessages → onChatMessage → deferred.resolve pipeline works.
@@ -109,7 +109,7 @@ describe("Scheduled tasks — DO business flow", () => {
 
   it("normal chat unaffected: no deferred means onChatMessage is a no-op for deferred", async () => {
     const room = crypto.randomUUID();
-    const agentStub = await getAgentByName(env.TestChatAgent, room);
+    const agentStub = await getServerByName(env.TestChatAgent, room);
 
     // First: normal chat (no deferred set)
     const userMsg: ChatMessage = {
@@ -136,7 +136,7 @@ describe("Scheduled tasks — DO business flow", () => {
 
   it("D1 session guard: missing session triggers cleanup and returns early", async () => {
     const room = crypto.randomUUID();
-    const agentStub = await getAgentByName(env.TestChatAgent, room);
+    const agentStub = await getServerByName(env.TestChatAgent, room);
 
     // Set userId and sessionUuid in DO storage (simulates production state)
     const userId = await createTestUser(db);
@@ -154,7 +154,7 @@ describe("Scheduled tasks — DO business flow", () => {
 
   it("D1 session guard: existing session allows task to proceed", async () => {
     const room = crypto.randomUUID();
-    const agentStub = await getAgentByName(env.TestChatAgent, room);
+    const agentStub = await getServerByName(env.TestChatAgent, room);
 
     // Create a real user + session in D1
     const userId = await createTestUser(db);
@@ -185,7 +185,7 @@ describe("Scheduled tasks — DO business flow", () => {
 
   it("D1 session guard: skipped when userId/sessionUuid not set", async () => {
     const room = crypto.randomUUID();
-    const agentStub = await getAgentByName(env.TestChatAgent, room);
+    const agentStub = await getServerByName(env.TestChatAgent, room);
 
     // Don't set userId/sessionUuid — guard should be skipped
     const result = await agentStub.executeScheduledTask({

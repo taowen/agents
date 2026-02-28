@@ -2,7 +2,12 @@ import * as Sentry from "@sentry/cloudflare";
 import { tool, type ToolSet } from "ai";
 import { z } from "zod";
 import type { Bash } from "just-bash";
-import type { DeviceHub, ExecLogEntry } from "./device-hub";
+import {
+  type DeviceHub,
+  type ExecLogEntry,
+  getChatAgentStub,
+  findDevices
+} from "./device-hub";
 import {
   type DebugRingBuffer,
   getSentryTraceContext
@@ -110,52 +115,6 @@ export function createDeviceExecTool(
 }
 
 // ---- Device tools (for normal sessions to discover and send tasks to devices) ----
-
-/** Shared helper: query D1 for device sessions and check DO liveness. */
-async function findDevices(
-  env: Env,
-  userId: string
-): Promise<
-  {
-    name: string;
-    sessionId: string;
-    online: boolean;
-    stub: DurableObjectStub;
-  }[]
-> {
-  const rows = await env.DB.prepare(
-    "SELECT id FROM sessions WHERE user_id = ? AND id LIKE 'device-%'"
-  )
-    .bind(userId)
-    .all<{ id: string }>();
-
-  if (rows.results.length === 0) return [];
-
-  const checks = await Promise.allSettled(
-    rows.results.map(async (s) => {
-      const stub = env.ChatAgent.get(
-        env.ChatAgent.idFromName(encodeURIComponent(`${userId}:${s.id}`))
-      );
-      const res = await stub.fetch(new Request("http://agent/status"));
-      const body = (await res.json()) as { online: boolean };
-      const name = s.id.replace("device-", "");
-      return { name, sessionId: s.id, online: body.online, stub };
-    })
-  );
-
-  return checks
-    .filter(
-      (
-        r
-      ): r is PromiseFulfilledResult<{
-        name: string;
-        sessionId: string;
-        online: boolean;
-        stub: DurableObjectStub;
-      }> => r.status === "fulfilled"
-    )
-    .map((r) => r.value);
-}
 
 export function createDeviceTools(
   env: Env,

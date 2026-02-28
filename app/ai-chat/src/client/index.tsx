@@ -1,9 +1,18 @@
 import "./styles.css";
-import { useState, useRef } from "react";
+import { useState, useRef, useEffect } from "react";
 import * as Sentry from "@sentry/react";
 import { createRoot } from "react-dom/client";
-import { createBrowserRouter, Navigate, RouterProvider } from "react-router";
-import { ThemeProvider } from "@cloudflare/agents-ui/hooks";
+import {
+  createBrowserRouter,
+  Navigate,
+  RouterProvider,
+  useRouteError,
+  useLocation,
+  useNavigationType,
+  createRoutesFromChildren,
+  matchRoutes
+} from "react-router";
+import { ThemeProvider } from "../lib/agents-ui/hooks";
 import { useSessions } from "./api";
 import { RootLayout } from "./RootLayout";
 import { AuthLayout } from "./AuthLayout";
@@ -37,23 +46,54 @@ function IndexRedirect() {
   return null;
 }
 
+function RouteErrorFallback() {
+  const error = useRouteError();
+  useEffect(() => {
+    Sentry.captureException(error);
+  }, [error]);
+  return (
+    <div style={{ padding: "2rem", textAlign: "center" }}>
+      <h2>Something went wrong</h2>
+      <p style={{ color: "#888" }}>
+        {error instanceof Error ? error.message : "Unknown error"}
+      </p>
+      <a href="/" style={{ color: "#3b82f6" }}>
+        Go home
+      </a>
+    </div>
+  );
+}
+
 declare const __SENTRY_DSN__: string;
 
 if (__SENTRY_DSN__) {
   Sentry.init({
     dsn: __SENTRY_DSN__,
-    integrations: [Sentry.browserTracingIntegration()],
+    integrations: [
+      Sentry.reactRouterV7BrowserTracingIntegration({
+        useEffect,
+        useLocation,
+        useNavigationType,
+        createRoutesFromChildren,
+        matchRoutes
+      })
+    ],
     tracesSampleRate: 1.0
   });
 }
 
-const router = createBrowserRouter([
+const sentryCreateBrowserRouter =
+  Sentry.wrapCreateBrowserRouterV7(createBrowserRouter);
+
+const router = sentryCreateBrowserRouter([
   {
     path: "/device",
-    element: <DevicePage />
+    element: <DevicePage />,
+    errorElement: <RouteErrorFallback />
   },
   {
     element: <RootLayout />,
+    errorElement: <RouteErrorFallback />,
     children: [
       {
         element: <AuthLayout />,

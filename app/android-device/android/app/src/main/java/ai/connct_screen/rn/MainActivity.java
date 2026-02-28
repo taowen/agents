@@ -1,10 +1,13 @@
 package ai.connct_screen.rn;
 
+import android.content.BroadcastReceiver;
 import android.content.Context;
 import android.content.Intent;
+import android.content.IntentFilter;
 import android.content.SharedPreferences;
 import android.content.res.Configuration;
 import android.graphics.Bitmap;
+import android.graphics.Typeface;
 import android.os.Build;
 import android.os.Bundle;
 import android.os.Handler;
@@ -29,6 +32,8 @@ import android.widget.ViewFlipper;
 
 import android.Manifest;
 import android.content.pm.PackageManager;
+import android.net.ConnectivityManager;
+import android.net.Network;
 
 import androidx.appcompat.app.AppCompatActivity;
 import androidx.core.app.ActivityCompat;
@@ -69,10 +74,11 @@ public class MainActivity extends AppCompatActivity implements DeviceConnection.
 
     // Task screen views
     private View headerRow;
-    private View taskInputRow;
-    private Spinner agentSpinner;
-    private EditText taskInput;
-    private Button sendBtn;
+    private TextView tabApp, tabBrowser;
+    private View appPane, browserPane;
+    private EditText appTaskInput, browserTaskInput;
+    private Button appSendBtn, browserSendBtn;
+    private View browserTaskInputRow;
     private WebView browserWebView;
     private View browserBar;
     private EditText browserUrlInput;
@@ -87,7 +93,8 @@ public class MainActivity extends AppCompatActivity implements DeviceConnection.
     private String apiKey;
     private String currentDeviceCode;
     private Runnable pollRunnable;
-    private boolean isRunning;
+    private boolean appRunning;
+    private boolean browserRunning;
     private boolean serviceRunning;
 
     // Settings screen views
@@ -112,16 +119,17 @@ public class MainActivity extends AppCompatActivity implements DeviceConnection.
     private boolean appConnected;
     private boolean browserConnected;
 
-    // Spinner items: "App - Connected", "App - Offline", "Browser - Connected", "Browser - Offline"
-    private String[] spinnerItems;
-    private ArrayAdapter<String> spinnerAdapter;
     private String currentAgentType = "app"; // selected agent type
-    private boolean spinnerInitialized = false;
+
+    private BroadcastReceiver screenOnReceiver;
+    private ConnectivityManager.NetworkCallback networkCallback;
 
     @Override
     protected void onCreate(Bundle savedInstanceState) {
         super.onCreate(savedInstanceState);
         setContentView(R.layout.activity_main);
+
+        DeviceConnection.setAppContext(getApplicationContext());
 
         // Light status bar: dark icons on light background
         getWindow().setStatusBarColor(0xFFF5F5F5);
@@ -139,10 +147,15 @@ public class MainActivity extends AppCompatActivity implements DeviceConnection.
 
         // Task screen
         headerRow = findViewById(R.id.headerRow);
-        taskInputRow = findViewById(R.id.taskInputRow);
-        agentSpinner = findViewById(R.id.agentSpinner);
-        taskInput = findViewById(R.id.taskInput);
-        sendBtn = findViewById(R.id.sendBtn);
+        tabApp = findViewById(R.id.tabApp);
+        tabBrowser = findViewById(R.id.tabBrowser);
+        appPane = findViewById(R.id.appPane);
+        browserPane = findViewById(R.id.browserPane);
+        appTaskInput = findViewById(R.id.appTaskInput);
+        appSendBtn = findViewById(R.id.appSendBtn);
+        browserTaskInput = findViewById(R.id.browserTaskInput);
+        browserSendBtn = findViewById(R.id.browserSendBtn);
+        browserTaskInputRow = findViewById(R.id.browserTaskInputRow);
         browserWebView = findViewById(R.id.browserWebView);
         browserBar = findViewById(R.id.browserBar);
         browserUrlInput = findViewById(R.id.browserUrlInput);
@@ -175,14 +188,16 @@ public class MainActivity extends AppCompatActivity implements DeviceConnection.
         cancelLoginBtn.setOnClickListener(v -> cancelDeviceLogin());
         retryLoginBtn.setOnClickListener(v -> startDeviceLogin());
 
-        // Send button: handles both "No A11y" → open settings, and normal send
-        sendBtn.setOnClickListener(v -> {
+        // App send button: handles "No A11y" → open settings, and normal send
+        appSendBtn.setOnClickListener(v -> {
             if (!serviceRunning) {
                 startActivity(new Intent(Settings.ACTION_ACCESSIBILITY_SETTINGS));
             } else {
                 handleSend();
             }
         });
+        // Browser send button: no a11y check needed
+        browserSendBtn.setOnClickListener(v -> handleSend());
 
         // Browser bar handlers
         browserBackBtn.setOnClickListener(v -> {
@@ -200,43 +215,35 @@ public class MainActivity extends AppCompatActivity implements DeviceConnection.
             return false;
         });
 
-        // Set up agent spinner
-        spinnerItems = new String[] {
-            "App - Offline \u25BE",
-            "Browser - Offline \u25BE"
-        };
-        spinnerAdapter = new ArrayAdapter<>(this,
-                R.layout.spinner_item, spinnerItems);
-        spinnerAdapter.setDropDownViewResource(R.layout.spinner_dropdown_item);
-        agentSpinner.setAdapter(spinnerAdapter);
-        agentSpinner.setOnItemSelectedListener(new AdapterView.OnItemSelectedListener() {
-            @Override
-            public void onItemSelected(AdapterView<?> parent, View view, int position, long id) {
-                if (!spinnerInitialized) {
-                    spinnerInitialized = true;
-                    return;
-                }
-                if (position == 0) {
-                    currentAgentType = "app";
-                    browserWebView.setVisibility(View.GONE);
-                    browserBar.setVisibility(View.GONE);
-                    logScroll.setVisibility(View.VISIBLE);
-                } else {
-                    currentAgentType = "browser";
-                    browserWebView.setVisibility(View.VISIBLE);
-                    browserBar.setVisibility(View.VISIBLE);
-                    logScroll.setVisibility(View.GONE);
-                }
-                updateBrowserChrome();
-                updateSendButton();
-            }
-
-            @Override
-            public void onNothingSelected(AdapterView<?> parent) {}
-        });
+        // Set up agent tabs
+        tabApp.setOnClickListener(v -> selectTab("app"));
+        tabBrowser.setOnClickListener(v -> selectTab("browser"));
 
         // Set up WebView
         setupWebView();
+
+        // Register screen-on receiver for WebSocket reconnect
+        screenOnReceiver = new BroadcastReceiver() {
+            @Override
+            public void onReceive(Context context, Intent intent) {
+                if (Intent.ACTION_SCREEN_ON.equals(intent.getAction())) {
+                    DeviceConnection.reconnectAll();
+                }
+            }
+        };
+        registerReceiver(screenOnReceiver, new IntentFilter(Intent.ACTION_SCREEN_ON));
+
+        // Register network callback for WebSocket reconnect
+        ConnectivityManager cm = (ConnectivityManager) getSystemService(Context.CONNECTIVITY_SERVICE);
+        if (cm != null) {
+            networkCallback = new ConnectivityManager.NetworkCallback() {
+                @Override
+                public void onAvailable(Network network) {
+                    DeviceConnection.reconnectAll();
+                }
+            };
+            cm.registerDefaultNetworkCallback(networkCallback);
+        }
 
         // Check if already logged in
         SharedPreferences prefs = getSharedPreferences(PREFS_NAME, Context.MODE_PRIVATE);
@@ -294,12 +301,27 @@ public class MainActivity extends AppCompatActivity implements DeviceConnection.
     protected void onResume() {
         super.onResume();
         checkService();
+        DeviceConnection.reconnectAll();
+        // Sync UI with actual connection state (may have reconnected while paused)
+        appConnected = DeviceConnection.getInstance("app").isConnected();
+        browserConnected = DeviceConnection.getInstance("browser").isConnected();
+        updateTabs();
+        updateSendButton();
     }
 
     @Override
     protected void onDestroy() {
         super.onDestroy();
         stopDevicePoll();
+        if (screenOnReceiver != null) {
+            unregisterReceiver(screenOnReceiver);
+            screenOnReceiver = null;
+        }
+        if (networkCallback != null) {
+            ConnectivityManager cm = (ConnectivityManager) getSystemService(Context.CONNECTIVITY_SERVICE);
+            if (cm != null) cm.unregisterNetworkCallback(networkCallback);
+            networkCallback = null;
+        }
         DeviceConnection.getInstance("app").setListener(null);
         DeviceConnection.getInstance("browser").setListener(null);
     }
@@ -463,7 +485,7 @@ public class MainActivity extends AppCompatActivity implements DeviceConnection.
         boolean browserMode = "browser".equals(currentAgentType);
         int vis = (landscape && browserMode) ? View.GONE : View.VISIBLE;
         headerRow.setVisibility(vis);
-        taskInputRow.setVisibility(vis);
+        browserTaskInputRow.setVisibility(vis);
     }
 
     private void navigateBrowserUrl() {
@@ -481,42 +503,83 @@ public class MainActivity extends AppCompatActivity implements DeviceConnection.
     }
 
     private void handleSend() {
-        String text = taskInput.getText().toString().trim();
+        EditText input = "app".equals(currentAgentType) ? appTaskInput : browserTaskInput;
+        String text = input.getText().toString().trim();
         boolean currentConnected = "app".equals(currentAgentType) ? appConnected : browserConnected;
-        if (text.isEmpty() || isRunning || !currentConnected) return;
+        boolean running = "app".equals(currentAgentType) ? appRunning : browserRunning;
+        if (text.isEmpty() || running || !currentConnected) return;
 
-        logText.setText("");
-        taskInput.setText("");
-        isRunning = true;
+        if ("app".equals(currentAgentType)) {
+            logText.setText("");
+            appRunning = true;
+        } else {
+            browserRunning = true;
+        }
+        input.setText("");
         updateSendButton();
 
         appendLog("[TASK] Sending to server (" + currentAgentType + "): " + text);
         DeviceConnection.getInstance(currentAgentType).sendUserTask(text);
     }
 
-    private void updateSpinnerItems() {
-        spinnerItems[0] = (appConnected ? "App - Connected" : "App - Offline") + " \u25BE";
-        spinnerItems[1] = (browserConnected ? "Browser - Connected" : "Browser - Offline") + " \u25BE";
-        spinnerAdapter.notifyDataSetChanged();
+    private void selectTab(String agentType) {
+        if (agentType.equals(currentAgentType)) return;
+        currentAgentType = agentType;
+        if ("app".equals(agentType)) {
+            appPane.setVisibility(View.VISIBLE);
+            browserPane.setVisibility(View.GONE);
+        } else {
+            appPane.setVisibility(View.GONE);
+            browserPane.setVisibility(View.VISIBLE);
+        }
+        updateBrowserChrome();
+        updateTabs();
+        updateSendButton();
+    }
+
+    private void updateTabs() {
+        boolean appActive = "app".equals(currentAgentType);
+        // App tab
+        tabApp.setText("App");
+        tabApp.setTextColor(appActive ? 0xFF1976D2 : 0xFF666666);
+        tabApp.setBackgroundColor(appActive ? 0xFFFFFFFF : 0xFFE0E0E0);
+        tabApp.setTypeface(null, appActive ? Typeface.BOLD : Typeface.NORMAL);
+        // Browser tab
+        tabBrowser.setText("Browser");
+        tabBrowser.setTextColor(!appActive ? 0xFF1976D2 : 0xFF666666);
+        tabBrowser.setBackgroundColor(!appActive ? 0xFFFFFFFF : 0xFFE0E0E0);
+        tabBrowser.setTypeface(null, !appActive ? Typeface.BOLD : Typeface.NORMAL);
     }
 
     private void updateSendButton() {
+        // App send button: checks a11y service
         if (!serviceRunning) {
-            sendBtn.setText("No A11y");
-            sendBtn.setEnabled(true);
-            sendBtn.setBackgroundColor(0xFFC62828);
-            taskInput.setEnabled(false);
-        } else if (isRunning) {
-            sendBtn.setText("Running");
-            sendBtn.setEnabled(false);
-            sendBtn.setBackgroundColor(0xFF666666);
-            taskInput.setEnabled(false);
+            appSendBtn.setText("No A11y");
+            appSendBtn.setEnabled(true);
+            appSendBtn.setBackgroundColor(0xFFC62828);
+            appTaskInput.setEnabled(false);
+        } else if (appRunning) {
+            appSendBtn.setText("Running");
+            appSendBtn.setEnabled(false);
+            appSendBtn.setBackgroundColor(0xFF666666);
+            appTaskInput.setEnabled(false);
         } else {
-            boolean currentConnected = "app".equals(currentAgentType) ? appConnected : browserConnected;
-            sendBtn.setText(currentConnected ? "Send" : "Offline");
-            sendBtn.setEnabled(currentConnected);
-            sendBtn.setBackgroundColor(currentConnected ? 0xFF1976D2 : 0x661976D2);
-            taskInput.setEnabled(true);
+            appSendBtn.setText(appConnected ? "Send" : "Offline");
+            appSendBtn.setEnabled(appConnected);
+            appSendBtn.setBackgroundColor(appConnected ? 0xFF1976D2 : 0x661976D2);
+            appTaskInput.setEnabled(true);
+        }
+        // Browser send button: no a11y check
+        if (browserRunning) {
+            browserSendBtn.setText("Running");
+            browserSendBtn.setEnabled(false);
+            browserSendBtn.setBackgroundColor(0xFF666666);
+            browserTaskInput.setEnabled(false);
+        } else {
+            browserSendBtn.setText(browserConnected ? "Send" : "Offline");
+            browserSendBtn.setEnabled(browserConnected);
+            browserSendBtn.setBackgroundColor(browserConnected ? 0xFF1976D2 : 0x661976D2);
+            browserTaskInput.setEnabled(true);
         }
     }
 
@@ -775,7 +838,7 @@ public class MainActivity extends AppCompatActivity implements DeviceConnection.
             } else if ("browser".equals(agentType)) {
                 browserConnected = connected;
             }
-            updateSpinnerItems();
+            updateTabs();
             updateSendButton();
         });
     }
@@ -784,7 +847,11 @@ public class MainActivity extends AppCompatActivity implements DeviceConnection.
     public void onTaskDone(String agentType, String result) {
         handler.post(() -> {
             appendLog("[DONE] (" + agentType + ") " + result);
-            isRunning = false;
+            if ("app".equals(agentType)) {
+                appRunning = false;
+            } else {
+                browserRunning = false;
+            }
             updateSendButton();
         });
     }
@@ -802,7 +869,7 @@ public class MainActivity extends AppCompatActivity implements DeviceConnection.
             // Reset connection status
             appConnected = false;
             browserConnected = false;
-            updateSpinnerItems();
+            updateTabs();
             // Show login screen
             viewFlipper.setDisplayedChild(0);
             loginBtn.setVisibility(View.VISIBLE);

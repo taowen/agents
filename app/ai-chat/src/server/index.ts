@@ -1,6 +1,6 @@
 import * as Sentry from "@sentry/cloudflare";
 import { Hono } from "hono";
-import { routeAgentRequest } from "agents";
+import { routeAgentRequest } from "../lib/agents";
 import { handleAuthRoutes, requireAuth, handleIncomingEmail } from "./auth";
 import { apiRoutes } from "./api";
 import { handleGitHubOAuth } from "./github-oauth";

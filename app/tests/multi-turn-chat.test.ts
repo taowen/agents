@@ -8,7 +8,7 @@
  */
 import { createExecutionContext, env } from "cloudflare:test";
 import { describe, it, expect } from "vitest";
-import { getAgentByName } from "agents";
+import { getServerByName } from "partyserver";
 import type { UIMessage as ChatMessage } from "ai";
 import {
   connectChatWS,
@@ -30,7 +30,7 @@ describe("Multi-turn chat", () => {
 
     await sendChatRequest(ws, "req-1", [userMsg]);
 
-    const agentStub = await getAgentByName(env.TestChatAgent, room);
+    const agentStub = await getServerByName(env.TestChatAgent, room);
     const messages = (await agentStub.getPersistedMessages()) as ChatMessage[];
     expect(messages.length).toBe(2);
     expect(messages[0].role).toBe("user");
@@ -55,7 +55,7 @@ describe("Multi-turn chat", () => {
     expect(serverMessageId).toBeDefined();
     expect(serverMessageId).toMatch(/^assistant_/);
 
-    const agentStub = await getAgentByName(env.TestChatAgent, room);
+    const agentStub = await getServerByName(env.TestChatAgent, room);
     const messages = (await agentStub.getPersistedMessages()) as ChatMessage[];
     const serverAssistant = messages.find((m) => m.role === "assistant")!;
     expect(serverAssistant.id).toBe(serverMessageId);
@@ -78,7 +78,7 @@ describe("Multi-turn chat", () => {
     const serverMessageId = extractStartMessageId(received);
     expect(serverMessageId).toBeDefined();
 
-    const agentStub = await getAgentByName(env.TestChatAgent, room);
+    const agentStub = await getServerByName(env.TestChatAgent, room);
     const messagesAfterTurn1 =
       (await agentStub.getPersistedMessages()) as ChatMessage[];
     expect(messagesAfterTurn1.length).toBe(2);
@@ -116,7 +116,7 @@ describe("Multi-turn chat", () => {
     ws.close(1000);
   });
 
-  it("regression: client ignores messageId, duplicate occurs (3 assistants)", async () => {
+  it("regression fixed: client ignores messageId, dedup reconciles (2 assistants)", async () => {
     const room = crypto.randomUUID();
     const { ws } = await connectChatWS(`/agents/test-chat-agent/${room}`);
 
@@ -129,7 +129,7 @@ describe("Multi-turn chat", () => {
 
     await sendChatRequest(ws, "req-1", [userMsg1]);
 
-    const agentStub = await getAgentByName(env.TestChatAgent, room);
+    const agentStub = await getServerByName(env.TestChatAgent, room);
     const messagesAfterTurn1 =
       (await agentStub.getPersistedMessages()) as ChatMessage[];
     const serverAssistant = messagesAfterTurn1.find(
@@ -161,10 +161,11 @@ describe("Multi-turn chat", () => {
       (m) => m.role === "assistant"
     );
 
-    // 3 assistant messages: the server's original, the rogue client's copy, and turn 2's response.
-    // This documents that the persistence layer itself has no text-only dedup —
-    // the fix works by preventing the ID mismatch from occurring in the first place.
-    expect(assistantMessages.length).toBe(3);
+    // _reconcileAssistantIdsWithServerState matches the rogue client ID to the
+    // server's assistant by content, replacing the ID before persistence.
+    // The upsert then updates the existing row instead of creating a duplicate.
+    // Result: only 2 assistant messages (turn 1 + turn 2), not 3.
+    expect(assistantMessages.length).toBe(2);
 
     ws.close(1000);
   });
@@ -183,7 +184,7 @@ describe("Multi-turn chat", () => {
     ws.accept();
     await ctx.waitUntil(Promise.resolve());
 
-    const agentStub = await getAgentByName(env.TestChatAgent, room);
+    const agentStub = await getServerByName(env.TestChatAgent, room);
 
     const toolCallId = "call_test_123";
     await agentStub.persistMessages([
@@ -238,7 +239,7 @@ describe("Multi-turn chat", () => {
     ws.close(1000);
   });
 
-  it("new connection receives existing messages via cf_agent_chat_messages", async () => {
+  it("new connection receives empty cf_agent_chat_messages (history loaded via /get-messages)", async () => {
     const room = crypto.randomUUID();
     const { ws: ws1 } = await connectChatWS(`/agents/test-chat-agent/${room}`);
 
@@ -275,13 +276,16 @@ describe("Multi-turn chat", () => {
     ws2.accept();
     const messagesReceived = await messagePromise;
 
+    // onConnect now sends empty messages intentionally — initial message
+    // loading is handled by the HTTP /get-messages endpoint to avoid
+    // redundant bandwidth on WebSocket connect.
     expect(messagesReceived).not.toBeNull();
     const chatMessagesEvent = messagesReceived as {
       type: string;
       messages: ChatMessage[];
     };
     expect(chatMessagesEvent.type).toBe("cf_agent_chat_messages");
-    expect(chatMessagesEvent.messages.length).toBeGreaterThanOrEqual(2);
+    expect(chatMessagesEvent.messages.length).toBe(0);
 
     ws1.close(1000);
     ws2.close(1000);

@@ -126,7 +126,7 @@
         android:orientation="vertical"
         android:padding="12dp">
 
-        <!-- Header row -->
+        <!-- Header row: tab bar -->
         <LinearLayout
             android:id="@+id/headerRow"
             android:layout_width="match_parent"
@@ -136,23 +136,29 @@
             android:layout_marginBottom="8dp">
 
             <TextView
+                android:id="@+id/tabApp"
                 android:layout_width="0dp"
-                android:layout_height="wrap_content"
-                android:layout_weight="1"
-                android:text="RN Agent"
-                android:textColor="#212121"
-                android:textSize="20sp"
-                android:textStyle="bold" />
-
-            <!-- Agent mode selector -->
-            <Spinner
-                android:id="@+id/agentSpinner"
-                android:layout_width="wrap_content"
                 android:layout_height="36dp"
+                android:layout_weight="1"
+                android:text="App"
+                android:textSize="14sp"
+                android:textStyle="bold"
+                android:textColor="#1976D2"
+                android:gravity="center"
+                android:background="#ffffff"
+                android:layout_marginEnd="4dp" />
+
+            <TextView
+                android:id="@+id/tabBrowser"
+                android:layout_width="0dp"
+                android:layout_height="36dp"
+                android:layout_weight="1"
+                android:text="Browser"
+                android:textSize="14sp"
+                android:textColor="#666666"
+                android:gravity="center"
                 android:background="#e0e0e0"
-                android:popupBackground="#ffffff"
-                android:paddingHorizontal="10dp"
-                android:gravity="center_vertical" />
+                android:layout_marginEnd="4dp" />
 
             <!-- Settings button -->
             <TextView
@@ -163,44 +169,7 @@
                 android:textSize="22sp"
                 android:textColor="#666666"
                 android:gravity="center"
-                android:layout_marginStart="8dp"
                 android:background="?android:attr/selectableItemBackgroundBorderless" />
-        </LinearLayout>
-
-        <!-- Task input row -->
-        <LinearLayout
-            android:id="@+id/taskInputRow"
-            android:layout_width="match_parent"
-            android:layout_height="wrap_content"
-            android:orientation="horizontal"
-            android:layout_marginBottom="8dp">
-
-            <EditText
-                android:id="@+id/taskInput"
-                android:layout_width="0dp"
-                android:layout_height="wrap_content"
-                android:layout_weight="1"
-                android:hint="Enter task..."
-                android:textColorHint="#999999"
-                android:textColor="#212121"
-                android:background="#ffffff"
-                android:padding="10dp"
-                android:textSize="14sp"
-                android:maxHeight="80dp"
-                android:inputType="textMultiLine"
-                android:layout_marginEnd="8dp" />
-
-            <Button
-                android:id="@+id/sendBtn"
-                android:layout_width="wrap_content"
-                android:layout_height="wrap_content"
-                android:text="Send"
-                android:textColor="#ffffff"
-                android:textStyle="bold"
-                android:textSize="15sp"
-                android:background="#1976D2"
-                android:paddingHorizontal="16dp"
-                android:textAllCaps="false" />
         </LinearLayout>
 
         <!-- Voice status bar -->
@@ -258,89 +227,172 @@
             android:layout_marginBottom="4dp"
             android:visibility="gone" />
 
-        <!-- Browser WebView (hidden by default) -->
-        <android.webkit.WebView
-            android:id="@+id/browserWebView"
-            android:layout_width="match_parent"
-            android:layout_height="0dp"
-            android:layout_weight="1"
-            android:visibility="gone" />
-
-        <!-- Browser bottom bar (hidden by default) -->
+        <!-- App pane (visible by default) -->
         <LinearLayout
-            android:id="@+id/browserBar"
-            android:layout_width="match_parent"
-            android:layout_height="wrap_content"
-            android:orientation="horizontal"
-            android:gravity="center_vertical"
-            android:background="#ffffff"
-            android:padding="4dp"
-            android:visibility="gone">
-
-            <Button
-                android:id="@+id/browserBackBtn"
-                android:layout_width="40dp"
-                android:layout_height="40dp"
-                android:text="\u2190"
-                android:textSize="18sp"
-                android:background="?android:attr/selectableItemBackground"
-                android:padding="0dp" />
-
-            <Button
-                android:id="@+id/browserFwdBtn"
-                android:layout_width="40dp"
-                android:layout_height="40dp"
-                android:text="\u2192"
-                android:textSize="18sp"
-                android:background="?android:attr/selectableItemBackground"
-                android:padding="0dp" />
-
-            <EditText
-                android:id="@+id/browserUrlInput"
-                android:layout_width="0dp"
-                android:layout_height="36dp"
-                android:layout_weight="1"
-                android:singleLine="true"
-                android:inputType="textUri"
-                android:hint="Search or URL"
-                android:textSize="13sp"
-                android:textColor="#212121"
-                android:textColorHint="#999999"
-                android:background="#f0f0f0"
-                android:paddingHorizontal="8dp"
-                android:layout_marginHorizontal="4dp" />
-
-            <Button
-                android:id="@+id/browserGoBtn"
-                android:layout_width="wrap_content"
-                android:layout_height="36dp"
-                android:text="Go"
-                android:textSize="14sp"
-                android:textColor="#ffffff"
-                android:background="#1976D2"
-                android:paddingHorizontal="12dp"
-                android:textAllCaps="false" />
-        </LinearLayout>
-
-        <!-- Logs (visible by default) -->
-        <ScrollView
-            android:id="@+id/logScroll"
+            android:id="@+id/appPane"
             android:layout_width="match_parent"
             android:layout_height="0dp"
             android:layout_weight="1"
-            android:background="#ffffff"
-            android:padding="8dp">
+            android:orientation="vertical">
 
-            <TextView
-                android:id="@+id/logText"
+            <LinearLayout
                 android:layout_width="match_parent"
                 android:layout_height="wrap_content"
-                android:textColor="#424242"
-                android:fontFamily="monospace"
-                android:textSize="11sp"
-                android:lineSpacingExtra="4dp"
-                android:text="Enter a task and tap Send" />
-        </ScrollView>
+                android:orientation="horizontal"
+                android:layout_marginBottom="8dp">
+
+                <EditText
+                    android:id="@+id/appTaskInput"
+                    android:layout_width="0dp"
+                    android:layout_height="wrap_content"
+                    android:layout_weight="1"
+                    android:hint="Enter task..."
+                    android:textColorHint="#999999"
+                    android:textColor="#212121"
+                    android:background="#ffffff"
+                    android:padding="10dp"
+                    android:textSize="14sp"
+                    android:maxHeight="80dp"
+                    android:inputType="textMultiLine"
+                    android:layout_marginEnd="8dp" />
+
+                <Button
+                    android:id="@+id/appSendBtn"
+                    android:layout_width="wrap_content"
+                    android:layout_height="wrap_content"
+                    android:text="Send"
+                    android:textColor="#ffffff"
+                    android:textStyle="bold"
+                    android:textSize="15sp"
+                    android:background="#1976D2"
+                    android:paddingHorizontal="16dp"
+                    android:textAllCaps="false" />
+            </LinearLayout>
+
+            <ScrollView
+                android:id="@+id/logScroll"
+                android:layout_width="match_parent"
+                android:layout_height="0dp"
+                android:layout_weight="1"
+                android:background="#ffffff"
+                android:padding="8dp">
+
+                <TextView
+                    android:id="@+id/logText"
+                    android:layout_width="match_parent"
+                    android:layout_height="wrap_content"
+                    android:textColor="#424242"
+                    android:fontFamily="monospace"
+                    android:textSize="11sp"
+                    android:lineSpacingExtra="4dp"
+                    android:text="Enter a task and tap Send" />
+            </ScrollView>
+        </LinearLayout>
+
+        <!-- Browser pane (hidden by default) -->
+        <LinearLayout
+            android:id="@+id/browserPane"
+            android:layout_width="match_parent"
+            android:layout_height="0dp"
+            android:layout_weight="1"
+            android:orientation="vertical"
+            android:visibility="gone">
+
+            <LinearLayout
+                android:id="@+id/browserTaskInputRow"
+                android:layout_width="match_parent"
+                android:layout_height="wrap_content"
+                android:orientation="horizontal"
+                android:layout_marginBottom="4dp">
+
+                <EditText
+                    android:id="@+id/browserTaskInput"
+                    android:layout_width="0dp"
+                    android:layout_height="wrap_content"
+                    android:layout_weight="1"
+                    android:hint="Enter task..."
+                    android:textColorHint="#999999"
+                    android:textColor="#212121"
+                    android:background="#ffffff"
+                    android:padding="10dp"
+                    android:textSize="14sp"
+                    android:maxHeight="80dp"
+                    android:inputType="textMultiLine"
+                    android:layout_marginEnd="8dp" />
+
+                <Button
+                    android:id="@+id/browserSendBtn"
+                    android:layout_width="wrap_content"
+                    android:layout_height="wrap_content"
+                    android:text="Send"
+                    android:textColor="#ffffff"
+                    android:textStyle="bold"
+                    android:textSize="15sp"
+                    android:background="#1976D2"
+                    android:paddingHorizontal="16dp"
+                    android:textAllCaps="false" />
+            </LinearLayout>
+
+            <android.webkit.WebView
+                android:id="@+id/browserWebView"
+                android:layout_width="match_parent"
+                android:layout_height="0dp"
+                android:layout_weight="1" />
+
+            <LinearLayout
+                android:id="@+id/browserBar"
+                android:layout_width="match_parent"
+                android:layout_height="wrap_content"
+                android:orientation="horizontal"
+                android:gravity="center_vertical"
+                android:background="#ffffff"
+                android:padding="4dp">
+
+                <Button
+                    android:id="@+id/browserBackBtn"
+                    android:layout_width="40dp"
+                    android:layout_height="40dp"
+                    android:text="\u2190"
+                    android:textSize="18sp"
+                    android:background="?android:attr/selectableItemBackground"
+                    android:padding="0dp" />
+
+                <Button
+                    android:id="@+id/browserFwdBtn"
+                    android:layout_width="40dp"
+                    android:layout_height="40dp"
+                    android:text="\u2192"
+                    android:textSize="18sp"
+                    android:background="?android:attr/selectableItemBackground"
+                    android:padding="0dp" />
+
+                <EditText
+                    android:id="@+id/browserUrlInput"
+                    android:layout_width="0dp"
+                    android:layout_height="36dp"
+                    android:layout_weight="1"
+                    android:singleLine="true"
+                    android:inputType="textUri"
+                    android:hint="Search or URL"
+                    android:textSize="13sp"
+                    android:textColor="#212121"
+                    android:textColorHint="#999999"
+                    android:background="#f0f0f0"
+                    android:paddingHorizontal="8dp"
+                    android:layout_marginHorizontal="4dp" />
+
+                <Button
+                    android:id="@+id/browserGoBtn"
+                    android:layout_width="wrap_content"
+                    android:layout_height="36dp"
+                    android:text="Go"
+                    android:textSize="14sp"
+                    android:textColor="#ffffff"
+                    android:background="#1976D2"
+                    android:paddingHorizontal="12dp"
+                    android:textAllCaps="false" />
+            </LinearLayout>
+        </LinearLayout>
     </LinearLayout>
     <!-- Screen 2: Settings -->
     <LinearLayout

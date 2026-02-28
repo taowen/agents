@@ -52,6 +52,9 @@ export class SessionContext {
   cachedLlmModel: ReturnType<typeof getLlmModel> | null = null;
   cachedModelId: string | null = null;
 
+  // ---- Compact boundary ----
+  compactBoundaryId: string | null = null;
+
   // ---- Prompt / tools cache ----
   cachedSystemPrompt: string | null = null;
   cachedDynamicContext: string | null = null;
@@ -182,6 +185,20 @@ export class SessionContext {
       );
     }
     await this.mountPromise;
+  }
+
+  // ---- Compact boundary ----
+
+  async getCompactBoundaryId(): Promise<string | null> {
+    if (this.compactBoundaryId !== null) return this.compactBoundaryId;
+    const stored = await this.ctx.storage.get<string>("compactBoundaryId");
+    this.compactBoundaryId = stored ?? null;
+    return this.compactBoundaryId;
+  }
+
+  async setCompactBoundaryId(id: string): Promise<void> {
+    this.compactBoundaryId = id;
+    await this.ctx.storage.put("compactBoundaryId", id);
   }
 
   /** Invalidate cached LLM config so the next request re-reads /etc/llm.json. */

@@ -2,6 +2,7 @@ import { defineCommand } from "just-bash";
 import type { CustomCommand } from "just-bash";
 import { generateText } from "ai";
 import { getCachedLlmConfig, getLlmModel } from "./llm-config";
+import { chatAgentIsolatedName } from "./device-hub";
 
 /**
  * Create a `web-search` custom command that searches the web via the configured search API.
@@ -93,10 +94,11 @@ export function createWebFetchCommand(
       };
     }
 
-    if (!env.CF_ACCOUNT_ID || !env.CF_BROWSER_TOKEN) {
+    if (!env.CLOUDFLARE_ACCOUNT_ID || !env.CF_BROWSER_TOKEN) {
       return {
         stdout: "",
-        stderr: "web-fetch: CF_ACCOUNT_ID and CF_BROWSER_TOKEN must be set\n",
+        stderr:
+          "web-fetch: CLOUDFLARE_ACCOUNT_ID and CF_BROWSER_TOKEN must be set\n",
         exitCode: 1
       };
     }
@@ -105,7 +107,7 @@ export function createWebFetchCommand(
     const prompt = args.length > 1 ? args.slice(1).join(" ") : null;
     try {
       const resp = await fetch(
-        `https://api.cloudflare.com/client/v4/accounts/${env.CF_ACCOUNT_ID}/browser-rendering/markdown`,
+        `https://api.cloudflare.com/client/v4/accounts/${env.CLOUDFLARE_ACCOUNT_ID}/browser-rendering/markdown`,
         {
           method: "POST",
           headers: {
@@ -238,7 +240,7 @@ export function createSessionsCommand(
       const lines = result.results.map((row) => {
         const date = row.created_at.slice(0, 10);
         const doId = chatAgentNs
-          .idFromName(`${userId}:${row.id}`)
+          .idFromName(chatAgentIsolatedName(userId, row.id))
           .toString()
           .slice(0, 12);
         const title = row.title || "Untitled";

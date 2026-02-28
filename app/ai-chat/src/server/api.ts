@@ -19,6 +19,11 @@ import { handleFileRoutes } from "./api-files";
 import { createDeviceToken } from "./auth";
 import { QUOTA_LIMITS } from "./quota-config";
 import {
+  getChatAgentStub,
+  chatAgentIsolatedName,
+  findDevices
+} from "./device-hub";
+import {
   aggregateUsage,
   fetchDoUsage,
   cacheSessionUsage
@@ -106,9 +111,7 @@ api.delete("/sessions/:id", async (c) => {
 
   // Cancel all scheduled tasks and destroy the DO
   try {
-    const isolatedName = encodeURIComponent(`${userId}:${sessionId}`);
-    const doId = c.env.ChatAgent.idFromName(isolatedName);
-    const stub = c.env.ChatAgent.get(doId);
+    const stub = getChatAgentStub(c.env.ChatAgent, userId, sessionId);
     await stub.fetch(new Request("http://agent/destroy", { method: "POST" }));
   } catch (e) {
     console.error("destroy DO failed:", e);
@@ -126,15 +129,13 @@ api.delete("/sessions/:id", async (c) => {
 api.get("/sessions/:id/schedules", async (c) => {
   const userId = c.get("userId");
   const sessionId = c.req.param("id");
-  const isolatedName = encodeURIComponent(`${userId}:${sessionId}`);
-  const id = c.env.ChatAgent.idFromName(isolatedName);
-  const stub = c.env.ChatAgent.get(id);
+  const stub = getChatAgentStub(c.env.ChatAgent, userId, sessionId);
   return stub.fetch(
     new Request("http://agent/get-schedules", {
       headers: {
         "x-user-id": userId,
         "x-session-id": sessionId,
-        "x-partykit-room": isolatedName
+        "x-partykit-room": chatAgentIsolatedName(userId, sessionId)
       }
     })
   );
@@ -348,36 +349,16 @@ api.post("/proxy/v1/chat/completions", async (c) => {
 // GET /devices — list online devices for the current user (checks DO liveness)
 api.get("/devices", async (c) => {
   const userId = c.get("userId");
-  const rows = await c.env.DB.prepare(
-    "SELECT id, title FROM sessions WHERE user_id = ? AND id LIKE 'device-%'"
-  )
-    .bind(userId)
-    .all<{ id: string; title: string }>();
-
-  // Check each device DO for actual WebSocket liveness
-  const results = await Promise.allSettled(
-    rows.results.map(async (s) => {
-      const stub = c.env.ChatAgent.get(
-        c.env.ChatAgent.idFromName(encodeURIComponent(`${userId}:${s.id}`))
-      );
-      const res = await stub.fetch(new Request("http://agent/status"));
-      const body = (await res.json()) as { online: boolean };
-      return { ...s, online: body.online };
-    })
-  );
-
-  const online = results
-    .map((r, i) =>
-      r.status === "fulfilled" ? r.value : { ...rows.results[i], online: false }
-    )
-    .filter((r) => r.online);
+  const devices = await findDevices(c.env, userId);
 
   return c.json(
-    online.map((r) => ({
-      deviceName: r.id.replace("device-", ""),
-      sessionId: r.id,
-      title: r.title
-    }))
+    devices
+      .filter((d) => d.online)
+      .map((d) => ({
+        deviceName: d.name,
+        sessionId: d.sessionId,
+        title: d.title
+      }))
   );
 });
 

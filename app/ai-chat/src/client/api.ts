@@ -1,5 +1,6 @@
 import useSWR from "swr";
 import * as Sentry from "@sentry/react";
+import type { UIMessage } from "ai";
 import type { SessionInfo } from "./SessionSidebar";
 
 export interface UserInfo {
@@ -243,6 +244,22 @@ export function useInitialMessages(sessionId: string | undefined) {
     }
   );
   return { messages: data ?? [], isLoading };
+}
+
+// --- Older Messages (Lazy Loading) ---
+
+export async function fetchOlderMessages(
+  sessionId: string,
+  beforeId: string,
+  limit = 50
+): Promise<UIMessage[]> {
+  const res = await fetch(
+    `/agents/chat-agent/${sessionId}/get-messages?before=${encodeURIComponent(beforeId)}&limit=${limit}`
+  );
+  if (!res.ok) return [];
+  const text = await res.text();
+  if (!text.trim()) return [];
+  return JSON.parse(text);
 }
 
 // --- Bug Reports ---

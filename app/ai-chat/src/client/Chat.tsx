@@ -1,17 +1,22 @@
 import { useCallback, useState, useEffect, useRef } from "react";
 import { useParams, useOutletContext } from "react-router";
-import { useAgent } from "agents/react";
-import { useAgentChat } from "@cloudflare/ai-chat/react";
+import { useAgent } from "../lib/agents/react";
+import { useAgentChat } from "../lib/ai-chat/react";
 import { isToolUIPart } from "ai";
 import type { UIMessage, FileUIPart } from "ai";
 import { Button, Badge, InputArea, Empty, Text } from "@cloudflare/kumo";
-import { useQuotaStatus, useInitialMessages, useDevices } from "./api";
+import {
+  useQuotaStatus,
+  useInitialMessages,
+  useDevices,
+  fetchOlderMessages
+} from "./api";
 import type { AuthLayoutContext } from "./AuthLayout";
 import {
   ConnectionIndicator,
   ModeToggle,
   type ConnectionStatus
-} from "@cloudflare/agents-ui";
+} from "../lib/agents-ui";
 import {
   PaperPlaneRightIcon,
   StopIcon,
@@ -31,6 +36,71 @@ import {
   MIME_TYPES,
   getExtension
 } from "../shared/file-utils";
+function TokenUsage({
+  cached,
+  uncached,
+  output,
+  messageText
+}: {
+  cached: number;
+  uncached: number;
+  output: number;
+  messageText: string;
+}) {
+  const [copied, setCopied] = useState(false);
+  return (
+    <div className="text-[11px] text-kumo-tertiary mt-1 ml-1 font-mono flex items-center gap-1">
+      <button
+        type="button"
+        className="opacity-40 hover:opacity-80 transition-opacity"
+        onClick={() => {
+          navigator.clipboard.writeText(messageText);
+          setCopied(true);
+          setTimeout(() => setCopied(false), 1500);
+        }}
+        title="Copy message"
+      >
+        {copied ? (
+          <svg
+            width="11"
+            height="11"
+            viewBox="0 0 16 16"
+            fill="none"
+            stroke="currentColor"
+            strokeWidth="2"
+            strokeLinecap="round"
+            strokeLinejoin="round"
+          >
+            <polyline points="4 8.5 7 11.5 12 5" />
+          </svg>
+        ) : (
+          <svg
+            width="11"
+            height="11"
+            viewBox="0 0 16 16"
+            fill="none"
+            stroke="currentColor"
+            strokeWidth="2"
+            strokeLinecap="round"
+            strokeLinejoin="round"
+          >
+            <rect x="5.5" y="5.5" width="8" height="8" rx="1.5" />
+            <path d="M10.5 5.5V3.5A1.5 1.5 0 0 0 9 2H3.5A1.5 1.5 0 0 0 2 3.5V9a1.5 1.5 0 0 0 1.5 1.5h2" />
+          </svg>
+        )}
+      </button>
+      <span className="text-green-500">{cached}</span>
+      <span className="opacity-50"> cached </span>
+      <span className="opacity-50">| </span>
+      <span>{uncached}</span>
+      <span className="opacity-50"> input </span>
+      <span className="opacity-50">| </span>
+      <span className="text-blue-500">{output}</span>
+      <span className="opacity-50"> output</span>
+    </div>
+  );
+}
+
 interface ChatMessageMetadata {
   usage?: {
     inputTokens?: number;
@@ -173,6 +243,9 @@ function ChatInner({
   const [fileManagerOpen, setFileManagerOpen] = useState(false);
   const [selectedDevice, setSelectedDevice] = useState<string | null>(null);
   const messagesEndRef = useRef<HTMLDivElement>(null);
+  const scrollContainerRef = useRef<HTMLDivElement>(null);
+  const [isLoadingOlder, setIsLoadingOlder] = useState(false);
+  const [hasMoreMessages, setHasMoreMessages] = useState(true);
   const firstMessageSent = useRef(false);
 
   const { devices } = useDevices();
@@ -198,16 +271,22 @@ function ChatInner({
     )
   });
 
-  const { messages, sendMessage, addToolApprovalResponse, status, stop } =
-    useAgentChat({
-      agent,
-      getInitialMessages: null,
-      messages: initialMessages,
-      body: {
-        clientVersion: "1.0.0",
-        timezone: Intl.DateTimeFormat().resolvedOptions().timeZone
-      }
-    });
+  const {
+    messages,
+    sendMessage,
+    addToolApprovalResponse,
+    status,
+    stop,
+    setLocalMessages
+  } = useAgentChat({
+    agent,
+    getInitialMessages: null,
+    messages: initialMessages,
+    body: {
+      clientVersion: "1.0.0",
+      timezone: Intl.DateTimeFormat().resolvedOptions().timeZone
+    }
+  });
 
   const { quota } = useQuotaStatus();
 
@@ -215,8 +294,60 @@ function ChatInner({
   const isConnected = connectionStatus === "connected";
 
   useEffect(() => {
-    messagesEndRef.current?.scrollIntoView({ behavior: "smooth" });
+    const container = scrollContainerRef.current;
+    if (!container) return;
+    // Only auto-scroll if user is near the bottom (within 300px)
+    const distanceFromBottom =
+      container.scrollHeight - container.scrollTop - container.clientHeight;
+    if (distanceFromBottom < 300) {
+      messagesEndRef.current?.scrollIntoView({ behavior: "smooth" });
+    }
   }, [messages]);
+
+  // Lazy load older messages on scroll up
+  useEffect(() => {
+    const container = scrollContainerRef.current;
+    if (!container) return;
+
+    const handleScroll = () => {
+      if (
+        container.scrollTop < 100 &&
+        !isLoadingOlder &&
+        hasMoreMessages &&
+        messages.length > 0
+      ) {
+        setIsLoadingOlder(true);
+        const oldestMessage = messages[0];
+        const prevScrollHeight = container.scrollHeight;
+
+        fetchOlderMessages(sessionId, oldestMessage.id).then(
+          (olderMessages) => {
+            if (olderMessages.length === 0) {
+              setHasMoreMessages(false);
+            } else {
+              setLocalMessages((prev: UIMessage[]) => {
+                // Deduplicate: only add messages not already in local state
+                const existingIds = new Set(prev.map((m) => m.id));
+                const newMessages = olderMessages.filter(
+                  (m) => !existingIds.has(m.id)
+                );
+                return [...newMessages, ...prev];
+              });
+              // Preserve scroll position after prepending
+              requestAnimationFrame(() => {
+                const newScrollHeight = container.scrollHeight;
+                container.scrollTop = newScrollHeight - prevScrollHeight;
+              });
+            }
+            setIsLoadingOlder(false);
+          }
+        );
+      }
+    };
+
+    container.addEventListener("scroll", handleScroll);
+    return () => container.removeEventListener("scroll", handleScroll);
+  }, [isLoadingOlder, hasMoreMessages, messages, sessionId, setLocalMessages]);
 
   const selectedDeviceRef = useRef(selectedDevice);
   selectedDeviceRef.current = selectedDevice;
@@ -322,8 +453,24 @@ function ChatInner({
       )}
 
       {/* Messages */}
-      <div className="flex-1 overflow-y-auto">
+      <div className="flex-1 overflow-y-auto" ref={scrollContainerRef}>
         <div className="max-w-3xl mx-auto px-4 md:px-5 py-6 space-y-5">
+          {/* Loading indicator for older messages */}
+          {isLoadingOlder && (
+            <div className="text-center py-2">
+              <Text size="sm" variant="secondary">
+                Loading older messages...
+              </Text>
+            </div>
+          )}
+          {!hasMoreMessages && messages.length > 0 && (
+            <div className="text-center py-2">
+              <Text size="sm" variant="secondary">
+                Beginning of conversation
+              </Text>
+            </div>
+          )}
+
           {messages.length === 0 && (
             <Empty
               icon={<CloudSunIcon size={32} />}
@@ -379,16 +526,12 @@ function ChatInner({
                     const uncached = (u.inputTokens || 0) - cached;
                     const output = u.outputTokens || 0;
                     return (
-                      <div className="text-[11px] text-kumo-tertiary mt-1 ml-1 font-mono">
-                        <span className="text-green-500">{cached}</span>
-                        <span className="opacity-50"> cached </span>
-                        <span className="opacity-50">| </span>
-                        <span>{uncached}</span>
-                        <span className="opacity-50"> input </span>
-                        <span className="opacity-50">| </span>
-                        <span className="text-blue-500">{output}</span>
-                        <span className="opacity-50"> output</span>
-                      </div>
+                      <TokenUsage
+                        cached={cached}
+                        uncached={uncached}
+                        output={output}
+                        messageText={getMessageText(message)}
+                      />
                     );
                   })()}
 

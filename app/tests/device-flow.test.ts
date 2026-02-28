@@ -11,7 +11,7 @@
  */
 import { env } from "cloudflare:test";
 import { describe, it, expect, beforeAll } from "vitest";
-import { getAgentByName } from "agents";
+import { getServerByName } from "partyserver";
 import type { UIMessage as ChatMessage } from "ai";
 import {
   applyD1Schema,
@@ -133,7 +133,7 @@ describe("Device authorization flow", () => {
 describe("Device-initiated message flow", () => {
   it("handleDeviceInitiatedTask persists user message + assistant response and returns result", async () => {
     const room = crypto.randomUUID();
-    const agentStub = await getAgentByName(env.TestChatAgent, room);
+    const agentStub = await getServerByName(env.TestChatAgent, room);
 
     const result =
       await agentStub.handleDeviceInitiatedTask("Turn on the lights");
@@ -157,7 +157,7 @@ describe("Device-initiated message flow", () => {
 
   it("multi-turn: sequential device tasks accumulate in conversation", async () => {
     const room = crypto.randomUUID();
-    const agentStub = await getAgentByName(env.TestChatAgent, room);
+    const agentStub = await getServerByName(env.TestChatAgent, room);
 
     await agentStub.handleDeviceInitiatedTask("First task");
     await agentStub.handleDeviceInitiatedTask("Second task");
@@ -180,7 +180,7 @@ describe("Device-initiated message flow", () => {
 
   it("returns 'done' when onChatMessage resolves with empty text", async () => {
     const room = crypto.randomUUID();
-    const agentStub = await getAgentByName(env.TestChatAgent, room);
+    const agentStub = await getServerByName(env.TestChatAgent, room);
 
     // TestChatAgent.onChatMessage resolves with "Hello from chat agent!"
     // which is non-empty, so this just confirms the fallback path exists.
@@ -191,7 +191,7 @@ describe("Device-initiated message flow", () => {
 
   it("device task and scheduled task use the same deferred pattern on the same DO", async () => {
     const room = crypto.randomUUID();
-    const agentStub = await getAgentByName(env.TestChatAgent, room);
+    const agentStub = await getServerByName(env.TestChatAgent, room);
 
     // Device task first
     const deviceResult =

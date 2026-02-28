@@ -6,6 +6,7 @@
 import * as Sentry from "@sentry/cloudflare";
 import { listSessions } from "./db";
 import { upsertSessionSnapshot } from "./usage-archive";
+import { getChatAgentStub, chatAgentIsolatedName } from "./device-hub";
 
 export type UsageRow = {
   hour: string;
@@ -59,15 +60,13 @@ export async function fetchDoUsage(
   sessionId: string,
   since?: string
 ): Promise<UsageRow[]> {
-  const isolatedName = encodeURIComponent(`${userId}:${sessionId}`);
-  const doId = env.ChatAgent.idFromName(isolatedName);
-  const stub = env.ChatAgent.get(doId);
+  const stub = getChatAgentStub(env.ChatAgent, userId, sessionId);
   const url = since
     ? `http://agent/get-usage?since=${encodeURIComponent(since)}`
     : "http://agent/get-usage";
   const res = await stub.fetch(
     new Request(url, {
-      headers: { "x-partykit-room": isolatedName }
+      headers: { "x-partykit-room": chatAgentIsolatedName(userId, sessionId) }
     })
   );
   return res.ok ? ((await res.json()) as UsageRow[]) : [];

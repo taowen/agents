@@ -4,7 +4,7 @@ import worker from "./worker";
 import type { Env } from "./worker";
 
 // Re-export MessageType from the ai-chat package
-export { MessageType } from "@cloudflare/ai-chat/types";
+export { MessageType } from "../ai-chat/src/lib/ai-chat/types";
 
 // D1 Schema SQL (from app/ai-chat/migrations/0001_init.sql)
 const SCHEMA_SQL = `

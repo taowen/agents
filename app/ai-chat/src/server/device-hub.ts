@@ -33,6 +33,66 @@ export function getDeviceName(sessionUuid: string): string {
   return sessionUuid.slice("device-".length);
 }
 
+/** Build the isolated DO name used for ChatAgent stubs. */
+export function chatAgentIsolatedName(
+  userId: string,
+  sessionId: string
+): string {
+  return encodeURIComponent(`${userId}:${sessionId}`);
+}
+
+/** Get a ChatAgent DO stub for the given user + session. */
+export function getChatAgentStub(
+  ns: DurableObjectNamespace,
+  userId: string,
+  sessionId: string
+): DurableObjectStub {
+  return ns.get(ns.idFromName(chatAgentIsolatedName(userId, sessionId)));
+}
+
+export interface DeviceRecord {
+  name: string;
+  sessionId: string;
+  title: string;
+  online: boolean;
+  stub: DurableObjectStub;
+}
+
+/** Query D1 for device sessions and check DO liveness for each. */
+export async function findDevices(
+  env: Env,
+  userId: string
+): Promise<DeviceRecord[]> {
+  const rows = await env.DB.prepare(
+    "SELECT id, title FROM sessions WHERE user_id = ? AND id LIKE 'device-%'"
+  )
+    .bind(userId)
+    .all<{ id: string; title: string }>();
+
+  if (rows.results.length === 0) return [];
+
+  const checks = await Promise.allSettled(
+    rows.results.map(async (s) => {
+      const stub = getChatAgentStub(env.ChatAgent, userId, s.id);
+      const res = await stub.fetch(new Request("http://agent/status"));
+      const body = (await res.json()) as { online: boolean };
+      return {
+        name: s.id.replace("device-", ""),
+        sessionId: s.id,
+        title: s.title || "",
+        online: body.online,
+        stub
+      };
+    })
+  );
+
+  return checks
+    .filter(
+      (r): r is PromiseFulfilledResult<DeviceRecord> => r.status === "fulfilled"
+    )
+    .map((r) => r.value);
+}
+
 export class DeviceHub {
   private pendingExecs = new Map<string, PendingExec>();
 

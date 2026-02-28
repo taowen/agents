@@ -7,7 +7,7 @@
  */
 import { env } from "cloudflare:test";
 import { describe, it, expect, beforeAll } from "vitest";
-import { getAgentByName } from "agents";
+import { getServerByName } from "partyserver";
 import type {
   DebugEntry,
   LlmInteractionEntry
@@ -58,7 +58,7 @@ describe("Bug reporting", () => {
 
   it("debug ring buffer stores and retrieves entries in order", async () => {
     await ensureDOInitialized();
-    const stub = await getAgentByName(env.TestChatAgent, room);
+    const stub = await getServerByName(env.TestChatAgent, room);
     await stub.debugBufferReset(20);
 
     await stub.debugBufferPush(makeLlmEntry({ traceId: "trace-1" }));
@@ -74,7 +74,7 @@ describe("Bug reporting", () => {
 
   it("ring buffer evicts oldest beyond maxSize", async () => {
     await ensureDOInitialized();
-    const stub = await getAgentByName(env.TestChatAgent, room);
+    const stub = await getServerByName(env.TestChatAgent, room);
     await stub.debugBufferReset(3);
 
     for (let i = 0; i < 5; i++) {
@@ -90,7 +90,7 @@ describe("Bug reporting", () => {
 
   it("ring buffer updateResponse modifies entry in place", async () => {
     await ensureDOInitialized();
-    const stub = await getAgentByName(env.TestChatAgent, room);
+    const stub = await getServerByName(env.TestChatAgent, room);
     await stub.debugBufferReset(20);
 
     const rowId = (await stub.debugBufferPush(makeLlmEntry())) as number;

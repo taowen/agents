@@ -4,6 +4,7 @@
  */
 
 import * as Sentry from "@sentry/cloudflare";
+import { chatAgentIsolatedName } from "./device-hub";
 
 interface SubmitBugReportParams {
   db: D1Database;
@@ -30,8 +31,7 @@ export async function submitBugReport({
     .toUpperCase()}`;
 
   // Compute sessionDir from the DO ID (first 12 hex chars)
-  const isolatedName = encodeURIComponent(`${userId}:${sessionId}`);
-  const doId = chatAgentNs.idFromName(isolatedName);
+  const doId = chatAgentNs.idFromName(chatAgentIsolatedName(userId, sessionId));
   const sessionDir = doId.toString().slice(0, 12);
 
   // Query D1 for recent chat messages

@@ -113,6 +113,7 @@ export async function archiveSessionUsage(
     cache_read_tokens: number;
     output_tokens: number;
   }[];
+
   for (const row of hourRows) {
     upsertSessionSnapshot(
       db,

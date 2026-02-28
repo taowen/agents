@@ -3,9 +3,15 @@ import react from "@vitejs/plugin-react";
 import tailwindcss from "@tailwindcss/vite";
 import { sentryVitePlugin } from "@sentry/vite-plugin";
 import { defineConfig } from "vite";
-import dotenv from "dotenv";
+import { readFileSync, existsSync } from "node:fs";
 
-dotenv.config({ path: ".env.sentry" });
+const envSentryPath = new URL(".env.sentry", import.meta.url);
+if (existsSync(envSentryPath)) {
+  for (const line of readFileSync(envSentryPath, "utf-8").split("\n")) {
+    const match = line.match(/^\s*([^#=]+?)\s*=\s*(.*?)\s*$/);
+    if (match) process.env[match[1]] = match[2];
+  }
+}
 
 export default defineConfig({
   define: {
@@ -18,8 +24,7 @@ export default defineConfig({
     sentryVitePlugin({
       authToken: process.env.SENTRY_SOURCEMAP_AUTH_TOKEN,
       org: "txom",
-      project: "cloudflare-worker",
-      url: "https://us.sentry.io"
+      project: "cloudflare-worker"
     })
   ],
   build: {

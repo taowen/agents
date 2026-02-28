@@ -13,16 +13,15 @@
   "author": "Cloudflare Agents <1800-agents@cloudflare.com>",
   "private": true,
   "scripts": {
-    "build": "npm run build -w agents -w hono-agents -w @cloudflare/ai-chat -w @cloudflare/codemode",
+    "build": "echo 'no packages to build'",
     "format": "oxfmt --write .",
     "format:check": "oxfmt --check .",
-    "lint": "oxlint examples/ packages/ guides/ openai-sdk/ site/",
+    "lint": "oxlint packages/ guides/ site/",
     "typecheck": "npx tsx scripts/typecheck.ts",
     "check:exports": "npx tsx scripts/check-exports.ts",
     "check:updates": "npx tsx scripts/check-updates.ts",
-    "check": "sherif && npm run check:exports && oxfmt --check . && oxlint examples/ packages/ guides/ openai-sdk/ site/ && npm run typecheck",
-    "test": "npm run test -w agents -w @cloudflare/ai-chat",
-    "test:react": "npm run test:react -w agents",
+    "check": "sherif && npm run check:exports && oxfmt --check . && oxlint packages/ guides/ site/ && npm run typecheck",
+    "test": "echo 'no package tests to run'",
     "postinstall": "patch-package",
     "prepare:playwright": "playwright install --with-deps chromium",
     "prepare": "husky"
@@ -64,8 +63,8 @@
     "patch-package": "^8.0.1",
     "pkg-pr-new": "^0.0.63",
     "playwright": "^1.58.2",
-    "react": "19.2.3",
-    "react-dom": "19.2.3",
+    "react": "19.2.4",
+    "react-dom": "19.2.4",
     "sherif": "^1.10.0",
     "tsdown": "^0.20.3",
     "tsx": "^4.21.0",
@@ -80,11 +79,8 @@
   },
   "workspaces": [
     "app/*",
-    "examples/*",
     "packages/*",
     "guides/*",
-    "experimental/*",
-    "openai-sdk/*",
     "site/*"
   ],
   "overrides": {

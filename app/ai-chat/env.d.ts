@@ -20,7 +20,7 @@ declare namespace Cloudflare {
     SEARCH_API_KEY?: string;
     SEARCH_API_BASE_URL?: string;
     SEARCH_API_MODEL?: string;
-    CF_ACCOUNT_ID?: string;
+    CLOUDFLARE_ACCOUNT_ID?: string;
     CF_BROWSER_TOKEN?: string;
 
     AUTH_SECRET: string;

@@ -7,7 +7,8 @@ import {
   ArrowLeftIcon,
   ListIcon,
   PlusIcon,
-  XIcon
+  XIcon,
+  SignOutIcon
 } from "@phosphor-icons/react";
 import { Button, Text } from "@cloudflare/kumo";
 import {
@@ -503,6 +504,19 @@ export function SettingsPage() {
               {error}
             </Text>
           )}
+        </div>
+
+        {/* Logout */}
+        <div className="mt-8 pt-5 border-t border-kumo-line">
+          <button
+            onClick={() => {
+              window.location.href = "/auth/logout";
+            }}
+            className="flex items-center gap-2 px-4 py-2 rounded-lg text-sm font-medium text-red-600 dark:text-red-400 hover:bg-red-50 dark:hover:bg-red-900/20 transition-colors"
+          >
+            <SignOutIcon size={16} />
+            退出登录
+          </button>
         </div>
       </div>
     </div>

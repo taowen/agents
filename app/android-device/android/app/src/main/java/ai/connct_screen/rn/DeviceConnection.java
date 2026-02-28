@@ -1,5 +1,7 @@
 package ai.connct_screen.rn;
 
+import android.content.Context;
+import android.net.wifi.WifiManager;
 import android.os.Handler;
 import android.os.Looper;
 import android.util.Log;
@@ -40,6 +42,11 @@ public class DeviceConnection {
     }
 
     private static final Map<String, DeviceConnection> instances = new HashMap<>();
+    private static Context appContext;
+
+    public static void setAppContext(Context ctx) {
+        appContext = ctx.getApplicationContext();
+    }
 
     private final String agentType;
     private OkHttpClient client;
@@ -58,6 +65,7 @@ public class DeviceConnection {
 
     // Persistent Hermes runtime for exec_js
     private boolean hermesInitialized = false;
+    private WifiManager.WifiLock wifiLock;
 
     private DeviceConnection(String agentType) {
         this.agentType = agentType;
@@ -101,6 +109,7 @@ public class DeviceConnection {
                 reconnectDelayMs = RECONNECT_BASE_MS;
                 lastPingTime = System.currentTimeMillis();
                 notifyConnectionStatus(true);
+                acquireWifiLock();
                 // Send ready message with system prompt and tools
                 try {
                     JSONObject ready = new JSONObject();
@@ -201,11 +210,16 @@ public class DeviceConnection {
     }
 
     public synchronized void disconnect() {
+        if (pendingReconnect != null) {
+            mainHandler.removeCallbacks(pendingReconnect);
+            pendingReconnect = null;
+        }
         if (ws != null) {
             try { ws.close(1000, "disconnect"); } catch (Exception ignored) {}
             ws = null;
         }
         connected = false;
+        releaseWifiLock();
         if (hermesInitialized) {
             try { HermesRuntime.nativeDestroyRuntime(agentType); } catch (Exception ignored) {}
             hermesInitialized = false;
@@ -253,6 +267,51 @@ public class DeviceConnection {
         }
     }
 
+    /** Reconnect immediately if disconnected. Safe to call multiple times. */
+    public synchronized void reconnectNow() {
+        if (connected || lastUrl == null) return;
+        Log.i(TAG, "[" + agentType + "] reconnectNow triggered");
+        reconnectDelayMs = RECONNECT_BASE_MS;
+        if (pendingReconnect != null) {
+            mainHandler.removeCallbacks(pendingReconnect);
+            pendingReconnect = null;
+        }
+        connect(lastUrl, lastDeviceName);
+    }
+
+    /** Reconnect all disconnected instances immediately. */
+    public static synchronized void reconnectAll() {
+        for (DeviceConnection conn : instances.values()) {
+            conn.reconnectNow();
+        }
+    }
+
+    private void acquireWifiLock() {
+        if (wifiLock != null && wifiLock.isHeld()) return;
+        if (appContext == null) return;
+        try {
+            WifiManager wm = (WifiManager) appContext.getSystemService(Context.WIFI_SERVICE);
+            if (wm != null) {
+                wifiLock = wm.createWifiLock(WifiManager.WIFI_MODE_FULL_HIGH_PERF,
+                        "DeviceConn:" + agentType);
+                wifiLock.acquire();
+                Log.i(TAG, "[" + agentType + "] WiFi lock acquired");
+            }
+        } catch (Exception e) {
+            Log.w(TAG, "[" + agentType + "] Failed to acquire WiFi lock", e);
+        }
+    }
+
+    private void releaseWifiLock() {
+        if (wifiLock != null && wifiLock.isHeld()) {
+            try {
+                wifiLock.release();
+                Log.i(TAG, "[" + agentType + "] WiFi lock released");
+            } catch (Exception ignored) {}
+        }
+        wifiLock = null;
+    }
+
     /**
      * Execute JS code in a persistent Hermes runtime and send the result back.
      */
@@ -268,10 +327,10 @@ public class DeviceConnection {
                         "JSON.stringify(executeCodeForServer(" + escapeJsString(code) + "))",
                         "exec_js"
                 );
-                // If executeCodeForServer is gone (runtime state lost), reinit and retry once
-                if (rawResult != null && rawResult.contains("executeCodeForServer")
-                        && rawResult.contains("doesn't exist")) {
-                    Log.w(TAG, "[" + agentType + "] executeCodeForServer missing, reinitializing runtime");
+                // If runtime is gone or executeCodeForServer is missing, reinit and retry once
+                if (rawResult != null && (rawResult.contains("Runtime not created")
+                        || (rawResult.contains("executeCodeForServer") && rawResult.contains("doesn't exist")))) {
+                    Log.w(TAG, "[" + agentType + "] Runtime issue, reinitializing: " + rawResult);
                     hermesInitialized = false;
                     initHermesRuntime();
                     rawResult = HermesRuntime.nativeEvaluateJS(
@@ -323,18 +382,28 @@ public class DeviceConnection {
         // Load the appropriate JS bundle
         String assetName = "app".equals(agentType) ? "agent-standalone.js" : "browser-standalone.js";
 
-        com.google.android.accessibility.selecttospeak.SelectToSpeakService service =
-                com.google.android.accessibility.selecttospeak.SelectToSpeakService.getInstance();
-        if (service == null) {
-            Log.e(TAG, "[" + agentType + "] A11y service not available, destroying bare runtime");
-            HermesRuntime.nativeDestroyRuntime(agentType);
-            return;
+        Context loadContext;
+        if ("app".equals(agentType)) {
+            com.google.android.accessibility.selecttospeak.SelectToSpeakService service =
+                    com.google.android.accessibility.selecttospeak.SelectToSpeakService.getInstance();
+            if (service == null) {
+                Log.e(TAG, "[" + agentType + "] A11y service not available, destroying bare runtime");
+                HermesRuntime.nativeDestroyRuntime(agentType);
+                throw new RuntimeException("Accessibility service is not enabled. Please enable it in Android Settings > Accessibility > Select to Speak.");
+            }
+            loadContext = service;
+        } else {
+            if (appContext == null) {
+                HermesRuntime.nativeDestroyRuntime(agentType);
+                throw new RuntimeException("Application context not available");
+            }
+            loadContext = appContext;
         }
-        String bundleJs = HermesRuntime.loadAsset(service, assetName);
+        String bundleJs = HermesRuntime.loadAsset(loadContext, assetName);
         if (bundleJs == null) {
             Log.e(TAG, "[" + agentType + "] Failed to load " + assetName + ", destroying bare runtime");
             HermesRuntime.nativeDestroyRuntime(agentType);
-            return;
+            throw new RuntimeException("Failed to load JS bundle: " + assetName);
         }
         HermesRuntime.nativeEvaluateJS(agentType, bundleJs, assetName);
 
